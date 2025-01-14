@@ -182,6 +182,18 @@ class Training:
     loaded from this path instead of downloaded.
     """
 
+    dataset_inner_name: str | None = None
+    """Dataset name to use (`name` argument of `datasets.load_dataset`)"""
+
+    dataset_split: str = "train"
+    """Dataset split to use"""
+
+    dataset_streaming: bool = False
+    """Whether to stream the dataset"""
+
+    dataset_key: str = "text"
+    """Key to use for extracting the relevant text data from the dataset's samples"""
+
     local_batch_size: int = 8
     """Local batch size (i.e., per-device batch size)"""
 
@@ -718,6 +730,18 @@ class Validation:
 
     dataset_path: str | None = None
     """Path to dataset to use for validation"""
+
+    dataset_inner_name: str | None = None
+    """Dataset name to use for validation (`name` argument of `datasets.load_dataset`)"""
+
+    dataset_split: str = "train"
+    """Dataset split to use for validation"""
+
+    dataset_streaming: bool = False
+    """Whether to stream the validation dataset"""
+
+    dataset_key: str = "text"
+    """Key to use for extracting the relevant text data from the validation dataset's samples"""
 
     local_batch_size: int = 8
     """Batch size for validation"""

@@ -327,6 +327,8 @@ class Transformer(nn.Module, ModelProtocol):
 
     """
 
+    transformer_block_cls = TransformerBlock
+
     def __init__(self, model_args: TransformerModelArgs):
         super().__init__()
         self.model_args = model_args
@@ -341,7 +343,9 @@ class Transformer(nn.Module, ModelProtocol):
 
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(model_args.n_layers):
-            self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
+            self.layers[str(layer_id)] = self.transformer_block_cls(
+                layer_id, model_args
+            )
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
         self.init_weights()
@@ -423,3 +427,257 @@ class Transformer(nn.Module, ModelProtocol):
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
         return output
+
+
+class BitNetAttention(nn.Module):
+    """
+    BitNet Multi-head attention module.
+
+    Args:
+        model_args (TransformerModelArgs): Model configuration arguments.
+
+    Attributes:
+        n_kv_heads (int): Number of key and value heads.
+        n_heads (int): Number of query heads.
+        n_rep (int): Number of repetitions for local heads.
+        head_dim (int): Dimension size of each attention head.
+        wq (Linear): Linear transformation for queries.
+        wk (Linear): Linear transformation for keys.
+        wv (Linear): Linear transformation for values.
+        wo (Linear): Linear transformation for output.
+        wq_norm (RMSNorm): Layer normalization for query projection input.
+        wk_norm (RMSNorm): Layer normalization for key projection input.
+        wv_norm (RMSNorm): Layer normalization for value projection input.
+        wo_norm (RMSNorm): Layer normalization for Attention output
+            projection input.
+
+    """
+
+    def __init__(self, model_args: TransformerModelArgs):
+        super().__init__()
+        self.n_heads = model_args.n_heads
+        self.n_kv_heads = (
+            model_args.n_heads
+            if model_args.n_kv_heads is None
+            else model_args.n_kv_heads
+        )
+        self.n_rep = self.n_heads // self.n_kv_heads
+        self.head_dim = model_args.dim // model_args.n_heads
+
+        self.wq = nn.Linear(
+            model_args.dim, model_args.n_heads * self.head_dim, bias=False
+        )
+        self.wk = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(
+            model_args.n_heads * self.head_dim, model_args.dim, bias=False
+        )
+        self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
+
+        self.wq_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.wk_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.wv_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.wo_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+
+    def init_weights(self, init_std: float):
+        for norm in (self.wq_norm, self.wk_norm, self.wv_norm, self.wo_norm):
+            norm.reset_parameters()
+        for linear in (self.wq, self.wk, self.wv):
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ):
+        """
+        Forward pass of the attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            freqs_cis (torch.Tensor): Precomputed frequency tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after attention.
+
+        """
+
+        bs, seqlen, _ = x.shape
+        xq, xk, xv = (
+            self.wq(self.wq_norm(x)),
+            self.wk(self.wk_norm(x)),
+            self.wv(self.wv_norm(x)),
+        )
+
+        # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
+        # local heads from sizes of xq, xk, and xv as TP may have sharded them
+        # after the above linear ops.
+        xq = xq.view(bs, seqlen, -1, self.head_dim)
+        xk = xk.view(bs, seqlen, -1, self.head_dim)
+        xv = xv.view(bs, seqlen, -1, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+
+        output = self.sdpa(xq, xk, xv)
+
+        output = output.transpose(
+            1, 2
+        ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
+        output = output.view(bs, seqlen, -1)
+        return self.wo(self.wo_norm(output))
+
+
+class BitNetFeedForward(nn.Module):
+    """
+    BitNet FeedForward module
+
+    Args:
+        dim (int): Input dimension.
+        hidden_dim (int): Hidden dimension of the feedforward layer.
+        multiple_of (int): Value to ensure hidden dimension is a multiple of this value.
+        ffn_dim_multiplier (float | None): Custom multiplier for hidden dimension. Defaults to None.
+        norm_eps (float): Numerical stabilizer for norms.
+
+    Attributes:
+        w1 (Linear): Linear transformation for the first layer.
+        w2 (Linear): Linear transformation for the second layer.
+        w3 (Linear): Linear transformation for the third layer.
+        w1_norm (RMSNorm): Layer normalization for non-gated input.
+        w2_norm (RMSNorm): Layer normalization for GLU output.
+        w3_norm (RMSNorm): Layer normalization for gated input.
+
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: float | None,
+        norm_eps: float,
+    ):
+        super().__init__()
+        hidden_dim = int(2 * hidden_dim / 3)
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+
+        self.w1_norm = nn.RMSNorm(dim, eps=norm_eps)
+        self.w2_norm = nn.RMSNorm(hidden_dim, eps=norm_eps)
+        self.w3_norm = nn.RMSNorm(dim, eps=norm_eps)
+
+    def forward(self, x):
+        return self.w2(
+            self.w2_norm(F.silu(self.w1(self.w1_norm(x))) * self.w3(self.w3_norm(x)))
+        )
+
+    def init_weights(self, init_std: float):
+        for norm in (self.w1_norm, self.w2_norm, self.w3_norm):
+            norm.reset_parameters()
+        nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
+        for linear in (self.w2, self.w3):
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
+
+
+class BitNetTransformerBlock(nn.Module):
+    """
+    BitNet TransformerBlock Module
+
+    Args:
+        layer_id (int): Identifier for the layer.
+        model_args (TransformerModelArgs): Model configuration arguments.
+
+    Attributes:
+        n_heads (int): Number of attention heads.
+        dim (int): Dimension size of the model.
+        head_dim (int): Dimension size of each attention head.
+        attention (Attention): Attention module.
+        feed_forward (FeedForward): FeedForward module.
+        layer_id (int): Identifier for the layer.
+
+    """
+
+    def __init__(self, layer_id: int, model_args: TransformerModelArgs):
+        super().__init__()
+        self.n_heads = model_args.n_heads
+        self.dim = model_args.dim
+        self.attention = BitNetAttention(model_args)
+        self.feed_forward = BitNetFeedForward(
+            dim=model_args.dim,
+            hidden_dim=4 * model_args.dim,
+            multiple_of=model_args.multiple_of,
+            ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+            norm_eps=model_args.norm_eps,
+        )
+
+        if model_args.depth_init:
+            self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
+        else:
+            self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ):
+        """
+        Perform a forward pass through the TransformerBlock.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+
+        Returns:
+            torch.Tensor: Output tensor after applying attention and feedforward layers.
+
+        """
+        h = x + self.attention(x, freqs_cis)
+        out = h + self.feed_forward(h)
+        return out
+
+    def init_weights(self):
+        self.attention.init_weights(self.weight_init_std)
+        self.feed_forward.init_weights(self.weight_init_std)
+
+
+class BitNetTransformer(Transformer):
+    """
+    BitNet Transformer Module
+
+    Args:
+        model_args (TransformerModelArgs): Model configuration arguments.
+
+    Attributes:
+        model_args (TransformerModelArgs): Model configuration arguments.
+        vocab_size (int): Vocabulary size.
+        n_layers (int): Number of layers in the model.
+        tok_embeddings (ParallelEmbedding): Token embeddings.
+        layers (torch.nn.ModuleList): List of Transformer blocks.
+        norm (RMSNorm): Layer normalization for the model output.
+        output (Linear): Linear layer for final output.
+        freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+
+    """
+
+    transformer_block_cls = BitNetTransformerBlock
+
+    def __init__(self, *args, **kwargs):
+        from torchao import quantize_
+        from torchao.prototype.quantized_training import bitnet_training
+
+        super().__init__(*args, **kwargs)
+        quantize_(self.layers, bitnet_training(), set_inductor_config=False)

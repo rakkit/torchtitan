@@ -410,6 +410,15 @@ class HuggingFaceTokenizer(BaseTokenizer):
         return self.tokenizer.id_to_token(token_id)
 
 
+class HuggingFaceByteTokenizer(HuggingFaceTokenizer):
+    def _load_tokenizer_from_path(self, *args, **kwargs) -> Tokenizer:
+        tokenizer = super()._load_tokenizer_from_path(*args, **kwargs)
+        # Need to re-set this attribute after loading to split special
+        # tokens when encoding.
+        tokenizer.encode_special_tokens = True
+        return tokenizer
+
+
 def build_hf_tokenizer(
     job_config: JobConfig,
 ) -> Union[HuggingFaceTokenizer, BaseTokenizer]:
@@ -427,4 +436,24 @@ def build_hf_tokenizer(
         tokenizer (HuggingFaceTokenizer): Loaded tokenizer instance with intelligent BOS/EOS handling
     """
     tokenizer = HuggingFaceTokenizer(job_config.model.hf_assets_path)
+    return tokenizer
+
+
+def build_hf_byte_tokenizer(
+    job_config: JobConfig,
+) -> HuggingFaceByteTokenizer:
+    """
+    Builds a HuggingFaceByteTokenizer from the specified path.
+
+    This function creates a HuggingFaceByteTokenizer instance that handles BOS/EOS token
+    inference and intelligent encoding. The tokenizer automatically detects and loads
+    from various file formats and infers special token behavior.
+
+    Args:
+        JobConfig: A JobConfig object containing the path to the tokenizer directory.
+
+    Returns:
+        tokenizer (HuggingFaceByteTokenizer): Loaded tokenizer instance with intelligent BOS/EOS handling
+    """
+    tokenizer = HuggingFaceByteTokenizer(job_config.model.hf_assets_path)
     return tokenizer

@@ -7,6 +7,7 @@
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
 
+import math
 from dataclasses import dataclass
 
 from torch import nn
@@ -38,6 +39,16 @@ class TransformerModelArgs(BaseModelArgs):
     eos_id: int = 0
 
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
+        if job_config.model.vocab_size_multiple_of:
+            orig_vocab_size = self.vocab_size
+            vocab_divisor = job_config.model.vocab_size_multiple_of
+            self.vocab_size = int(
+                math.ceil(self.vocab_size / vocab_divisor) * vocab_divisor
+            )
+            logger.info(
+                f"Padded vocab size from {orig_vocab_size} to {self.vocab_size}."
+            )
+
         seq_len = job_config.training.seq_len
         if seq_len > self.max_seq_len:
             logger.warning(

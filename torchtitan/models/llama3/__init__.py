@@ -15,7 +15,7 @@ from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 from .infra.parallelize import parallelize_llama
 from .infra.pipeline import pipeline_llama
 from .model.args import TransformerModelArgs
-from .model.model import Transformer
+from .model.model import BitNetTransformer, Transformer
 from .model.state_dict_adapter import Llama3StateDictAdapter
 
 __all__ = [
@@ -218,6 +218,23 @@ register_train_spec(
         build_validator_fn=build_validator,
         # TODO Not tested, but we expect that the
         #      `Llama3StateDictAdapter` works for Llama-2 as well.
+        state_dict_adapter=Llama3StateDictAdapter,
+    )
+)
+
+register_train_spec(
+    TrainSpec(
+        name="bit_byte_llama3",
+        model_cls=BitNetTransformer,
+        model_args=byte_llama3_configs,
+        parallelize_fn=parallelize_llama,
+        pipelining_fn=pipeline_llama,
+        build_optimizers_fn=build_optimizers,
+        build_lr_schedulers_fn=build_lr_schedulers,
+        build_dataloader_fn=build_hf_dataloader,
+        build_tokenizer_fn=build_hf_byte_tokenizer,
+        build_loss_fn=build_cross_entropy_loss,
+        build_validator_fn=build_validator,
         state_dict_adapter=Llama3StateDictAdapter,
     )
 )

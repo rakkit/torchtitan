@@ -643,6 +643,12 @@ class MX:
 
 
 @dataclass
+class BitNet:
+    precompute_bitnet_scale_for_fsdp: bool = False
+    """Whether to precompute BitNet scales dynamically for FSDP"""
+
+
+@dataclass
 class Comm:
     init_timeout_seconds: int = 300
     """Timeout for communication operations, during initialization and first train step."""
@@ -803,6 +809,7 @@ class JobConfig:
     compile: Compile = field(default_factory=Compile)
     float8: Float8 = field(default_factory=Float8)
     mx: MX = field(default_factory=MX)
+    bitnet: BitNet = field(default_factory=BitNet)
     comm: Comm = field(default_factory=Comm)
     memory_estimation: MemoryEstimation = field(default_factory=MemoryEstimation)
     fault_tolerance: FaultTolerance = field(default_factory=FaultTolerance)

@@ -674,10 +674,3 @@ class BitNetTransformer(Transformer):
     """
 
     transformer_block_cls = BitNetTransformerBlock
-
-    def __init__(self, *args, **kwargs):
-        from torchao import quantize_
-        from torchao.prototype.quantized_training import bitnet_training
-
-        super().__init__(*args, **kwargs)
-        quantize_(self.layers, bitnet_training(), set_inductor_config=False)

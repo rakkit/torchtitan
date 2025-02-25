@@ -14,5 +14,6 @@
 # The quantization modules are intended to be ran under `torch.compile`` for competitive performance
 
 # Import to register quantization modules as ModelConverter
+import torchtitan.components.quantization.bitnet  # noqa: F401
 import torchtitan.components.quantization.float8  # noqa: F401
 import torchtitan.components.quantization.mx  # noqa: F401

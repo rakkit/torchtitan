@@ -32,10 +32,7 @@ from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.config.job_config import ActivationCheckpoint as ACConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
-from torchtitan.models.llama3.model.model import (
-    BitNetTransformerBlock,
-    TransformerBlock,
-)
+from torchtitan.models.llama3.model.model import BitNetTransformerBlock
 from torchtitan.tools.logging import logger
 
 
@@ -196,53 +193,32 @@ def apply_tp(
     #       by folding (and unfolding) the batch dimension and the sequence dimension.
     #       Examples can be found at https://github.com/pytorch/torchtitan/pull/437
     for transformer_block in model.layers.values():
-        if isinstance(transformer_block, TransformerBlock):
-            layer_plan = {
-                "attention_norm": SequenceParallel(),
-                "attention": prepare_module_input(
-                    input_layouts=(Shard(1), None),
-                    desired_input_layouts=(Replicate(), None),
-                ),
-                "attention.wq": colwise_parallel(),
-                "attention.wk": colwise_parallel(),
-                "attention.wv": colwise_parallel(),
-                "attention.wo": rowwise_parallel(output_layouts=Shard(1)),
-                "ffn_norm": SequenceParallel(),
-                "feed_forward": prepare_module_input(
-                    input_layouts=(Shard(1),),
-                    desired_input_layouts=(Replicate(),),
-                ),
-                "feed_forward.w1": colwise_parallel(),
-                "feed_forward.w2": rowwise_parallel(output_layouts=Shard(1)),
-                "feed_forward.w3": colwise_parallel(),
-            }
-        elif isinstance(transformer_block, BitNetTransformerBlock):
-            layer_plan = {
-                "attention": prepare_module_input(
-                    input_layouts=(Shard(1), None),
-                    desired_input_layouts=(Replicate(), None),
-                ),
-                "attention.wq": colwise_parallel(),
-                "attention.wk": colwise_parallel(),
-                "attention.wv": colwise_parallel(),
-                "attention.wo": rowwise_parallel(output_layouts=Shard(1)),
-                "attention.wq_norm": SequenceParallel(),
-                "attention.wk_norm": SequenceParallel(),
-                "attention.wv_norm": SequenceParallel(),
-                "attention.wo_norm": SequenceParallel(),
-                "feed_forward": prepare_module_input(
-                    input_layouts=(Shard(1),),
-                    desired_input_layouts=(Replicate(),),
-                ),
-                "feed_forward.w1": colwise_parallel(),
-                "feed_forward.w2": rowwise_parallel(output_layouts=Shard(1)),
-                "feed_forward.w3": colwise_parallel(),
-                "feed_forward.w1_norm": SequenceParallel(),
-                "feed_forward.w2_norm": SequenceParallel(),
-                "feed_forward.w3_norm": SequenceParallel(),
-            }
-        else:
-            raise TypeError("unknown transformer block type")
+        layer_plan = {
+            "attention_norm": SequenceParallel(),
+            "attention": prepare_module_input(
+                input_layouts=(Shard(1), None),
+                desired_input_layouts=(Replicate(), None),
+            ),
+            "attention.wq": colwise_parallel(),
+            "attention.wk": colwise_parallel(),
+            "attention.wv": colwise_parallel(),
+            "attention.wo": rowwise_parallel(output_layouts=Shard(1)),
+            "ffn_norm": SequenceParallel(),
+            "feed_forward": prepare_module_input(
+                input_layouts=(Shard(1),),
+                desired_input_layouts=(Replicate(),),
+            ),
+            "feed_forward.w1": colwise_parallel(),
+            "feed_forward.w2": rowwise_parallel(output_layouts=Shard(1)),
+            "feed_forward.w3": colwise_parallel(),
+        }
+        if isinstance(transformer_block, BitNetTransformerBlock):
+            layer_plan.update(
+                {
+                    "attention.wo_norm": SequenceParallel(),
+                    "feed_forward.w2_norm": SequenceParallel(),
+                }
+            )
 
         parallelize_module(
             module=transformer_block,

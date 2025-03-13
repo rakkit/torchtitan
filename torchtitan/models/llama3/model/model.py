@@ -147,10 +147,25 @@ class Attention(nn.Module):
         )
         self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
 
+        self.qk_norm = model_args.qk_norm
+        if self.qk_norm:
+            self.q_norm = nn.RMSNorm(
+                self.head_dim,
+                eps=model_args.norm_eps,
+            )
+            self.k_norm = nn.RMSNorm(
+                self.head_dim,
+                eps=model_args.norm_eps,
+            )
+
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+
+        if self.qk_norm:
+            for norm in (self.q_norm, self.k_norm):
+                norm.reset_parameters()
 
     def forward(
         self,
@@ -178,6 +193,11 @@ class Attention(nn.Module):
         xq = xq.view(bs, seqlen, -1, self.head_dim)
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
+
+        # Apply optional QK normalization
+        if self.qk_norm:
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
@@ -487,6 +507,11 @@ class BitNetAttention(Attention):
         xq = xq.view(bs, seqlen, -1, self.head_dim)
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
+
+        # Apply optional QK normalization
+        if self.qk_norm:
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 

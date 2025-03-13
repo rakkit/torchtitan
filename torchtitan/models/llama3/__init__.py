@@ -15,7 +15,8 @@ from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 from .infra.parallelize import parallelize_llama
 from .infra.pipeline import pipeline_llama
 from .model.args import TransformerModelArgs
-from .model.model import BitNetTransformer, Transformer
+from .model.bitnet_model import BitNetTransformer
+from .model.model import Transformer
 from .model.state_dict_adapter import Llama3StateDictAdapter
 
 __all__ = [

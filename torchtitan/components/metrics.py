@@ -362,6 +362,7 @@ class MetricsProcessor:
         global_max_loss: float,
         grad_norm: float,
         extra_metrics: dict[str, Any] | None = None,
+        extra_print_data: str = "",
     ):
         assert self.num_flops_per_token > 0, "num_flops_per_token must be set"
 
@@ -416,6 +417,7 @@ class MetricsProcessor:
             f"{color.blue}tps: {round(tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
             f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
+            f"{extra_print_data}"
         )
 
         self.ntokens_since_last_log = 0

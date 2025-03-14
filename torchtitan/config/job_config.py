@@ -128,6 +128,21 @@ class Optimizer:
     weight_decay: float = 0.1
     """Weight decay to use"""
 
+    is_light: bool = False
+    """Whether to use Scion's light (memory-saving) version"""
+
+    is_unconstrained: bool = False
+    """Whether to use Scion's unconstrained version"""
+
+    backend_steps: int = 5
+    """Number of steps for the Scion backend"""
+
+    momentum: float = 0.95
+    """Scion momentum to use"""
+
+    nesterov: bool = False
+    """Whether to use Nesterov momentum in Scion"""
+
     implementation: Literal["for-loop", "foreach", "fused"] = "fused"
     """
     Specify which optimizer implementation to use:

@@ -21,6 +21,7 @@ from torch.optim import Optimizer
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
+from torchtitan.optimizers import Scion
 
 __all__ = [
     "OptimizersContainer",
@@ -76,6 +77,11 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         self.model_parts = model_parts
         for model in self.model_parts:
             params = [p for p in model.parameters() if p.requires_grad]
+
+            extra_kwargs = optimizer_kwargs.pop("extra_kwargs")
+            is_scion = issubclass(optimizer_cls, Scion)
+            if is_scion:
+                optimizer_kwargs.update(extra_kwargs)
             self.optimizers.append(optimizer_cls(params, **optimizer_kwargs))
             all_params.extend(params)
         self._validate_length(len(self.model_parts))
@@ -93,7 +99,8 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
 
     def zero_grad(self, *args, **kwargs) -> None:
         for optimizer in self.optimizers:
-            optimizer.zero_grad(*args, **kwargs)
+            if not (isinstance(optimizer, Scion) and optimizer.is_light):
+                optimizer.zero_grad(*args, **kwargs)
 
     def state_dict(self) -> dict[str, Any]:
         func = functools.partial(
@@ -246,6 +253,7 @@ def build_optimizers(
     optimizer_config: OptimizerConfig,
     parallel_dims: ParallelDims,
     ft_manager: FTManager | None = None,
+    extra_kwargs: dict[str, Any] | None = None,
 ) -> OptimizersContainer:
     """Create a OptimizersContainer for the given model parts and job config.
 
@@ -280,6 +288,8 @@ def build_optimizers(
                 "TorchFT is not supported with optimizers in backward."
             )
 
+    extra_kwargs = extra_kwargs if extra_kwargs is not None else {}
+
     name = optimizer_config.name
     lr = optimizer_config.lr
     beta1 = optimizer_config.beta1
@@ -287,24 +297,51 @@ def build_optimizers(
     eps = optimizer_config.eps
     weight_decay = optimizer_config.weight_decay
 
-    optim_implementation = optimizer_config.implementation
-    assert optim_implementation in ["fused", "foreach", "for-loop"]
+    if name in ["Adam", "AdamW"]:
+        optim_implementation = optimizer_config.implementation
+        assert optim_implementation in ["fused", "foreach", "for-loop"]
 
-    fused = optim_implementation == "fused"
-    foreach = optim_implementation == "foreach"
+        fused = optim_implementation == "fused"
+        foreach = optim_implementation == "foreach"
 
-    optimizer_kwargs = {
-        "lr": lr,
-        "betas": (beta1, beta2),
-        "eps": eps,
-        "weight_decay": weight_decay,
-        "fused": fused,
-        "foreach": foreach,
+        optimizer_kwargs = {
+            "lr": lr,
+            "betas": (beta1, beta2),
+            "eps": eps,
+            "weight_decay": weight_decay,
+            "fused": fused,
+            "foreach": foreach,
+        }
+    elif name == "Scion":
+        backend_steps = optimizer_config.backend_steps
+        momentum = optimizer_config.momentum
+        nesterov = optimizer_config.nesterov
+        is_light = optimizer_config.is_light
+        is_unconstrained = optimizer_config.is_unconstrained
+
+        optimizer_kwargs = {
+            "is_light": is_light,
+            "is_unconstrained": is_unconstrained,
+            "lr": lr,
+            "momentum": momentum,
+            "nesterov": nesterov,
+            "eps": eps,
+            "norm_factor": "spectral",
+            "backend": "newtonschulz5",
+            "backend_steps": backend_steps,
+        }
+    else:
+        raise NotImplementedError(f"Optimizer {name} not added.")
+
+    optimizer_kwargs["extra_kwargs"] = {
+        "parallel_dims": parallel_dims,
+        **extra_kwargs,
     }
 
     optimizer_classes = {
         "Adam": torch.optim.Adam,
         "AdamW": torch.optim.AdamW,
+        "Scion": Scion,
     }
     if name not in optimizer_classes:
         raise NotImplementedError(f"Optimizer {name} not added.")

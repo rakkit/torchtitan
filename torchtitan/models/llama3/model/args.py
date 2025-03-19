@@ -41,8 +41,13 @@ class TransformerModelArgs(BaseModelArgs):
     attn_mask_type: str = "causal"
     eos_id: int = 0
 
+    # Number of additional modules to insert for multi-token prediction.
+    num_mtp_modules: int = 0
+
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
         self.norm_type = job_config.model.norm_type
+        self.num_mtp_modules = job_config.training.num_mtp_tokens
+        assert self.num_mtp_modules >= 0
 
         if self.vocab_size == -1:
             tokenizer = kwargs.get("tokenizer")

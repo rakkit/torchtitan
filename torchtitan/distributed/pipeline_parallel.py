@@ -129,15 +129,17 @@ def generate_llm_fqn_per_model_part(
     num_layers: int,
     input_weight: int = 1,
     output_weight: int = 1,
+    num_mtp_layers: int = 0,
 ) -> list[list[str]]:
     """
     Programmatically generates module names model part, focused on LLMs models.
 
     Args:
         num_stages: Number of pipeline stages
-        num_layers: Total number of transformer layers in the model
+        num_layers: Total number of transformer layers in the model (including MTP layers).
         input_weight: Weight for input modules (tok_embeddings) in layer calculation
         output_weight: Weight for output modules (norm + output) in layer calculation
+        num_mtp_layers (int): The number of MTP layers in the model.
 
     Returns:
         List of lists containing module names for each model part
@@ -149,10 +151,13 @@ def generate_llm_fqn_per_model_part(
     if num_stages < 1:
         raise ValueError("Number of stages must be at least 1")
 
+    num_non_mtp_layers = num_layers - num_mtp_layers
+
     if num_stages == 1:
         # Single stage gets everything
-        layer_names = [f"layers.{i}" for i in range(num_layers)]
-        return [["tok_embeddings"] + layer_names + ["norm", "output"]]
+        layer_names = [f"layers.{i}" for i in range(num_non_mtp_layers)]
+        mtp_layer_names = [f"mtp_layers.{i}" for i in range(num_mtp_layers)]
+        return [["tok_embeddings"] + layer_names + ["norm", "output"] + mtp_layer_names]
 
     # Calculate effective layers including weights
     num_effective_layers = num_layers + input_weight + output_weight
@@ -186,6 +191,26 @@ def generate_llm_fqn_per_model_part(
             f"output_weight ({output_weight}) exceeds minimum layers per stage ({layers_per_stage})."
         )
 
+    def _get_transformer_layer_name(current_layer):
+        if current_layer >= num_non_mtp_layers:
+            layer_name = f"mtp_layers.{current_layer - num_non_mtp_layers}"
+        else:
+            layer_name = f"layers.{current_layer}"
+        return layer_name
+
+    def _keep_output_for_mtp(stage_modules):
+        # If MTP is used, the final norm and output layers of the
+        # non-MTP part of the module need to be kept.
+        # We insert these right before the first MTP layer.
+        if num_mtp_layers > 0 and f"layers.{num_non_mtp_layers - 1}" in stage_modules:
+            last_non_mtp_index = len(stage_modules) - 1
+            while last_non_mtp_index >= 0 and not stage_modules[
+                last_non_mtp_index
+            ].startswith("mtp_layers."):
+                last_non_mtp_index -= 1
+            stage_modules.insert(last_non_mtp_index + 1, "norm")
+            stage_modules.insert(last_non_mtp_index + 2, "output")
+
     module_names_per_stage = []
     current_layer = 0
 
@@ -206,8 +231,10 @@ def generate_llm_fqn_per_model_part(
             # Add transformer layers
             for _ in range(remaining_layers_for_stage):
                 if current_layer < num_layers:
-                    stage_modules.append(f"layers.{current_layer}")
+                    stage_modules.append(_get_transformer_layer_name(current_layer))
                     current_layer += 1
+
+            _keep_output_for_mtp(stage_modules)
 
         # Last stage: handle output modules with weighting
         elif stage_idx == num_stages - 1:
@@ -217,18 +244,25 @@ def generate_llm_fqn_per_model_part(
             # Add transformer layers
             for _ in range(remaining_layers_for_stage):
                 if current_layer < num_layers:
-                    stage_modules.append(f"layers.{current_layer}")
+                    stage_modules.append(_get_transformer_layer_name(current_layer))
                     current_layer += 1
 
             # Add output modules
-            stage_modules.extend(["norm", "output"])
+            if num_mtp_layers > 0:
+                # We may have already added these elsewhere in the MTP
+                # case.
+                _keep_output_for_mtp(stage_modules)
+            else:
+                stage_modules.extend(["norm", "output"])
 
         # Middle stages: only transformer layers
         else:
             for _ in range(effective_layers_for_stage):
                 if current_layer < num_layers:
-                    stage_modules.append(f"layers.{current_layer}")
+                    stage_modules.append(_get_transformer_layer_name(current_layer))
                     current_layer += 1
+
+            _keep_output_for_mtp(stage_modules)
 
         module_names_per_stage.append(stage_modules)
 

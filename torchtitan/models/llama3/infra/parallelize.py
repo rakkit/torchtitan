@@ -439,6 +439,13 @@ def apply_fsdp(
             **fsdp_config,
             reshard_after_forward=reshard_after_forward_policy == "always",
         )
+    if model.model_args.num_mtp_modules > 0:
+        for layer_id, transformer_block in model.mtp_layers.items():
+            fully_shard(
+                transformer_block,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward_policy == "always",
+            )
     fully_shard(model, **fsdp_config)
 
 

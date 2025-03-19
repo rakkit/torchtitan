@@ -342,6 +342,69 @@ class TransformerBlock(nn.Module):
         self.feed_forward.init_weights(self.weight_init_std)
 
 
+class MTPModule(nn.Module):
+    def __init__(
+        self,
+        layer_id: int,
+        model_args: TransformerModelArgs,
+        parent_transformer: nn.Module,
+    ):
+        super().__init__()
+        self.model_args = model_args
+
+        # TODO handle these for pipelining
+        self.tok_embeddings = parent_transformer.tok_embeddings
+        self.norm = parent_transformer.norm
+        self.output = parent_transformer.output
+
+        self.in_norm = build_norm(
+            model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
+        )
+        self.mtp_proj = nn.Linear(2 * model_args.dim, model_args.dim)
+        self.block = parent_transformer.transformer_block_cls(layer_id, model_args)
+
+    def init_weights(self):
+        self.in_norm.reset_parameters()
+        # Re-use block's init std.
+        self.mtp_proj.init_weights(self.block.weight_init_std)
+        self.block.init_weights()
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        prev_embed: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        start_pos: int = -1,
+    ):
+        """
+        Perform a forward pass through the Transformer model.
+
+        Args:
+            tokens (torch.Tensor): Input token indices.
+            prev_embed (torch.Tensor): Output token embeddings of previous
+                Transformer layer (after output norm, before unembedding).
+            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+
+        Returns:
+            torch.Tensor: Output logits after applying the Transformer model.
+            torch.Tensor: Output token embeddings after applying the Transformer model.
+
+        """
+        # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
+        h = self.tok_embeddings(tokens)
+
+        h = self.in_norm(h)
+
+        h = torch.cat([h, prev_embed], dim=-1)
+        h = self.mtp_proj(h)
+        h = self.block(h, freqs_cis, start_pos=start_pos)
+
+        h = self.norm(h)
+        output = self.output(h)
+        prev_embed = h
+        return output, prev_embed
+
+
 class Transformer(nn.Module, ModelProtocol):
     """
     Transformer Module
@@ -384,6 +447,18 @@ class Transformer(nn.Module, ModelProtocol):
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
         )
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
+
+        # Optionally add MTP modules.
+        if model_args.num_mtp_modules > 0:
+            self.mtp_layers = torch.nn.ModuleDict()
+            for mtp_layer_id in range(model_args.num_mtp_modules):
+                layer_id = mtp_layer_id + model_args.n_layers
+                self.mtp_layers[str(mtp_layer_id)] = MTPModule(
+                    layer_id,
+                    model_args,
+                    self,
+                )
+
         self.init_weights()
 
     def init_weights(
@@ -421,6 +496,10 @@ class Transformer(nn.Module, ModelProtocol):
                 a=-cutoff_factor * final_out_std,
                 b=cutoff_factor * final_out_std,
             )
+        if self.model_args.num_mtp_modules > 0:
+            for layer in self.mtp_layers.values():
+                if layer is not None:
+                    layer.init_weights()
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
         return precompute_freqs_cis(
@@ -434,14 +513,16 @@ class Transformer(nn.Module, ModelProtocol):
 
     def forward(
         self,
-        tokens: torch.Tensor,
+        tokens_list: list[torch.Tensor | None] | torch.Tensor,
         input_batch: torch.Tensor | None = None,
+        prev_embed: torch.Tensor | None = None,
     ):
         """
         Perform a forward pass through the Transformer model.
 
         Args:
-            tokens (torch.Tensor): Input token indices if pipeline parallelism is not enabled.
+            tokens_list (Union[list[torch.Tensor | None], torch.Tensor]):
+                Input token indices if pipeline parallelism is not enabled.
                 If pipeline parallelism is enabled, this will be the input token indices
                 for the ranks on the first pipeline stage. This will be the activation of the
                 previous pipeline stage if the current rank is not on the first stage.
@@ -449,17 +530,59 @@ class Transformer(nn.Module, ModelProtocol):
                 This will always be the input batch regardless of the pipeline stage.
                 This field is required for non-first PP stages to perform document
                 masking attention (to analyze the boundary of the document).
+            prev_embed (torch.Tensor | None): Output token embeddings of
+                previous Transformer layer (after output norm, before
+                unembedding).
 
         Returns:
-            torch.Tensor: Output logits after applying the Transformer model.
+            list[torch.Tensor | None]: Output logits after applying the
+                Transformer model for each output token.
 
         """
+        if not isinstance(tokens_list, list):
+            tokens = tokens_list
+            tokens_list = [None] * (1 + self.model_args.num_mtp_modules)
+            tokens_list[0] = tokens
+        else:
+            tokens = tokens_list[0]
+
+        if input_batch is None:
+            input_batch = tokens
+
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
-        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+        h = (
+            self.tok_embeddings(tokens[:, : self.model_args.max_seq_len])
+            if self.tok_embeddings
+            else tokens
+        )
 
         for layer in self.layers.values():
             h = layer(h, self.freqs_cis)
 
         h = self.norm(h) if self.norm else h
+
         output = self.output(h) if self.output else h
-        return output
+        tokens_list[0] = output
+
+        # Calculate multi-token predictions.
+
+        if self.model_args.num_mtp_modules > 0:
+            # Check if output norm is in this stage. If yes, assign the
+            # hidden embedding.
+            if self.norm and prev_embed is None:
+                prev_embed = h
+
+            for (mtp_layer_id, mtp_layer) in self.mtp_layers.items():
+                mtp_layer_id = int(mtp_layer_id)
+                token_offset = mtp_layer_id + 1
+                output, prev_embed = mtp_layer(
+                    input_batch[
+                        :, token_offset : token_offset + self.model_args.max_seq_len
+                    ],
+                    prev_embed,
+                    freqs_cis,
+                    start_pos=start_pos,
+                )
+                tokens_list[mtp_layer_id + 1] = output
+
+        return tokens_list, input_batch, prev_embed

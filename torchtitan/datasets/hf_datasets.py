@@ -172,6 +172,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
+        num_mtp_tokens: int = 0,
         dataset_inner_name: str | None = None,
         dataset_files: str | Sequence[str] | None = None,
         dataset_split: str = "train",
@@ -197,6 +198,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         self._tokenizer = tokenizer
         self.seq_len = seq_len
         self.infinite = infinite
+        self.num_mtp_tokens = num_mtp_tokens
         self._text_processor = text_processor
 
         # Variables for checkpointing
@@ -215,7 +217,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         return iter(self._data)
 
     def __iter__(self):
-        max_buffer_token_len = 1 + self.seq_len
+        max_buffer_token_len = 1 + self.seq_len + self.num_mtp_tokens
 
         while True:
             for sample in self._get_data_iter():
@@ -283,6 +285,7 @@ def build_hf_dataloader(
     dataset_path = job_config.training.dataset_path
     batch_size = job_config.training.local_batch_size
     seq_len = job_config.training.seq_len
+    num_mtp_tokens = job_config.training.num_mtp_tokens
     dataset_inner_name = job_config.training.dataset_inner_name
     dataset_files = job_config.training.dataset_files
     dataset_split = job_config.training.dataset_split
@@ -297,6 +300,7 @@ def build_hf_dataloader(
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
         infinite=infinite,
+        num_mtp_tokens=num_mtp_tokens,
         dataset_inner_name=dataset_inner_name,
         dataset_files=dataset_files,
         dataset_split=dataset_split,

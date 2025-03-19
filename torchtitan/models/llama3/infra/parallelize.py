@@ -7,6 +7,7 @@
 # This file applies the PT-D parallelisms (except pipeline parallelism) and various
 # training techniques (e.g. activation checkpointing and compile) to the Llama model.
 
+import itertools
 from collections import defaultdict
 from typing import Optional
 
@@ -425,7 +426,12 @@ def apply_fsdp(
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
         )
-    for layer_id, transformer_block in model.layers.items():
+    transformer_blocks = model.layers.items()
+    if model.model_args.num_mtp_modules > 0:
+        transformer_blocks = itertools.chain(
+            transformer_blocks, model.mtp_layers.items()
+        )
+    for layer_id, transformer_block in transformer_blocks:
         fully_shard(
             transformer_block,
             **fsdp_config,

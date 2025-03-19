@@ -112,7 +112,11 @@ def pipeline_llama(
     module_names_per_stage = job_config.parallelism.module_fqns_per_model_part
     if module_names_per_stage is None:
         module_names_per_stage = generate_llm_fqn_per_model_part(
-            num_virtual_stages, num_layers, input_weight, output_weight
+            num_virtual_stages,
+            num_layers + model_args.num_mtp_modules,
+            input_weight,
+            output_weight,
+            num_mtp_layers=model_args.num_mtp_modules,
         )
     for i, stage_ms in enumerate(module_names_per_stage):
         logger.debug(f"Stage {i}: {stage_ms}")

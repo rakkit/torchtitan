@@ -732,6 +732,9 @@ class Transformer(nn.Module, ModelProtocol):
                 This will always be the input batch regardless of the pipeline stage.
                 This field is required for non-first PP stages to perform document
                 masking attention (to analyze the boundary of the document).
+            prev_embed (torch.Tensor | None): Output token embeddings of
+                previous Transformer layer (after output norm, before
+                unembedding).
 
         Returns:
             MTPInputsDict: Dictionary containing the following keys and
@@ -792,7 +795,7 @@ class Transformer(nn.Module, ModelProtocol):
             if self.norm and prev_embed is None:
                 prev_embed = h
 
-            for (mtp_layer_id, mtp_layer) in self.mtp_layers.items():
+            for mtp_layer_id, mtp_layer in self.mtp_layers.items():
                 mtp_layer_id = int(mtp_layer_id)
                 token_offset = mtp_layer_id + 1
                 output, prev_embed = mtp_layer(

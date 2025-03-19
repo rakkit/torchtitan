@@ -54,7 +54,7 @@ def multi_token_cross_entropy_loss(
     main_loss = loss_fn(preds[0], labels[:, : job_config.training.seq_len])
 
     mtp_loss = 0
-    for (label_offset, pred) in enumerate(preds[1:], 1):
+    for label_offset, pred in enumerate(preds[1:], 1):
         loss = loss_fn(
             pred,
             labels[:, label_offset : label_offset + job_config.training.seq_len],

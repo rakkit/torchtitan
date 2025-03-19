@@ -171,6 +171,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
+        num_mtp_tokens: int = 0,
         dataset_inner_name: str | None = None,
         dataset_files: str | Sequence[str] | None = None,
         dataset_split: str = "train",
@@ -195,6 +196,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
         self._tokenizer = tokenizer
         self.infinite = infinite
+        self.num_mtp_tokens = num_mtp_tokens
         self._text_processor = text_processor
 
         # Variables for checkpointing
@@ -553,7 +555,7 @@ def build_hf_dataloader(
             len(d) == normed_list_length
         ), f"list {d} does not match length of list of datasets (length = {normed_list_length})"
     hf_datasets = []
-    for (d_name, d_path, d_inner_name, d_split, d_key) in zip(
+    for d_name, d_path, d_inner_name, d_split, d_key in zip(
         dataset_name,
         dataset_path,
         dataset_inner_name,

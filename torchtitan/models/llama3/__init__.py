@@ -69,6 +69,63 @@ llama3_configs = {
     ),
 }
 
+
+byte_llama3_configs = {
+    "debugmodel": TransformerModelArgs(
+        dim=256, n_layers=6, n_heads=16, vocab_size=-1, rope_theta=500000
+    ),
+    "debugmodel_flex_attn": TransformerModelArgs(
+        dim=256,
+        n_layers=6,
+        n_heads=16,
+        vocab_size=-1,
+        rope_theta=500000,
+        use_flex_attn=True,
+        attn_mask_type="block_causal",
+    ),
+    "8B": TransformerModelArgs(
+        dim=4096,
+        n_layers=32,
+        n_heads=32,
+        n_kv_heads=8,
+        vocab_size=-1,
+        ffn_dim_multiplier=1.3,
+        multiple_of=1024,
+        rope_theta=500000,
+    ),
+    "8B_qk": TransformerModelArgs(
+        dim=4096,
+        n_layers=32,
+        n_heads=32,
+        n_kv_heads=8,
+        vocab_size=-1,
+        ffn_dim_multiplier=1.3,
+        multiple_of=1024,
+        rope_theta=500000,
+        qk_norm=True,
+    ),
+    "70B": TransformerModelArgs(
+        dim=8192,
+        n_layers=80,
+        n_heads=64,
+        n_kv_heads=8,
+        vocab_size=-1,
+        ffn_dim_multiplier=1.3,
+        multiple_of=4096,
+        rope_theta=500000,
+    ),
+    "405B": TransformerModelArgs(
+        dim=16384,
+        n_layers=126,
+        n_heads=128,
+        n_kv_heads=8,
+        vocab_size=-1,
+        ffn_dim_multiplier=1.2,
+        multiple_of=4096,
+        rope_theta=500000,
+    ),
+}
+
 llama2_configs = {
     "debugmodel": llama3_configs["debugmodel"],
     "7B": TransformerModelArgs(
@@ -104,6 +161,23 @@ register_train_spec(
         build_lr_schedulers_fn=build_lr_schedulers,
         build_dataloader_fn=build_hf_dataloader,
         build_tokenizer_fn=build_hf_tokenizer,
+        build_loss_fn=build_cross_entropy_loss,
+        build_validator_fn=build_validator,
+        state_dict_adapter=Llama3StateDictAdapter,
+    )
+)
+
+register_train_spec(
+    TrainSpec(
+        name="byte_llama3",
+        model_cls=Transformer,
+        model_args=byte_llama3_configs,
+        parallelize_fn=parallelize_llama,
+        pipelining_fn=pipeline_llama,
+        build_optimizers_fn=build_optimizers,
+        build_lr_schedulers_fn=build_lr_schedulers,
+        build_dataloader_fn=build_hf_dataloader,
+        build_tokenizer_fn=build_hf_byte_tokenizer,
         build_loss_fn=build_cross_entropy_loss,
         build_validator_fn=build_validator,
         state_dict_adapter=Llama3StateDictAdapter,

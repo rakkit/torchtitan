@@ -20,6 +20,7 @@ from torchtitan.components.dataloader import DataloaderStopIteration
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
 from torchtitan.components.loss import (
     build_cross_entropy_loss,
+    moe_loss,
     multi_token_cross_entropy_loss,
     rescale_accumulated_loss,
 )
@@ -30,6 +31,7 @@ from torchtitan.components.metrics import (
 from torchtitan.config import ConfigManager, JobConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.models.attention import init_attention_mask
+from torchtitan.models.MoEllama.model.model import Transformer as MoETransformer
 from torchtitan.protocols.model_converter import build_model_converters
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
@@ -204,6 +206,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             buffer_device = None
 
         self.loss_fn = self.train_spec.build_loss_fn(job_config)
+
+        if issubclass(self.train_spec.model_cls, MoETransformer):
+            pre_moe_loss_fn = self.loss_fn
+            self.loss_fn = functools.partial(
+                moe_loss,
+                loss_fn=pre_moe_loss_fn,
+            )
 
         if job_config.training.num_mtp_tokens > 0:
             assert (
@@ -488,16 +497,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     aux_loss = pred.get("aux_loss", None)
 
                     loss = self.loss_fn(pred, labels)
-                    if aux_loss is not None:
-                        if isinstance(aux_loss, float):
-                            aux_loss = torch.tensor(
-                                aux_loss, dtype=loss.dtype, device=loss.device
-                            )
-                        loss += aux_loss / self.gradient_accumulation_steps
                 # need to free to before bwd to avoid peaking memory
                 del pred
                 loss.backward()
 
+        if isinstance(aux_loss, float):
+            aux_loss = torch.tensor(aux_loss, dtype=loss.dtype, device=loss.device)
         return loss, aux_loss
 
     def train_step(

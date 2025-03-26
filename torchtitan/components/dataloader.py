@@ -48,6 +48,8 @@ class ParallelAwareDataloader(StatefulDataLoader, BaseDataLoader):
         dp_world_size: The world size of the data parallelism.
         batch_size: The batch size to use for each iteration.
         collate_fn: Optional function to collate samples in a batch.
+        data_loader_kwargs: Additional arguments to pass to the
+            ``torchdata.stateful_dataloader.StatefulDataLoader`` constructor.
     """
 
     dp_rank: int
@@ -61,11 +63,14 @@ class ParallelAwareDataloader(StatefulDataLoader, BaseDataLoader):
         dp_world_size: int,
         batch_size: int,
         collate_fn: Callable | None = None,
+        **data_loader_kwargs,
     ):
         self.dp_world_size = dp_world_size
         self.dp_rank = dp_rank
         self.batch_size = batch_size
-        super().__init__(dataset, batch_size, collate_fn=collate_fn)
+        super().__init__(
+            dataset, batch_size, collate_fn=collate_fn, **data_loader_kwargs
+        )
         self._rank_id = f"dp_rank_{dp_rank}"
 
     def state_dict(self) -> dict[str, Any]:

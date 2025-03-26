@@ -168,11 +168,9 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         dataset_name: str,
         dataset_path: str | None,
         tokenizer: BaseTokenizer,
-        seq_len: int = 2048,
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
-        num_mtp_tokens: int = 0,
         dataset_inner_name: str | None = None,
         dataset_files: str | Sequence[str] | None = None,
         dataset_split: str = "train",
@@ -196,14 +194,11 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         self.dataset_name = dataset_name
         self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
         self._tokenizer = tokenizer
-        self.seq_len = seq_len
         self.infinite = infinite
-        self.num_mtp_tokens = num_mtp_tokens
         self._text_processor = text_processor
 
         # Variables for checkpointing
         self._sample_idx = 0
-        self._token_buffer: list[int] = []
 
     def _get_data_iter(self):
         # For map-style datasets, resume by skipping to the correct index
@@ -217,8 +212,6 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         return iter(self._data)
 
     def __iter__(self):
-        max_buffer_token_len = 1 + self.seq_len + self.num_mtp_tokens
-
         while True:
             for sample in self._get_data_iter():
                 # Use the dataset-specific text processor
@@ -226,16 +219,8 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                 sample_tokens = self._tokenizer.encode(
                     sample_text, add_bos=True, add_eos=True
                 )
-                self._token_buffer.extend(sample_tokens)
                 self._sample_idx += 1
-
-                while len(self._token_buffer) >= max_buffer_token_len:
-                    x = torch.LongTensor(self._token_buffer[:max_buffer_token_len])
-                    # update tokens to the remaining tokens
-                    self._token_buffer = self._token_buffer[max_buffer_token_len:]
-                    input = x[:-1]
-                    label = x[1:]
-                    yield {"input": input}, label
+                yield sample_tokens
 
             if not self.infinite:
                 logger.warning(f"Dataset {self.dataset_name} has run out of data")
@@ -252,8 +237,6 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                         self._data.set_epoch(self._data.epoch + 1)
 
     def load_state_dict(self, state_dict):
-        self._token_buffer = state_dict["token_buffer"]
-
         if isinstance(self._data, Dataset):
             self._sample_idx = state_dict["sample_idx"]
         else:
@@ -261,7 +244,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             self._data.load_state_dict(state_dict["data"])
 
     def state_dict(self):
-        _state_dict = {"token_buffer": self._token_buffer}
+        _state_dict = {}
 
         if isinstance(self._data, Dataset):
             _state_dict["sample_idx"] = self._sample_idx
@@ -271,6 +254,77 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             _state_dict["data"] = self._data.state_dict()
 
         return _state_dict
+
+
+class GreedyPackedDataset(IterableDataset, Stateful):
+    def __init__(
+        self,
+        dataset: IterableDataset,
+        seq_len: int = 2048,
+        infinite: bool = False,
+        num_mtp_tokens: int = 0,
+    ) -> None:
+        self._data = dataset
+        self.seq_len = seq_len
+        self.infinite = infinite
+        self.num_mtp_tokens = num_mtp_tokens
+
+        # Variables for checkpointing
+        self._sample_idx = 0
+        self._token_buffer: list[int] = []
+
+    @property
+    def dataset_name(self):
+        return self._data.dataset_name
+
+    def _get_data_iter(self):
+        # We don't use the sample index because we defer skipping to the
+        # sub-dataset.
+        return iter(self._data)
+
+    def __iter__(self):
+        max_buffer_token_len = 1 + self.seq_len + self.num_mtp_tokens
+
+        while True:
+            for sample_tokens in self._get_data_iter():
+                self._token_buffer.extend(sample_tokens)
+                self._sample_idx += 1
+
+                while len(self._token_buffer) >= max_buffer_token_len:
+                    x = torch.LongTensor(self._token_buffer[:max_buffer_token_len])
+                    # update tokens to the remaining tokens
+                    self._token_buffer = self._token_buffer[max_buffer_token_len:]
+                    input = x[:-1]
+                    label = x[1:]
+                    yield {"input": input}, label
+
+            if not self.infinite:
+                logger.warning(
+                    f"Packed dataset {self.dataset_name} has run out of data"
+                )
+                break
+            else:
+                # Reset offset for the next iteration
+                self._sample_idx = 0
+                logger.warning(f"Packed dataset {self.dataset_name} is being re-looped")
+                # Ensures re-looping a dataset loaded from a checkpoint works correctly
+                if not isinstance(self._data, Dataset):
+                    if hasattr(self._data, "set_epoch") and hasattr(
+                        self._data, "epoch"
+                    ):
+                        self._data.set_epoch(self._data.epoch + 1)
+
+    def load_state_dict(self, state_dict):
+        self._sample_idx = state_dict["sample_idx"]
+        self._token_buffer = state_dict["token_buffer"]
+        self._data.load_state_dict(state_dict["dataset"])
+
+    def state_dict(self):
+        return {
+            "token_buffer": self._token_buffer,
+            "sample_idx": self._sample_idx,
+            "dataset": self._data.state_dict(),
+        }
 
 
 def build_hf_dataloader(
@@ -296,16 +350,21 @@ def build_hf_dataloader(
         dataset_name=dataset_name,
         dataset_path=dataset_path,
         tokenizer=tokenizer,
-        seq_len=seq_len,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
         infinite=infinite,
-        num_mtp_tokens=num_mtp_tokens,
         dataset_inner_name=dataset_inner_name,
         dataset_files=dataset_files,
         dataset_split=dataset_split,
         dataset_streaming=dataset_streaming,
         dataset_key=dataset_key,
+    )
+
+    hf_ds = GreedyPackedDataset(
+        dataset=hf_ds,
+        seq_len=seq_len,
+        infinite=infinite,
+        num_mtp_tokens=num_mtp_tokens,
     )
 
     rng = torch.Generator()
@@ -343,7 +402,6 @@ def build_hf_validation_dataloader(
         dataset_name=dataset_name,
         dataset_path=dataset_path,
         tokenizer=tokenizer,
-        seq_len=seq_len,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
         infinite=False,
@@ -352,6 +410,12 @@ def build_hf_validation_dataloader(
         dataset_split=dataset_split,
         dataset_streaming=dataset_streaming,
         dataset_key=dataset_key,
+    )
+
+    hf_ds = GreedyPackedDataset(
+        dataset=hf_ds,
+        seq_len=seq_len,
+        infinite=False,
     )
 
     return ParallelAwareDataloader(

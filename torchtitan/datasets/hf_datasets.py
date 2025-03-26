@@ -6,7 +6,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-
+from random import Random
 from typing import Any, Callable
 
 import torch
@@ -254,6 +254,89 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             _state_dict["data"] = self._data.state_dict()
 
         return _state_dict
+
+
+class MixedDataset(IterableDataset, Stateful):
+    def __init__(self, datasets: list[IterableDataset], weights: list[float] | None):
+        self.datasets = datasets
+        self.weights = [1.0] * len(self.datasets) if weights is None else weights
+
+        self.num_sampled_per_dataset = [0] * len(self.datasets)
+        self._dataset_indices = list(range(len(self.datasets)))
+        self._sample_idx = 0
+        self._data_iters = None
+        self._rng = Random(self._sample_idx)
+
+    @property
+    def normed_weights(self):
+        weights_sum = sum(self.weights)
+        return [w / weights_sum for w in self.weights]
+
+    def _init_data_iters(self):
+        self._data_iters = [iter(dataset) for dataset in self.datasets]
+
+    def _sample_dataset(self, sample_idx: int):
+        self._rng.seed(sample_idx)
+        dataset_index = self._rng.choices(self._dataset_indices, weights=self.weights)[
+            0
+        ]
+        return dataset_index
+
+    def _get_next(self, dataset_index: int):
+        data_iter = self._data_iters[dataset_index]
+        try:
+            return next(data_iter)
+        except StopIteration:
+            dataset = self.datasets[dataset_index]
+            logger.warning(f"Removing {dataset.dataset_name} from data mix.")
+            self.weights[dataset_index] = 0.0
+            return None
+
+    def __iter__(self):
+        if self._data_iters is None:
+            self._init_data_iters()
+        while True:
+            sample = None
+            # Handle exhausted data iterators.
+            while sample is None:
+                dataset_index = self._sample_dataset(self._sample_idx)
+                sample = self._get_next(dataset_index)
+
+            self.num_sampled_per_dataset[dataset_index] += 1
+            self._sample_idx += 1
+            yield sample
+
+            if all(w == 0.0 for w in self.weights):
+                logger.warning(
+                    "Data mix is empty (all sampling weights have been set to zero); "
+                    "stopping iteration."
+                )
+                break
+        # Unset data iterators so they will be re-initialized.
+        self._data_iters = None
+
+    def load_state_dict(self, state_dict):
+        self._sample_idx = state_dict["sample_idx"]
+        self.weights = state_dict["weights"]
+        self.num_sampled_per_dataset = state_dict["num_sampled_per_dataset"]
+
+        # Restore sub-datasets.
+        dataset_dicts = state_dict["datasets"]
+        for dataset in self.datasets:
+            dataset.load_state_dict(dataset_dicts[dataset.dataset_name])
+
+        # Unset data iterators so they will be re-initialized.
+        self._data_iters = None
+
+    def state_dict(self):
+        return {
+            "sample_idx": self._sample_idx,
+            "weights": self.weights,
+            "num_sampled_per_dataset": self.num_sampled_per_dataset,
+            "datasets": {
+                dataset.dataset_name: dataset.state_dict() for dataset in self.datasets
+            },
+        }
 
 
 class GreedyPackedDataset(IterableDataset, Stateful):

@@ -10,16 +10,19 @@ from typing import Callable, TypeAlias
 import torch
 
 from torchtitan.config import JobConfig
+from torchtitan.models.inputs import MTPInputsDict, TransformerInputsDict
 from torchtitan.tools.logging import logger
 
 LossFunction: TypeAlias = Callable[..., torch.Tensor]
 
 
 def cross_entropy_loss(
-    pred: torch.Tensor | list[torch.Tensor],
+    pred: torch.Tensor | list[torch.Tensor] | TransformerInputsDict,
     labels: torch.Tensor,
 ) -> torch.Tensor:
     """Common cross-entropy loss function for Transformer models training."""
+    if isinstance(pred, dict):
+        pred = pred["tokens_list"]
     if isinstance(pred, list):
         pred = pred[0]
     return torch.nn.functional.cross_entropy(
@@ -36,7 +39,7 @@ def build_cross_entropy_loss(job_config: JobConfig):
 
 
 def multi_token_cross_entropy_loss(
-    preds: list[torch.Tensor],
+    preds: list[torch.Tensor] | MTPInputsDict,
     labels: torch.Tensor,
     job_config: JobConfig,
 ) -> torch.Tensor:
@@ -44,6 +47,9 @@ def multi_token_cross_entropy_loss(
 
     Based on DeepSeek-V3 technical report: https://arxiv.org/abs/2412.19437.
     """
+    if isinstance(preds, dict):
+        preds = preds["tokens_list"]
+    assert isinstance(preds, list)
     main_loss = cross_entropy_loss(preds[0], labels[:, : job_config.training.seq_len])
 
     mtp_loss = 0

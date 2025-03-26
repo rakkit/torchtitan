@@ -481,15 +481,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with self.train_context(optional_context_parallel_ctx):
                 assert len(model_parts) == 1
                 with self.maybe_enable_amp:
-                    output = model_parts[0](inputs)
-                    if isinstance(output, tuple):
-                        if self.job_config.training.num_mtp_tokens > 0:
-                            pred = output[0]
-                        else:
-                            assert len(output) == 2
-                            pred, aux_loss = output
-                    else:
-                        pred = output
+                    pred = model_parts[0](inputs)
+
+                    aux_loss = pred.get("aux_loss", None)
+
                     loss = self.loss_fn(pred, labels)
                     if aux_loss is not None:
                         if isinstance(aux_loss, float):

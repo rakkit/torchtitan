@@ -194,13 +194,14 @@ class LRScheduler:
 
 @dataclass
 class Training:
-    dataset: str = "c4_test"
+    dataset: list[str] = field(default_factory=lambda: ["c4_test"])
     """Dataset to use"""
 
-    dataset_path: str | None = None
+    dataset_path: list[str] | None = None
     """
     Path to the dataset in the file system. If provided, data will be
     loaded from this path instead of downloaded.
+    Entries with string "None" will be replaced with the Python literal `None`.
     """
 
     dataset_num_workers: int = 0
@@ -209,19 +210,34 @@ class Training:
     dataset_pin_memory: bool = False
     """Whether to use memory pinning in the data loader"""
 
-    dataset_inner_name: str | None = None
-    """Dataset name to use (`name` argument of `datasets.load_dataset`)"""
+    dataset_weights: list[str] | None = None
+    """
+    Probability of sampling from each dataset, separated by commas.
+    If not given, sample uniformly.
+    """
+
+    dataset_mix_in_seq: bool = False
+    """
+    Whether to also mix datasets in the sequence dimension during
+    packing. If not given, only mix in batch dimension.
+    """
+
+    dataset_inner_name: list[str] | None = None
+    """
+    Dataset name to use (`name` argument of `datasets.load_dataset`).
+    Entries with string "None" will be replaced with the Python literal `None`.
+    """
 
     dataset_files: list[str] | None = None
     """Dataset files to use (only necessary for certain types of datasets)"""
 
-    dataset_split: str = "train"
+    dataset_split: list[str] = field(default_factory=lambda: ["train"])
     """Dataset split to use"""
 
     dataset_streaming: bool = False
     """Whether to stream the dataset"""
 
-    dataset_key: str = "text"
+    dataset_key: list[str] = field(default_factory=lambda: ["text"])
     """Key to use for extracting the relevant text data from the dataset's samples"""
 
     local_batch_size: int = 8

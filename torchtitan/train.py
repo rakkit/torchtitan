@@ -15,6 +15,7 @@ import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
 import torchtitan.protocols.train_spec as train_spec_module
+from torchtitan.components.activation_offload import get_act_offloading_ctx_manager
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderStopIteration
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
@@ -352,6 +353,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             ft_manager=self.ft_manager,
         )
 
+        self.activations_handling_ctx = get_act_offloading_ctx_manager(
+            self.model_parts[0], enable_activation_offloading=False
+        )
+
         loss_parallel_enabled = (
             parallel_dims.tp_enabled and not parallelism_config.disable_loss_parallel
         )
@@ -467,7 +472,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if parallel_dims.pp_enabled:
             # Pipeline Parallel forward / backward inside step() call
-            with self.train_context(optional_context_parallel_ctx):
+            with self.train_context(
+                optional_context_parallel_ctx, self.activations_handling_ctx
+            ):
                 targets, losses = (
                     (labels, []) if self.pp_has_last_stage else (None, None)
                 )

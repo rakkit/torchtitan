@@ -216,6 +216,9 @@ class Training:
     use the same as `training.seed`.
     """
 
+    dataset_shuffle_buffer_size: int = 0
+    """Buffer size of windowed shuffling buffer. 0 means no shuffling (the default)."""
+
     dataset_weights: list[str] | None = None
     """
     Probability of sampling from each dataset, separated by commas.

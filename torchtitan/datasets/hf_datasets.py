@@ -455,8 +455,7 @@ class WindowShuffledDataset(IterableDataset, Stateful):
 
     def reset(self) -> None:
         self._buffer = []
-        if self._enabled:
-            self._rng.seed(self._initial_seed)
+        self._rng.seed(self._initial_seed)
 
     def load_state_dict(self, state_dict):
         self._buffer = state_dict["shuffle_buffer"]

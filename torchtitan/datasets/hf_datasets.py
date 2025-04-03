@@ -410,6 +410,71 @@ class GreedyPackedDataset(IterableDataset, Stateful):
         }
 
 
+class WindowShuffledDataset(IterableDataset, Stateful):
+    # Implementation highly inspired by
+    # `torch.utils.data.datapipes.iter.ShufflerIterDataPipe`.
+
+    def __init__(
+        self,
+        dataset: IterableDataset,
+        *,
+        buffer_size: int = 10000,
+        seed: int | None = 0,
+    ) -> None:
+        assert buffer_size > 0, "buffer_size should be larger than 0"
+        self.dataset = dataset
+        self._buffer = []
+        self.buffer_size = buffer_size
+        self._enabled = True
+        self._initial_seed = seed
+        self._rng = Random(self._initial_seed)
+
+    def set_shuffle(self, shuffle: bool = True):
+        self._enabled = shuffle
+        return self
+
+    def set_initial_seed(self, seed: int | None = None):
+        self._initial_seed = seed
+        self._rng.seed(self._initial_seed)
+        return self
+
+    def __iter__(self):
+        if not self._enabled:
+            yield from self.dataset
+        else:
+            for x in self.dataset:
+                if len(self._buffer) >= self.buffer_size:
+                    idx = self._rng.randint(0, len(self._buffer) - 1)
+                    val, self._buffer[idx] = self._buffer[idx], x
+                    yield val
+                else:
+                    self._buffer.append(x)
+            while self._buffer:
+                idx = self._rng.randint(0, len(self._buffer) - 1)
+                yield self._buffer.pop(idx)
+
+    def reset(self) -> None:
+        self._buffer = []
+        if self._enabled:
+            self._rng.seed(self._initial_seed)
+
+    def load_state_dict(self, state_dict):
+        self._buffer = state_dict["shuffle_buffer"]
+        self._initial_seed = state_dict["initial_seed"]
+        self._enabled = state_dict["enabled"]
+        self._rng.setstate(state_dict["rng_state"])
+        self.dataset.load_state_dict(state_dict["dataset"])
+
+    def state_dict(self):
+        return {
+            "shuffle_buffer": self._buffer,
+            "initial_seed": self._initial_seed,
+            "enabled": self._enabled,
+            "rng_state": self._rng.getstate(),
+            "dataset": self.dataset.state_dict(),
+        }
+
+
 def _normalize_list(
     xs: list[str | None] | None,
     length: int,
@@ -522,6 +587,13 @@ def build_hf_dataloader(
 
     if job_config.training.dataset_seed is None:
         job_config.training.dataset_seed = job_config.training.seed
+
+    if job_config.training.dataset_shuffle_buffer_size:
+        hf_ds = WindowShuffledDataset(
+            hf_ds,
+            buffer_size=job_config.training.dataset_shuffle_buffer_size,
+            seed=job_config.training.dataset_seed,
+        )
 
     rng = torch.Generator()
     if job_config.training.dataset_seed is not None:

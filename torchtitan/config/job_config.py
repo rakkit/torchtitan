@@ -210,6 +210,12 @@ class Training:
     dataset_pin_memory: bool = False
     """Whether to use memory pinning in the data loader"""
 
+    dataset_seed: int | None = None
+    """
+    Choose the base RNG seed used for data shuffling. By default,
+    use the same as `training.seed`.
+    """
+
     dataset_weights: list[str] | None = None
     """
     Probability of sampling from each dataset, separated by commas.

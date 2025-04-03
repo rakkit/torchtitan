@@ -4,8 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import datetime
 import functools
 import importlib
+import json
 import os
 import time
 from datetime import timedelta
@@ -82,6 +84,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.job_config = job_config
 
+        self.save_job_config()
         logger.info(f"Starting job: {job_config.job.description}")
 
         if job_config.experimental.custom_import:
@@ -408,6 +411,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"total steps {job_config.training.steps} "
             f"(warmup {job_config.lr_scheduler.warmup_steps})"
         )
+
+    def save_job_config(self):
+        if os.environ["RANK"] == "0":
+            # Save job config to dump folder.
+            os.makedirs(self.job_config.job.dump_folder, exist_ok=True)
+            job_config_save_path = os.path.join(
+                self.job_config.job.dump_folder,
+                "job_config_"
+                + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+                + ".json",
+            )
+            with open(job_config_save_path, "w") as f:
+                json.dump(self.job_config.to_dict(), f)
 
     def batch_generator(
         self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]

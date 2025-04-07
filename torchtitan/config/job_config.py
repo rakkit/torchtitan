@@ -69,6 +69,18 @@ class Metrics:
     enable_wandb: bool = False
     """Whether to log metrics to Weights & Biases"""
 
+    wandb_project: str | None = None
+    """
+    Weights & Biases project name. Use "torchtitan" if neither this is given
+    nor the `WANDB_PROJECT` environment variable set.
+    """
+
+    wandb_group: str | None = None
+    """Weights & Biases group name"""
+
+    wandb_name: str | None = None
+    """Weights & Biases run name"""
+
 
 @dataclass
 class Model:

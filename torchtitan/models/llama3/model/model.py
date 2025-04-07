@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from torchtitan.distributed.utils import get_param_dtype
 from torchtitan.models.attention import build_attention
 from torchtitan.models.inputs import MTPInputs, MTPInputsDict
 from torchtitan.models.norms import build_norm
@@ -109,6 +110,39 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
+class KVCache(nn.Module):
+    def __init__(
+        self,
+        batch_size: int,
+        seq_length: int,
+        n_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        super().__init__()
+        cache_shape = (batch_size, seq_length, n_kv_heads, head_dim)
+        self.register_buffer(
+            "cache_k",
+            torch.zeros(cache_shape, dtype=dtype, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "cache_v",
+            torch.zeros(cache_shape, dtype=dtype, device=device),
+            persistent=False,
+        )
+
+    def update(self, start_pos, xk, xv):
+        assert start_pos >= 0
+        bsz, seqlen, _ = xk.shape
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        xk = self.cache_k[:bsz, : start_pos + seqlen]
+        xv = self.cache_v[:bsz, : start_pos + seqlen]
+        return xk, xv
+
+
 class Attention(nn.Module):
     """
     Multi-head attention module.
@@ -149,6 +183,8 @@ class Attention(nn.Module):
         )
         self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
 
+        self._kv_cache: KVCache | None = None
+
         self.qk_norm = model_args.qk_norm or model_args.norm_everywhere
         self.norm_everywhere = model_args.norm_everywhere
         if self.qk_norm:
@@ -186,10 +222,24 @@ class Attention(nn.Module):
             for norm in (self.v_norm, self.o_norm):
                 norm.reset_parameters()
 
+    def init_kv_cache(
+        self, max_batch_size: int, max_seq_length: int, dtype: torch.dtype
+    ):
+        device = self.wk.weight.device
+        self._kv_cache = KVCache(
+            batch_size=max_batch_size,
+            seq_length=max_seq_length,
+            n_kv_heads=self.n_kv_heads,
+            head_dim=self.head_dim,
+            dtype=dtype,
+            device=device,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
+        start_pos: int = -1,
     ):
         """
         Forward pass of the attention module.
@@ -221,6 +271,9 @@ class Attention(nn.Module):
             xv = self.v_norm(xv)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        if self._kv_cache is not None and start_pos >= 0:
+            xk, xv = self._kv_cache.update(start_pos, xk, xv)
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
@@ -390,6 +443,11 @@ class TransformerBlock(nn.Module):
             norm.reset_parameters()
         self.attention.init_weights(self.weight_init_std)
         self.feed_forward.init_weights(self.weight_init_std)
+
+    def init_kv_cache(
+        self, max_batch_size: int, max_seq_length: int, dtype: torch.dtype
+    ):
+        self.attention.init_kv_cache(max_batch_size, max_seq_length, dtype=dtype)
 
 
 class MTPModule(nn.Module):
@@ -561,6 +619,16 @@ class Transformer(nn.Module, ModelProtocol):
             self.model_args.rope_theta,
         )
 
+    def init_kv_cache(self, max_batch_size: int, max_seq_length: int):
+        dtype = get_param_dtype(self)
+        for layer in self.layers.values():
+            if layer is not None:
+                layer.init_kv_cache(max_batch_size, max_seq_length, dtype=dtype)
+        if self.model_args.num_mtp_modules > 0:
+            for layer in self.mtp_layers.values():
+                if layer is not None:
+                    layer.init_kv_cache(max_batch_size, max_seq_length, dtype=dtype)
+
     def forward(
         self,
         inputs: MTPInputs,
@@ -598,6 +666,7 @@ class Transformer(nn.Module, ModelProtocol):
         if not isinstance(inputs, dict):
             inputs = {"tokens_list": inputs}
         tokens_list = inputs["tokens_list"]
+        start_pos = -1
         prev_embed = inputs.get("prev_embed", None)
         if not isinstance(tokens_list, list):
             tokens = tokens_list
@@ -609,6 +678,13 @@ class Transformer(nn.Module, ModelProtocol):
         if input_batch is None:
             input_batch = tokens
 
+        if not self.model_args.use_flex_attn and start_pos >= 0:
+            raise ValueError(
+                "`start_pos >= 0`, but cannot use caching without FlexAttention"
+            )
+
+        seqlen = tokens.shape[1]
+
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = (
             self.tok_embeddings(tokens[:, : self.model_args.max_seq_len])
@@ -616,8 +692,12 @@ class Transformer(nn.Module, ModelProtocol):
             else tokens
         )
 
+        if start_pos >= 0:
+            freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        else:
+            freqs_cis = self.freqs_cis
         for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
+            h = layer(h, freqs_cis, start_pos=start_pos)
 
         h = self.norm(h) if self.norm else h
 

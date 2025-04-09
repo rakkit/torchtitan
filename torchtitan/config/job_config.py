@@ -155,6 +155,18 @@ class Optimizer:
     nesterov: bool = False
     """Whether to use Nesterov momentum in Scion"""
 
+    embed_lr: float | None = None
+    """Embedding layer learning rate"""
+
+    unembed_lr: float | None = None
+    """Unembedding layer learning rate"""
+
+    embed_str_match: str | None = None
+    """String to match for embedding layer parameter group"""
+
+    unembed_str_match: str | None = None
+    """String to match for unembedding layer parameter group"""
+
     implementation: Literal["for-loop", "foreach", "fused"] = "fused"
     """
     Specify which optimizer implementation to use:

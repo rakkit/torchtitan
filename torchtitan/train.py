@@ -626,6 +626,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
+        extra_metrics.update(self.optimizers.get_lrs())
         if self.job_config.metrics.log_norm_freq > 0 and (
             self.step == 1 or self.step % self.job_config.metrics.log_norm_freq == 0
         ):

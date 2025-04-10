@@ -375,7 +375,7 @@ class MetricsProcessor:
         step: int,
         global_avg_loss: float,
         global_max_loss: float,
-        grad_norm: float,
+        grad_norm: float | None,
         extra_metrics: dict[str, Any] | None = None,
         extra_print_data: str = "",
     ):
@@ -417,6 +417,12 @@ class MetricsProcessor:
             "memory/num_ooms": device_mem_stats.num_ooms,
         }
 
+        if grad_norm is None:
+            del metrics["grad_norm"]
+            grad_norm_str = ""
+        else:
+            grad_norm_str = f"{self.color.orange}grad_norm: {grad_norm:7.4f}  "
+
         if extra_metrics:
             metrics.update(extra_metrics)
 
@@ -426,7 +432,7 @@ class MetricsProcessor:
         logger.info(
             f"{color.red}step: {step:2}  "
             f"{color.green}loss: {global_avg_loss:7.4f}  "
-            f"{color.orange}grad_norm: {grad_norm:7.4f}  "
+            f"{grad_norm_str}"
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "

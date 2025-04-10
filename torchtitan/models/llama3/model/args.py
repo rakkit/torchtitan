@@ -64,7 +64,11 @@ class TransformerModelArgs(BaseModelArgs):
     num_mtp_modules: int = 0
 
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
-        self.norm_type = job_config.model.norm_type
+        for name in [
+            "norm_type",
+        ]:
+            value = getattr(job_config.model, name)
+            setattr(self, name, value)
         self.num_mtp_modules = job_config.training.num_mtp_tokens
         assert self.num_mtp_modules >= 0
 

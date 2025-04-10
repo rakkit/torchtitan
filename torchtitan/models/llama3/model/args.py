@@ -34,6 +34,23 @@ class TransformerModelArgs(BaseModelArgs):
     # If `True`, then each transformer block init uses its layer ID, and if
     # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
+    first_in_init_fn_type: str = "normal"
+    first_in_init_std: float = 1.0
+    # Exponent applied to the first input layer's input dimensionality
+    # to obtain its init std factor.
+    first_in_exp: float = 0.0
+    intermediate_init_fn_type: str = "trunc_normal"
+    intermediate_init_std: float = 0.02
+    # Exponent applied to the model's hidden dimensionality to obtain
+    # intermediate layers' init std factors.
+    intermediate_exp: float = 0.0
+    # Whether to initialize the GLU gate as if it was a residual layer.
+    init_gate_as_residual: bool = True
+    final_out_init_fn_type: str = "trunc_normal"
+    final_out_init_std: float = 1.0
+    # Exponent applied to the final output layer's input dimensionality
+    # to obtain its init std factor.
+    final_out_exp: float = -0.5
     norm_type: str = "rmsnorm"
     qk_norm: bool = False
     # If this is True, it implies `qk_norm=True`.

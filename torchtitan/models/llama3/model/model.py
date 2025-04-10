@@ -619,6 +619,12 @@ class Transformer(nn.Module, ModelProtocol):
             * self.model_args.vocab_size**self.model_args.first_in_exp
         )
         if self.tok_embeddings is not None:
+            if self.model_args.first_in_init_fn_type == "scion_normal":
+                # catch cases when axis=1 is sharded
+                assert self.tok_embeddings.weight.size(1) == self.model_args.dim, (
+                    f"Input embedding last dim does not match model dim. "
+                    f"Got shape: {self.tok_embeddings.weight.shape}"
+                )
             first_in_init_fn(
                 self.tok_embeddings.weight,
                 mean=0.0,
@@ -640,6 +646,12 @@ class Transformer(nn.Module, ModelProtocol):
             if self.model_args.final_out_init_fn_type == "trunc_normal":
                 extra_kwargs["a"] = -cutoff_factor * final_out_std
                 extra_kwargs["b"] = cutoff_factor * final_out_std
+            if self.model_args.final_out_init_fn_type == "scion_normal":
+                # catch cases when axis=1 is sharded
+                assert self.output.weight.size(1) == self.model_args.dim, (
+                    f"Output last dim does not match model dim. "
+                    f"Got shape: {self.output.weight.shape}"
+                )
             final_out_init_fn(
                 self.output.weight,
                 mean=0.0,

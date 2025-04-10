@@ -93,6 +93,43 @@ class Model:
     flavor: str = "debugmodel"
     """Which model config to train"""
 
+    first_in_init_fn_type: str = "normal"
+    """Weight initialization method to use for the first input layer."""
+
+    first_in_init_std: float = 1.0
+    """Standard deviation multiplier for first input layer's weight initialization."""
+
+    first_in_exp: float = 0.0
+    """
+    Exponent applied to the first input layer's input dimensionality to obtain its init std factor.
+    """
+
+    intermediate_init_fn_type: str = "normal"
+    """Weight initialization method to use for the intermediate layers."""
+
+    intermediate_init_std: float = 0.02
+    """Standard deviation multiplier for intermediate layers' weight initialization."""
+
+    intermediate_exp: float = 0.0
+    """
+    Exponent applied to the model's hidden dimensionality to obtain intermediate layers' init std
+    factors.
+    """
+
+    init_gate_as_residual = True
+    """Whether to initialize the GLU gate as if it was a residual layer."""
+
+    final_out_init_fn_type: str = "trunc_normal"
+    """Weight initialization method to use for the final output layer."""
+
+    final_out_init_std: float = 1.0
+    """Standard deviation multiplier for final output layer's weight initialization."""
+
+    final_out_exp: float = -0.5
+    """
+    Exponent applied to the final output layer's input dimensionality to obtain its init std factor.
+    """
+
     norm_type: str = "rmsnorm"
     """Type of layer normalization to use [layernorm, np_layernorm, rmsnorm, np_rmsnorm]"""
 

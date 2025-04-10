@@ -28,6 +28,14 @@ wandb_name = "test-run"
 name = "bit_byte_llama3"
 flavor = "debugmodel"
 norm_type = "rmsnorm" # layernorm / np_layernorm / rmsnorm / np_rmsnorm
+first_in_init_fn_type = "normal"
+first_in_exp = -0.5
+intermediate_init_fn_type = "normal"
+intermediate_init_std = 1.0
+intermediate_exp = -0.5
+init_gate_as_residual = False
+final_out_init_fn_type = "normal"
+final_out_exp = -1.0
 # tokenizer_path = ???
 # converters = ???
 

@@ -22,16 +22,16 @@ class Scion(torch.optim.Optimizer):
     def __init__(
         self,
         params,
-        is_light=False,
-        is_unconstrained=True,
-        lr=0.02,
-        momentum=0.95,
-        nesterov=True,
-        eps=1e-7,
-        norm_factor="none",
-        backend="newtonschulz5",
-        backend_steps=5,
-        parallel_dims=None,
+        is_light,
+        is_unconstrained,
+        lr,
+        momentum,
+        nesterov,
+        eps,
+        norm_factor,
+        backend,
+        backend_steps,
+        parallel_dims,
     ):
         defaults = dict(
             lr=lr,
@@ -44,7 +44,7 @@ class Scion(torch.optim.Optimizer):
         )
         self.is_light = is_light
         self.is_unconstrained = is_unconstrained
-        self.fsdp_enabled = parallel_dims is not None and parallel_dims.fsdp_enabled
+        self.fsdp_enabled = parallel_dims.fsdp_enabled
         logger.info(
             f"Scion optimizer (is_light={self.is_light}, is_unconstrained={self.is_unconstrained}) "
             f"is enabled with world_mesh={parallel_dims.world_mesh} | "

@@ -180,6 +180,12 @@ class Optimizer:
     weight_decay: float = 0.1
     """Weight decay to use"""
 
+    mup_width_multiplier: float = 1.0
+    """
+    Width multiplier for the model to apply μP scaling (only used
+    for Adam/Muon-based optimizers).
+    """
+
     is_light: bool = False
     """Whether to use Scion's light (memory-saving) version"""
 

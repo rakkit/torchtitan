@@ -68,7 +68,7 @@ steps = 10
 seq_len = 4096
 local_batch_size = 4
 global_batch_size = 4
-max_norm = 1  # grad norm clipping
+max_norm = -1  # grad norm clipping
 
 [parallelism]
 data_parallel_replicate_degree = 1

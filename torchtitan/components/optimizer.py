@@ -541,6 +541,7 @@ def build_optimizers(
     eps = optimizer_config.eps
     weight_decay = optimizer_config.weight_decay
 
+    width_multiplier = 1
     if name in ["Adam", "AdamW"]:
         optim_implementation = optimizer_config.implementation
         assert optim_implementation in ["fused", "foreach", "for-loop"]
@@ -548,11 +549,14 @@ def build_optimizers(
         fused = optim_implementation == "fused"
         foreach = optim_implementation == "foreach"
 
+        width_multiplier = optimizer_config.mup_width_multiplier
+
         optimizer_kwargs = {
-            "lr": lr,
+            "lr": lr / width_multiplier,
             "betas": (beta1, beta2),
-            "eps": eps,
-            "weight_decay": weight_decay,
+            "eps": eps / width_multiplier,
+            "weight_decay": weight_decay
+            * width_multiplier,  # WD is coupled with LR in torch AdamW
             "fused": fused,
             "foreach": foreach,
         }
@@ -582,26 +586,26 @@ def build_optimizers(
     embed_str_match = optimizer_config.embed_str_match
     if embed_lr is not None and embed_str_match:
         param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
-        param_groups_config.append(
-            {
-                "param_str_match": embed_str_match,
-                "lr": embed_lr,
-                "norm_factor": "embed_sqrt",
-                "backend": "identity",
-            }
-        )
+        param_group_config = {
+            "param_str_match": embed_str_match,
+            "lr": embed_lr,
+        }
+        if name == "Scion":
+            param_group_config["norm_factor"] = "embed_sqrt"
+            param_group_config["backend"] = "identity"
+        param_groups_config.append(param_group_config)
     unembed_lr = optimizer_config.unembed_lr
     unembed_str_match = optimizer_config.unembed_str_match
     if unembed_lr is not None and unembed_str_match:
         param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
-        param_groups_config.append(
-            {
-                "param_str_match": unembed_str_match,
-                "lr": unembed_lr,
-                "norm_factor": "unembed_sqrt",
-                "backend": "identity",
-            }
-        )
+        param_group_config = {
+            "param_str_match": unembed_str_match,
+            "lr": unembed_lr / width_multiplier,
+        }
+        if name == "Scion":
+            param_group_config["norm_factor"] = "unembed_sqrt"
+            param_group_config["backend"] = "identity"
+        param_groups_config.append(param_group_config)
 
     optimizer_kwargs["extra_kwargs"] = {
         "parallel_dims": parallel_dims,

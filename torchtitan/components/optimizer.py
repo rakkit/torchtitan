@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
+import math
 import re
+import warnings
 from collections import OrderedDict
 from typing import Any, Generic, Iterator, TypeVar
 
@@ -18,12 +20,15 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
 )
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate
 from torch.optim import Optimizer
 
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.optimizers import Scion
+from torchtitan.optimizers.muon_utils import gather_full_grad, zeropower_backends
 
 __all__ = [
     "OptimizersContainer",
@@ -39,6 +44,47 @@ if has_torchft:
 T = TypeVar("T", bound=Optimizer)
 
 
+@torch.no_grad()
+def spectral_norm(W):
+    assert W.ndim == 2, "operator norm can only be applied to matrices"
+    return torch.linalg.norm(W.to(torch.float32), ord=2, dtype=torch.float32)
+
+
+@torch.no_grad()
+def l1_to_rms_norm(W):
+    assert W.ndim == 2, "operator norm can only be applied to matrices"
+    norm = torch.max(
+        torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32)
+    )
+    scale = torch.sqrt(torch.tensor(W.shape[0], dtype=W.dtype, device=W.device))
+    norm /= scale
+    return norm
+
+
+@torch.no_grad()
+def rms_to_l1_norm(W):
+    assert W.ndim == 2, "operator norm can only be applied to matrices"
+    norm = torch.max(
+        torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32)
+    )
+    scale = torch.sqrt(torch.tensor(W.shape[1], dtype=W.dtype, device=W.device))
+    norm *= scale
+    return norm
+
+
+@torch.no_grad()
+def supremum_norm(x):
+    return x.abs().max()
+
+
+NORM_FUNCTIONS = {
+    "spectral": spectral_norm,
+    "l1_to_rms": l1_to_rms_norm,
+    "rms_to_l1": rms_to_l1_norm,
+    "supremum": supremum_norm,
+}
+
+
 def _extract_param_groups(
     model: torch.nn.Module,
     optimizer_config: dict[str, Any] | None = None,
@@ -48,36 +94,35 @@ def _extract_param_groups(
         if optimizer_config is not None
         else None
     )
+    if param_groups_config is None:
+        param_groups_config = []
 
-    if optimizer_config is None or not param_groups_config:
-        params = [p for p in model.parameters() if p.requires_grad]
-    else:
-        params = []
-        param_dict = OrderedDict(
-            (n, p) for n, p in model.named_parameters() if p.requires_grad
-        )
+    param_dict = OrderedDict(
+        (n, p) for n, p in model.named_parameters() if p.requires_grad
+    )
+    params = []
 
-        for param_group_config in param_groups_config:
-            str_match = param_group_config.pop("param_str_match")
-            filter_fn = functools.partial(re.search, str_match)
-            param_names = [n for n in param_dict.keys() if filter_fn(n)]
-            group_params = {
-                "params": [param_dict.pop(n) for n in param_names],
-                "param_names": param_names,
-            }
-            assert len(group_params["params"]) == len(group_params["param_names"])
-            group_params.update(param_group_config)
-            params.append(group_params)
+    for param_group_config in param_groups_config:
+        str_match = param_group_config.pop("param_str_match")
+        filter_fn = functools.partial(re.search, str_match)
+        param_names = [n for n in param_dict.keys() if filter_fn(n)]
+        group_params = {
+            "params": [param_dict.pop(n) for n in param_names],
+            "param_names": param_names,
+        }
+        assert len(group_params["params"]) == len(group_params["param_names"])
+        group_params.update(param_group_config)
+        params.append(group_params)
 
-        param_names = list(param_dict.keys())
-        params.insert(
-            0,
-            {
-                "params": [param_dict.pop(n) for n in param_names],
-                "param_names": param_names,
-            },
-        )
-        assert not param_dict
+    param_names = list(param_dict.keys())
+    params.insert(
+        0,
+        {
+            "params": [param_dict.pop(n) for n in param_names],
+            "param_names": param_names,
+        },
+    )
+    assert not param_dict
     return params
 
 
@@ -142,7 +187,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         self._validate_length(len(self.model_parts))
         # Do not separately save the external settings in
         # optimizer defaults.
-        del optimizer_kwargs["param_groups"]
+        optimizer_kwargs.pop("param_groups", None)
         optimizer_kwargs.update(optimizer_kwargs.pop("extra_kwargs", {}))
         self._post_init(all_params, optimizer_kwargs)
 
@@ -179,6 +224,130 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             options=StateDictOptions(flatten_optimizer_state_dict=True),
         )
         list(map(func, self.model_parts, self.optimizers))
+
+    @staticmethod
+    def compute_grad(p, optimizer=None, **kwargs):
+        if isinstance(optimizer, Scion):
+            g = p.grad
+            if g is None or not p.requires_grad:
+                return None
+
+            momentum = kwargs.pop("momentum")
+            nesterov = kwargs.pop("nesterov")
+            if not optimizer.is_light and momentum != 1:
+                state = optimizer.state[p]
+                if "momentum_buffer" not in state.keys():
+                    raise ValueError(
+                        "Momentum buffer not found in optimizer state. "
+                        "Please check if the optimizer is initialized correctly."
+                    )
+                buf = state["momentum_buffer"]
+                buf = buf.mul(1 - momentum).add(g, alpha=momentum)
+                g = (
+                    buf
+                    if not nesterov
+                    else buf.mul(1 - momentum).add(g, alpha=momentum)
+                )
+            if optimizer.fsdp_enabled:
+                g = gather_full_grad(g)
+
+            return optimizer.lmo(g, **kwargs)
+        elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+            eps = kwargs["eps"]
+            weight_decay = kwargs["weight_decay"]
+            beta1, beta2 = kwargs["betas"]
+            assert (
+                weight_decay == 0.0
+            ), "Weight decay not supported for grad computation."
+
+            param_optim_state = optimizer.state[p]
+            if "step" not in param_optim_state:
+                step = 0
+            else:
+                step = param_optim_state["step"].item()
+            if "exp_avg_sq" in param_optim_state and "exp_avg" in param_optim_state:
+                bias_correction1 = 1 - beta1**step
+                bias_correction2 = 1 - beta2**step
+                denom = (
+                    param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)
+                ) + eps
+                step_size = 1 / bias_correction1
+                g = step_size * param_optim_state["exp_avg"].div(denom)
+            else:
+                # TODO(JSC): if we shard the MoE model, we need to remove the following code
+                g = p.grad
+
+            assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
+            return g.redistribute(placements=[Replicate()] * g.device_mesh.ndim)
+        else:
+            raise TypeError(
+                f"Optimizer {optimizer.__class__.__name__} does not support "
+                f"gradient computation."
+            )
+
+    def get_parameter_norms(self):
+        norms = {}
+        for i, _ in enumerate(self.model_parts):
+            # NB: assumes correspondences between model parts and optimizers
+            optimizer = self.optimizers[i]
+            for group in optimizer.param_groups:
+                if isinstance(optimizer, Scion):
+                    param_kwargs = {
+                        "momentum": group["momentum"],
+                        "nesterov": group["nesterov"],
+                        "eps": group["eps"],
+                        "norm_factor": group["norm_factor"],
+                        "zeropower_backend": zeropower_backends[group["backend"]],
+                        "backend_steps": group["backend_steps"],
+                    }
+                elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+                    param_kwargs = {
+                        "eps": group["eps"],
+                        "betas": group["betas"],
+                        "weight_decay": group["weight_decay"],
+                    }
+                else:
+                    warnings.warn(
+                        f"Optimizer {optimizer.__class__.__name__} does not support "
+                        f"norm computation."
+                    )
+                    continue
+
+                for n, p in zip(group["param_names"], group["params"]):
+                    g = self.compute_grad(p, optimizer, **param_kwargs)
+                    if g is not None:
+                        p = (
+                            p.redistribute(
+                                placements=[Replicate()] * p.device_mesh.ndim,
+                            ).to_local()
+                            if isinstance(p, DTensor)
+                            else p
+                        )
+                        g = g.to_local() if isinstance(g, DTensor) else g
+                        update = -group["lr"] * g
+                        if "tok_embeddings" in n:
+                            p, update = p.T, update.T
+                        for norm_name, norm_func in NORM_FUNCTIONS.items():
+                            if norm_name != "supremum" and (
+                                p.ndim < 2 or update.ndim < 2
+                            ):
+                                # Operator norms require a matrix.
+                                continue
+                            else:
+                                if p.ndim > 2 or update.ndim > 2:
+                                    warnings.warn(
+                                        f"Encountered parameter or update {n} with shape "
+                                        f"{p.shape} or {update.shape}, respectively; "
+                                        f"this may not be an issue, but please ensure its "
+                                        f"norms are calculated correctly."
+                                    )
+                                norms[
+                                    f"model_part_{i}/{n}/param/{norm_name}"
+                                ] = norm_func(p)
+                                norms[
+                                    f"model_part_{i}/{n}/update/{norm_name}"
+                                ] = norm_func(update)
+        return norms
 
     def _validate_length(self, expected_length: int) -> None:
         assert expected_length == len(self.optimizers), (

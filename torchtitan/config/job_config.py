@@ -49,6 +49,9 @@ class Metrics:
     log_freq: int = 10
     """How often to log metrics to TensorBoard, in iterations"""
 
+    log_norm_freq: int = 0
+    """How often to log parameter norm metrics to TensorBoard, in iterations"""
+
     enable_tensorboard: bool = False
     """Whether to log metrics to TensorBoard"""
 

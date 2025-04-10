@@ -626,6 +626,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
+        if self.job_config.metrics.log_norm_freq > 0 and (
+            self.step == 1 or self.step % self.job_config.metrics.log_norm_freq == 0
+        ):
+            param_norms = self.optimizers.get_parameter_norms()
+            extra_metrics.update(param_norms)
+
         if aux_loss is not None:
             extra_metrics["loss_metrics/aux_loss"] = aux_loss
 

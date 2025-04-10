@@ -46,9 +46,9 @@ class BitNetAttention(Attention):
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
         )
 
-    def init_weights(self, init_std: float):
+    def init_weights(self, init_std: float, residual_div: float, init_fn_type: str):
         self.wo_norm.reset_parameters()
-        super().init_weights(init_std)
+        super().init_weights(init_std, residual_div, init_fn_type)
 
     def forward(
         self,
@@ -136,9 +136,17 @@ class BitNetFeedForward(FeedForward):
     def forward(self, x):
         return self.w2(self.w2_norm(F.silu(self.w1(x)) * self.w3(x)))
 
-    def init_weights(self, init_std: float):
+    def init_weights(
+        self,
+        init_std: float,
+        residual_div: float,
+        init_gate_as_residual: bool,
+        init_fn_type: str,
+    ):
         self.w2_norm.reset_parameters()
-        super().init_weights(init_std)
+        super().init_weights(
+            init_std, residual_div, init_gate_as_residual, init_fn_type
+        )
 
 
 class BitNetTransformerBlock(TransformerBlock):

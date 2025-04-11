@@ -333,6 +333,15 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                             ):
                                 # Operator norms require a matrix.
                                 continue
+                            elif p.ndim == 3 or update.ndim == 3:
+                                # Special handling for grouped MoE.
+                                for ep_idx in range(p.shape[0]):
+                                    norms[
+                                        f"model_part_{i}/ep_{ep_idx}/{n}/param/{norm_name}"
+                                    ] = norm_func(p[ep_idx])
+                                    norms[
+                                        f"model_part_{i}/ep_{ep_idx}/{n}/update/{norm_name}"
+                                    ] = norm_func(update[ep_idx])
                             else:
                                 if p.ndim > 2 or update.ndim > 2:
                                     warnings.warn(

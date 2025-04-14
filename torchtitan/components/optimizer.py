@@ -249,7 +249,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                     else buf.mul(1 - momentum).add(g, alpha=momentum)
                 )
             if optimizer.fsdp_enabled:
-                g = gather_full_grad(g)
+                g = gather_full_grad(g).to_local()
 
             return optimizer.lmo(g, **kwargs)
         elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
@@ -548,6 +548,10 @@ def build_optimizers(
 
         fused = optim_implementation == "fused"
         foreach = optim_implementation == "foreach"
+
+        if parallel_dims.ep_enabled:
+            # Because for Expert Parallel, we have two different device meshes.
+            fused, foreach = False, False
 
         width_multiplier = optimizer_config.mup_width_multiplier
 

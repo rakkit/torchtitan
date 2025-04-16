@@ -161,6 +161,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # set the model args from training job configs
         model_args.update_from_config(job_config, tokenizer=self.tokenizer)
         self.model_args = model_args
+        self.save_model_args(model_args)
 
         logger.info(
             f"Building {self.train_spec.name} {job_config.model.flavor} with {model_args}"
@@ -424,6 +425,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
             with open(job_config_save_path, "w") as f:
                 json.dump(self.job_config.to_dict(), f)
+
+    def save_model_args(self, model_args: train_spec_module.BaseModelArgs):
+        if torch.distributed.get_rank() == 0:
+            # Save model args to dump folder.
+            os.makedirs(self.job_config.job.dump_folder, exist_ok=True)
+            model_args_save_path = os.path.join(
+                self.job_config.job.dump_folder,
+                "model_args_"
+                + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+                + ".json",
+            )
+            with open(model_args_save_path, "w") as f:
+                json.dump(vars(model_args), f)
 
     def batch_generator(
         self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]

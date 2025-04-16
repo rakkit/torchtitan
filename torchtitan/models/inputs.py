@@ -11,6 +11,7 @@ import torch
 
 class TransformerInputsDict(TypedDict):
     tokens_list: list[torch.Tensor | None] | torch.Tensor
+    start_pos: NotRequired[int]
 
 
 TransformerInputs = torch.Tensor | TransformerInputsDict

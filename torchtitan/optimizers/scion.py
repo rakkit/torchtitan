@@ -6,6 +6,7 @@
 
 import torch
 import torch.distributed.tensor
+from torch.distributed.tensor import DTensor
 
 from torchtitan.optimizers.muon_utils import gather_full_grad, zeropower_backends
 from torchtitan.tools.logging import logger
@@ -103,7 +104,10 @@ class Scion(torch.optim.Optimizer):
                     device_mesh = g.device_mesh
                     placements = g.placements
                     g = gather_full_grad(g)
-                update = self.lmo(g.to_local(), **param_kwargs)
+                if isinstance(g, DTensor):
+                    update = self.lmo(g.to_local(), **param_kwargs)
+                else:
+                    update = self.lmo(g, **param_kwargs)
                 if self.fsdp_enabled:
                     # update = shard_full_grad(update)
                     update = torch.distributed.tensor.distribute_tensor(

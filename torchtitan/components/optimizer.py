@@ -27,7 +27,7 @@ from torch.optim import Optimizer
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.optimizers import Scion
+from torchtitan.optimizers import DistributedScion, Scion
 from torchtitan.optimizers.muon_utils import gather_full_grad, zeropower_backends
 
 __all__ = [
@@ -179,7 +179,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             extra_kwargs = kwargs.pop("extra_kwargs")
             params = _extract_param_groups(model, kwargs)
 
-            is_scion = issubclass(optimizer_cls, Scion)
+            is_scion = issubclass(optimizer_cls, (Scion, DistributedScion))
             if is_scion:
                 kwargs.update(extra_kwargs)
             self.optimizers.append(optimizer_cls(params, **kwargs))
@@ -227,7 +227,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
 
     @staticmethod
     def compute_grad(p, optimizer=None, **kwargs):
-        if isinstance(optimizer, Scion):
+        if isinstance(optimizer, (Scion, DistributedScion)):
             g = p.grad
             if g is None or not p.requires_grad:
                 return None
@@ -291,7 +291,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             # NB: assumes correspondences between model parts and optimizers
             optimizer = self.optimizers[i]
             for group in optimizer.param_groups:
-                if isinstance(optimizer, Scion):
+                if isinstance(optimizer, (Scion, DistributedScion)):
                     param_kwargs = {
                         "momentum": group["momentum"],
                         "nesterov": group["nesterov"],
@@ -541,6 +541,8 @@ def build_optimizers(
     eps = optimizer_config.eps
     weight_decay = optimizer_config.weight_decay
 
+    is_scion = name == "Scion" or name == "DistributedScion"
+
     width_multiplier = 1
     if name in ["Adam", "AdamW"]:
         optim_implementation = optimizer_config.implementation
@@ -564,7 +566,7 @@ def build_optimizers(
             "fused": fused,
             "foreach": foreach,
         }
-    elif name == "Scion":
+    elif is_scion:
         backend_steps = optimizer_config.backend_steps
         momentum = optimizer_config.momentum
         nesterov = optimizer_config.nesterov
@@ -594,7 +596,7 @@ def build_optimizers(
             "param_str_match": embed_str_match,
             "lr": embed_lr,
         }
-        if name == "Scion":
+        if is_scion:
             param_group_config["norm_factor"] = "embed_sqrt"
             param_group_config["backend"] = "identity"
         param_groups_config.append(param_group_config)
@@ -606,7 +608,7 @@ def build_optimizers(
             "param_str_match": unembed_str_match,
             "lr": unembed_lr / width_multiplier,
         }
-        if name == "Scion":
+        if is_scion:
             param_group_config["norm_factor"] = "unembed_sqrt"
             param_group_config["backend"] = "identity"
         param_groups_config.append(param_group_config)
@@ -620,6 +622,7 @@ def build_optimizers(
         "Adam": torch.optim.Adam,
         "AdamW": torch.optim.AdamW,
         "Scion": Scion,
+        "DistributedScion": DistributedScion,
     }
     if name not in optimizer_classes:
         raise NotImplementedError(f"Optimizer {name} not added.")

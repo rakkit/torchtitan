@@ -92,7 +92,15 @@ def build_init_fn(init_fn_type: str):
     elif init_fn_type == "zeros":
         return _wrap_ignore_generator(_wrap_ignore_mean_std(nn.init.zeros_))
     elif init_fn_type == "orthogonal":
-        return _wrap_ignore_mean_std(orthogonal_)
+
+        def _wrap_orthogonal(fn):
+            @functools.wraps(fn)
+            def wrapped_fn(tensor, mean=None, std=1, *args, **kwargs):
+                return fn(tensor, gain=std, *args, **kwargs)
+
+            return wrapped_fn
+
+        return _wrap_orthogonal(orthogonal_)
     elif init_fn_type == "scion_normal":
         return scion_normal_
     else:

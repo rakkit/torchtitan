@@ -22,6 +22,15 @@ def _wrap_ignore_mean_std(fn):
     return wrapped_fn
 
 
+# Deliberately throw away the `generator` argument.
+def _wrap_ignore_generator(fn):
+    @functools.wraps(fn)
+    def wrapped_fn(tensor, *args, generator=None, **kwargs):
+        return fn(tensor, *args, **kwargs)
+
+    return wrapped_fn
+
+
 def orthogonal_(param, gain: float = 1.0, generator: torch.Generator | None = None):
     with torch.no_grad():
         if not isinstance(param.data, DTensor):
@@ -47,11 +56,13 @@ def scion_normal_(
     std: float = 1.0,
     norm_axis: int = 1,
     eps: float = 1e-12,
+    generator: torch.Generator | None = None,
 ):
     nn.init.normal_(
         tensor,
         mean=mean,
         std=std,
+        generator=generator,
     )
     with torch.no_grad():
         divisor = torch.rsqrt(tensor.pow(2).sum(axis=norm_axis, keepdim=True) + eps)
@@ -79,7 +90,7 @@ def build_init_fn(init_fn_type: str):
     elif init_fn_type == "normal":
         return nn.init.normal_
     elif init_fn_type == "zeros":
-        return _wrap_ignore_mean_std(nn.init.zeros_)
+        return _wrap_ignore_generator(_wrap_ignore_mean_std(nn.init.zeros_))
     elif init_fn_type == "orthogonal":
         return _wrap_ignore_mean_std(orthogonal_)
     elif init_fn_type == "scion_normal":

@@ -155,7 +155,8 @@ class Scion(torch.optim.Optimizer):
             g = g * (g.size(0) / g.size(1)) ** 0.5
         elif norm_factor.startswith("embed"):
             # NB: here assume shape [vocab_size, embed_dim]
-            g = g * torch.rsqrt(g.pow(2).sum(axis=1, keepdim=True) + eps)
+            rms_values = torch.sqrt(g.pow(2).sum(axis=1, keepdim=True))
+            g = g / (rms_values + eps)
             if norm_factor == "embed_linear":
                 g = g * g.size(1)
             elif norm_factor == "embed_sqrt":
@@ -163,7 +164,8 @@ class Scion(torch.optim.Optimizer):
             else:
                 raise ValueError(f"Unknown norm_factor: {norm_factor}")
         elif norm_factor.startswith("unembed"):
-            g = g * torch.rsqrt(g.pow(2).sum(axis=1, keepdim=True) + eps)
+            rms_values = torch.sqrt(g.pow(2).sum(axis=1, keepdim=True))
+            g = g / (rms_values + eps)
             if norm_factor == "unembed_linear":
                 g = g / g.size(1)
             elif norm_factor == "unembed_sqrt":

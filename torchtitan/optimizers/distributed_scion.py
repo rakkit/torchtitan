@@ -12,9 +12,11 @@ import torch
 import torch.distributed as dist
 import torch.distributed.tensor
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate
 
-from torchtitan.optimizers.muon_utils import zeropower_backends
 from torchtitan.tools.logging import logger
+
+from .muon_utils import zeropower_backends
 
 __all__ = [
     "DistributedScion",
@@ -49,18 +51,28 @@ def get_param_type(p, fsdp_enabled, expert_enabled):
         return ParamType.Unknown
 
 
-def calculate_shard_shape(shape, source_rank, world_size):
-    full_dim0 = shape[0]
-    base = (full_dim0 + world_size - 1) // world_size  # ceil division
-    remainder = full_dim0 - base * (world_size - 1)
-    if source_rank < world_size - 1:
-        dim0 = base
-    else:
-        dim0 = remainder
+# def calculate_shard_shape(shape, source_rank, world_size):
+#     full_dim0 = shape[0]
+#     base = (full_dim0 + world_size - 1) // world_size  # ceil division
+#     remainder = full_dim0 - base * (world_size - 1)
+#     if source_rank < world_size - 1:
+#         dim0 = base
+#     else:
+#         dim0 = remainder
+#     return (dim0, *shape[1:])
+
+
+def calculate_shard_shape(shape, rank, world_size):
+    full = shape[0]
+    base = full // world_size
+    extra = full % world_size
+    dim0 = base + 1 if rank < extra else base
     return (dim0, *shape[1:])
 
 
 class DistributedScion(torch.optim.Optimizer):
+    CACHE_GRAD = set()
+
     def __init__(
         self,
         params,
@@ -86,6 +98,10 @@ class DistributedScion(torch.optim.Optimizer):
             backend_steps=backend_steps,
         )
         self.is_light = is_light
+        self.use_momentum = (
+            momentum > 0 and momentum < 1
+        )  # NB: use default momentum here, param groups can have its own values
+
         self.is_unconstrained = is_unconstrained
         self.world_mesh = parallel_dims.world_mesh
 
@@ -150,8 +166,13 @@ class DistributedScion(torch.optim.Optimizer):
                     "embed"
                 ) or norm_factor.startswith("unembed")
 
-                if backend is zeropower_backends["identity"] and is_embed_norm:
+                if (
+                    backend is zeropower_backends["identity"]
+                    and is_embed_norm
+                    and self.fsdp_enabled
+                ):
                     sgd_params.append(p)
+                    # fsdp_params.append(p)
                     continue
 
                 param_type = get_param_type(p, self.fsdp_enabled, self.expert_enabled)
@@ -168,6 +189,7 @@ class DistributedScion(torch.optim.Optimizer):
 
         fsdp_params.sort(key=lambda x: x.numel(), reverse=True)
         expert_params.sort(key=lambda x: (x.numel(), x.shape[1]), reverse=True)
+
         self.step_sgd(sgd_params)
         self.step_ddp(ddp_params)
         self.step_expert(expert_params)
@@ -202,7 +224,8 @@ class DistributedScion(torch.optim.Optimizer):
             g = g * (g.size(0) / g.size(1)) ** 0.5
         elif norm_factor.startswith("embed"):
             # NB: here assume shape [vocab_size, embed_dim]
-            g = g * torch.rsqrt(g.pow(2).sum(axis=1, keepdim=True) + eps)
+            rms_values = torch.sqrt(g.pow(2).sum(axis=1, keepdim=True))
+            g = g / (rms_values + eps)
             if norm_factor == "embed_linear":
                 g = g * g.size(1)
             elif norm_factor == "embed_sqrt":
@@ -210,7 +233,8 @@ class DistributedScion(torch.optim.Optimizer):
             else:
                 raise ValueError(f"Unknown norm_factor: {norm_factor}")
         elif norm_factor.startswith("unembed"):
-            g = g * torch.rsqrt(g.pow(2).sum(axis=1, keepdim=True) + eps)
+            rms_values = torch.sqrt(g.pow(2).sum(axis=1, keepdim=True))
+            g = g / (rms_values + eps)
             if norm_factor == "unembed_linear":
                 g = g / g.size(1)
             elif norm_factor == "unembed_sqrt":
@@ -245,32 +269,22 @@ class DistributedScion(torch.optim.Optimizer):
             elif isinstance(param, torch.Tensor):
                 param.grad = None
 
-    def update_momentum_via_nestroev(self, p, nesterov=False, momentum=0):
-        g = p.grad
-        state = self.state[p]
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros_like(g)
-        buf = state["momentum_buffer"]
-        buf.mul_(momentum).add_(g)
-        g = buf if not nesterov else buf.mul(1 - momentum).add(g, alpha=momentum)
-        return g
-
     def update_bucket_params(self, params, updates, start_idx, end_idx):
+
         for idx_in_bucket in range(start_idx, end_idx):
             shift = idx_in_bucket - start_idx
+            self.CACHE_GRAD.add(idx_in_bucket)
             p = params[idx_in_bucket]
             u = updates[shift]
             lr, nesterov, momentum, param_kwargs = self.groups_info[
                 self.paramters_to_groups[id(p)]
             ]
+
             if not self.is_unconstrained:
-                if isinstance(p, DTensor):
-                    p.data.to_local().mul_(1 - lr)
-                else:
-                    p.data.mul_(1 - lr)
+                p.data.mul_(1 - lr)
 
             if isinstance(p, DTensor):
-                p.data.to_local().add_(u, alpha=-lr)
+                p.to_local().add_(u, alpha=-lr)
             else:
                 p.data.add_(u, alpha=-lr)
 
@@ -287,13 +301,20 @@ class DistributedScion(torch.optim.Optimizer):
             lr, nesterov, momentum, param_kwargs = self.groups_info[
                 self.paramters_to_groups[id(p)]
             ]
-            g = self.update_momentum_via_nestroev(p, nesterov, momentum)
+            g = self.get_momentum_or_grad(
+                p, momentum, nesterov, update_buffer=True, gather_to_local=False
+            )
+            if isinstance(g, DTensor):
+                u = self.lmo(g.to_local(), **param_kwargs)
+                if not self.is_unconstrained:
+                    p.data.to_local().mul_(1 - lr)
+                p.data.to_local().add_(u, alpha=-lr)
 
-            u = self.lmo(g.to_local(), **param_kwargs)
-
-            if not self.is_unconstrained:
-                p.data.to_local().mul_(1 - lr)
-            p.data.to_local().add_(u, alpha=-lr)
+            else:
+                u = self.lmo(g, **param_kwargs)
+                if not self.is_unconstrained:
+                    p.data.mul_(1 - lr)
+                p.data.add_(u, alpha=-lr)
 
             if momentum != 1 and self.is_light:
                 raise NotImplementedError("Scion-light is not ready yet")
@@ -323,7 +344,9 @@ class DistributedScion(torch.optim.Optimizer):
                 _, nesterov, momentum, _ = self.groups_info[
                     self.paramters_to_groups[id(p)]
                 ]
-                g = self.update_momentum_via_nestroev(p, nesterov, momentum)
+                g = self.get_momentum_or_grad(
+                    p, momentum, nesterov, update_buffer=True, gather_to_local=False
+                )
 
             else:
                 """
@@ -364,7 +387,7 @@ class DistributedScion(torch.optim.Optimizer):
 
         device = fsdp_params[0].device
         cast_dtype = self.communication_dtype
-        zero_tensor = partial(torch.zeros, dtype=cast_dtype, device=device)
+        zero_tensor = partial(torch.empty, dtype=cast_dtype, device=device)
 
         # Process each bucket
         for bucket_idx in range(total_buckets):
@@ -385,7 +408,13 @@ class DistributedScion(torch.optim.Optimizer):
                         self.paramters_to_groups[id(p)]
                     ]
                     g = (
-                        self.update_momentum_via_nestroev(p, nesterov, momentum)
+                        self.get_momentum_or_grad(
+                            p,
+                            momentum,
+                            nesterov,
+                            update_buffer=True,
+                            gather_to_local=False,
+                        )
                         .to_local()
                         .to(dtype=cast_dtype)
                     )
@@ -421,6 +450,7 @@ class DistributedScion(torch.optim.Optimizer):
             _, _, _, param_kwargs = self.groups_info[
                 self.paramters_to_groups[id(fsdp_params[_IDX_OF_NS5])]
             ]
+
             u = self.lmo(full_g, **param_kwargs)
 
             # Step 6: Split the processed tensor back for second all_to_all
@@ -440,6 +470,8 @@ class DistributedScion(torch.optim.Optimizer):
                 end_idx,
             )
 
+        self.CACHE_GRAD.clear()
+
     def step_expert(self, expert_params):
         if len(expert_params) == 0:
             return
@@ -451,7 +483,9 @@ class DistributedScion(torch.optim.Optimizer):
             lr, nesterov, momentum, param_kwargs = self.groups_info[
                 self.paramters_to_groups[id(p)]
             ]
-            g = self.update_momentum_via_nestroev(p, nesterov, momentum)
+            g = self.get_momentum_or_grad(
+                p, momentum, nesterov, update_buffer=True, gather_to_local=False
+            )
 
             u = self.lmo(g.to_local(), **param_kwargs)
 
@@ -462,3 +496,50 @@ class DistributedScion(torch.optim.Optimizer):
             if momentum != 1 and self.is_light:
                 raise NotImplementedError("Scion-light is not ready yet")
                 g.mul_(1 - momentum)
+
+    @torch.no_grad()
+    def get_momentum_or_grad(
+        self, p, momentum, nesterov, update_buffer=False, gather_to_local=True
+    ):
+        g = p.grad
+        if g is None or not p.requires_grad:
+            return None
+
+        if not self.is_light and momentum != 1:
+            state = self.state[p]
+            if "momentum_buffer" not in state.keys():
+                if update_buffer:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                else:
+                    """
+                    When you using DDP + Dist-muon,you might trieer an error here.
+                    Because in the optimizer.log you try to log all gradient's norm.
+                    But for DDP + Dist-muon, each rank only has a part of the gradient.
+
+                    --
+                    For debug, you can return None here.
+                    """
+                    raise ValueError(
+                        "Momentum buffer not found in optimizer state. "
+                        "Please check if the optimizer is initialized correctly."
+                    )
+            buf = state["momentum_buffer"]
+            if update_buffer:
+                buf.mul_(1 - momentum).add_(g, alpha=momentum)
+            else:
+                buf = buf.mul(1 - momentum).add(g, alpha=momentum)
+            g = buf if not nesterov else buf.mul(1 - momentum).add(g, alpha=momentum)
+
+        if gather_to_local:
+            g = gather_full_grad(g).to_local()
+
+        return g
+
+
+def gather_full_grad(g):
+    """Gathers the full gradient across all distributed processes using DTensor."""
+    assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
+    replicated_grad = g.redistribute(
+        placements=[Replicate()] * g.device_mesh.ndim
+    )  # make sure all rank has the same shape
+    return replicated_grad

@@ -93,7 +93,8 @@ def supremum_norm(x):
 @torch.no_grad()
 def condition_number(W):
     assert W.ndim == 2, "condition number calculation can only be applied to matrices"
-    return torch.linalg.cond(W.to(torch.float32), p=2)
+    S = torch.linalg.svdvals(W.to(torch.float32), driver="gesvd")
+    return S[0] / S[-1]
 
 
 NORM_FUNCTIONS = {

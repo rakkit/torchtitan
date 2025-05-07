@@ -77,11 +77,18 @@ def supremum_norm(x):
     return x.abs().max()
 
 
+@torch.no_grad()
+def condition_number(W):
+    assert W.ndim == 2, "condition number calculation can only be applied to matrices"
+    return torch.linalg.cond(W.to(torch.float32), p=2)
+
+
 NORM_FUNCTIONS = {
     "spectral": spectral_norm,
     "l1_to_rms": l1_to_rms_norm,
     "rms_to_l1": rms_to_l1_norm,
     "supremum": supremum_norm,
+    "condition_number": condition_number,
 }
 
 

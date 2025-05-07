@@ -28,6 +28,7 @@ class ByteTokenizer(BaseTokenizer):
         self,
         bos_token: str = "〈BOS〉",
         eos_token: str = "〈EOS〉",
+        pad_token: str = "〈PAD〉",
         special_tokens: list[str] | None = None,
     ):
         super().__init__()
@@ -38,6 +39,8 @@ class ByteTokenizer(BaseTokenizer):
             special_tokens.insert(0, bos_token)
         if eos_token not in special_tokens:
             special_tokens.insert(1, eos_token)
+        if pad_token not in special_tokens:
+            special_tokens.append(pad_token)
 
         self.special_tokens = {
             tok: i + ByteTokenizer.NUM_BYTE_VALUES
@@ -45,14 +48,16 @@ class ByteTokenizer(BaseTokenizer):
         }
         self.bos_id = self.special_tokens[bos_token]
         self.eos_id = self.special_tokens[eos_token]
-        self.pad_id = -1
+        self.pad_id = self.special_tokens[pad_token]
 
-        self._vocab_size = ByteTokenizer.NUM_BYTE_VALUES + len(self.special_tokens)
+        # -1 because we don't count pad ID
+        self._vocab_size = ByteTokenizer.NUM_BYTE_VALUES + len(self.special_tokens) - 1
 
         self._vocab = {chr(i): i for i in range(ByteTokenizer.NUM_BYTE_VALUES)}
         self._vocab.update(self.special_tokens)
 
-        assert len(self._vocab) == self._vocab_size, (
+        # -1 because we don't count pad ID
+        assert len(self._vocab) - 1 == self._vocab_size, (
             f"unexpected vocabulary size; make sure none of the specified "
             f"special tokens collide with the original "
             f"{ByteTokenizer.NUM_BYTE_VALUES} ASCII symbols"
@@ -61,7 +66,7 @@ class ByteTokenizer(BaseTokenizer):
         self._inv_vocab = {v: k for (k, v) in self._vocab.items()}
         logger.info(
             f"ByteTokenizer built: #words {self.get_vocab_size()}, BOS ID {self.bos_id}, "
-            f"EOS ID {self.eos_id}"
+            f"EOS ID {self.eos_id}, PAD ID {self.pad_id}"
         )
 
     def encode(self, text: str, *, bos: bool, eos: bool) -> list[int]:

@@ -28,7 +28,7 @@ from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.optimizers import DistributedScion, Scion
-from torchtitan.optimizers.muon_utils import gather_full_grad, zeropower_backends
+from torchtitan.optimizers.muon_utils import zeropower_backends
 
 __all__ = [
     "OptimizersContainer",
@@ -210,7 +210,11 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
 
     def zero_grad(self, *args, **kwargs) -> None:
         for optimizer in self.optimizers:
-            if not (isinstance(optimizer, Scion) and optimizer.is_light):
+            if not (
+                isinstance(optimizer, Scion)
+                and optimizer.is_light
+                and optimizer.use_momentum
+            ):
                 optimizer.zero_grad(*args, **kwargs)
 
     def state_dict(self) -> dict[str, Any]:
@@ -235,31 +239,27 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
     @staticmethod
     def compute_grad(p, optimizer=None, **kwargs):
         if isinstance(optimizer, (Scion, DistributedScion)):
-            g = p.grad
-            if g is None or not p.requires_grad:
-                return None
-
             momentum = kwargs.pop("momentum")
             nesterov = kwargs.pop("nesterov")
-            if not optimizer.is_light and momentum != 1:
-                state = optimizer.state[p]
-                if "momentum_buffer" not in state.keys():
-                    raise ValueError(
-                        "Momentum buffer not found in optimizer state. "
-                        "Please check if the optimizer is initialized correctly."
-                    )
-                buf = state["momentum_buffer"]
-                buf = buf.mul(1 - momentum).add(g, alpha=momentum)
-                g = (
-                    buf
-                    if not nesterov
-                    else buf.mul(1 - momentum).add(g, alpha=momentum)
-                )
-            if optimizer.fsdp_enabled:
-                g = gather_full_grad(g).to_local()
-
-            return optimizer.lmo(g, **kwargs)
+            g = optimizer.get_momentum_or_grad(
+                p,
+                momentum,
+                nesterov,
+                update_buffer=False,
+                gather_to_local=optimizer.fsdp_enabled,
+            )
+            if g is None:
+                return None
+            else:
+                return optimizer.lmo(g, **kwargs)
         elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+            if p.ndim == 3:
+                warnings.warn(
+                    f"Optimizer {optimizer.__class__.__name__} does not support "
+                    f"gradient computation for 3D tensors for logging."
+                )
+                return None
+
             eps = kwargs["eps"]
             weight_decay = kwargs["weight_decay"]
             beta1, beta2 = kwargs["betas"]

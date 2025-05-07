@@ -31,9 +31,10 @@ class TransformerModelArgs(BaseModelArgs):
     rope_theta: float = 10000
 
     max_seq_len: int = 131072
-    # If `True`, then each transformer block init uses its layer ID, and if
-    # `False`, each uses the total number of transformer blocks
-    depth_init: bool = True
+    # If `True`, then each transformer block init uses its layer ID, and
+    # if `False`, each uses the total number of transformer blocks. If
+    # `None`, do not apply any depth scaling.
+    depth_init: bool | None = True
     first_in_init_fn_type: str = "normal"
     first_in_init_std: float = 1.0
     # Exponent applied to the first input layer's input dimensionality

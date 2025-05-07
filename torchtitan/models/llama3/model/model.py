@@ -428,7 +428,9 @@ class TransformerBlock(nn.Module):
             model_args.intermediate_init_std
             * model_args.dim**model_args.intermediate_exp
         )
-        if model_args.depth_init:
+        if model_args.depth_init is None:
+            self.residual_div = 1.0
+        elif model_args.depth_init:
             self.residual_div = (2 * (layer_id + 1)) ** 0.5
         else:
             self.residual_div = (2 * model_args.n_layers) ** 0.5

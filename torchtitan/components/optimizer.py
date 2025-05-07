@@ -45,9 +45,22 @@ T = TypeVar("T", bound=Optimizer)
 
 
 @torch.no_grad()
-def spectral_norm(W):
+def rms_to_rms_norm(W):
+    """
+    Note:
+        Be aware that ``fan_in`` and ``fan_out`` are calculated assuming
+        that the weight matrix is used in a transposed manner,
+        (i.e., ``x @ w.T`` in ``Linear`` layers, where ``w.shape = [fan_out, fan_in]``).
+        This is important for correct initialization.
+        If you plan to use ``x @ w``, where ``w.shape = [fan_in, fan_out]``,
+        pass in a transposed weight matrix, i.e. ``nn.init.xavier_uniform_(w.T, ...)``.
+    """
     assert W.ndim == 2, "operator norm can only be applied to matrices"
-    return torch.linalg.norm(W.to(torch.float32), ord=2, dtype=torch.float32)
+    norm = torch.linalg.norm(W.to(torch.float32), ord=2, dtype=torch.float32)
+    fan_out, fan_in = W.shape
+    scale = math.sqrt(fan_in / fan_out)
+    norm *= scale
+    return norm
 
 
 @torch.no_grad()
@@ -84,7 +97,7 @@ def condition_number(W):
 
 
 NORM_FUNCTIONS = {
-    "spectral": spectral_norm,
+    "rms_to_rms": rms_to_rms_norm,
     "l1_to_rms": l1_to_rms_norm,
     "rms_to_l1": rms_to_l1_norm,
     "supremum": supremum_norm,

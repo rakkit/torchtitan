@@ -60,6 +60,7 @@ class TransformerModelArgs(BaseModelArgs):
     use_flex_attn: bool = False
     attn_mask_type: str = "causal"
     eos_id: int = 0
+    pad_id: int = -1
 
     # Number of additional modules to insert for multi-token prediction.
     num_mtp_modules: int = 0
@@ -91,6 +92,14 @@ class TransformerModelArgs(BaseModelArgs):
                 "(since `vocab_size == -1`)."
             )
             self.vocab_size = tokenizer.get_vocab_size()
+            # `pad_id` is not part of the `Tokenizer` interface, so keep it
+            # optional.
+            if hasattr(tokenizer, "pad_id"):
+                self.pad_id = tokenizer.pad_id
+            # Add an additional vocab element if we are explicitly
+            # supporting a pad token.
+            if self.pad_id >= 0:
+                self.vocab_size += 1
 
         if job_config.model.vocab_size_multiple_of:
             orig_vocab_size = self.vocab_size

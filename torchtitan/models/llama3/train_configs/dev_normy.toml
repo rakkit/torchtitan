@@ -37,13 +37,6 @@ intermediate_exp = 0
 final_out_init_fn_type = "scion_normal_output"
 final_out_init_std = 1
 final_out_exp = 0
-depth_init = false
-init_gate_as_residual = false
-ffn_dim_multiplier = 1
-multiple_of = 256
-rope_theta = 500000
-qk_norm = true
-norm_eps = 1e-12
 
 # tokenizer_path = ???
 # converters = ???

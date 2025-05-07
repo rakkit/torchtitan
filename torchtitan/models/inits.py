@@ -108,8 +108,8 @@ def scion_normal_(
         raise ValueError(f"Unknown scale_type: {scale_type}")
 
     with torch.no_grad():
-        scale = scale * torch.rsqrt(
-            tensor.pow(2).sum(axis=norm_axis, keepdim=True) + eps
+        scale = scale / (
+            torch.sqrt(tensor.pow(2).sum(axis=norm_axis, keepdim=True)) + eps
         )
         tensor.mul_(scale)
 

@@ -17,6 +17,8 @@ INIT_FN_TYPES = [
     "orthogonal",
     "scaled_orthogonal",
     "scion_normal",
+    "scion_normal_input",
+    "scion_normal_output",
 ]
 
 
@@ -86,17 +88,30 @@ def scion_normal_(
     std: float = 1.0,
     norm_axis: int = 1,
     eps: float = 1e-12,
+    scale_type: str | None = None,
     generator: torch.Generator | None = None,
 ):
+    assert tensor.ndim == 2, "Tensor for scion_normal_ init must have 2 dimensions"
     nn.init.normal_(
         tensor,
         mean=mean,
         std=std,
         generator=generator,
     )
+    if scale_type is None:
+        scale = 1.0
+    elif scale_type == "input":
+        scale = math.sqrt(tensor.shape[norm_axis])
+    elif scale_type == "output":
+        scale = 1 / math.sqrt(tensor.shape[norm_axis])
+    else:
+        raise ValueError(f"Unknown scale_type: {scale_type}")
+
     with torch.no_grad():
-        divisor = torch.rsqrt(tensor.pow(2).sum(axis=norm_axis, keepdim=True) + eps)
-        tensor.mul_(divisor)
+        scale = scale * torch.rsqrt(
+            tensor.pow(2).sum(axis=norm_axis, keepdim=True) + eps
+        )
+        tensor.mul_(scale)
 
 
 def build_init_fn(init_fn_type: str):
@@ -134,5 +149,17 @@ def build_init_fn(init_fn_type: str):
         return _wrap_orthogonal(scaled_orthogonal_)
     elif init_fn_type == "scion_normal":
         return scion_normal_
+    elif init_fn_type == "scion_normal_input":
+        return functools.partial(
+            scion_normal_,
+            scale_type="input",
+            norm_axis=1,
+        )
+    elif init_fn_type == "scion_normal_output":
+        return functools.partial(
+            scion_normal_,
+            scale_type="output",
+            norm_axis=1,
+        )
     else:
         raise NotImplementedError(f"Unknown `init_fn_type`: '{init_fn_type}'")

@@ -7,6 +7,7 @@
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
 import functools
+import warnings
 from typing import Callable, ClassVar
 
 import torch
@@ -98,6 +99,18 @@ class FlexAttention(torch.nn.Module):
         return causal_mask
 
     @staticmethod
+    def _get_padded_causal_mask_mod(
+        batch: torch.Tensor, pad_id: int
+    ) -> _mask_mod_signature:
+        # batch is [b, s, h, d] shape
+        mask = batch != pad_id
+
+        def padded_causal_mask(b, h, q_idx, kv_idx):
+            return mask[b, q_idx] & mask[b, kv_idx] & (q_idx >= kv_idx)
+
+        return padded_causal_mask
+
+    @staticmethod
     def _get_cached_causal_mask_mod(start_pos: int) -> _mask_mod_signature:
         assert start_pos >= 0
 
@@ -105,6 +118,27 @@ class FlexAttention(torch.nn.Module):
             return (kv_idx >= start_pos) & (q_idx >= kv_idx)
 
         return cached_causal_mask
+
+    @staticmethod
+    def _get_cached_padded_causal_mask_mod(
+        batch: torch.Tensor,
+        start_pos: int,
+        pad_id: int,
+    ) -> _mask_mod_signature:
+        assert start_pos >= 0
+
+        # batch is [b, s, h, d] shape
+        mask = batch != pad_id
+
+        def cached_padded_causal_mask(b, h, q_idx, kv_idx):
+            return (
+                mask[b, q_idx]
+                & mask[b, kv_idx]
+                & (kv_idx >= start_pos)
+                & (q_idx >= kv_idx)
+            )
+
+        return cached_padded_causal_mask
 
     @staticmethod
     def _get_block_causal_mask_mod(
@@ -164,18 +198,21 @@ class FlexAttention(torch.nn.Module):
     def init_attention_mask(
         batch: torch.Tensor,
         eos_id: int | None = None,
+        pad_id: int | None = None,
         start_pos: int = -1,
     ) -> None:
         # batch is [b, s, h, d] shape
         for mask_key in FlexAttention.used_attn_mask_types:
             seq_len = batch.shape[1]
             use_cached_mask = start_pos >= 0 and seq_len > 1
+            use_padded_mask = pad_id is not None
 
             attn_mask_type, fixed_block_size = mask_key
             match attn_mask_type:
                 case "causal":
                     if (
                         start_pos < 0
+                        and not use_padded_mask
                         and FlexAttention.block_masks.get(mask_key, None) is not None
                     ):
                         continue
@@ -183,9 +220,23 @@ class FlexAttention(torch.nn.Module):
                     # all samples have the same lower triangle mask.
                     batch_dimension = 1
                     if use_cached_mask:
-                        mask_mod = FlexAttention._get_cached_causal_mask_mod(start_pos)
+                        if use_padded_mask:
+                            mask_mod = FlexAttention._get_cached_padded_causal_mask_mod(
+                                batch,
+                                start_pos,
+                                pad_id,
+                            )
+                        else:
+                            mask_mod = FlexAttention._get_cached_causal_mask_mod(
+                                start_pos
+                            )
                     else:
-                        mask_mod = FlexAttention._get_causal_mask_mod()
+                        if use_padded_mask:
+                            mask_mod = FlexAttention._get_padded_causal_mask_mod(
+                                batch, pad_id
+                            )
+                        else:
+                            mask_mod = FlexAttention._get_causal_mask_mod()
                 case "block_causal":
                     if eos_id is None:
                         raise RuntimeError(
@@ -194,6 +245,12 @@ class FlexAttention(torch.nn.Module):
                     if start_pos >= 0:
                         raise ValueError(
                             '`start_pos` not supported with "block_causal" mask.'
+                        )
+                    if use_padded_mask:
+                        warnings.warn(
+                            '`pad_id` not supported with "block_causal" mask. If you are not using '
+                            '`pad_id` concurrently with "block_causal" masking, it is fine to '
+                            "ignore this warning."
                         )
                     batch_dimension = batch.shape[0]
                     mask_mod = FlexAttention._get_block_causal_mask_mod(batch, eos_id)
@@ -275,6 +332,7 @@ def init_attention_mask(
     batch: torch.Tensor,
     eos_id: int | None,
     cp_mesh: torch.distributed.device_mesh.DeviceMesh | None = None,
+    pad_id: int | None = None,
     start_pos: int = -1,
 ) -> None:
 
@@ -286,4 +344,4 @@ def init_attention_mask(
             create_cp_block_mask, device_mesh=cp_mesh
         )
 
-    FlexAttention.init_attention_mask(batch, eos_id, start_pos=start_pos)
+    FlexAttention.init_attention_mask(batch, eos_id, pad_id=pad_id, start_pos=start_pos)

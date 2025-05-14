@@ -496,7 +496,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             cp_mesh = (
                 parallel_dims.world_mesh["cp"] if parallel_dims.cp_enabled else None
             )
-            init_attention_mask(inputs, self.tokenizer.eos_id, cp_mesh)
+            init_attention_mask(
+                inputs,
+                self.tokenizer.eos_id,
+                cp_mesh,
+                # Assume we'll never use padding if its token ID is
+                # negative.
+                pad_id=self.model_args.pad_id if self.model_args.pad_id >= 0 else None,
+            )
 
         aux_loss = None
 

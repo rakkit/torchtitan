@@ -106,6 +106,13 @@ NORM_FUNCTIONS = {
 }
 
 
+def _remove_orig_mod_and_weight_for_p_name(name: str) -> str:
+    # Remove ._orig_mod and .weight anywhere in the parameter name
+    name = re.sub(r"\._orig_mod", "", name)
+    name = re.sub(r"\.weight", "", name)
+    return name
+
+
 def _extract_param_groups(
     model: torch.nn.Module,
     optimizer_config: dict[str, Any] | None = None,
@@ -334,7 +341,14 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                     )
                     continue
 
-                for n, p in zip(group["param_names"], group["params"]):
+                for p_name, p in zip(group["param_names"], group["params"]):
+
+                    """
+                    the module name usally named
+                    track_update_condition_number/model_part_0/layers.0._orig_mod.attention.wo.weight
+                    we can remove '._orig_mod' and '.weight' to get the clean layer name
+                    """
+                    cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(p_name)
                     g = self.compute_grad(p, optimizer, **param_kwargs)
                     if g is not None:
                         p = (
@@ -346,7 +360,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                         )
                         g = g.to_local() if isinstance(g, DTensor) else g
                         update = -group["lr"] * g
-                        if "tok_embeddings" in n:
+                        if "tok_embeddings" in p_name:
                             p, update = p.T, update.T
                         for norm_name, norm_func in NORM_FUNCTIONS.items():
                             if norm_name != "supremum" and (
@@ -358,25 +372,28 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                                 # Special handling for grouped MoE.
                                 for ep_idx in range(p.shape[0]):
                                     norms[
-                                        f"model_part_{i}/ep_{ep_idx}/{n}/param/{norm_name}"
-                                    ] = norm_func(p[ep_idx])
-                                    norms[
-                                        f"model_part_{i}/ep_{ep_idx}/{n}/update/{norm_name}"
+                                        f"track_update_{norm_name}/model_part_{i}/ep_{ep_idx}/{cleaned_p_name}"
                                     ] = norm_func(update[ep_idx])
+
+                                    norms[
+                                        f"track_param_{norm_name}/model_part_{i}/ep_{ep_idx}/{cleaned_p_name}"
+                                    ] = norm_func(p[ep_idx])
+
                             else:
                                 if p.ndim > 2 or update.ndim > 2:
                                     warnings.warn(
-                                        f"Encountered parameter or update {n} with shape "
+                                        f"Encountered parameter or update {cleaned_p_name} with shape "
                                         f"{p.shape} or {update.shape}, respectively; "
                                         f"this may not be an issue, but please ensure its "
                                         f"norms are calculated correctly."
                                     )
                                 norms[
-                                    f"model_part_{i}/{n}/param/{norm_name}"
+                                    f"track_param_{norm_name}/model_part_{i}/{cleaned_p_name}"
                                 ] = norm_func(p)
                                 norms[
-                                    f"model_part_{i}/{n}/update/{norm_name}"
+                                    f"track_update_{norm_name}/model_part_{i}/{cleaned_p_name}"
                                 ] = norm_func(update)
+
         return norms
 
     def get_lrs(self):

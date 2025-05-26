@@ -192,6 +192,9 @@ class Optimizer:
     is_unconstrained: bool = False
     """Whether to use Scion's unconstrained version"""
 
+    zeropower_backend: str = "newtonschulz5"
+    "Which `zeropower_backend` to use."
+
     backend_steps: int = 5
     """Number of steps for the Scion backend"""
 

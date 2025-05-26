@@ -104,6 +104,9 @@ class Model:
     Exponent applied to the first input layer's input dimensionality to obtain its init std factor.
     """
 
+    router_init_fn_type: str = "normal"
+    """Weight initialization method to use for router layers."""
+
     intermediate_init_fn_type: str = "normal"
     """Weight initialization method to use for the intermediate layers."""
 
@@ -215,6 +218,9 @@ class Optimizer:
 
     unembed_str_match: str | None = None
     """String to match for unembedding layer parameter group"""
+
+    router_str_match: str | None = None
+    """String to match for MoE router layer parameter group"""
 
     implementation: Literal["for-loop", "foreach", "fused"] = "fused"
     """

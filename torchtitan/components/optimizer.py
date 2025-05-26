@@ -652,6 +652,19 @@ def build_optimizers(
             param_group_config["backend"] = "identity"
         param_groups_config.append(param_group_config)
 
+    router_str_match = optimizer_config.router_str_match
+    if router_str_match:
+        param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
+        param_group_config = {
+            "param_str_match": router_str_match,
+            "lr": lr,
+        }
+        if is_scion:
+            param_group_config["norm_factor"] = "image_spectral"
+            # param_group_config["backend"] = "identity"
+            param_group_config["backend"] = zeropower_backend_algorithm
+        param_groups_config.append(param_group_config)
+
     optimizer_kwargs["extra_kwargs"] = {
         "parallel_dims": parallel_dims,
         **extra_kwargs,

@@ -13,10 +13,26 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.optim.optimizer import _device_dtype_check_for_fused, _get_scalar_dtype
 
 
+# def zeropower_via_svd(G, **kwargs):
+#     U, S, V = G.svd()
+#     X = U @ V.T
+#     return X
+
+
 def zeropower_via_svd(G, **kwargs):
+    original_dtype = G.dtype
+    G = G.to(torch.float32)
+    # SVD does not support bfloat16
+    if G.size(0) > G.size(1):
+        G = G.T
+        transpose = True
+    else:
+        transpose = False
     U, S, V = G.svd()
     X = U @ V.T
-    return X
+    if transpose:
+        X = X.T
+    return X.to(original_dtype).contiguous()
 
 
 @torch.compile

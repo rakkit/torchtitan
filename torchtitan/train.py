@@ -13,6 +13,7 @@ import time
 from datetime import timedelta
 from typing import Any, Generator, Iterable, Optional
 
+import tomli_w
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
@@ -423,8 +424,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 + datetime.datetime.now().strftime("%Y%m%d-%H%M")
                 + ".json",
             )
+            config_dict = self.job_config.to_dict()
             with open(job_config_save_path, "w") as f:
-                json.dump(self.job_config.to_dict(), f, indent=4)
+                json.dump(config_dict, f, indent=4)
+
+            clean_config_dict = {}
+            for (header, subdict) in config_dict.items():
+                clean_subdict = {}
+                clean_config_dict[header] = clean_subdict
+                for (key, value) in subdict.items():
+                    if value is not None:
+                        clean_subdict[key] = value
+
+            with open(job_config_save_path.replace(".json", ".toml"), "wb") as f:
+                tomli_w.dump(clean_config_dict, f)
 
     def save_model_args(self, model_args: train_spec_module.BaseModelArgs):
         if torch.distributed.get_rank() == 0:

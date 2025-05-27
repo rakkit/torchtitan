@@ -41,6 +41,15 @@ llama3_configs = {
         use_flex_attn=True,
         attn_mask_type="block_causal",
     ),
+    "debugmodel_qk": TransformerModelArgs(
+        dim=256,
+        n_layers=8,
+        n_heads=16,
+        rope_theta=500000,
+        qk_norm=True,
+        depth_init=False,
+        norm_eps=1e-30,
+    ),
     # 14M parameters
     "debugmodel-multiplier-1": TransformerModelArgs(
         dim=256,

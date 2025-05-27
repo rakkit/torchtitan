@@ -424,7 +424,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 + ".json",
             )
             with open(job_config_save_path, "w") as f:
-                json.dump(self.job_config.to_dict(), f)
+                json.dump(self.job_config.to_dict(), f, indent=4)
 
     def save_model_args(self, model_args: train_spec_module.BaseModelArgs):
         if torch.distributed.get_rank() == 0:
@@ -437,7 +437,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 + ".json",
             )
             with open(model_args_save_path, "w") as f:
-                json.dump(vars(model_args), f)
+                json.dump(vars(model_args), f, indent=4)
 
     def batch_generator(
         self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]

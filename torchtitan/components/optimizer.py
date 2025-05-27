@@ -194,6 +194,8 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         self.optimizers = []
         self.model_parts = model_parts
         param_groups_config = optimizer_kwargs.get("param_groups", None)
+        # Whether to keep old LR values when loading.
+        self.preserve_lrs_when_loading = False
 
         for model in self.model_parts:
             # copy parts we will pop from to preserve settings across model parts
@@ -250,10 +252,8 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             for k, v in sd.items()
         }
 
-    def load_state_dict(
-        self, state_dict: dict[str, Any], preserve_lrs: bool = False
-    ) -> None:
-        if preserve_lrs:
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if self.preserve_lrs_when_loading:
             # Store current learning rates
             prev_lrs = []
             for optimizer in self.optimizers:
@@ -266,10 +266,10 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         )
         list(map(func, self.model_parts, self.optimizers))
 
-        if preserve_lrs:
+        if self.preserve_lrs_when_loading:
             # Restore the original learning rates
-            for optimizer, saved_lrs in zip(self.optimizers, prev_lrs):
-                for param_group, prev_lr in zip(optimizer.param_groups, saved_lrs):
+            for optimizer, optim_prev_lrs in zip(self.optimizers, prev_lrs):
+                for param_group, prev_lr in zip(optimizer.param_groups, optim_prev_lrs):
                     if param_group["lr"] != prev_lr:
                         logger.warning(
                             f"Restoring lr from {param_group['lr']} to {prev_lr} | "
@@ -515,14 +515,12 @@ class FTOptimizersContainer(OptimizersContainer):
     def state_dict(self) -> dict[str, Any]:
         return self.cache_state_dict
 
-    def load_state_dict(
-        self, state_dict: dict[str, Any], preserve_lrs: bool = False
-    ) -> None:
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         # We have to invalidate the `cache_state_dict` because optimizer uses
         # assign instead of copy when doing `load_state_dict()`. Without
         # invalidating the `cache_state_dict`, there will be memory leakage.
         self.cache_state_dict = {}
-        super().load_state_dict(state_dict, preserve_lrs=preserve_lrs)
+        super().load_state_dict(state_dict)
         self.init_cache_state_dict()
 
     def step(self, *args, **kwargs) -> None:

@@ -214,6 +214,10 @@ class CheckpointManager:
             self.ft_manager.set_state_dict_fns(load_state_dict, state_dict)
             self.ft_replica_id = ft_manager.replica_id
 
+        if checkpoint_config.reconfigure_lrs:
+            optimizers.preserve_lrs_when_loading = True
+            lr_schedulers.preserve_lrs_when_loading = True
+
         async_mode = checkpoint_config.async_mode.lower()
         self.enable_staging = (
             self.enable and async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM

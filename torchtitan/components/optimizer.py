@@ -29,6 +29,7 @@ from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.optimizers import DistributedScion, Scion
 from torchtitan.optimizers.muon_utils import zeropower_backends
+from torchtitan.tools.logging import logger
 
 __all__ = [
     "OptimizersContainer",
@@ -249,13 +250,32 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             for k, v in sd.items()
         }
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+    def load_state_dict(
+        self, state_dict: dict[str, Any], preserve_lrs: bool = False
+    ) -> None:
+        if preserve_lrs:
+            # Store current learning rates
+            prev_lrs = []
+            for optimizer in self.optimizers:
+                prev_lrs.append([group["lr"] for group in optimizer.param_groups])
+
         func = functools.partial(
             set_optimizer_state_dict,
             optim_state_dict=state_dict,
             options=StateDictOptions(flatten_optimizer_state_dict=True),
         )
         list(map(func, self.model_parts, self.optimizers))
+
+        if preserve_lrs:
+            # Restore the original learning rates
+            for optimizer, saved_lrs in zip(self.optimizers, prev_lrs):
+                for param_group, prev_lr in zip(optimizer.param_groups, saved_lrs):
+                    if param_group["lr"] != prev_lr:
+                        logger.warning(
+                            f"Restoring lr from {param_group['lr']} to {prev_lr} | "
+                            f"for {param_group['param_names']}"
+                        )
+                        param_group["lr"] = prev_lr
 
     @staticmethod
     def compute_grad(p, optimizer=None, **kwargs):
@@ -495,12 +515,14 @@ class FTOptimizersContainer(OptimizersContainer):
     def state_dict(self) -> dict[str, Any]:
         return self.cache_state_dict
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+    def load_state_dict(
+        self, state_dict: dict[str, Any], preserve_lrs: bool = False
+    ) -> None:
         # We have to invalidate the `cache_state_dict` because optimizer uses
         # assign instead of copy when doing `load_state_dict()`. Without
         # invalidating the `cache_state_dict`, there will be memory leakage.
         self.cache_state_dict = {}
-        super().load_state_dict(state_dict)
+        super().load_state_dict(state_dict, preserve_lrs=preserve_lrs)
         self.init_cache_state_dict()
 
     def step(self, *args, **kwargs) -> None:

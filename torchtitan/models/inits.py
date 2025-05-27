@@ -19,6 +19,7 @@ INIT_FN_TYPES = [
     "scion_normal",
     "scion_normal_input",
     "scion_normal_output",
+    "image_orthogonal",
 ]
 
 
@@ -77,6 +78,21 @@ def scaled_orthogonal_(
         ), "Fan in and fan out can not be computed for tensor with other than 2 dimensions"
         fan_out, fan_in = param.shape
         scale = math.sqrt(fan_out / fan_in)
+        gain *= scale
+
+    return orthogonal_(param, gain, generator)
+
+
+def image_orthogonal_(
+    param, gain: float = 1.0, generator: torch.Generator | None = None
+):
+    """Image domain initialization as specified in the Scion paper."""
+    with torch.no_grad():
+        assert (
+            param.ndim == 2
+        ), "Fan in and fan out can not be computed for tensor with other than 2 dimensions"
+        fan_out, fan_in = param.shape
+        scale = max(math.sqrt(fan_out / fan_in), 1.0)
         gain *= scale
 
     return orthogonal_(param, gain, generator)
@@ -147,6 +163,8 @@ def build_init_fn(init_fn_type: str):
         return _wrap_orthogonal(orthogonal_)
     elif init_fn_type == "scaled_orthogonal":
         return _wrap_orthogonal(scaled_orthogonal_)
+    elif init_fn_type == "image_orthogonal":
+        return _wrap_orthogonal(image_orthogonal_)
     elif init_fn_type == "scion_normal":
         return scion_normal_
     elif init_fn_type == "scion_normal_input":

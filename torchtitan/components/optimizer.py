@@ -392,18 +392,20 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                                 # Special handling for grouped MoE.
                                 for ep_idx in range(p.shape[0]):
                                     norms[
-                                        f"track_update_{norm_name}/model_part_{i}/ep_{ep_idx}/{cleaned_p_name}"
+                                        f"track_update_{norm_name}/model_part_{i}/ep_{ep_idx}/"
+                                        f"{cleaned_p_name}"
                                     ] = norm_func(update[ep_idx])
 
                                     norms[
-                                        f"track_param_{norm_name}/model_part_{i}/ep_{ep_idx}/{cleaned_p_name}"
+                                        f"track_param_{norm_name}/model_part_{i}/ep_{ep_idx}/"
+                                        f"{cleaned_p_name}"
                                     ] = norm_func(p[ep_idx])
 
                             else:
                                 if p.ndim > 2 or update.ndim > 2:
                                     warnings.warn(
-                                        f"Encountered parameter or update {cleaned_p_name} with shape "
-                                        f"{p.shape} or {update.shape}, respectively; "
+                                        f"Encountered parameter or update {cleaned_p_name} with "
+                                        f"shape {p.shape} or {update.shape}, respectively; "
                                         f"this may not be an issue, but please ensure its "
                                         f"norms are calculated correctly."
                                     )

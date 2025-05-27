@@ -229,7 +229,7 @@ class Scion(torch.optim.Optimizer):
                     self.state.setdefault(param, {})["grad_state"] = param.grad
 
     def _load_grads_from_state(self):
-        for (param, state) in self.state.items():
+        for param, state in self.state.items():
             if "grad_state" in state:
                 param.grad = state["grad_state"]
             elif isinstance(param, torch.Tensor):

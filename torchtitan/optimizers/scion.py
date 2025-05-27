@@ -155,6 +155,9 @@ class Scion(torch.optim.Optimizer):
     def normalise_grad(self, g, norm_factor, eps):
         if norm_factor == "spectral":
             g = g * (g.size(0) / g.size(1)) ** 0.5
+        elif norm_factor == "image_spectral":
+            # Image domain norm as described in Scion paper.
+            g = g * max((g.size(0) / g.size(1)) ** 0.5, 1)
         elif norm_factor.startswith("embed"):
             # NB: here assume shape [vocab_size, embed_dim]
             rms_values = torch.sqrt(g.pow(2).sum(axis=1, keepdim=True))

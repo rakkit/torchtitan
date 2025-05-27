@@ -660,17 +660,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def train(self):
         job_config = self.job_config
-        config_lrs = [sched.base_lrs for sched in self.lr_schedulers.schedulers]
 
         self.checkpointer.load(step=job_config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}")
-
-        # This is a hack to ensure that, when resuming from a
-        # checkpoint, and the LR is changed in the `JobConfig`, the
-        # loaded LR is correctly modified to the one specified in the
-        # `JobConfig`.
-        for sched, lr in zip(self.lr_schedulers.schedulers, config_lrs):
-            sched.base_lrs = lr
 
         leaf_folder = (
             ""

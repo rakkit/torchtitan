@@ -663,6 +663,12 @@ class Checkpoint:
     This will load the model only, excluding the specified keys.
     """
 
+    reconfigure_lrs: bool = False
+    """
+    Whether _not_ to load LRs from the checkpoint, but instead use those specified in
+    the current job's config.
+    """
+
     enable_first_step_checkpoint: bool = False
     """
     Enable the checkpoint save at first step. This will save a checkpoint immediately

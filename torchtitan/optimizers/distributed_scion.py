@@ -51,17 +51,6 @@ def get_param_type(p, fsdp_enabled, expert_enabled):
         return ParamType.Unknown
 
 
-# def calculate_shard_shape(shape, source_rank, world_size):
-#     full_dim0 = shape[0]
-#     base = (full_dim0 + world_size - 1) // world_size  # ceil division
-#     remainder = full_dim0 - base * (world_size - 1)
-#     if source_rank < world_size - 1:
-#         dim0 = base
-#     else:
-#         dim0 = remainder
-#     return (dim0, *shape[1:])
-
-
 def calculate_shard_shape(shape, rank, world_size):
     full = shape[0]
     base = full // world_size

@@ -152,7 +152,19 @@ class DistributedScion(torch.optim.Optimizer):
         fsdp_params = []
         expert_params = []
 
-        for group in self.param_groups:
+        for group_idx, group in enumerate(self.param_groups):
+            # we should update self.groups_info here incase we have LR and momentum scheduler
+            lr = group["lr"]
+            nesterov = group["nesterov"]
+            momentum = group["momentum"]
+            param_kwargs = {
+                "eps": group["eps"],
+                "norm_factor": group["norm_factor"],
+                "zeropower_backend": zeropower_backends[group["backend"]],
+                "backend_steps": group["backend_steps"],
+            }
+            self.groups_info[group_idx] = [lr, nesterov, momentum, param_kwargs]
+
             for p in group["params"]:
                 param_kwargs = self.groups_info[self.paramters_to_groups[id(p)]][-1]
                 norm_factor = param_kwargs["norm_factor"]

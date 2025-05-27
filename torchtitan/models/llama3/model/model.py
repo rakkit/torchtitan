@@ -149,7 +149,8 @@ class Attention(nn.Module):
         )
         self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
 
-        self.qk_norm = model_args.qk_norm
+        self.qk_norm = model_args.qk_norm or model_args.norm_everywhere
+        self.norm_everywhere = model_args.norm_everywhere
         if self.qk_norm:
             self.q_norm = build_norm(
                 model_args.norm_type,
@@ -161,6 +162,17 @@ class Attention(nn.Module):
                 dim=self.head_dim,
                 eps=model_args.norm_eps,
             )
+        if self.norm_everywhere:
+            self.v_norm = build_norm(
+                model_args.norm_type,
+                dim=self.head_dim,
+                eps=model_args.norm_eps,
+            )
+            self.o_norm = build_norm(
+                model_args.norm_type,
+                dim=model_args.dim,
+                eps=model_args.norm_eps,
+            )
 
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
@@ -169,6 +181,9 @@ class Attention(nn.Module):
 
         if self.qk_norm:
             for norm in (self.q_norm, self.k_norm):
+                norm.reset_parameters()
+        if self.norm_everywhere:
+            for norm in (self.v_norm, self.o_norm):
                 norm.reset_parameters()
 
     def forward(
@@ -202,6 +217,8 @@ class Attention(nn.Module):
         if self.qk_norm:
             xq = self.q_norm(xq)
             xk = self.k_norm(xk)
+        if self.norm_everywhere:
+            xv = self.v_norm(xv)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
@@ -219,6 +236,8 @@ class Attention(nn.Module):
             1, 2
         ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
         output = output.view(bs, seqlen, -1)
+        if self.norm_everywhere:
+            output = self.o_norm(output)
         return self.wo(output)
 
 
@@ -231,6 +250,12 @@ class FeedForward(nn.Module):
         hidden_dim (int): Hidden dimension of the feedforward layer.
         multiple_of (int): Value to ensure hidden dimension is a multiple of this value.
         ffn_dim_multiplier (float | None): Custom multiplier for hidden dimension. Defaults to None.
+        norm_everywhere (bool): Whether to normalize the gating output.
+        norm_type (Optional[str]): Normalization function to use. Only
+            relevant and required, if `norm_everywhere=True`.
+        norm_eps (str): Numerical stability epsilon for normalization
+            layers. Only relevant and required, if
+            `norm_everywhere=True`.
 
     Attributes:
         w1 (Linear): Linear transformation for the first layer.
@@ -245,6 +270,9 @@ class FeedForward(nn.Module):
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: float | None,
+        norm_everywhere: bool = False,
+        norm_type: str | None = None,
+        norm_eps: float | None = None,
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
@@ -257,13 +285,31 @@ class FeedForward(nn.Module):
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
+        if norm_everywhere:
+            assert (
+                norm_type is not None
+            ), "`norm_type` needs to be passed when `norm_everywhere=True`"
+            assert (
+                norm_eps is not None
+            ), "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            self.out_norm = build_norm(
+                norm_type,
+                dim=hidden_dim,
+                eps=norm_eps,
+            )
+        else:
+            self.out_norm = nn.Identity()
+
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(self.out_norm(F.silu(self.w1(x)) * self.w3(x)))
 
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
         for linear in (self.w2, self.w3):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
+
+        if not isinstance(self.out_norm, nn.Identity):
+            self.out_norm.reset_parameters()
 
 
 class TransformerBlock(nn.Module):
@@ -299,6 +345,9 @@ class TransformerBlock(nn.Module):
             hidden_dim=4 * model_args.dim,
             multiple_of=model_args.multiple_of,
             ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+            norm_type=model_args.norm_type,
+            norm_everywhere=model_args.norm_everywhere,
+            norm_eps=model_args.norm_eps,
         )
         self.attention_norm = build_norm(
             model_args.norm_type,

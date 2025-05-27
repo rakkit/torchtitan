@@ -36,6 +36,8 @@ class TransformerModelArgs(BaseModelArgs):
     depth_init: bool = True
     norm_type: str = "rmsnorm"
     qk_norm: bool = False
+    # If this is True, it implies `qk_norm=True`.
+    norm_everywhere: bool = False
 
     use_flex_attn: bool = False
     attn_mask_type: str = "causal"
@@ -81,6 +83,7 @@ class TransformerModelArgs(BaseModelArgs):
             )
 
         self.max_seq_len = seq_len
+        self.qk_norm = self.qk_norm or self.norm_everywhere
 
     def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
         nparams = sum(p.numel() for p in model.parameters())

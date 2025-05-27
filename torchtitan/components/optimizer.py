@@ -232,7 +232,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
     def zero_grad(self, *args, **kwargs) -> None:
         for optimizer in self.optimizers:
             if not (
-                isinstance(optimizer, Scion)
+                isinstance(optimizer, (Scion, DistributedScion))
                 and optimizer.is_light
                 and optimizer.use_momentum
             ):

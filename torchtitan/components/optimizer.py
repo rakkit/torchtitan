@@ -660,9 +660,11 @@ def build_optimizers(
             "lr": lr,
         }
         if is_scion:
-            param_group_config["norm_factor"] = "image_spectral"
-            # param_group_config["backend"] = "identity"
-            param_group_config["backend"] = zeropower_backend_algorithm
+            # param_group_config["norm_factor"] = "image_spectral"
+            # param_group_config["backend"] = zeropower_backend_algorithm
+            param_group_config["norm_factor"] = "none"
+            param_group_config["backend"] = "identity"
+
         param_groups_config.append(param_group_config)
 
     optimizer_kwargs["extra_kwargs"] = {

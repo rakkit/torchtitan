@@ -146,6 +146,12 @@ class DistributedScion(torch.optim.Optimizer):
             for param in group["params"]:
                 self.paramters_to_groups[id(param)] = group_idx
 
+            if self.is_light and nesterov:
+                raise RuntimeError(
+                    "Nesterov momentum is not supported for Scion's light mode. "
+                    "Please set nesterov=False."
+                )
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -291,7 +297,6 @@ class DistributedScion(torch.optim.Optimizer):
                 p.data.add_(u, alpha=-lr)
 
             if momentum != 1 and self.is_light:
-                raise NotImplementedError("Scion-light is not ready yet")
                 p.grad.mul_(1 - momentum)
 
     def step_sgd(self, sgd_params):
@@ -319,7 +324,6 @@ class DistributedScion(torch.optim.Optimizer):
                 p.data.add_(u, alpha=-lr)
 
             if momentum != 1 and self.is_light:
-                raise NotImplementedError("Scion-light is not ready yet")
                 g.mul_(1 - momentum)
 
     def step_ddp(self, ddp_params):
@@ -496,7 +500,6 @@ class DistributedScion(torch.optim.Optimizer):
             p.data.to_local().add_(u, alpha=-lr)
 
             if momentum != 1 and self.is_light:
-                raise NotImplementedError("Scion-light is not ready yet")
                 g.mul_(1 - momentum)
 
     @torch.no_grad()

@@ -92,6 +92,10 @@ class TransformerModelArgs(BaseModelArgs):
                 "(since `vocab_size == -1`)."
             )
             self.vocab_size = tokenizer.get_vocab_size()
+            # `eos_id` is not part of the `Tokenizer` interface, so keep it
+            # optional.
+            if hasattr(tokenizer, "eos_id"):
+                self.eos_id = tokenizer.eos_id
             # `pad_id` is not part of the `Tokenizer` interface, so keep it
             # optional.
             if hasattr(tokenizer, "pad_id"):

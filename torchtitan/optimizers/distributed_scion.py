@@ -438,7 +438,7 @@ class DistributedScion(torch.optim.Optimizer):
 
             # Make sure target_shape is initialized
             if target_shape is None and end_idx > 0:
-                target_shape = fsdp_params[start_idx].shape
+                target_shape = fsdp_params[end_idx - 1].shape
 
             recv_shapes = [
                 calculate_shard_shape(target_shape, rank_idx, world_size)

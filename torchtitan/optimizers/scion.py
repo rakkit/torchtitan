@@ -77,7 +77,7 @@ class Scion(torch.optim.Optimizer):
             param_kwargs = {
                 "eps": group["eps"],
                 "norm_factor": group["norm_factor"],
-                "zeropower_backend": zeropower_backends[group["backend"]],
+                "zeropower_backend": group["backend"],
                 "backend_steps": group["backend_steps"],
             }
             # NB: here assume that normalisation with norm_factor is
@@ -133,7 +133,7 @@ class Scion(torch.optim.Optimizer):
         #     since it is also called during the log of gradients
 
         def _lmo_for_2d_tensor(g):
-            g = zeropower_backend(g, steps=backend_steps, eps=eps)
+            g = zeropower_backends[zeropower_backend](g, steps=backend_steps, eps=eps)
             g = self.normalise_grad(g, norm_factor=norm_factor, eps=eps)
             return g
 

@@ -139,6 +139,13 @@ def _extract_param_groups(
             "param_names": param_names,
         }
         assert len(group_params["params"]) == len(group_params["param_names"])
+
+        if len(param_names) == 0:
+            logger.warning(
+                f'Notice: No parameters found for `str_match` "{str_match}" on '
+                f"global rank {torch.distributed.get_rank()}"
+            )
+            continue
         group_params.update(param_group_config)
         params.append(group_params)
 

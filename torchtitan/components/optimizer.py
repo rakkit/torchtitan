@@ -28,7 +28,6 @@ from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.optimizers import DistributedScion, Scion
-from torchtitan.optimizers.muon_utils import zeropower_backends
 from torchtitan.tools.logging import logger
 
 __all__ = [
@@ -345,7 +344,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                         "nesterov": group["nesterov"],
                         "eps": group["eps"],
                         "norm_factor": group["norm_factor"],
-                        "zeropower_backend": zeropower_backends[group["backend"]],
+                        "zeropower_backend": group["backend"],
                         "backend_steps": group["backend_steps"],
                     }
                 elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):

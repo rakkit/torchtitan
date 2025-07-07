@@ -55,9 +55,12 @@ def get_param_type(p, fsdp_enabled, expert_enabled):
 
 def calculate_shard_shape(shape, rank, world_size):
     full = shape[0]
-    base = full // world_size
-    extra = full % world_size
-    dim0 = base + 1 if rank < extra else base
+    splits = torch.arange(full).chunk(world_size)
+    if rank >= len(splits):
+        dim0 = 0
+    else:
+        dim0 = len(splits[rank])
+
     return (dim0, *shape[1:])
 
 
@@ -224,13 +227,19 @@ class DistributedScion(torch.optim.Optimizer):
         if g.ndim == 2:
             g = _lmo_for_2d_tensor(g, need_transpose=is_grouped_experts)
         elif g.ndim == 3:
-            g = torch.stack(
-                [
-                    _lmo_for_2d_tensor(g[i], need_transpose=is_grouped_experts)
-                    for i in range(g.shape[0])
-                ],
-                dim=0,
-            )
+            if g.shape[0] > 0:
+                # When world_size [fsdp x EP] > Total number of experts,
+                # some ranks may have 0 experts that shape will be [0, d-in, d-out]
+                # We should return the original grad here and **do not** do stack
+                g = torch.stack(
+                    [
+                        _lmo_for_2d_tensor(g[i], need_transpose=is_grouped_experts)
+                        for i in range(g.shape[0])
+                    ],
+                    dim=0,
+                )
+            else:
+                pass
         else:
             raise ValueError(f"Unknown grad shape: {g.shape}")
 

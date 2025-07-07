@@ -169,23 +169,29 @@ def gather_and_merge(local_stats: dict, dst: int = 0):
     dtype = torch.bfloat16
 
     my_keys = list(local_stats.keys())
-    key_bucket: list[Any] | None = [None] * world if rank == dst else None
+
+    if len(my_keys) > 0:
+        val_tensor = torch.stack([local_stats[k].to(dtype) for k in my_keys])
+    else:
+        my_keys = "padding"
+        val_tensor = None
+
+    key_bucket = [None] * world if rank == dst else None
+    val_bucket = [None] * world if rank == dst else None
+
     dist.gather_object(my_keys, key_bucket, dst=dst)
-    dist.barrier()
-
-    val_tensor = torch.stack([local_stats[k].to(dtype) for k in my_keys])
-
-    gather_list = (
-        [torch.empty_like(val_tensor) for _ in range(world)] if rank == dst else None
-    )
-    dist.gather(val_tensor, gather_list=gather_list, dst=dst)
+    # dist.barrier()
+    dist.gather_object(val_tensor, val_bucket, dst=dst)
     dist.barrier()
 
     merged = {}
     if rank == dst:
         for peer, keys in enumerate(key_bucket):
-            for k, v in zip(keys, gather_list[peer]):
-                merged[k] = v
+            if val_bucket[peer] is None:
+                continue
+            for k, v in zip(keys, val_bucket[peer]):
+                if k != "padding":
+                    merged[k] = v
 
     dist.barrier()
     if rank == dst:
@@ -326,11 +332,13 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                 momentum,
                 nesterov,
                 update_buffer=False,
-                gather_to_local=optimizer.fsdp_enabled,
+                gather_to_local=optimizer.fsdp_enabled and p.ndim < 3,
+                # we do not gather the moe's grads
             )
             if g is None:
                 return None
             else:
+                g = g.to_local() if isinstance(g, DTensor) else g
                 return optimizer.lmo(g, **kwargs)
         elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
             if p.ndim == 3:
@@ -422,7 +430,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                             FLAG_NEED_SYNC = True
                             local_rank = dist.get_rank()
                             world_size = dist.get_world_size()
-                            ep_per_rank = p.shape[0] // world_size
+                            ep_per_rank = math.ceil(p.shape[0] / world_size)
                             # We dont gather the parameters for 3D
                             # tensors, which is [G, D_in, D_out] of
                             # GroupedExperts

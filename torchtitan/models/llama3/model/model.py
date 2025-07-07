@@ -188,6 +188,12 @@ class Attention(nn.Module):
 
         self.qk_norm = model_args.qk_norm or model_args.norm_everywhere
         self.norm_everywhere = model_args.norm_everywhere
+
+        self.q_norm = nn.Identity()
+        self.k_norm = nn.Identity()
+        self.v_norm = nn.Identity()
+        self.o_norm = nn.Identity()
+
         if self.qk_norm:
             self.q_norm = build_norm(
                 model_args.norm_type,
@@ -217,11 +223,8 @@ class Attention(nn.Module):
             init_fn(linear.weight, mean=0.0, std=init_std)
         init_fn(self.wo.weight, mean=0.0, std=init_std / residual_div)
 
-        if self.qk_norm:
-            for norm in (self.q_norm, self.k_norm):
-                norm.reset_parameters()
-        if self.norm_everywhere:
-            for norm in (self.v_norm, self.o_norm):
+        for norm in (self.q_norm, self.k_norm, self.v_norm, self.o_norm):
+            if not isinstance(norm, nn.Identity):
                 norm.reset_parameters()
 
     def init_kv_cache(
@@ -266,11 +269,10 @@ class Attention(nn.Module):
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
         # Apply optional QK normalization
-        if self.qk_norm:
-            xq = self.q_norm(xq)
-            xk = self.k_norm(xk)
-        if self.norm_everywhere:
-            xv = self.v_norm(xv)
+
+        xq = self.q_norm(xq)
+        xk = self.k_norm(xk)
+        xv = self.v_norm(xv)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
@@ -291,8 +293,7 @@ class Attention(nn.Module):
             1, 2
         ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
         output = output.view(bs, seqlen, -1)
-        if self.norm_everywhere:
-            output = self.o_norm(output)
+        output = self.o_norm(output)
         return self.wo(output)
 
 

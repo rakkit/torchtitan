@@ -17,6 +17,8 @@ import tomli_w
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
+import torchtitan.models  # noqa: F401
+
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.activation_offload import get_act_offloading_ctx_manager
 from torchtitan.components.checkpoint import CheckpointManager

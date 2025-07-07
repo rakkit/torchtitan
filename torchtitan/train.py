@@ -784,3 +784,4 @@ if __name__ == "__main__":
         trainer.close()
         torch.distributed.destroy_process_group()
         logger.info("Process group destroyed")
+    os._exit(0)

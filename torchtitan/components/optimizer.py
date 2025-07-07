@@ -12,6 +12,7 @@ from collections import OrderedDict
 from typing import Any, Generic, Iterator, TypeVar
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.distributed.checkpoint.state_dict import (
@@ -110,6 +111,7 @@ def _remove_orig_mod_and_weight_for_p_name(name: str) -> str:
     # Remove ._orig_mod and .weight anywhere in the parameter name
     name = re.sub(r"\._orig_mod", "", name)
     name = re.sub(r"\.weight", "", name)
+    name = re.sub(r"\._checkpoint_wrapped_module", "", name)
     return name
 
 
@@ -159,6 +161,37 @@ def _extract_param_groups(
     )
     assert not param_dict
     return params
+
+
+def gather_and_merge(local_stats: dict, dst: int = 0):
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    dtype = torch.bfloat16
+
+    my_keys = list(local_stats.keys())
+    key_bucket: list[Any] | None = [None] * world if rank == dst else None
+    dist.gather_object(my_keys, key_bucket, dst=dst)
+    dist.barrier()
+
+    val_tensor = torch.stack([local_stats[k].to(dtype) for k in my_keys])
+
+    gather_list = (
+        [torch.empty_like(val_tensor) for _ in range(world)] if rank == dst else None
+    )
+    dist.gather(val_tensor, gather_list=gather_list, dst=dst)
+    dist.barrier()
+
+    merged = {}
+    if rank == dst:
+        for peer, keys in enumerate(key_bucket):
+            for k, v in zip(keys, gather_list[peer]):
+                merged[k] = v
+
+    dist.barrier()
+    if rank == dst:
+        return merged
+    else:
+        return {}
 
 
 class OptimizersContainer(Optimizer, Stateful, Generic[T]):
@@ -340,7 +373,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             )
 
     def get_parameter_norms(self):
-        norms = {}
+        all_norms = {}
         for i, _ in enumerate(self.model_parts):
             # NB: assumes correspondences between model parts and optimizers
             optimizer = self.optimizers[i]
@@ -367,8 +400,9 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                     )
                     continue
 
+                FLAG_NEED_SYNC = False
+                moe_norms, fsdp_norms = {}, {}
                 for p_name, p in zip(group["param_names"], group["params"]):
-
                     """
                     the module name usally named
                     track_update_condition_number/model_part_0/layers.0._orig_mod.attention.wo.weight
@@ -376,16 +410,27 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                     """
                     cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(p_name)
                     g = self.compute_grad(p, optimizer, **param_kwargs)
+                    assert not torch.isnan(
+                        g
+                    ).any(), f"There is nan in the grad of {p_name}"
                     if g is not None:
-                        p = (
-                            p.redistribute(
-                                placements=[Replicate()] * p.device_mesh.ndim,
-                            ).to_local()
-                            if isinstance(p, DTensor)
-                            else p
-                        )
+                        if p.ndim < 3:
+                            p = p.redistribute(
+                                placements=[Replicate()] * p.device_mesh.ndim
+                            )
+                        else:
+                            FLAG_NEED_SYNC = True
+                            local_rank = dist.get_rank()
+                            world_size = dist.get_world_size()
+                            ep_per_rank = p.shape[0] // world_size
+                            # We dont gather the parameters for 3D
+                            # tensors, which is [G, D_in, D_out] of
+                            # GroupedExperts
+                            pass
+                        p = p.to_local() if isinstance(p, DTensor) else p
                         g = g.to_local() if isinstance(g, DTensor) else g
                         update = -group["lr"] * g
+
                         if "tok_embeddings" in p_name:
                             p, update = p.T, update.T
                         for norm_name, norm_func in NORM_FUNCTIONS.items():
@@ -396,16 +441,19 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                                 continue
                             elif p.ndim == 3 or update.ndim == 3:
                                 # Special handling for grouped MoE.
+                                # remember MoE's Paramters is [G, D_in, D_out]
+                                # But we expected to call norm_func for [D_out, D_in]
                                 for ep_idx in range(p.shape[0]):
-                                    norms[
-                                        f"track_update_{norm_name}/model_part_{i}/ep_{ep_idx}/"
-                                        f"{cleaned_p_name}"
-                                    ] = norm_func(update[ep_idx])
+                                    actual_ep_idx = ep_idx + local_rank * ep_per_rank
+                                    moe_norms[
+                                        f"track_update_{norm_name}/model_part_{i}/"
+                                        f"ep_{actual_ep_idx}/{cleaned_p_name}"
+                                    ] = norm_func(update[ep_idx].transpose(0, 1))
 
-                                    norms[
-                                        f"track_param_{norm_name}/model_part_{i}/ep_{ep_idx}/"
-                                        f"{cleaned_p_name}"
-                                    ] = norm_func(p[ep_idx])
+                                    moe_norms[
+                                        f"track_param_{norm_name}/model_part_{i}/"
+                                        f"ep_{actual_ep_idx}/{cleaned_p_name}"
+                                    ] = norm_func(p[ep_idx].transpose(0, 1))
 
                             else:
                                 if p.ndim > 2 or update.ndim > 2:
@@ -415,14 +463,23 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                                         f"this may not be an issue, but please ensure its "
                                         f"norms are calculated correctly."
                                     )
-                                norms[
+                                fsdp_norms[
                                     f"track_param_{norm_name}/model_part_{i}/{cleaned_p_name}"
                                 ] = norm_func(p)
-                                norms[
+
+                                fsdp_norms[
                                     f"track_update_{norm_name}/model_part_{i}/{cleaned_p_name}"
                                 ] = norm_func(update)
 
-        return norms
+                if FLAG_NEED_SYNC:
+                    # remove the comment below to gather the moe_norms on all ranks
+                    moe_norms = gather_and_merge(moe_norms)
+                    pass
+
+                all_norms.update(fsdp_norms)
+                all_norms.update(moe_norms)
+
+        return all_norms
 
     def get_lrs(self):
         lrs = {}

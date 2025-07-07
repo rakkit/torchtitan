@@ -128,26 +128,39 @@ class Scion(torch.optim.Optimizer):
         return loss
 
     @torch.no_grad()
-    def lmo(self, g, eps, norm_factor, zeropower_backend, backend_steps):
+    def lmo(
+        self,
+        g,
+        eps,
+        norm_factor,
+        zeropower_backend,
+        backend_steps,
+        is_grouped_experts=False,
+    ):
         # NB: make sure this function does not modify the grad inplace
         #     since it is also called during the log of gradients
-
-        def _lmo_for_2d_tensor(g):
+        def _lmo_for_2d_tensor(g, need_transpose=False):
+            g = g if not need_transpose else g.transpose(0, 1)
             g = zeropower_backends[zeropower_backend](g, steps=backend_steps, eps=eps)
             g = self.normalise_grad(g, norm_factor=norm_factor, eps=eps)
-            return g
+            return g if not need_transpose else g.transpose(0, 1)
+
+        if not is_grouped_experts:
+            # double check if the grad is grouped experts
+            is_grouped_experts = g.ndim == 3
 
         if g.ndim == 2:
-            g = _lmo_for_2d_tensor(g)
+            g = _lmo_for_2d_tensor(g, need_transpose=is_grouped_experts)
         elif g.ndim == 3:
             g = torch.stack(
-                [_lmo_for_2d_tensor(g[i]) for i in range(g.shape[0])],
+                [
+                    _lmo_for_2d_tensor(g[i], need_transpose=is_grouped_experts)
+                    for i in range(g.shape[0])
+                ],
                 dim=0,
             )
         else:
-            raise ValueError(
-                f"Unsupported tensor shape: {g.shape}. " "Expected 2D or 3D tensor."
-            )
+            raise ValueError(f"Unknown grad shape: {g.shape}")
 
         return g
 

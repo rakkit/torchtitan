@@ -36,6 +36,8 @@ def get_param_type(p, fsdp_enabled, expert_enabled):
     if not fsdp_enabled and not expert_enabled and isinstance(p, torch.Tensor):
         return ParamType.DDP
     device_mesh = p.device_mesh
+    if p.ndim == 3:
+        return ParamType.Expert
     if (
         len(device_mesh.mesh.shape) == 1
         and device_mesh.mesh_dim_names[0] == "dp_shard_cp"
@@ -198,20 +200,35 @@ class DistributedScion(torch.optim.Optimizer):
         return loss
 
     @torch.no_grad()
-    def lmo(self, g, eps, norm_factor, zeropower_backend, backend_steps):
+    def lmo(
+        self,
+        g,
+        eps,
+        norm_factor,
+        zeropower_backend,
+        backend_steps,
+        is_grouped_experts=False,
+    ):
         # NB: make sure this function does not modify the grad inplace
         #     since it is also called during the log of gradients
-        # g = zeropower_backend(g, steps=backend_steps, eps=eps)
-        def _lmo_for_2d_tensor(g):
+        def _lmo_for_2d_tensor(g, need_transpose=False):
+            g = g if not need_transpose else g.transpose(0, 1)
             g = zeropower_backends[zeropower_backend](g, steps=backend_steps, eps=eps)
             g = self.normalise_grad(g, norm_factor=norm_factor, eps=eps)
-            return g
+            return g if not need_transpose else g.transpose(0, 1)
+
+        if not is_grouped_experts:
+            # double check if the grad is grouped experts
+            is_grouped_experts = g.ndim == 3
 
         if g.ndim == 2:
-            g = _lmo_for_2d_tensor(g)
+            g = _lmo_for_2d_tensor(g, need_transpose=is_grouped_experts)
         elif g.ndim == 3:
             g = torch.stack(
-                [_lmo_for_2d_tensor(g[i]) for i in range(g.shape[0])],
+                [
+                    _lmo_for_2d_tensor(g[i], need_transpose=is_grouped_experts)
+                    for i in range(g.shape[0])
+                ],
                 dim=0,
             )
         else:
@@ -483,8 +500,7 @@ class DistributedScion(torch.optim.Optimizer):
             g = self.get_momentum_or_grad(
                 p, momentum, nesterov, update_buffer=True, gather_to_local=False
             )
-
-            u = self.lmo(g.to_local(), **param_kwargs)
+            u = self.lmo(g.to_local(), is_grouped_experts=True, **param_kwargs)
 
             if not self.is_unconstrained:
                 p.data.to_local().mul_(1 - lr)

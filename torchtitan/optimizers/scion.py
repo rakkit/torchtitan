@@ -152,13 +152,19 @@ class Scion(torch.optim.Optimizer):
         if g.ndim == 2:
             g = _lmo_for_2d_tensor(g, need_transpose=is_grouped_experts)
         elif g.ndim == 3:
-            g = torch.stack(
-                [
-                    _lmo_for_2d_tensor(g[i], need_transpose=is_grouped_experts)
-                    for i in range(g.shape[0])
-                ],
-                dim=0,
-            )
+            if g.shape[0] > 0:
+                # When world_size [fsdp x EP] > Total number of experts,
+                # some ranks may have 0 experts that shape will be [0, d-in, d-out]
+                # We should return the original grad here and **do not** do stack
+                g = torch.stack(
+                    [
+                        _lmo_for_2d_tensor(g[i], need_transpose=is_grouped_experts)
+                        for i in range(g.shape[0])
+                    ],
+                    dim=0,
+                )
+            else:
+                pass
         else:
             raise ValueError(f"Unknown grad shape: {g.shape}")
 

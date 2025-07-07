@@ -509,6 +509,8 @@ class DistributedScion(torch.optim.Optimizer):
             g = self.get_momentum_or_grad(
                 p, momentum, nesterov, update_buffer=True, gather_to_local=False
             )
+            if g.to_local().shape[0] == 0:
+                continue
             u = self.lmo(g.to_local(), is_grouped_experts=True, **param_kwargs)
 
             if not self.is_unconstrained:

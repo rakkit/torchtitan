@@ -477,6 +477,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 assert len(model_parts) == 1
                 pred = model_parts[0](inputs)
 
+                #! TODO(JS): TEMPORARY FIX FOR PP-DEBUG
+                if isinstance(pred, torch.Tensor):
+                    pred = {"tokens_list": [pred]}
+
                 aux_loss = pred.get("aux_loss", None)
                 moe_entropy_per_layer = pred.get("moe_entropy_per_layer", None)
 
@@ -522,6 +526,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 pp_mesh=self.world_mesh["pp"] if parallel_dims.pp_enabled else None,
             )
         self.checkpointer.maybe_wait_for_staging()
+
+        if self.job_config.metrics.log_norm_freq > 0 and (
+            self.step == 1 or self.step % self.job_config.metrics.log_norm_freq == 0
+        ):
+            self.optimizers.calculate_norm_at_next_step()
+
         self.optimizers.step()
         self.lr_schedulers.step()
 
@@ -586,8 +596,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.job_config.metrics.log_norm_freq > 0
                 and (self.step == 1 or self.step % self.job_config.metrics.log_norm_freq == 0)
         ):
-            param_norms = self.optimizers.get_parameter_norms()
-            extra_metrics.update(param_norms)
+            # s = time.time()
+            # param_norms = self.optimizers.get_parameter_norms()
+            # extra_metrics.update(param_norms)
+            # print(f"get_parameter_norms time: {time.time() - s}")
+            # # raise Exception("stop here")
+            extra_metrics.update(self.optimizers.get_norms_at_current_step())
 
         if aux_loss is not None:
             extra_metrics["loss_metrics/aux_loss"] = aux_loss
@@ -681,21 +695,22 @@ if __name__ == "__main__":
         trainer = Trainer(config)
 
         if config.checkpoint.create_seed_checkpoint:
-            assert int(
-                os.environ["WORLD_SIZE"]
+            assert (
+                int(os.environ["WORLD_SIZE"]) == 1
             ), "Must create seed checkpoint using a single device, to disable sharding."
             assert (
                 config.checkpoint.enable_checkpoint
             ), "Must enable checkpointing when creating a seed checkpoint."
-            trainer.checkpointer.save(curr_step=0, force=True)
+            trainer.checkpointer.save(curr_step=0, last_step=True)
             logger.info("Created seed checkpoint")
         else:
             trainer.train()
-    finally:
+    except Exception:
         if trainer:
             trainer.close()
-
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-            logger.info("Process group destroyed.")
+        raise
+    else:
+        trainer.close()
+        torch.distributed.destroy_process_group()
+        logger.info("Process group destroyed.")
     os._exit(0)

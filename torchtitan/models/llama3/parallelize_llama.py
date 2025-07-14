@@ -218,6 +218,11 @@ def apply_tp(
                 "feed_forward.w2_norm": SequenceParallel(),
             })
 
+        if not isinstance(transformer_block.feed_forward.out_norm, nn.Identity):
+            layer_plan["feed_forward.out_norm"] = PrepareMidNormInputOutput()
+        if not isinstance(transformer_block.attention.o_norm, nn.Identity):
+            layer_plan["attention.o_norm"] = PrepareMidNormInputOutput()
+
         parallelize_module(
             module=transformer_block,
             device_mesh=tp_mesh,
@@ -420,3 +425,53 @@ def apply_ddp(
     replicate(model, device_mesh=dp_mesh, bucket_cap_mb=100)
 
     logger.info("Applied DDP to the model")
+
+
+class PrepareMidNormInputOutput(torch.distributed.tensor.parallel.ParallelStyle):
+    """
+    when `norm_everywhere=True`, we need to particularly handle
+    the mid-norm in mid of FFN.
+
+    We need to
+    1. Replicate[gather] the input to the norm layer,
+    2. Run the norm layer
+    3. Shard the output back
+    """
+
+    def __init__(
+        self,
+        shard_dim: int = -1,
+    ):
+        # fixed layouts for the MLP mid-norm case
+        self._in_layout = (Shard(shard_dim),)
+        self._desired_in = (Replicate(),)
+        self._out_layout = (Replicate(),)
+        self._desired_out = (Shard(shard_dim),)
+
+    def _prep_in(self, inputs, mesh):
+        x, *rest = inputs
+        if not isinstance(x, torch.distributed.tensor.DTensor):
+            x = torch.distributed.tensor.DTensor.from_local(
+                x, mesh, self._in_layout, run_check=False
+            )
+        if self._in_layout != self._desired_in:
+            x = x.redistribute(placements=self._desired_in)
+        return (x.to_local(), *rest)  # hand local tensor to module
+
+    def _prep_out(self, outputs, mesh):
+        if not isinstance(outputs, torch.distributed.tensor.DTensor):
+            outputs = torch.distributed.tensor.DTensor.from_local(
+                outputs, mesh, self._out_layout, run_check=False
+            )
+        if self._out_layout != self._desired_out:
+            outputs = outputs.redistribute(placements=self._desired_out)
+        return outputs.to_local()  # keep local shard
+
+    def _apply(self, module: nn.Module, mesh: DeviceMesh) -> nn.Module:
+        module.register_forward_pre_hook(  # gather before norm
+            lambda m, i: self._prep_in(i, mesh)
+        )
+        module.register_forward_hook(  # re-shard after norm
+            lambda m, i, o: self._prep_out(o, mesh)
+        )
+        return module

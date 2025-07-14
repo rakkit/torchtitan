@@ -27,6 +27,8 @@ from torch.optim import Optimizer
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
 from torchtitan.optimizers import DistributedScion, Scion
+from torchtitan.optimizers.norm_helper import calculate_norm
+from torchtitan.optimizers.muon_utils import zeropower_backends
 from torchtitan.tools.logging import logger
 
 __all__ = [
@@ -64,7 +66,9 @@ def rms_to_rms_norm(W):
 @torch.no_grad()
 def l1_to_rms_norm(W):
     assert W.ndim == 2, "operator norm can only be applied to matrices"
-    norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32))
+    norm = torch.max(
+        torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32)
+    )
     scale = torch.sqrt(torch.tensor(W.shape[0], dtype=W.dtype, device=W.device))
     norm /= scale
     return norm
@@ -73,7 +77,9 @@ def l1_to_rms_norm(W):
 @torch.no_grad()
 def rms_to_l1_norm(W):
     assert W.ndim == 2, "operator norm can only be applied to matrices"
-    norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32))
+    norm = torch.max(
+        torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32)
+    )
     scale = torch.sqrt(torch.tensor(W.shape[1], dtype=W.dtype, device=W.device))
     norm *= scale
     return norm
@@ -87,7 +93,7 @@ def supremum_norm(x):
 @torch.no_grad()
 def condition_number(W):
     assert W.ndim == 2, "condition number calculation can only be applied to matrices"
-    S = torch.linalg.svdvals(W.to(torch.float32), driver='gesvd')
+    S = torch.linalg.svdvals(W.to(torch.float32), driver="gesvd")
     return S[0] / S[-1]
 
 
@@ -138,7 +144,7 @@ def _extract_param_groups(
         if len(param_names) == 0:
             logger.warning(
                 f'Notice: No parameters found for `str_match` "{str_match}" on '
-                f'global rank {torch.distributed.get_rank()}'
+                f"global rank {torch.distributed.get_rank()}"
             )
             continue
         group_params.update(param_group_config)
@@ -314,6 +320,23 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                         )
                         param_group["lr"] = prev_lr
 
+    def get_norms_at_current_step(self):
+        norms_at_current_step = {}
+        for i, _ in enumerate(self.model_parts):
+            # NB: assumes correspondences between model parts and optimizers
+            optimizer = self.optimizers[i]
+            if isinstance(optimizer, DistributedScion):
+                norms_at_current_step.update(optimizer.get_norms_at_current_step())
+            else:
+                norms_at_current_step.update(optimizer.get_parameter_norms())
+        return norms_at_current_step
+
+    def calculate_norm_at_next_step(self):
+        for i, _ in enumerate(self.model_parts):
+            optimizer = self.optimizers[i]
+            if isinstance(optimizer, DistributedScion):
+                optimizer.calculate_norm_at_next_step()
+
     @staticmethod
     def compute_grad(p, optimizer=None, **kwargs):
         if isinstance(optimizer, (Scion, DistributedScion)):
@@ -343,7 +366,9 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             eps = kwargs["eps"]
             weight_decay = kwargs["weight_decay"]
             beta1, beta2 = kwargs["betas"]
-            assert weight_decay == 0.0, "Weight decay not supported for grad computation."
+            assert (
+                weight_decay == 0.0
+            ), "Weight decay not supported for grad computation."
 
             param_optim_state = optimizer.state[p]
             if "step" not in param_optim_state:
@@ -353,7 +378,9 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             if "exp_avg_sq" in param_optim_state and "exp_avg" in param_optim_state:
                 bias_correction1 = 1 - beta1**step
                 bias_correction2 = 1 - beta2**step
-                denom = (param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)) + eps
+                denom = (
+                    param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)
+                ) + eps
                 step_size = 1 / bias_correction1
                 g = step_size * param_optim_state["exp_avg"].div(denom)
             else:
@@ -399,13 +426,10 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                 FLAG_NEED_SYNC = False
                 moe_norms, fsdp_norms = {}, {}
                 for p_name, p in zip(group["param_names"], group["params"]):
-                    """
-                    the module name usally named
-                    track_update_condition_number/model_part_0/layers.0._orig_mod.attention.wo.weight
-                    we can remove '._orig_mod' and '.weight' to get the clean layer name
-                    """
                     cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(p_name)
                     g = self.compute_grad(p, optimizer, **param_kwargs)
+                    if g is None:
+                        continue
                     assert not torch.isnan(
                         g
                     ).any(), f"There is nan in the grad of {p_name}"
@@ -419,9 +443,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                             local_rank = dist.get_rank()
                             world_size = dist.get_world_size()
                             ep_per_rank = math.ceil(p.shape[0] / world_size)
-                            # We dont gather the parameters for 3D
-                            # tensors, which is [G, D_in, D_out] of
-                            # GroupedExperts
+                            # We dont gather the parameters for 3D tensors, which is [G, D_in, D_out] of GroupedExperts
                             pass
                         p = p.to_local() if isinstance(p, DTensor) else p
                         g = g.to_local() if isinstance(g, DTensor) else g
@@ -430,7 +452,9 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                         if "tok_embeddings" in p_name:
                             p, update = p.T, update.T
                         for norm_name, norm_func in NORM_FUNCTIONS.items():
-                            if norm_name != "supremum" and (p.ndim < 2 or update.ndim < 2):
+                            if norm_name != "supremum" and (
+                                p.ndim < 2 or update.ndim < 2
+                            ):
                                 # Operator norms require a matrix.
                                 continue
                             elif p.ndim == 3 or update.ndim == 3:
@@ -440,13 +464,13 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                                 for ep_idx in range(p.shape[0]):
                                     actual_ep_idx = ep_idx + local_rank * ep_per_rank
                                     moe_norms[
-                                        f"track_update_{norm_name}/model_part_{i}/"
-                                        f"ep_{actual_ep_idx}/{cleaned_p_name}"
+                                        f"track_update_{norm_name}/model_part_{i}/ep_{actual_ep_idx}/"
+                                        f"{cleaned_p_name}"
                                     ] = norm_func(update[ep_idx].transpose(0, 1))
 
                                     moe_norms[
-                                        f"track_param_{norm_name}/model_part_{i}/"
-                                        f"ep_{actual_ep_idx}/{cleaned_p_name}"
+                                        f"track_param_{norm_name}/model_part_{i}/ep_{actual_ep_idx}/"
+                                        f"{cleaned_p_name}"
                                     ] = norm_func(p[ep_idx].transpose(0, 1))
 
                             else:
@@ -650,9 +674,8 @@ def build_optimizers(
         foreach = optim_implementation == "foreach"
 
         mesh_dim_names = extra_kwargs["world_mesh"].mesh_dim_names
-        ep_enable = (
-            mesh_dim_names is not None
-            and ("dp_shard_1" in mesh_dim_names or "dp_shard_2" in mesh_dim_names)
+        ep_enable = mesh_dim_names is not None and (
+            "dp_shard_1" in mesh_dim_names or "dp_shard_2" in mesh_dim_names
         )
         if ep_enable:
             # Because for Expert Parallel, we have two different device meshes.
@@ -672,7 +695,8 @@ def build_optimizers(
             "lr": lr / width_multiplier,
             "eps": eps / width_multiplier,
             "betas": (0.9, 0.95),
-            "weight_decay": weight_decay * width_multiplier,  # WD is coupled with LR in torch AdamW
+            "weight_decay": weight_decay
+            * width_multiplier,  # WD is coupled with LR in torch AdamW
             "fused": fused,
             "foreach": foreach,
         }

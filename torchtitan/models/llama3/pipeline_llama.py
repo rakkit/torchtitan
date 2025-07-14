@@ -130,13 +130,7 @@ def pipeline_llama_manual_split(
                 if drop_layers:
                     del model.mtp_layers[name]
 
-        if (
-                not is_last
-                and not (
-                    start_layer.startswith("layers.")
-                    and stop_layer.startswith("mtp_layers.")
-                )
-        ):
+        if not is_last and not stop_layer.startswith("mtp_layers."):
             model.norm = None
             model.output = None
 

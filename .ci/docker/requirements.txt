@@ -9,3 +9,4 @@ tabulate
 wandb
 fsspec
 tomli-w >= 1.1.0
+psutil

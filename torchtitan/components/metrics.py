@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any
 
 import torch
+
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
@@ -139,12 +140,12 @@ class WandBLogger(BaseLogger):
     """Logger implementation for Weights & Biases."""
 
     def __init__(
-            self,
-            log_dir: str,
-            tag: str | None = None,
-            project: str | None = None,
-            group: str | None = None,
-            name: str | None = None,
+        self,
+        log_dir: str,
+        tag: str | None = None,
+        project: str | None = None,
+        group: str | None = None,
+        name: str | None = None,
     ):
         # Import wandb here to avoid startup import
         import wandb

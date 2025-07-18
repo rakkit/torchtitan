@@ -34,6 +34,7 @@ def orthogonal_(
         #     device_mesh=param.device_mesh,
         # )
         # torch.distributed.barrier()
+        # param.copy_(params_data.to(param.dtype))
 
         # ##########################################
         # Implementation-2: Use `DTensor.from_local`
@@ -42,11 +43,7 @@ def orthogonal_(
         for dim, (o, s) in enumerate(zip(offs, sizes)):
             temp_tensor = temp_tensor.narrow(dim, o, s)
 
-        params_data = DTensor.from_local(
-            temp_tensor.contiguous(),
-            placements=param.placements,
-            device_mesh=param.device_mesh,
-        )
+        param.data.to_local().copy_(temp_tensor)
 
         """
         impl-1 use `distribute_tensor`, its explicitly do communication 
@@ -61,7 +58,6 @@ def orthogonal_(
         Gonna use impl-2 for now to avoid the barrier.
         # TODO(JSC): We shall do a benchmark later to see which one is better.
         """
-        param.copy_(params_data.to(param.dtype))
         return param
 
 

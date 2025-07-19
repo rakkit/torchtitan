@@ -10,6 +10,7 @@ import math
 import re
 from typing import Any, Generic, Iterator, TypeVar
 import warnings
+import os
 
 import torch
 import torch.nn as nn
@@ -26,6 +27,8 @@ from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
 from torchtitan.optimizers import DistributedScion, Scion, naive_param_norm
 from torchtitan.tools.logging import logger
+from torchtitan.tools.utils import Color
+from torchtitan.distributed import ParallelDims
 
 
 __all__ = [
@@ -69,9 +72,10 @@ def _extract_param_groups(
         assert len(group_params["params"]) == len(group_params["param_names"])
 
         if len(param_names) == 0:
+            color = Color()
             logger.warning(
-                f'Notice: No parameters found for `str_match` "{str_match}" on '
-                f"global rank {torch.distributed.get_rank()}"
+                f'{color.red}Notice: No parameters found for `str_match` "{str_match}" on '
+                f"global rank {torch.distributed.get_rank()}{color.reset}"
             )
             continue
         group_params.update(param_group_config)
@@ -371,8 +375,9 @@ class FTOptimizersContainer(OptimizersContainer):
 def build_optimizers(
     model_parts: list[nn.Module],
     job_config: JobConfig,
+    parallel_dims: ParallelDims,
     ft_manager: FTManager,
-    extra_kwargs: dict[str, Any],
+    extra_kwargs: dict[str, Any] = {},
 ) -> OptimizersContainer:
     """Create a OptimizersContainer for the given model parts and job config.
 
@@ -392,10 +397,19 @@ def build_optimizers(
         job_config (JobConfig): Job config containing the optimizer name and parameters.
     """
     optim_in_bwd = job_config.optimizer.early_step_in_backward
-    if optim_in_bwd and job_config.parallelism.pipeline_parallel_degree > 1:
-        raise NotImplementedError(
-            "Optimizers in backward is not supported with pipeline parallelism."
-        )
+    if optim_in_bwd:
+        if parallel_dims.ep_enabled:
+            raise NotImplementedError(
+                "Optimizers in backward is not supported with Expert Parallel."
+            )
+        if parallel_dims.pp_enabled:
+            raise NotImplementedError(
+                "Optimizers in backward is not supported with Pipeline Parallel."
+            )
+        if ft_manager and ft_manager.enabled:
+            raise NotImplementedError(
+                "TorchFT is not supported with optimizers in backward."
+            )
     name = job_config.optimizer.name
     lr = job_config.optimizer.lr
     eps = job_config.optimizer.eps
@@ -411,10 +425,7 @@ def build_optimizers(
         fused = optim_implementation == "fused"
         foreach = optim_implementation == "foreach"
 
-        mesh_dim_names = extra_kwargs["world_mesh"].mesh_dim_names
-        ep_enable = mesh_dim_names is not None and (
-            "dp_shard_1" in mesh_dim_names or "dp_shard_2" in mesh_dim_names
-        )
+        ep_enable = parallel_dims.ep_enabled
         if ep_enable:
             # Because for Expert Parallel, we have two different device meshes.
             fused, foreach = False, False
@@ -445,6 +456,16 @@ def build_optimizers(
         nesterov = job_config.optimizer.nesterov
         is_light = job_config.optimizer.is_light
         is_unconstrained = job_config.optimizer.is_unconstrained
+        if os.environ.get("SCION_DEBUG_GRAD") == "1":
+            # only if we wanna to debug the gradient
+            # which we dont run SVD
+            norm_factor = "none"
+            zeropower_backend_algorithm = "identity"
+            logger.warning(
+                "SCION_DEBUG_GRAD is set to 1, we will not run SVD and use identity backend"
+            )
+        else:
+            norm_factor = "spectral"
 
         optimizer_kwargs = {
             "is_light": is_light,
@@ -453,7 +474,7 @@ def build_optimizers(
             "momentum": momentum,
             "nesterov": nesterov,
             "eps": eps,
-            "norm_factor": "spectral",
+            "norm_factor": norm_factor,
             "backend": zeropower_backend_algorithm,
             "backend_steps": backend_steps,
         }
@@ -486,11 +507,11 @@ def build_optimizers(
             param_group_config["backend"] = "identity"
         param_groups_config.append(param_group_config)
 
-    gate_str_match = job_config.optimizer.gate_str_match
-    if gate_str_match:
+    router_str_match = job_config.optimizer.router_str_match
+    if router_str_match:
         param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
         param_group_config = {
-            "param_str_match": gate_str_match,
+            "param_str_match": router_str_match,
             "lr": lr,
         }
         if is_scion:
@@ -500,10 +521,24 @@ def build_optimizers(
             # param_group_config["backend"] = "identity"
             param_group_config["norm_factor"] = "spectral"
             param_group_config["backend"] = zeropower_backend_algorithm
-
         param_groups_config.append(param_group_config)
 
-    optimizer_kwargs["extra_kwargs"] = extra_kwargs
+    ss_norm_str_match = "ssnorm_scale"
+    if ss_norm_str_match:
+        param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
+        param_group_config = {
+            "param_str_match": ss_norm_str_match,
+            "lr": lr,
+        }
+        if is_scion:
+            param_group_config["norm_factor"] = "sign"
+            param_group_config["backend"] = "identity"
+        param_groups_config.append(param_group_config)
+
+    optimizer_kwargs["extra_kwargs"] = {
+        "parallel_dims": parallel_dims,
+        **extra_kwargs,
+    }
 
     optimizer_classes = {
         "Adam": torch.optim.Adam,

@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from torchtitan.models.llama3.model import (
+from torchtitan.models.llama3.model.model import (
     apply_rotary_emb,
     Attention,
     FeedForward,
@@ -38,7 +38,9 @@ class BitNetAttention(Attention):
 
     def __init__(self, model_args: TransformerModelArgs):
         super().__init__(model_args)
-        self.wo_norm = build_norm(model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps)
+        self.wo_norm = build_norm(
+            model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
+        )
 
     def init_weights(self, init_std: float, residual_div: float, init_fn_type: str):
         self.wo_norm.reset_parameters()
@@ -131,14 +133,16 @@ class BitNetFeedForward(FeedForward):
         return self.w2(self.w2_norm(F.silu(self.w1(x)) * self.w3(x)))
 
     def init_weights(
-            self,
-            init_std: float,
-            residual_div: float,
-            init_gate_as_residual: bool,
-            init_fn_type: str,
+        self,
+        init_std: float,
+        residual_div: float,
+        init_gate_as_residual: bool,
+        init_fn_type: str,
     ):
         self.w2_norm.reset_parameters()
-        super().init_weights(init_std, residual_div, init_gate_as_residual, init_fn_type)
+        super().init_weights(
+            init_std, residual_div, init_gate_as_residual, init_fn_type
+        )
 
 
 class BitNetTransformerBlock(TransformerBlock):
@@ -165,7 +169,10 @@ class BitNetTransformerBlock(TransformerBlock):
     feed_forward_cls = BitNetFeedForward
 
     def __init__(self, layer_id: int, model_args: TransformerModelArgs):
-        assert model_args.norm_type.lower() in ["rmsnorm", "np_rmsnorm"], "BitNet assumes RMSNorm"
+        assert model_args.norm_type.lower() in [
+            "rmsnorm",
+            "np_rmsnorm",
+        ], "BitNet assumes RMSNorm"
 
         self._init_feed_forward_builder(model_args)
         super().__init__(layer_id, model_args)
@@ -213,5 +220,8 @@ class BitNetTransformer(Transformer):
     transformer_block_cls = BitNetTransformerBlock
 
     def __init__(self, model_args: TransformerModelArgs):
-        assert model_args.norm_type.lower() in ["rmsnorm", "np_rmsnorm"], "BitNet assumes RMSNorm"
+        assert model_args.norm_type.lower() in [
+            "rmsnorm",
+            "np_rmsnorm",
+        ], "BitNet assumes RMSNorm"
         super().__init__(model_args)

@@ -1,14 +1,16 @@
 from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.lr_scheduler import build_lr_schedulers
-from torchtitan.components.optimizer import build_optimizers
+
 from torchtitan.datasets.hf_datasets import build_hf_dataloader
 from torchtitan.datasets.tokenizer.byte_tokenizer import build_byte_tokenizer
 from torchtitan.datasets.tokenizer.tiktoken import build_tiktoken_tokenizer
 from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
-from .pipeline_MoEllama import pipeline_llama
-from .parallelize_MoEllama import parallelize_llama
-from .moellama import Transformer, MoEModelArgs
+from .infra.build_optimizer import build_moe_optimizers as build_optimizers
+from .infra.pipeline import pipeline_llama
+from .infra.parallelize import parallelize_llama
+from .model.model import Transformer
+from .model.args import MoEModelArgs
 
 
 __all__ = [
@@ -29,10 +31,10 @@ moe_llama3_configs = {
         n_routed_experts=8,
         qk_norm=True,
         norm_everywhere=False,
-        depth_init=False,
+        depth_init="total_depth",
         norm_eps=1e-30,
     ),
-    "1B-7B-Proxy-8-layers": MoEModelArgs(
+    "1B-7B-Proxy-8layers": MoEModelArgs(
         dim=512,
         n_layers=8,
         n_heads=4,
@@ -43,16 +45,16 @@ moe_llama3_configs = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
+        depth_init="total_depth",
         init_gate_as_residual=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
         multiple_of=64,
         # MoE specific args
-        moe_gate_bias_update_speed=0.001,
+        moe_router_bias_update_speed=0.001,
         moe_aux_loss_alpha=0.01,
-        moe_routed_scaling_factor=2.8232,  # 8 of 64 experts
-        moe_gate_use_bias_for_routing=True,
+        moe_router_scaling_factor=2.8232,  # 8 of 64 experts
+        moe_router_use_bias_for_routing=True,
         moe_init_all_experts_same=False,
     ),
     "1B-7B-Proxy": MoEModelArgs(
@@ -66,16 +68,16 @@ moe_llama3_configs = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
+        depth_init="total_depth",
         init_gate_as_residual=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
         multiple_of=64,
         # MoE specific args
-        moe_gate_bias_update_speed=0.001,
+        moe_router_bias_update_speed=0.001,
         moe_aux_loss_alpha=0.01,
-        moe_routed_scaling_factor=2.8232,  # 8 of 64 experts
-        moe_gate_use_bias_for_routing=True,
+        moe_router_scaling_factor=2.8232,  # 8 of 64 experts
+        moe_router_use_bias_for_routing=True,
         moe_init_all_experts_same=False,
     ),
     "1B-7B-Proxy-wo-bias": MoEModelArgs(
@@ -89,16 +91,16 @@ moe_llama3_configs = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
+        depth_init="total_depth",
         init_gate_as_residual=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
         multiple_of=64,
         # MoE specific args
-        moe_gate_bias_update_speed=0.001,
+        moe_router_bias_update_speed=0.001,
         moe_aux_loss_alpha=0.01,
-        moe_routed_scaling_factor=2.8232,  # 8 of 64 experts
-        moe_gate_use_bias_for_routing=False,
+        moe_router_scaling_factor=2.8232,  # 8 of 64 experts
+        moe_router_use_bias_for_routing=False,
         moe_init_all_experts_same=False,
     ),
     "1B-7B-Proxy-wo-aux-loss": MoEModelArgs(
@@ -112,16 +114,16 @@ moe_llama3_configs = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
+        depth_init="total_depth",
         init_gate_as_residual=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
         multiple_of=64,
         # MoE specific args
-        moe_gate_bias_update_speed=0.001,
+        moe_router_bias_update_speed=0.001,
         moe_aux_loss_alpha=0.0,
-        moe_routed_scaling_factor=2.8232,  # 8 of 64 experts
-        moe_gate_use_bias_for_routing=True,
+        moe_router_scaling_factor=2.8232,  # 8 of 64 experts
+        moe_router_use_bias_for_routing=True,
         moe_init_all_experts_same=False,
     ),
     "1B-7B-Proxy-wo-bias-wo-aux-loss": MoEModelArgs(
@@ -135,16 +137,109 @@ moe_llama3_configs = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
+        depth_init="total_depth",
         init_gate_as_residual=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
         multiple_of=64,
         # MoE specific args
-        moe_gate_bias_update_speed=0.001,
+        moe_router_bias_update_speed=0.001,
         moe_aux_loss_alpha=0.0,
-        moe_routed_scaling_factor=2.8232,  # 8 of 64 experts
-        moe_gate_use_bias_for_routing=False,
+        moe_router_scaling_factor=2.8232,  # 8 of 64 experts
+        moe_router_use_bias_for_routing=False,
+        moe_init_all_experts_same=False,
+    ),
+    "1B-7B-Proxy-wo-aux-loss-2layers": MoEModelArgs(
+        dim=512,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        n_shared_experts=1,
+        activate_experts=8,
+        n_routed_experts=64,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init="total_depth",
+        init_gate_as_residual=False,
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+        multiple_of=64,
+        # MoE specific args
+        moe_router_bias_update_speed=0.001,
+        moe_aux_loss_alpha=0.0,
+        moe_router_scaling_factor=2.8232,  # 8 of 64 experts
+        moe_router_use_bias_for_routing=True,
+        moe_init_all_experts_same=False,
+    ),
+    "1B-7B-Proxy-wo-aux-loss-8layers": MoEModelArgs(
+        dim=512,
+        n_layers=8,
+        n_heads=4,
+        n_kv_heads=2,
+        n_shared_experts=1,
+        activate_experts=8,
+        n_routed_experts=64,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init="total_depth",
+        init_gate_as_residual=False,
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+        multiple_of=64,
+        # MoE specific args
+        moe_router_bias_update_speed=0.001,
+        moe_aux_loss_alpha=0.0,
+        moe_router_scaling_factor=2.8232,  # 8 of 64 experts
+        moe_router_use_bias_for_routing=True,
+        moe_init_all_experts_same=False,
+    ),
+    "1B-7B-Proxy-wo-aux-loss-64layers": MoEModelArgs(
+        dim=512,
+        n_layers=64,
+        n_heads=4,
+        n_kv_heads=2,
+        n_shared_experts=1,
+        activate_experts=8,
+        n_routed_experts=64,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init="total_depth",
+        init_gate_as_residual=False,
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+        multiple_of=64,
+        # MoE specific args
+        moe_router_bias_update_speed=0.001,
+        moe_aux_loss_alpha=0.0,
+        moe_router_scaling_factor=2.8232,  # 8 of 64 experts
+        moe_router_use_bias_for_routing=True,
+        moe_init_all_experts_same=False,
+    ),
+    "1B-7B-Proxy-wo-aux-loss-8layers-1dense": MoEModelArgs(
+        dim=512,
+        n_layers=8,
+        n_dense_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        n_shared_experts=1,
+        activate_experts=8,
+        n_routed_experts=64,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init="total_depth",
+        init_gate_as_residual=False,
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+        multiple_of=64,
+        # MoE specific args
+        moe_router_bias_update_speed=0.001,
+        moe_aux_loss_alpha=0.0,
+        moe_router_scaling_factor=2.8232,  # 8 of 64 experts
+        moe_router_use_bias_for_routing=True,
         moe_init_all_experts_same=False,
     ),
     "1B-7B": MoEModelArgs(
@@ -158,16 +253,16 @@ moe_llama3_configs = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
+        depth_init="total_depth",
         init_gate_as_residual=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
         multiple_of=256,
         # MoE specific args
-        moe_gate_bias_update_speed=0.001,
+        moe_router_bias_update_speed=0.001,
         moe_aux_loss_alpha=0.01,
-        moe_routed_scaling_factor=2.8232,  # 8 of 64 experts
-        moe_gate_use_bias_for_routing=True,
+        moe_router_scaling_factor=2.8232,  # 8 of 64 experts
+        moe_router_use_bias_for_routing=True,
         moe_init_all_experts_same=False,
     ),
     "1B-7B-wo-aux-loss": MoEModelArgs(
@@ -181,20 +276,43 @@ moe_llama3_configs = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
+        depth_init="total_depth",
         init_gate_as_residual=False,
         norm_type="np_rmsnorm",
         norm_everywhere=True,
         multiple_of=256,
         # MoE specific args
-        moe_gate_bias_update_speed=0.001,
+        moe_router_bias_update_speed=0.001,
         moe_aux_loss_alpha=0.0,
-        moe_routed_scaling_factor=2.8232,  # 8 of 64 experts
-        moe_gate_use_bias_for_routing=True,
+        moe_router_scaling_factor=2.8232,  # 8 of 64 experts
+        moe_router_use_bias_for_routing=True,
+        moe_init_all_experts_same=False,
+    ),
+    "test": MoEModelArgs(
+        dim=256,
+        n_layers=8,
+        n_heads=2,
+        n_kv_heads=1,
+        ffn_dim_multiplier=1,
+        multiple_of=64,
+        n_shared_experts=0,
+        activate_experts=4,
+        n_routed_experts=8,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init="total_depth",
+        init_gate_as_residual=False,
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+        # MoE specific args
+        moe_router_bias_update_speed=0.001,
+        moe_aux_loss_alpha=0.0,
+        moe_router_scaling_factor=1.0,
+        moe_router_use_bias_for_routing=True,
         moe_init_all_experts_same=False,
     ),
 }
-
 
 register_train_spec(
     TrainSpec(

@@ -16,10 +16,11 @@ from torchtitan.datasets.tokenizer.sentencepiece import build_sentencepiece_toke
 from torchtitan.datasets.tokenizer.tiktoken import build_tiktoken_tokenizer
 from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
-from .bitnet_model import BitNetTransformer
-from .model import Transformer, TransformerModelArgs
-from .parallelize_llama import parallelize_llama
-from .pipeline_llama import pipeline_llama
+from .infra.parallelize import parallelize_llama
+from .infra.pipeline import pipeline_llama
+from .model.args import TransformerModelArgs
+from .model.model import Transformer
+from .model.bitnet_model import BitNetTransformer
 
 __all__ = [
     "parallelize_llama",
@@ -40,7 +41,7 @@ llama3_configs = {
         n_heads=16,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
+        depth_init="total_depth",
         norm_eps=1e-30,
     ),
     # 14M parameters
@@ -53,7 +54,7 @@ llama3_configs = {
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
+        depth_init="total_depth",
         norm_eps=1e-30,
     ),
     # 55M parameters
@@ -66,7 +67,7 @@ llama3_configs = {
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
+        depth_init="total_depth",
         norm_eps=1e-30,
     ),
     # 206M parameters
@@ -79,7 +80,7 @@ llama3_configs = {
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
+        depth_init="total_depth",
         norm_eps=1e-30,
     ),
     # 824M parameters
@@ -92,7 +93,7 @@ llama3_configs = {
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
+        depth_init="total_depth",
         norm_eps=1e-30,
     ),
     # 3.2B parameters
@@ -105,7 +106,7 @@ llama3_configs = {
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
+        depth_init="total_depth",
         norm_eps=1e-30,
     ),
     # 1.9M parameters
@@ -118,7 +119,7 @@ llama3_configs = {
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
+        depth_init="total_depth",
         norm_eps=1e-30,
     ),
     # 609M parameters
@@ -131,7 +132,7 @@ llama3_configs = {
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
+        depth_init="total_depth",
         norm_eps=1e-30,
     ),
     # 2.4B parameters
@@ -144,7 +145,7 @@ llama3_configs = {
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
+        depth_init="total_depth",
         norm_eps=1e-30,
     ),
     "debugmodel-2layers-multiplier-16": TransformerModelArgs(
@@ -156,8 +157,64 @@ llama3_configs = {
         multiple_of=256,
         rope_theta=500000,
         qk_norm=True,
-        depth_init=False,
+        depth_init="total_depth",
         norm_eps=1e-30,
+    ),
+    "1B-Proxy-2layers": TransformerModelArgs(
+        dim=256,
+        n_layers=2,
+        n_heads=2,
+        n_kv_heads=1,  # need KV_head > TP for TP debugging
+        ffn_dim_multiplier=1,  # need to check
+        multiple_of=64,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init="total_depth",
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+    ),
+    "1B-Proxy-8layers": TransformerModelArgs(
+        dim=256,
+        n_layers=8,
+        n_heads=2,
+        n_kv_heads=1,  # need KV_head > TP for TP debugging
+        ffn_dim_multiplier=1,  # need to check
+        multiple_of=64,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init="total_depth",
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+    ),
+    "1B-Proxy-16layers": TransformerModelArgs(
+        dim=256,
+        n_layers=16,
+        n_heads=2,
+        n_kv_heads=1,  # need KV_head > TP for TP debugging
+        ffn_dim_multiplier=1,  # need to check
+        multiple_of=64,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init="total_depth",
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+    ),
+    "1B-Proxy-64layers": TransformerModelArgs(
+        dim=256,
+        n_layers=64,
+        n_heads=2,
+        n_kv_heads=1,  # need KV_head > TP for TP debugging
+        ffn_dim_multiplier=1,  # need to check
+        multiple_of=64,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init="total_depth",
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
     ),
     "1B-Proxy": TransformerModelArgs(
         dim=256,
@@ -169,7 +226,7 @@ llama3_configs = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
+        depth_init="total_depth",
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -183,7 +240,7 @@ llama3_configs = {
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,
-        depth_init=False,
+        depth_init="total_depth",
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
@@ -223,6 +280,48 @@ llama3_configs = {
         ffn_dim_multiplier=1.2,
         multiple_of=4096,
         rope_theta=500000,
+    ),
+    "3B-norm-everywhere": TransformerModelArgs(
+        dim=2048,
+        n_layers=36,
+        n_heads=16,
+        n_kv_heads=8,
+        ffn_dim_multiplier=2,
+        multiple_of=256,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init="total_depth",
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+    ),
+    "8B-norm-everywhere": TransformerModelArgs(
+        dim=4096,
+        n_layers=32,
+        n_heads=32,
+        n_kv_heads=8,
+        ffn_dim_multiplier=1.3,
+        multiple_of=1024,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init="total_depth",
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+    ),
+    "70B-norm-everywhere": TransformerModelArgs(
+        dim=8192,
+        n_layers=80,
+        n_heads=64,
+        n_kv_heads=8,
+        ffn_dim_multiplier=1.3,
+        multiple_of=4096,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init="total_depth",
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
     ),
 }
 

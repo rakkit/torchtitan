@@ -58,17 +58,62 @@ def condition_number(W):
 
 
 @torch.no_grad()
-def fused_metrics(W):
+def frobenius_norm(W):
+    return torch.linalg.norm(W.float(), ord="fro")
+
+
+@torch.no_grad()
+def average_entry_size(W):
+    # https://docs.modula.systems/examples/weight-erasure/
+    return frobenius_norm(W) / math.sqrt(W.numel())
+
+
+@torch.no_grad()
+def stable_rank(W):
+    # https://docs.modula.systems/examples/weight-erasure/
+    S = torch.linalg.svdvals(W.to(torch.float32), driver="gesvd")
+    spec = S[0]
+    if spec == 0:
+        return torch.tensor(0.0, device=W.device)
+    frob_norm = frobenius_norm(W)
+    return (frob_norm**2) / (spec**2)
+
+
+@torch.no_grad()
+def effective_rank(W):
+    # https://docs.modula.systems/examples/weight-erasure/
+    S = torch.linalg.svdvals(W.to(torch.float32), driver="gesvd")
+    p = (S / (S.sum() + 1e-12)).clamp_min(1e-12)
+    return torch.exp(-(p * p.log()).sum())
+
+
+NORM_FUNCTIONS = {
+    "rms_to_rms": rms_to_rms_norm,
+    "l1_to_rms": l1_to_rms_norm,
+    "rms_to_l1": rms_to_l1_norm,
+    "supremum": supremum_norm,
+    "condition_number": condition_number,
+    "frobenius_norm": frobenius_norm,
+    "average_entry_size": average_entry_size,
+    "stable_rank": stable_rank,
+    "effective_rank": effective_rank,
+}
+
+
+@torch.no_grad()
+@torch.compile(fullgraph=True)
+def fused_metrics(W, eps=1e-20):
     if W.ndim < 2:
         # Operator norms require a matrix.
         return {"supremum": W.abs().max()}
 
     Wf = W.float()
+    Wf_square = Wf * Wf
     fan_out, fan_in = Wf.shape
 
     sup = Wf.abs().amax()
-    rowsqsum = (Wf * Wf).sum(1)
-    colsqsum = (Wf * Wf).sum(0)
+    rowsqsum = Wf_square.sum(1)
+    colsqsum = Wf_square.sum(0)
 
     row_l2 = rowsqsum.sqrt()
     col_l2 = colsqsum.sqrt()
@@ -80,10 +125,19 @@ def fused_metrics(W):
 
     spec = S[0] * math.sqrt(fan_in / fan_out)
 
-    if S[-1] == 0:
-        cond = torch.inf
-    else:
-        cond = S[0] / S[-1]
+    cond = S[0] / (S[-1] + eps)
+    cond = cond.clamp_min(eps)
+
+    frob_norm = row_l2.norm(p=2)
+
+    spec_unscaled = S[0]
+    srank = (frob_norm**2) / (spec_unscaled**2 + eps)
+    srank = srank.clamp_min(eps)
+
+    p = (S / (S.sum() + eps)).clamp_min(eps)
+    erank = torch.exp(-(p * p.log()).sum())
+
+    avg_entry = frob_norm / math.sqrt(fan_out * fan_in)
 
     return {
         "rms_to_rms": spec,
@@ -91,16 +145,38 @@ def fused_metrics(W):
         "rms_to_l1": rms_to_l1,
         "supremum": sup,
         "condition_number": cond,
+        "frobenius_norm": frob_norm,
+        "stable_rank": srank,
+        "effective_rank": erank,
+        "average_entry_size": avg_entry,
     }
 
 
-NORM_FUNCTIONS = {
-    "rms_to_rms": rms_to_rms_norm,
-    "l1_to_rms": l1_to_rms_norm,
-    "rms_to_l1": rms_to_l1_norm,
-    "supremum": supremum_norm,
-    "condition_number": condition_number,
-}
+def set_norms_to_log(norms_to_log):
+    """
+    Remove some of the norms from the NORM_FUNCTIONS dictionary.
+    Only the nomrs in norms_to_log will be kept.
+    # `default`: keep l1_to_rms, rms_to_l1, rms_to_rms, supremum, condition_number
+    # `all` or `everything`: keep all norms
+    """
+    if isinstance(norms_to_log, str):
+        norms_to_log = [norms_to_log]
+
+    if "all" in norms_to_log or "everything" in norms_to_log:
+        pass
+    global NORM_FUNCTIONS
+    if "default" in norms_to_log:
+        keys_to_remove = [
+            "frobenius_norm",
+            "stable_rank",
+            "effective_rank",
+            "average_entry_size",
+        ]
+    else:
+        keys_to_remove = [key for key in NORM_FUNCTIONS if key not in norms_to_log]
+
+    for norm_name in keys_to_remove:
+        NORM_FUNCTIONS.pop(norm_name)
 
 
 def calculate_norm(
@@ -117,6 +193,7 @@ def calculate_norm(
         W = W.transpose(0, 1)
     if used_fused_metrics:
         norms = fused_metrics(W)
+        norms = {key: norms[key] for key in NORM_FUNCTIONS.keys()}
     else:
         norms = {
             norm_name: NORM_FUNCTIONS[norm_name](W)

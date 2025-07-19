@@ -8,6 +8,11 @@ import torch.nn.functional as F
 from torchtitan.models.inits import build_init_fn
 from torchtitan.models.norms import build_norm
 
+# from ..infra.expert_parallel import expert_parallel
+
+from torchtitan.experiments.kernels.moe.indices import (
+    generate_permute_indices,
+)
 
 try:
     from grouped_gemm.ops import gmm as grouped_gemm
@@ -18,8 +23,8 @@ except ImportError:
         # G = m_sizes.shape[0]
         shift = 0
         for g, n_tokens in enumerate(m_sizes):
-            input_tokens = x[shift:shift + n_tokens]
-            out[shift:shift + n_tokens] = input_tokens @ w[g]
+            input_tokens = x[shift : shift + n_tokens]
+            out[shift : shift + n_tokens] = input_tokens @ w[g]
             shift += n_tokens
         return out
 
@@ -38,10 +43,10 @@ class GroupedExperts(nn.Module):
         activation (nn.Module): Activation function to use. Default is F.silu.
     """
 
-    ep_mesh = None
-    ep_size = 1
-    ep_local_rank = None
-    expert_per_rank = None
+    # when ep is enabled, these are set in parallelize.py
+    ep_enable = False
+    expert_per_rank = -1
+    ep_size = -1
 
     def __init__(
         self,
@@ -69,18 +74,26 @@ class GroupedExperts(nn.Module):
 
         self.init_all_experts_same = moe_init_all_experts_same
 
+        self.expert_per_rank = num_experts
+        self.ep_size = 1
+
         if norm_everywhere:
-            assert norm_type is not None, \
-                "`norm_type` needs to be passed when `norm_everywhere=True`"
-            assert norm_eps is not None, "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            assert (
+                norm_type is not None
+            ), "`norm_type` needs to be passed when `norm_everywhere=True`"
+            assert (
+                norm_eps is not None
+            ), "`norm_eps` needs to be passed when `norm_everywhere=True`"
             self.out_norm = build_norm(norm_type, dim=dim_hidden, eps=norm_eps)
         else:
             self.out_norm = nn.Identity()
 
     def __repr__(self):
         model_str = f"GroupedExperts(dim_in={self.dim_in}, hidden={self.dim_hidden},\n"
-        model_str += f"\tnum_experts={self.num_experts}, local_experts={self.expert_per_rank}, "
-        model_str += f"ep_size={self.ep_size}, \n"
+        # model_str += (
+        #     f"\tnum_experts={self.num_experts}, local_experts={self.expert_per_rank}, "
+        # )
+        # model_str += f"ep_size={self.ep_size}, \n"
         model_str += f"\tup_proj={self.w1.shape}, \n"
         model_str += f"\tgate_proj={self.w3.shape}, \n"
         model_str += f"\tdown_proj={self.w2.shape}, \n"
@@ -88,42 +101,64 @@ class GroupedExperts(nn.Module):
         model_str += ")"
         return model_str
 
-    def setup_ep(self, ep_mesh, ep_size):
-        self.ep_mesh = ep_mesh
-        self.ep_size = ep_size
-        self.ep_local_rank = ep_mesh.get_local_rank()
-        self.expert_per_rank = self.num_experts // ep_size
-
     def forward(
         self,
         x: torch.Tensor,
         m_sizes: torch.LongTensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): with shape (total_tokens, dim_in)
-            m_sizes (torch.Tensor): with shape (num_experts), on CPU
 
-        Returns:
-            out (torch.Tensor): with shape (total_tokens, dim_in)
-        """
+        if not self.ep_enable:
+            m_sizes = m_sizes.long()
+            h = grouped_gemm(x, self.w1, m_sizes)
+            h = self.act_fn(h) * grouped_gemm(x, self.w3, m_sizes)
+            h = grouped_gemm(self.out_norm(h), self.w2, m_sizes)
+            return h
 
-        @torch.compile(fullgraph=True)
-        def norm_x(norm, x):
-            return norm(x)
+        ####### BELOW IS THE EP REGIME #######
+        # TODO(JSC): For now, EP does not work with compile
+        ALIGN_SIZE_M = 16
+        # ALIGN_SIZE_M = 1
 
-        h = grouped_gemm(x, self.w1, m_sizes)
-        h = self.act_fn(h) * grouped_gemm(x, self.w3, m_sizes)
-        h = grouped_gemm(norm_x(self.out_norm, h), self.w2, m_sizes)
+        if ALIGN_SIZE_M > 1:
+            max_len = x.shape[0] + self.expert_per_rank * ALIGN_SIZE_M
+        else:
+            max_len = x.shape[0]
 
-        return h
+        with torch.no_grad():
+            (
+                permuted_indices,
+                m_sizes,
+                _,  # offsets,
+            ) = generate_permute_indices(
+                m_sizes,
+                self.expert_per_rank,
+                self.ep_size,
+                max_len,
+                ALIGN_SIZE_M,
+                use_cpu=True,
+            )
+
+        if ALIGN_SIZE_M > 1:
+            x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
+        input_shape = x.shape
+        x = x[permuted_indices, :]
+        m_sizes = m_sizes.long()
+
+        out = grouped_gemm(x, self.w1.to_local(), m_sizes)
+        out = self.act_fn(out) * grouped_gemm(x, self.w3.to_local(), m_sizes)
+        out = grouped_gemm(self.out_norm(out), self.w2.to_local(), m_sizes)
+
+        out_unpermuted = out.new_empty(input_shape)
+        out_unpermuted[permuted_indices, :] = out
+        out = out_unpermuted[:-1]
+        return out
 
     def init_weights(
-            self,
-            init_std: float,
-            residual_div: float,
-            init_gate_as_residual: bool,
-            init_fn_type: str,
+        self,
+        init_std: float,
+        residual_div: float,
+        init_gate_as_residual: bool,
+        init_fn_type: str,
     ):
 
         init_fn = build_init_fn(init_fn_type)
@@ -138,6 +173,9 @@ class GroupedExperts(nn.Module):
         expert_init_fn(init_fn, self.w1.data, init_std)
         expert_init_fn(init_fn, self.w3.data, gate_init_std)
         expert_init_fn(init_fn, self.w2.data, init_std / residual_div)
+
+        if not isinstance(self.out_norm, nn.Identity):
+            self.out_norm.reset_parameters()
 
 
 def init_all_experts_same(init_fn, w, init_std):

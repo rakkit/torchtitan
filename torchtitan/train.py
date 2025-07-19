@@ -34,7 +34,7 @@ from torchtitan.components.metrics import (
 from torchtitan.components.activation_offload import get_act_offloading_ctx_manager
 from torchtitan.config_manager import JobConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
-from torchtitan.models.MoEllama.moellama import Transformer as MoETransformer
+from torchtitan.models.MoEllama.model.model import Transformer as MoETransformer
 from torchtitan.protocols.model_converter import build_model_converters
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
@@ -42,6 +42,7 @@ from torchtitan.tools.profiling import (
     maybe_enable_memory_snapshot,
     maybe_enable_profiling,
 )
+from torchtitan.optimizers import norm_helper
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
@@ -212,6 +213,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.metrics_processor = build_metrics_processor_fn(job_config, parallel_dims)
         color = self.metrics_processor.color
 
+        norm_helper.set_norms_to_log(job_config.metrics.norms_to_log)
         # calculate model size and flops per token
         (
             model_active_param_count,
@@ -281,7 +283,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.pp_has_last_stage,
             ) = self.train_spec.pipelining_fn(
                 model,
-                world_mesh,
                 parallel_dims,
                 job_config,
                 self.device,
@@ -303,11 +304,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             ensure_pp_loss_visible(parallel_dims, job_config, color)
         else:
             # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
-            model = self.train_spec.parallelize_fn(
-                model, world_mesh, parallel_dims, job_config
-            )
+            model = self.train_spec.parallelize_fn(model, parallel_dims, job_config)
 
             model.to_empty(device=init_device)
+            # TODO(JSC): Maybe add a flag to skip the init?
             with torch.no_grad():
                 model.init_weights(buffer_device=buffer_device)
             model.train()
@@ -325,11 +325,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"({device_mem_stats.max_reserved_pct:.2f}%)"
         )
 
-        extra_kwargs = {"world_mesh": world_mesh}
-
         # build optimizer after applying parallelisms to the model
         self.optimizers = self.train_spec.build_optimizers_fn(
-            self.model_parts, job_config, ft_manager, extra_kwargs
+            self.model_parts, job_config, parallel_dims, ft_manager
         )
         self.lr_schedulers = self.train_spec.build_lr_schedulers_fn(
             self.optimizers, job_config
@@ -442,7 +440,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         parallel_dims = self.parallel_dims
 
         aux_loss = None
-        moe_entropy_per_layer = None
 
         # apply context parallelism if cp is enabled
         # ensure CP handles the separate freqs_cis buffer for each pp stage
@@ -494,14 +491,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     pred = {"tokens_list": [pred]}
 
                 aux_loss = pred.get("aux_loss", None)
-                moe_entropy_per_layer = pred.get("moe_entropy_per_layer", None)
 
                 loss = self.loss_fn(pred, labels)
 
                 # need to free to before bwd to avoid peaking memory
                 del pred
                 loss.backward()
-        return loss, aux_loss, moe_entropy_per_layer
+        return loss, aux_loss
 
     def train_step(self, data_iterator: Iterable):
         self.optimizers.zero_grad()
@@ -510,25 +506,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         model_parts = self.model_parts
         parallel_dims = self.parallel_dims
 
-        accumulated_losses = []
-        accumulated_aux_losses, accumulated_moe_entropy_per_layer = [], []
+        accumulated_losses, accumulated_aux_losses = [], []
 
         for microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = self.next_batch(data_iterator)
-            loss, aux_loss, moe_entropy_per_layer = self.forward_backward_step(
-                input_dict, labels
-            )
+            loss, aux_loss = self.forward_backward_step(input_dict, labels)
             accumulated_losses.append(loss.detach())
             if aux_loss is not None:
                 accumulated_aux_losses.append(aux_loss.detach())
-            if moe_entropy_per_layer is not None:
-                accumulated_moe_entropy_per_layer.append(moe_entropy_per_layer)
-
-        # for MoE model, update the gate bias
-        token_selection_per_layer = []
-        for model in model_parts:
-            if hasattr(model, "update_gate_bias"):
-                token_selection_per_layer = model.update_gate_bias()
 
         # Adamw + EP seems does not work with gradient clipping
         grad_norm = None
@@ -560,19 +545,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         loss = torch.sum(torch.stack(accumulated_losses))
         if len(accumulated_aux_losses) > 0:
             aux_loss = torch.sum(torch.stack(accumulated_aux_losses))
-        if len(accumulated_moe_entropy_per_layer) > 0:
-            moe_entropy_per_layer = {}
-            _list_of_dict = accumulated_moe_entropy_per_layer
-            for layer_idx in _list_of_dict[0].keys():
-                moe_entropy_per_layer[layer_idx] = torch.sum(
-                    torch.stack([d[layer_idx] for d in _list_of_dict]),
-                )
 
         # log metrics
         if not self.metrics_processor.should_log(self.step):
             return
 
-        bias_dict = None
         if parallel_dims.dp_cp_enabled:
             loss = loss.detach()
             global_avg_loss, global_max_loss = (
@@ -583,22 +560,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 aux_loss = dist_utils.dist_mean(
                     aux_loss, parallel_dims.world_mesh["dp_cp"]
                 )
-            if moe_entropy_per_layer is not None:
-                moe_entropy_per_layer = {
-                    k: dist_utils.dist_mean(v, parallel_dims.world_mesh["dp_cp"])
-                    for (k, v) in moe_entropy_per_layer.items()
-                }
-                bias_dict = {}
-                for m_name, m in model_parts[0].named_modules():
-                    if "feed_forward.gate" in m_name and m.bias is not None:
-                        _layer_id = m_name.split(".")[1]
-                        base_name = f"moe_bias/L-{_layer_id}_EP-"
-                        bias_dict.update(
-                            {
-                                f"{base_name}{i}": m.bias.detach()[i].mean()
-                                for i in range(m.bias.shape[0])
-                            }
-                        )
 
         else:
             global_avg_loss = global_max_loss = loss.detach().item()
@@ -609,26 +570,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         extra_metrics.update(self.optimizers.get_lrs())
 
         if need_calulate_norm:
-            # TODO(JSC): Notice that, original Gradient norm-log's LR is alwasy one-step-behind the actual LR
+            # TODO(JSC)-Fixed: Notice that, original Gradient norm-log's LR is alwasy one-step-behind the actual LR
             # the dist-scion now can calculate the norm at current step - sycned LR
             param_norms = self.optimizers.get_parameter_norms()
             extra_metrics.update(param_norms)
 
         if aux_loss is not None:
             extra_metrics["loss_metrics/aux_loss"] = aux_loss
-        if moe_entropy_per_layer is not None:
-            for k, v in moe_entropy_per_layer.items():
-                extra_metrics[f"moe_entropy/moe_entropy_per_layer_{k}"] = v
-        if bias_dict is not None:
-            extra_metrics.update(bias_dict)
 
-        for layer_id, counts in token_selection_per_layer:
-            total = sum(counts) or 1.0
-            base = f"moe_ep_usage/L-{layer_id}_EP-"
-            # build and merge both “count” and “share” entries without explicit loops
-            extra_metrics.update(
-                {f"{base}{i}": cnt / total for i, cnt in enumerate(counts)}
-            )
+        for model_part in model_parts:
+            for layer in model_part.layers.values():
+                if not hasattr(layer.feed_forward, "_log_expert_metrics"):
+                    continue
+                extra_metrics.update(layer.feed_forward._log_expert_metrics)
 
         color = self.metrics_processor.color
         extra_print_data = ""

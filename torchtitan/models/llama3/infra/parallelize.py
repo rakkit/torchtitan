@@ -9,6 +9,7 @@
 
 from collections import defaultdict
 import itertools
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -24,19 +25,19 @@ from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
     PrepareModuleInput,
+    PrepareModuleOutput,
     RowwiseParallel,
     SequenceParallel,
 )
 
 from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims
-from torchtitan.models.llama3.bitnet_model import BitNetTransformerBlock
+from torchtitan.models.llama3.model.bitnet_model import BitNetTransformerBlock
 from torchtitan.tools.logging import logger
 
 
 def parallelize_llama(
     model: nn.Module,
-    world_mesh: DeviceMesh,
     parallel_dims: ParallelDims,
     job_config: JobConfig,
 ):
@@ -47,11 +48,22 @@ def parallelize_llama(
     NOTE: The passed-in model preferably should be on meta device. Otherwise,
     the model must fit on GPU or CPU memory.
     """
+    world_mesh = parallel_dims.world_mesh
+    # TODO: TP currently cannot handle uneven seq_len because we set
+    #       `use_local_output=True` to use plain Tensors for legacy reasons.
+    #       Need to revisit this.
+    assert (
+        job_config.training.seq_len % parallel_dims.seq_len_divisor == 0
+    ), f"""
+        Sequence length {job_config.training.seq_len} must be divisible by the product of TP degree
+        ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
+        """
 
     if parallel_dims.tp_enabled:
         if (
             job_config.parallelism.enable_async_tensor_parallel
             and not job_config.training.compile
+            and not job_config.parallelism.tensor_parallel_only_attention
         ):
             raise RuntimeError("Async TP requires --training.compile")
         if "bitnet" in job_config.model.converters:
@@ -71,9 +83,11 @@ def parallelize_llama(
         apply_tp(
             model,
             world_mesh["tp"],
-            loss_parallel=parallel_dims.loss_parallel_enabled,
+            loss_parallel=not job_config.parallelism.disable_loss_parallel,
             enable_float8_tensorwise_tp=enable_float8_tensorwise_tp,
             enable_async_tp=job_config.parallelism.enable_async_tensor_parallel,
+            tensor_parallel_only_attention=job_config.parallelism.tensor_parallel_only_attention,
+            enable_approx_mid_norm_for_tensor_parallel=job_config.parallelism.enable_approx_mid_norm_for_tensor_parallel,
         )
 
     if job_config.model.use_flex_attn:
@@ -96,9 +110,8 @@ def parallelize_llama(
     if job_config.training.compile:
         apply_compile(model)
 
-    if (
-        parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled
-    ):  # apply FSDP or HSDP, potentially with Context Parallel
+    if parallel_dims.fsdp_enabled:
+        # apply FSDP or HSDP, potentially with Context Parallel
         if parallel_dims.dp_replicate_enabled:
             dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
         else:
@@ -143,6 +156,8 @@ def apply_tp(
     loss_parallel: bool,
     enable_float8_tensorwise_tp: bool,
     enable_async_tp: bool,
+    tensor_parallel_only_attention: bool = False,
+    enable_approx_mid_norm_for_tensor_parallel: bool = False,
 ):
     """Apply tensor parallelism."""
     # 1. Parallelize the embedding and shard its outputs (which are the first
@@ -176,16 +191,28 @@ def apply_tp(
             PrepareFloat8ModuleInput,
         )
 
-        rowwise_parallel, colwise_parallel, prepare_module_input = (
+        (
+            rowwise_parallel,
+            colwise_parallel,
+            prepare_module_input,
+            prepare_module_output,
+        ) = (
             Float8RowwiseParallel,
             Float8ColwiseParallel,
             PrepareFloat8ModuleInput,
+            None,
         )
     else:
-        rowwise_parallel, colwise_parallel, prepare_module_input = (
+        (
+            rowwise_parallel,
+            colwise_parallel,
+            prepare_module_input,
+            prepare_module_output,
+        ) = (
             RowwiseParallel,
             ColwiseParallel,
             PrepareModuleInput,
+            PrepareModuleOutput,
         )
 
     # Apply tensor + sequence parallelism to every transformer block
@@ -203,25 +230,58 @@ def apply_tp(
             "attention.wk": colwise_parallel(),
             "attention.wv": colwise_parallel(),
             "attention.wo": rowwise_parallel(output_layouts=Shard(1)),
-            "ffn_norm": SequenceParallel(),
-            "feed_forward": prepare_module_input(
-                input_layouts=(Shard(1),),
-                desired_input_layouts=(Replicate(),),
-            ),
-            "feed_forward.w1": colwise_parallel(),
-            "feed_forward.w2": rowwise_parallel(output_layouts=Shard(1)),
-            "feed_forward.w3": colwise_parallel(),
         }
-        if isinstance(transformer_block, BitNetTransformerBlock):
-            layer_plan.update({
-                "attention.wo_norm": SequenceParallel(),
-                "feed_forward.w2_norm": SequenceParallel(),
-            })
 
-        if not isinstance(transformer_block.feed_forward.out_norm, nn.Identity):
-            layer_plan["feed_forward.out_norm"] = PrepareMidNormInputOutput()
+        if tensor_parallel_only_attention:
+            pass
+        else:
+            layer_plan.update(
+                {
+                    "ffn_norm": SequenceParallel(),
+                    "feed_forward": prepare_module_input(
+                        input_layouts=(Shard(1),),
+                        desired_input_layouts=(Replicate(),),
+                    ),
+                    "feed_forward.w1": colwise_parallel(),
+                    "feed_forward.w2": rowwise_parallel(output_layouts=Shard(1)),
+                    "feed_forward.w3": colwise_parallel(),
+                }
+            )
+
+        if isinstance(transformer_block, BitNetTransformerBlock):
+            layer_plan.update(
+                {
+                    "attention.wo_norm": SequenceParallel(),
+                }
+            )
+            if not tensor_parallel_only_attention:
+                layer_plan.update(
+                    {
+                        "feed_forward.w2_norm": SequenceParallel(),
+                    }
+                )
+
+        """
+        PrepareMidNormInputOutput() is the "correct" way to do it, 
+        We need to either  disable the Async TP and compile together.
+        Or use tensor_parallel_only_attention + compile + no_async_tp.
+
+        SequenceParallel(sequence_dim=-1) is a hack to make it work with Async TP and compile together.
+        This is an "approximate" solution, and might lead to error at some point.
+        """
         if not isinstance(transformer_block.attention.o_norm, nn.Identity):
-            layer_plan["attention.o_norm"] = PrepareMidNormInputOutput()
+            if enable_approx_mid_norm_for_tensor_parallel:
+                layer_plan["attention.o_norm"] = SequenceParallel(sequence_dim=-1)
+            else:
+                layer_plan["attention.o_norm"] = PrepareMidNormInputOutput()
+
+        if not tensor_parallel_only_attention and not isinstance(
+            transformer_block.feed_forward.out_norm, nn.Identity
+        ):
+            if enable_approx_mid_norm_for_tensor_parallel:
+                layer_plan["feed_forward.out_norm"] = SequenceParallel(sequence_dim=-1)
+            else:
+                layer_plan["feed_forward.out_norm"] = PrepareMidNormInputOutput()
 
         parallelize_module(
             module=transformer_block,
@@ -246,6 +306,7 @@ _save_list = {
     torch.ops.aten.mm.default,
     torch.ops.aten._scaled_dot_product_efficient_attention.default,
     torch.ops.aten._scaled_dot_product_flash_attention.default,
+    torch.ops._c10d_functional.reduce_scatter_tensor.default,
     # for low precision training, it's useful to always save
     # the result of max, since the absolute maximum is
     # used to compute the scaling factor for quantization.
@@ -253,7 +314,9 @@ _save_list = {
 }
 
 
-def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
+def _apply_ac_to_transformer_block(
+    module: nn.Module, ac_config, *, base_fqn: Optional[str] = None
+):
     valid_ac_modes = ("full", "selective")
     if ac_config.mode not in valid_ac_modes:
         raise ValueError(
@@ -272,32 +335,44 @@ def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
             f"Valid options: 'op' or a positive int representing layer frequency"
         )
     if use_op_sac:
-        mm_funs = [torch.ops.aten.mm.default]
-
         from torch.utils.checkpoint import (
             CheckpointPolicy,
             create_selective_checkpoint_contexts,
         )
-        if isinstance(module, BitNetTransformerBlock):
-            _save_list.update({
-                torch.ops.torchao.scaled_int8_mm.default,
-                torch.ops.aten._int_mm.default,
-                torch.ops.aten.mean.default,
-            })
-            mm_funs.extend([
-                torch.ops.torchao.scaled_int8_mm.default,
-                torch.ops.aten._int_mm.default,
-            ])
+
+        mm_recompute_shapes = set()
+        if len(ac_config.per_op_sac_force_recompute_mm_shapes_by_fqns) > 0:
+            for module_fqn, submod in module.named_modules():
+                fqn = module_fqn
+                if base_fqn is not None:
+                    fqn = f"{base_fqn}.{module_fqn}"
+                if not any(
+                    filter_fqn in fqn
+                    for filter_fqn in ac_config.per_op_sac_force_recompute_mm_shapes_by_fqns
+                ):
+                    continue
+                if not isinstance(submod, nn.Linear):
+                    raise ValueError(
+                        "per_op_sac_force_recompute_mm_shapes_by_fqns expected to match "
+                        f"a nn.Linear, but got: {submod}"
+                    )
+                out_f, in_f = submod.weight.shape
+                mm_recompute_shapes.add((in_f, out_f))
+            logger.debug(
+                f"Selective op AC force recomputing mms with rhs shapes {mm_recompute_shapes}"
+            )
 
         def _get_custom_policy(meta):
             def _custom_policy(ctx, func, *args, **kwargs):
                 mode = "recompute" if ctx.is_recompute else "forward"
                 mm_count_key = f"{mode}_mm_count"
-                if func in mm_funs:
+                if func == torch.ops.aten.mm.default:
+                    if args[1].shape in mm_recompute_shapes:
+                        return CheckpointPolicy.PREFER_RECOMPUTE
                     meta[mm_count_key] += 1
                 # Saves output of all compute ops, except every second mm
                 to_save = func in _save_list and not (
-                    func in mm_funs and meta[mm_count_key] % 2 == 0
+                    func == torch.ops.aten.mm.default and meta[mm_count_key] % 2 == 0
                 )
                 return (
                     CheckpointPolicy.MUST_SAVE
@@ -330,7 +405,9 @@ def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
 def apply_ac(model: nn.Module, ac_config):
     """Apply activation checkpointing to the model."""
     for layer_id, transformer_block in model.layers.named_children():
-        transformer_block = _apply_ac_to_transformer_block(transformer_block, ac_config)
+        transformer_block = _apply_ac_to_transformer_block(
+            transformer_block, ac_config, base_fqn=f"layers.{layer_id}"
+        )
         model.layers.register_module(layer_id, transformer_block)
 
     logger.info(f"Applied {ac_config.mode} activation checkpointing to the model")
@@ -381,7 +458,9 @@ def apply_fsdp(
 
     transformer_blocks = model.layers.items()
     if model.model_args.num_mtp_modules > 0:
-        transformer_blocks = itertools.chain(transformer_blocks, model.mtp_layers.items())
+        transformer_blocks = itertools.chain(
+            transformer_blocks, model.mtp_layers.items()
+        )
     for layer_id, transformer_block in transformer_blocks:
         if reshard_after_forward_policy == "always":
             reshard_after_forward = True
@@ -430,12 +509,18 @@ def apply_ddp(
 class PrepareMidNormInputOutput(torch.distributed.tensor.parallel.ParallelStyle):
     """
     when `norm_everywhere=True`, we need to particularly handle
-    the mid-norm in mid of FFN.
+    the mid-norm in mid of FFN. (and norm before out-proj in attention)
 
     We need to
     1. Replicate[gather] the input to the norm layer,
     2. Run the norm layer
     3. Shard the output back
+
+    But it does not work with async TP and compile together. (for FFN)
+
+    ###########
+    Insteard, Can we use SequenceParallel(dim=-1) here?
+    it seems to be working + loss and norm are aligned
     """
 
     def __init__(

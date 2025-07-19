@@ -10,49 +10,12 @@ from torch.distributed.tensor.placement_types import Replicate, _StridedShard, S
 
 from torchtitan.tools.logging import logger
 from .muon_utils import zeropower_backends
-from .norm_helper import calculate_norm, NORM_FUNCTIONS
+from .norm_helper import NORM_FUNCTIONS, calculate_norm as run_norm_calculation
 import re
 
 __all__ = [
     "DistributedScion",
 ]
-
-
-def gather_and_merge(local_stats: dict, dst: int = 0):
-    world = dist.get_world_size()
-    rank = dist.get_rank()
-    dtype = torch.bfloat16
-
-    my_keys = list(local_stats.keys())
-
-    if len(my_keys) > 0:
-        val_tensor = torch.stack([local_stats[k].to(dtype) for k in my_keys])
-    else:
-        my_keys = "padding"
-        val_tensor = None
-
-    key_bucket = [None] * world if rank == dst else None
-    val_bucket = [None] * world if rank == dst else None
-
-    dist.gather_object(my_keys, key_bucket, dst=dst)
-    # dist.barrier()
-    dist.gather_object(val_tensor, val_bucket, dst=dst)
-    dist.barrier()
-
-    merged = {}
-    if rank == dst:
-        for peer, keys in enumerate(key_bucket):
-            if val_bucket[peer] is None:
-                continue
-            for k, v in zip(keys, val_bucket[peer]):
-                if k != "padding":
-                    merged[k] = v
-
-    dist.barrier()
-    if rank == dst:
-        return merged
-    else:
-        return {}
 
 
 class ParamType(Enum):
@@ -70,7 +33,6 @@ def get_param_type(p, fsdp_enabled, expert_enabled):
         return ParamType.Unknown
     if not fsdp_enabled and not expert_enabled and isinstance(p, torch.Tensor):
         return ParamType.DDP
-    device_mesh = p.device_mesh
     if p.ndim == 3:
         return ParamType.Expert
     elif fsdp_enabled:
@@ -79,7 +41,7 @@ def get_param_type(p, fsdp_enabled, expert_enabled):
         return ParamType.Unknown
 
 
-def tp_axis(placements: tuple) -> int | None:
+def tp_axis(placements: tuple, tp_enabled: bool = False) -> int | None:
     """
     Return the index in `placements` that belongs to *tensor-parallel* (TP).
 
@@ -98,30 +60,22 @@ def tp_axis(placements: tuple) -> int | None:
         if isinstance(p, Shard) and p.dim != 0:
             return i
 
+    # this is a special case, We do TP only
+    if tp_enabled and len(placements) == 1:
+        if isinstance(placements[0], Shard):
+            return 0
     return None  # could not infer
 
 
 def gather_tp_shard(tensor, tp_group, tp_world_size, original_placements):
     # TP is used, we need to gather the TP-shard params first
-    tp_mesh_dim = tp_axis(original_placements)
+    tp_mesh_dim = tp_axis(original_placements, True)
     assert tp_mesh_dim is not None, "something wrong here"
     shard_dim = original_placements[tp_mesh_dim].dim
 
     output_tensors = [torch.empty_like(tensor) for _ in range(tp_world_size)]
     dist.all_gather(output_tensors, tensor, group=tp_group)
     return torch.cat(output_tensors, dim=shard_dim)
-
-    ## below is another version using all_gather_into_tensor
-    # local = tensor if shard_dim == 0 else tensor.movedim(shard_dim, 0).contiguous()
-
-    # out_shape = list(local.shape)
-    # out_shape[0] *= tp_world_size
-    # full_flat = torch.empty(*out_shape, dtype=local.dtype, device=local.device)
-
-    # dist.all_gather_into_tensor(full_flat, local, group=tp_group)
-
-    # full = full_flat if shard_dim == 0 else full_flat.movedim(0, shard_dim)
-    # return full.contiguous()
 
 
 def calculate_shard_shape(shape, rank, world_size):
@@ -167,7 +121,7 @@ class DistributedScion(torch.optim.Optimizer):
         norm_factor,
         backend,
         backend_steps,
-        world_mesh,
+        parallel_dims,
         communication_dtype=torch.bfloat16,
         extra_reduce_for_HSDP=False,
     ):
@@ -181,33 +135,18 @@ class DistributedScion(torch.optim.Optimizer):
             backend_steps=backend_steps,
         )
         self.is_light = is_light
-        self.use_momentum = (
-            momentum > 0 and momentum < 1
-        )  # NB: use default momentum here, param groups can have its own values
 
         self.is_unconstrained = is_unconstrained
-        self.world_mesh = world_mesh
-        mesh_dim_names = world_mesh.mesh_dim_names if world_mesh is not None else None
-        # There is a "bug" in current parallel_dims.py (from upstream)
-        # FOR FSDP, it gives `dp_shard_cp`
-        # FOR DDP+FSDP, it gives `dp_shard`
-        # FOR FSDP+EP, it gives `dp_shard_0` and `dp_shard_1`
-        # FOR CP, it gives `cp`
+        self.world_mesh = parallel_dims.world_mesh
 
-        self.fsdp_enabled = mesh_dim_names is not None and any(
-            dim in mesh_dim_names
-            for dim in ["dp_shard", "dp_shard_1", "dp_shard_cp", "cp"]
-        )
-        self.expert_enabled = (
-            world_mesh is not None
-            and mesh_dim_names is not None
-            and "dp_shard_1" in mesh_dim_names
-            and "dp_shard_0" in mesh_dim_names
-        )
+        self.fsdp_enabled = parallel_dims.fsdp_enabled
+        self.expert_enabled = parallel_dims.ep_enabled
+        self.dp_replicate_enabled = parallel_dims.dp_replicate_enabled
+        self.tp_enabled = parallel_dims.tp_enabled
         self.extra_reduce_for_HSDP = extra_reduce_for_HSDP
         logger.info(
             f"Distributed Scion optimizer (is_light={self.is_light}, is_unconstrained={self.is_unconstrained}) "
-            f"is enabled with world_mesh={world_mesh} | fsdp_enabled={self.fsdp_enabled} "
+            f"is enabled with world_mesh={self.world_mesh} | fsdp_enabled={self.fsdp_enabled} "
             f"| expert_enabled={self.expert_enabled}"
         )
 
@@ -264,6 +203,7 @@ class DistributedScion(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        scale_params, scale_param_names = [], []
         embed_params, embed_param_names = [], []
         ddp_params, ddp_param_names = [], []
         fsdp_params, fsdp_param_names = [], []
@@ -290,6 +230,17 @@ class DistributedScion(torch.optim.Optimizer):
                     "embed"
                 ) or norm_factor.startswith("unembed")
 
+                if p.numel() == 1:
+                    assert (
+                        backend == "identity"
+                    ), "scale params must use identity backend"
+                    assert (
+                        norm_factor == "sign"
+                    ), "scale params must use sign norm factor"
+                    scale_params.append(p)
+                    scale_param_names.append(p_name)
+                    continue
+
                 if backend == "identity" and is_embed_norm:
                     # for these Row/Col-wise norm, there is no need to gather the gradient
                     embed_params.append(p)
@@ -308,8 +259,9 @@ class DistributedScion(torch.optim.Optimizer):
                     expert_param_names.append(p_name)
                 elif param_type == ParamType.Unknown:
                     logger.warning(
-                        f"Unknown param type: {p_name}, the optimizer will skip this param"
+                        f"Unknown param type: {p_name}, p.shape {p.shape}, grad is None[?] {p.grad is None}, the optimizer will skip this param"
                     )
+                    # raise ValueError(f"Unknown param type: {p_name}")
                     continue
                 else:
                     raise ValueError("param_type")
@@ -327,7 +279,7 @@ class DistributedScion(torch.optim.Optimizer):
         if self.log_parameters_types:
             # only log once
             logger.info(
-                f"fsdp_params: {len(fsdp_params)} | expert_params: {len(expert_params)} | ddp_params: {len(ddp_params)} | embed_params: {len(embed_params)}"
+                f"fsdp_params: {len(fsdp_params)} | expert_params: {len(expert_params)} | ddp_params: {len(ddp_params)} | embed_params: {len(embed_params)} | scale_params: {len(scale_params)}"
             )
             self.log_parameters_types = False
 
@@ -337,18 +289,14 @@ class DistributedScion(torch.optim.Optimizer):
         But we might need to gather the `local_params` too 2D full-matrixs
         if we wanna to get the norm of the gradient.
         """
-        # reset the flag for the next step
-        calculate_norm = self.need_to_calculate_norm
-        self.need_to_calculate_norm = False
-        self.step_embedding(
-            embed_params, embed_param_names, calcualte_norm=calculate_norm
-        )
-        self.step_experts(
-            expert_params, expert_param_names, calcualte_norm=calculate_norm
-        )
-        self.step_ddp(ddp_params, ddp_param_names, calcualte_norm=calculate_norm)
-        self.step_fsdp(fsdp_params, fsdp_param_names, calcualte_norm=calculate_norm)
+        self.step_scalar(scale_params, scale_param_names)
+        self.step_embedding(embed_params, embed_param_names)
+        self.step_experts(expert_params, expert_param_names)
+        self.step_ddp(ddp_params, ddp_param_names)
+        self.step_fsdp(fsdp_params, fsdp_param_names)
 
+        # reset the flag for the next step
+        self.need_to_calculate_norm = False
         return loss
 
     @torch.no_grad()
@@ -418,6 +366,8 @@ class DistributedScion(torch.optim.Optimizer):
                 g = g / g.size(1) ** 0.5
             else:
                 raise ValueError(f"Unknown norm_factor: {norm_factor}")
+        elif norm_factor == "sign":
+            g = torch.sign(g)
         elif norm_factor == "none":
             pass
         else:
@@ -447,7 +397,8 @@ class DistributedScion(torch.optim.Optimizer):
                 param.grad = None
 
     def update_bucket_params(self, params, updates, start_idx, end_idx, tp_group=None):
-
+        # TODO(JSC): we could maybe use tesnor update rather than for-loop here
+        # can be helpful for FSDP and EP params
         for idx_in_bucket in range(start_idx, end_idx):
             shift = idx_in_bucket - start_idx
             p = params[idx_in_bucket]
@@ -460,8 +411,10 @@ class DistributedScion(torch.optim.Optimizer):
                 # p.data.mul_(1 - lr)
                 p.mul_(1 - lr)
 
-            original_placements = p.placements
-            tp_mesh_dim = tp_axis(original_placements)
+            if isinstance(p, DTensor) and self.tp_enabled:
+                original_placements = p.placements
+                tp_mesh_dim = tp_axis(original_placements, p.shape == u.shape)
+
             if isinstance(p, DTensor):
                 if tp_group is None or tp_mesh_dim is None:
                     p.to_local().add_(u, alpha=-lr)
@@ -483,23 +436,69 @@ class DistributedScion(torch.optim.Optimizer):
             if momentum != 1 and self.is_light and p.grad is not None:
                 p.grad.mul_(1 - momentum)
 
+    def step_scalar(
+        self,
+        scalar_params,
+        scalar_param_names,
+        skip_update=False,
+        apply_on_weight=True,
+    ):
+        if len(scalar_params) == 0:
+            return {}
+
+        calculate_norm = self.need_to_calculate_norm
+
+        final_norms = {}
+        apply_on_weight = apply_on_weight and calculate_norm
+
+        for param_idx in range(len(scalar_params)):
+            p = scalar_params[param_idx]
+            lr, nesterov, momentum, param_kwargs = self.groups_info[
+                self.paramters_to_groups[id(p)]
+            ]
+            g = self.get_momentum_or_grad(
+                p, momentum, nesterov, update_buffer=True, gather_to_local=False
+            )
+            g = g.to_local() if isinstance(g, DTensor) else g
+
+            # the lmo of scalar is just sign
+            u = torch.sign(g)
+
+            if not skip_update:
+                self.update_bucket_params([p], [u], 0, 1)
+
+            if calculate_norm:
+                cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(
+                    scalar_param_names[param_idx]
+                )
+                p = p.to_local() if isinstance(p, DTensor) else p
+                # final_norms[f"scalar_update_supremum/{cleaned_p_name}"] = -lr * u
+                # seems no need to log the update norm ? its always equals to LR
+                final_norms[f"scalar_param_supremum/{cleaned_p_name}"] = p.abs()
+
+        self.norms_at_current_step.update(final_norms)
+
     def step_embedding(
         self,
         embed_params,
         embed_param_names,
         skip_update=False,
-        calcualte_norm=False,
         apply_on_weight=True,
     ):
         if len(embed_params) == 0:
             return {}
 
-        dp_replicate_group = None
-        if "dp_replicate" in self.world_mesh.mesh_dim_names:
+        calculate_norm = self.need_to_calculate_norm
+
+        dp_replicate_group, tp_group = None, None
+        if self.dp_replicate_enabled:
             dp_replicate_group = self.world_mesh["dp_replicate"].get_group()
 
+        if self.tp_enabled:
+            tp_group = self.world_mesh["tp"].get_group()
+
         norms_of_update, norms_of_weight, final_norms = [], [], {}
-        apply_on_weight = apply_on_weight and calcualte_norm
+        apply_on_weight = apply_on_weight and calculate_norm
 
         for param_idx in range(len(embed_params)):
             p = embed_params[param_idx]
@@ -521,11 +520,10 @@ class DistributedScion(torch.optim.Optimizer):
             # ):
             #     dist.all_reduce(u, group=dp_replicate_group, op=dist.ReduceOp.AVG)
             #     dist.barrier(group=dp_replicate_group)
-
             if not skip_update:
-                self.update_bucket_params([p], [u], 0, 1)
+                self.update_bucket_params([p], [u], 0, 1, tp_group=tp_group)
 
-        if not calcualte_norm:
+        if not calculate_norm:
             return {}
 
         # for the embedding, if we want to calculate the norm, we need to gather the gradient
@@ -542,6 +540,7 @@ class DistributedScion(torch.optim.Optimizer):
             TODO(JSC): maybe we can improve this [?]
             Rather than Gather - LMO, we can do LMO - Gather such that we can avoid compute 
             lmo twice [?]. though lmo of embedding is not expensive
+            [kind of fixed], we dont do gather here anymore
             """
             u = self.lmo(g, **param_kwargs)
 
@@ -549,9 +548,13 @@ class DistributedScion(torch.optim.Optimizer):
                 p = p.full_tensor()
 
             norm_need_transpose = "tok_embeddings" in p_name
-            norms_of_update = calculate_norm(-lr * u, transpose=norm_need_transpose)
+            norms_of_update = run_norm_calculation(
+                -lr * u, transpose=norm_need_transpose
+            )
             if apply_on_weight:
-                norms_of_weight: dict = calculate_norm(p, transpose=norm_need_transpose)
+                norms_of_weight: dict = run_norm_calculation(
+                    p, transpose=norm_need_transpose
+                )
             else:
                 norms_of_weight = None
 
@@ -582,14 +585,29 @@ class DistributedScion(torch.optim.Optimizer):
         expert_params,
         expert_param_names,
         skip_update=False,
-        calcualte_norm=False,
         apply_on_weight=True,
     ):
         if len(expert_params) == 0:
             return {}
 
-        norms_of_update, norms_of_weight, final_norms = {}, {}, {}
-        apply_on_weight = apply_on_weight and calcualte_norm
+        calculate_norm = self.need_to_calculate_norm
+
+        norms_of_update, norms_of_weight, final_norms = [], [], {}
+        apply_on_weight = apply_on_weight and calculate_norm
+
+        device = expert_params[0].device
+        fsdp_group = self.world_mesh["dp_shard_cp"].get_group()
+        world_size = dist.get_world_size(fsdp_group)
+        local_rank = dist.get_rank(fsdp_group)
+        ep_per_rank = math.ceil(expert_params[0].shape[0] / world_size)
+
+        kinds_of_norms = len(NORM_FUNCTIONS.keys())
+
+        padding_norms = torch.tensor(0.0, device=device)
+        # each rank will process `len(expert_params) * ep_per_rank` experts
+        # each expert will have `NORM_FUNCTIONS.keys()` norms
+        # so each rank will have `len(expert_params) * ep_per_rank * len(NORM_FUNCTIONS.keys())` norms
+        # globally, its [[g0-ep0, g0-ep1, g0-ep2, ...], [g1-ep0, g1-ep1, g1-ep2, ...], ...] on each rank
 
         for param_idx in range(len(expert_params)):
             p = expert_params[param_idx]
@@ -604,34 +622,84 @@ class DistributedScion(torch.optim.Optimizer):
             if not skip_update:
                 self.update_bucket_params([p], [u], 0, 1)
 
-            if calcualte_norm:
-                local_rank = dist.get_rank()
-                world_size = dist.get_world_size()
-                ep_per_rank = math.ceil(u.shape[0] / world_size)
+            if calculate_norm:
                 cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(
                     expert_param_names[param_idx]
                 )
-                moe_norm_key_template = f"track_{{task}}_{{norm_name}}/ep_{{actual_ep_idx}}/{{cleaned_p_name}}"
                 assert u.ndim == 3
                 for ep_idx in range(u.shape[0]):
-                    actual_ep_idx = ep_idx + local_rank * ep_per_rank
-                    update_norms = calculate_norm(u[ep_idx], transpose=True)
+                    update_norms = run_norm_calculation(u[ep_idx], transpose=True)
                     # Template for MoE norm keys
-                    norms_of_update.update(
-                        {
-                            moe_norm_key_template.format(
-                                task="update",
-                                norm_name=norm_name,
-                                actual_ep_idx=actual_ep_idx,
-                                cleaned_p_name=cleaned_p_name,
-                            ): norm_value
-                            for norm_name, norm_value in update_norms.items()
-                        }
-                    )
+                    norms_of_update.extend(update_norms.values())
+                    if apply_on_weight:
+                        weight_norms = run_norm_calculation(
+                            p.to_local()[ep_idx], transpose=True
+                        )
+                        norms_of_weight.extend(weight_norms.values())
 
-        # now, each rank has a dict of norms_of_update
-        # we need to all-gather the norms_of_update
-        final_norms = gather_and_merge(norms_of_update)
+        if calculate_norm:
+            expected_total = len(expert_params) * ep_per_rank * kinds_of_norms
+            pad_needed = expected_total - len(norms_of_update)
+            if pad_needed > 0:
+                norms_of_update.extend([padding_norms] * pad_needed)
+                if apply_on_weight:  # keep weight-norms aligned
+                    norms_of_weight.extend([padding_norms] * pad_needed)
+
+            norms_tensor = torch.stack(norms_of_update).float().to(device)
+            gathered_update_norms = torch.empty(
+                world_size * norms_tensor.shape[0],
+                dtype=norms_tensor.dtype,
+                device=norms_tensor.device,
+            )
+            dist.all_gather_into_tensor(
+                gathered_update_norms, norms_tensor, group=fsdp_group
+            )
+
+            if apply_on_weight:
+                norms_tensor = torch.stack(norms_of_weight).float().to(device)
+                gathered_weight_norms = torch.empty(
+                    world_size * norms_tensor.shape[0],
+                    dtype=norms_tensor.dtype,
+                    device=norms_tensor.device,
+                )
+                dist.barrier()
+                dist.all_gather_into_tensor(
+                    gathered_weight_norms, norms_tensor, group=fsdp_group
+                )
+
+            if local_rank == 0:
+                norm_names = list(NORM_FUNCTIONS.keys())
+
+                P = len(expert_params)  # parameters per rank
+                E = ep_per_rank  # experts per rank
+                K = kinds_of_norms  # norms per expert
+                block = P * E * K  # values contributed by each rank
+
+                for idx in range(world_size * block):
+                    r, rem = divmod(idx, block)  # producing rank
+                    p, rem = divmod(rem, E * K)  # parameter index
+                    e, k = divmod(rem, K)  # expert, norm indices
+
+                    actual_ep_idx = e + r * E
+                    if actual_ep_idx >= expert_params[0].shape[0]:
+                        continue  # skip pure padding slots
+
+                    cleaned_name = _remove_orig_mod_and_weight_for_p_name(
+                        expert_param_names[p]
+                    )
+                    norm_name = norm_names[k]
+
+                    key_update = (
+                        f"track_update_{norm_name}/ep_{actual_ep_idx}/{cleaned_name}"
+                    )
+                    final_norms[key_update] = gathered_update_norms[idx]
+
+                    if apply_on_weight:
+                        key_param = (
+                            f"track_param_{norm_name}/ep_{actual_ep_idx}/{cleaned_name}"
+                        )
+                        final_norms[key_param] = gathered_weight_norms[idx]
+
         self.norms_at_current_step.update(final_norms)
 
     def step_ddp(
@@ -639,21 +707,34 @@ class DistributedScion(torch.optim.Optimizer):
         ddp_params,
         ddp_param_names,
         skip_update=False,
-        calcualte_norm=False,
         apply_on_weight=True,
     ):
-        # we should only call this function on "DDP-only" case?
-        if len(ddp_params) == 0:
-            return {}
+        # Either we do DDP
+        # or we do TP,  there is no [DDP + TP] case but for safety we add sevel checks
+        # if len(ddp_params) == 0:
+        #     return {}
 
-        world_size = self.world_mesh.size()
-        rank = self.world_mesh.get_rank()
+        calculate_norm = self.need_to_calculate_norm
 
-        ## @ THIS IS A HACK
-        bucket_size = world_size
-        total_buckets = math.ceil(len(ddp_params) / bucket_size)
+        tp_group, dp_replicate_group = None, None
 
-        device = ddp_params[0].device
+        rank = 0
+        bucket_size = world_size = 1
+        total_buckets = len(ddp_params)
+
+        if self.dp_replicate_enabled:
+            dp_replicate_group = self.world_mesh["dp_replicate"].get_group()
+            world_size = dp_replicate_group.size()
+            rank = dp_replicate_group.rank()
+
+            bucket_size = world_size
+            total_buckets = math.ceil(len(ddp_params) / bucket_size)
+
+        if self.tp_enabled:
+            tp_group = self.world_mesh["tp"].get_group()
+            tp_world_size = dist.get_world_size(group=tp_group)
+
+        device = ddp_params[0].device if len(ddp_params) > 0 else torch.device("cuda")
         cast_dtype = self.communication_dtype
         zero_tensor = partial(torch.zeros, dtype=cast_dtype, device=device)
 
@@ -662,7 +743,7 @@ class DistributedScion(torch.optim.Optimizer):
             norm_name: torch.tensor(0.0, device=device)
             for norm_name in NORM_FUNCTIONS.keys()
         }
-        apply_on_weight = apply_on_weight and calcualte_norm
+        apply_on_weight = apply_on_weight and calculate_norm
 
         # for DDP, we need to first update the buffer
         for param_idx in range(len(ddp_params)):
@@ -688,6 +769,11 @@ class DistributedScion(torch.optim.Optimizer):
                 g = self.get_momentum_or_grad(
                     p, momentum, nesterov, update_buffer=False, gather_to_local=False
                 )
+                if isinstance(g, DTensor) and self.tp_enabled:
+                    g = gather_tp_shard(
+                        g.to_local(), tp_group, tp_world_size, g.placements
+                    ).to(dtype=cast_dtype)
+
             else:
                 # To avoid idle stream, we padding the last rank
                 p = ddp_params[end_idx - 1]
@@ -701,95 +787,115 @@ class DistributedScion(torch.optim.Optimizer):
 
             if not skip_update:
                 # Step 3: FOR DDP, we do all-gather
-                gather_lists = [None] * world_size
-                for i in range(world_size):
-                    param_idx = start_idx + i
-                    if i == rank or param_idx >= len(ddp_params):
-                        gather_lists[i] = u.to(dtype=cast_dtype)
-                    elif param_idx < len(ddp_params):
-                        p = ddp_params[start_idx + i]
-                        gather_lists[i] = zero_tensor(p.shape)
-
-                dist.all_gather(gather_lists, u.to(dtype=cast_dtype))
+                if self.dp_replicate_enabled:
+                    # only gather params when we doing DDP + BUCKET
+                    gather_lists = [None] * world_size
+                    for i in range(world_size):
+                        param_idx = start_idx + i
+                        if i == rank or param_idx >= len(ddp_params):
+                            gather_lists[i] = u.to(dtype=cast_dtype)
+                        elif param_idx < len(ddp_params):
+                            p = ddp_params[start_idx + i]
+                            gather_lists[i] = zero_tensor(p.shape)
+                    dist.all_gather(
+                        gather_lists, u.to(dtype=cast_dtype), group=dp_replicate_group
+                    )
+                    if self.tp_enabled:
+                        # only if DP+TP we need to barrier here other-wise its automatically synced
+                        dist.barrier(group=dp_replicate_group)
+                else:
+                    # other wise (TP only), dp world_size is 1
+                    gather_lists = [u.to(dtype=cast_dtype)]
 
                 # Step 4: Update the parameters
-                self.update_bucket_params(ddp_params, gather_lists, start_idx, end_idx)
+                self.update_bucket_params(
+                    ddp_params, gather_lists, start_idx, end_idx, tp_group=tp_group
+                )
 
-            if calcualte_norm:
+            if calculate_norm:
                 # so here, we already have update of each rank
                 p = ddp_params[min(current_rank_idx, len(ddp_params) - 1)]
                 lr, *_ = self.groups_info[self.paramters_to_groups[id(p)]]
 
                 if current_rank_idx < end_idx:
-                    norms_of_update.extend(calculate_norm(-lr * u).values())
+                    norms_of_update.extend(run_norm_calculation(-lr * u).values())
                 else:
                     norms_of_update.extend(padding_norms.values())
                 if apply_on_weight:
                     if current_rank_idx < end_idx:
-                        norms_of_weight.extend(calculate_norm(p).values())
+                        if isinstance(p, DTensor) and self.tp_enabled:
+                            p = gather_tp_shard(
+                                p.to_local(), tp_group, tp_world_size, p.placements
+                            ).to(dtype=cast_dtype)
+
+                        norms_of_weight.extend(run_norm_calculation(p).values())
                     else:
                         norms_of_weight.extend(padding_norms.values())
 
-        if calcualte_norm and len(norms_of_update) > 0:
-
+        if calculate_norm and len(norms_of_update) > 0:
             norms_tensor = torch.stack(norms_of_update).to(device=device).float()
-            gathered_update_norms = torch.empty(
-                world_size * norms_tensor.shape[0],
-                dtype=norms_tensor.dtype,
-                device=norms_tensor.device,
-            )
-            dist.barrier()
-            dist.all_gather_into_tensor(gathered_update_norms, norms_tensor)
-            if apply_on_weight:
-                norms_tensor = torch.stack(norms_of_weight).to(device=device).float()
-                gathered_weight_norms = torch.empty(
+            if self.dp_replicate_enabled:
+                gathered_update_norms = torch.empty(
                     world_size * norms_tensor.shape[0],
                     dtype=norms_tensor.dtype,
                     device=norms_tensor.device,
                 )
-                dist.barrier()
-                dist.all_gather_into_tensor(gathered_weight_norms, norms_tensor)
+                dist.barrier(group=dp_replicate_group)
+                dist.all_gather_into_tensor(gathered_update_norms, norms_tensor)
+            else:
+                gathered_update_norms = norms_tensor
+
+            if apply_on_weight:
+                norms_tensor = torch.stack(norms_of_weight).to(device=device).float()
+                if self.dp_replicate_enabled:
+                    gathered_weight_norms = torch.empty(
+                        world_size * norms_tensor.shape[0],
+                        dtype=norms_tensor.dtype,
+                        device=norms_tensor.device,
+                    )
+                    dist.barrier(group=dp_replicate_group)
+                    dist.all_gather_into_tensor(gathered_weight_norms, norms_tensor)
+                else:
+                    gathered_weight_norms = norms_tensor
 
             if rank == 0:
                 ddp_norm_key_template = (
                     f"track_{{task_name}}_{{norm_name}}/{{cleaned_p_name}}"
                 )
-                reordered_names = []
-                # for param_idx in range(len(ddp_params)):
-                #     cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(
-                #         ddp_param_names[param_idx]
-                #     )
-                #     reordered_names.append(cleaned_p_name)
-                for rank_idx in range(world_size):
-                    # The inner loop jumps by world_size to get all params for a given rank
-                    for param_idx in range(rank_idx, len(ddp_params), world_size):
-                        cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(
-                            ddp_param_names[param_idx]
-                        )
-                        reordered_names.append(cleaned_p_name)
-                valid_norms = len(ddp_params) * len(NORM_FUNCTIONS.keys())
-                gathered_update_norms = gathered_update_norms[:valid_norms]
-                count = 0
-                for param_idx in range(len(ddp_params)):
-                    cleaned_p_name = reordered_names[param_idx]
-                    for norm_name in NORM_FUNCTIONS.keys():
+                num_norm_types = len(NORM_FUNCTIONS.keys())
+                # total_buckets is already defined
+
+                for param_idx, p_name in enumerate(ddp_param_names):
+                    cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(p_name)
+
+                    # Determine which rank and bucket handled this parameter
+                    param_rank = param_idx % world_size
+                    param_bucket = param_idx // world_size
+
+                    for norm_idx, norm_name in enumerate(NORM_FUNCTIONS.keys()):
+                        # Calculate the correct index in the gathered tensor
+                        base_idx = (
+                            param_rank * total_buckets + param_bucket
+                        ) * num_norm_types
+                        norm_value_idx = base_idx + norm_idx
+
                         final_norms[
                             ddp_norm_key_template.format(
                                 task_name="update",
                                 norm_name=norm_name,
                                 cleaned_p_name=cleaned_p_name,
                             )
-                        ] = gathered_update_norms[count]
+                        ] = gathered_update_norms[norm_value_idx]
+
                         if apply_on_weight:
-                            # gathered_weight_norms = gathered_weight_norms[:valid_norms]
                             final_norms[
                                 ddp_norm_key_template.format(
                                     task_name="param",
                                     norm_name=norm_name,
                                     cleaned_p_name=cleaned_p_name,
                                 )
-                            ] = gathered_weight_norms[count]
-                        count += 1
+                            ] = gathered_weight_norms[norm_value_idx]
+            dist.barrier()
 
         self.norms_at_current_step.update(final_norms)
 
@@ -798,11 +904,11 @@ class DistributedScion(torch.optim.Optimizer):
         fsdp_params,
         fsdp_param_names,
         skip_update=False,
-        calcualte_norm=False,
         apply_on_weight=True,
     ):
         if len(fsdp_params) == 0:
             return {}
+        calculate_norm = self.need_to_calculate_norm
         tp_group, dp_replicate_group = None, None
         """
         To make FSDP+DP works, we lets step_fsdp work on each dp_replicate separately.
@@ -813,10 +919,10 @@ class DistributedScion(torch.optim.Optimizer):
         # here we should use `dp_shard_cp` rather then `dp_shard` as of CP is also part of the dp_shard
         fsdp_group = self.world_mesh["dp_shard_cp"].get_group()
 
-        if "dp_replicate" in self.world_mesh.mesh_dim_names:
+        if self.dp_replicate_enabled:
             dp_replicate_group = self.world_mesh["dp_replicate"].get_group()
 
-        if "tp" in self.world_mesh.mesh_dim_names:
+        if self.tp_enabled:
             tp_group = self.world_mesh["tp"].get_group()
             tp_world_size = dist.get_world_size(group=tp_group)
 
@@ -838,7 +944,7 @@ class DistributedScion(torch.optim.Optimizer):
             for norm_name in NORM_FUNCTIONS.keys()
         }
 
-        apply_on_weight = apply_on_weight and calcualte_norm
+        apply_on_weight = apply_on_weight and calculate_norm
 
         # Process each bucket
         for bucket_idx in range(total_buckets):
@@ -933,12 +1039,12 @@ class DistributedScion(torch.optim.Optimizer):
                     tp_group=tp_group,
                 )
 
-            if calcualte_norm:
+            if calculate_norm:
                 if start_idx + rank < end_idx:
                     lr, *_ = self.groups_info[
                         self.paramters_to_groups[id(fsdp_params[start_idx + rank])]
                     ]
-                    norms = calculate_norm(-lr * u)
+                    norms = run_norm_calculation(-lr * u)
                 else:
                     norms = padding_norms
                 norms_of_update.extend(norms.values())
@@ -975,12 +1081,12 @@ class DistributedScion(torch.optim.Optimizer):
                     full_weight = torch.cat(recv_list, dim=0)
 
                     if start_idx + rank < end_idx:
-                        norms = calculate_norm(full_weight)
+                        norms = run_norm_calculation(full_weight)
                     else:
                         norms = padding_norms
                     norms_of_weight.extend(norms.values())
         # Beblow we need to all-gather the norms of update to rank-0
-        if calcualte_norm and len(norms_of_update) > 0:
+        if calculate_norm and len(norms_of_update) > 0:
             # Convert norms_of_update to a flat tensor for all-gather
             # Each rank has bucket_size * len(NORM_FUNCTIONS) norm values
             norms_tensor = torch.stack(norms_of_update).to(device=device).float()
@@ -1007,47 +1113,53 @@ class DistributedScion(torch.optim.Optimizer):
                 )
 
             if rank == 0:
-                # Only rank 0 processes the gathered data
-                reordered_names = []
-                # Loop through ranks, then through the parameters handled by each rank
-                for rank_idx in range(world_size):
-                    # The inner loop jumps by world_size to get all params for a given rank
-                    for param_idx in range(rank_idx, len(fsdp_params), world_size):
-                        cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(
-                            fsdp_param_names[param_idx]
-                        )
-                        reordered_names.append(cleaned_p_name)
+                # ----- only rank 0 reconstructs -----
+                num_norm_types = len(NORM_FUNCTIONS)
+                entries_per_rank = total_buckets * num_norm_types
 
-                valid_norms = len(fsdp_params) * len(NORM_FUNCTIONS.keys())
-                gathered_update_norms = gathered_update_norms[:valid_norms]
+                # pre-clean names once
+                cleaned_names = [
+                    _remove_orig_mod_and_weight_for_p_name(pn)
+                    for pn in fsdp_param_names
+                ]
 
-                count = 0
                 fsdp_norm_key_template = (
-                    f"track_{{task_name}}_{{norm_name}}/{{cleaned_p_name}}"
+                    "track_{task_name}_{norm_name}/{cleaned_p_name}"
                 )
 
-                for param_idx in range(len(fsdp_params)):
-                    cleaned_p_name = reordered_names[param_idx]
-                    for norm_name in NORM_FUNCTIONS.keys():
+                assert (
+                    gathered_update_norms.numel() == world_size * entries_per_rank
+                ), "update norms size mismatch"
+                if apply_on_weight:
+                    assert (
+                        gathered_weight_norms.numel() == world_size * entries_per_rank
+                    ), "weight norms size mismatch"
+
+                for param_idx, cleaned_p_name in enumerate(cleaned_names):
+                    r = param_idx % world_size  # rank that owned this param
+                    b = param_idx // world_size  # bucket index on that rank
+                    base = r * entries_per_rank + b * num_norm_types
+
+                    for norm_idx, norm_name in enumerate(NORM_FUNCTIONS.keys()):
+                        idx = base + norm_idx
+                        # Index must exist thanks to padding
                         final_norms[
                             fsdp_norm_key_template.format(
                                 task_name="update",
                                 norm_name=norm_name,
                                 cleaned_p_name=cleaned_p_name,
                             )
-                        ] = gathered_update_norms[count]
+                        ] = gathered_update_norms[idx]
 
                         if apply_on_weight:
-                            # gathered_weight_norms = gathered_weight_norms[:valid_norms]
                             final_norms[
                                 fsdp_norm_key_template.format(
                                     task_name="param",
                                     norm_name=norm_name,
                                     cleaned_p_name=cleaned_p_name,
                                 )
-                            ] = gathered_weight_norms[count]
+                            ] = gathered_weight_norms[idx]
 
-                        count += 1
             dist.barrier(group=fsdp_group)
         self.norms_at_current_step.update(final_norms)
 
@@ -1059,7 +1171,9 @@ class DistributedScion(torch.optim.Optimizer):
         if g is None or not p.requires_grad:
             return None
 
-        if not self.is_light and momentum != 1:
+        use_momentum = momentum > 0 and momentum < 1
+
+        if not self.is_light and use_momentum:
             state = self.state[p]
             if "momentum_buffer" not in state.keys():
                 if update_buffer:
@@ -1086,5 +1200,4 @@ class DistributedScion(torch.optim.Optimizer):
 
         if gather_to_local and isinstance(g, DTensor):
             g = g.redistribute(placements=[Replicate()] * g.device_mesh.ndim).to_local()
-
         return g

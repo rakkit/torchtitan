@@ -149,6 +149,20 @@ class JobConfig:
             help="How often to log parameter norm metrics to TensorBoard, in iterations",
         )
         self.parser.add_argument(
+            "--metrics.norms_to_log",
+            type=string_list,
+            default=[
+                "rms_to_rms",
+                "l1_to_rms",
+                "rms_to_l1",
+                "supremum",
+                "condition_number",
+                # "frobenius_norm", "stable_rank", "effective_rank", "average_entry_size"
+            ],
+            # default norms to log, aligns to previous implementation
+            help="Norms to log",
+        )
+        self.parser.add_argument(
             "--metrics.enable_tensorboard",
             action="store_true",
             help="Whether to log metrics to TensorBoard",
@@ -296,12 +310,46 @@ class JobConfig:
                 to obtain its init std factor.""",
         )
         self.parser.add_argument(
+            "--model.depth_init",
+            type=str,
+            default="identity",
+            choices=["identity", "depth", "total_depth"],
+            help="""
+                Whether to initialize the model depth-wise.
+                - 'identity': initialize the model depth-wise.
+                - 'depth': initialize layer by `current` layer id
+                - 'total_depth': initialize layer by `total` number of layers
+            """,
+        )
+        self.parser.add_argument(
+            "--model.residual_scale",
+            type=str,
+            default="identity",
+            choices=[
+                "identity",
+                "depth_scale",
+                "complete_p",
+            ],
+            help="""
+                Whether to scale the residual connection in forward pass.
+                - 'identity': no scaling
+                - 'depth_scale': see modular Norms
+                - 'complete_p': see completeP
+            """,
+        )
+        self.parser.add_argument(
             "--model.norm_type",
             type=str,
             default="rmsnorm",
-            choices=["layernorm", "np_layernorm", "rmsnorm", "np_rmsnorm"],
+            choices=[
+                "layernorm",
+                "np_layernorm",
+                "rmsnorm",
+                "np_rmsnorm",
+                "ss_rmsnorm",
+            ],
             help="""
-                Type of layer normalization to use [layernorm, np_layernorm, rmsnorm, np_rmsnorm]
+                Type of layer normalization to use [layernorm, np_layernorm, rmsnorm, np_rmsnorm, ss_rmsnorm]
             """,
         )
         self.parser.add_argument(
@@ -368,7 +416,10 @@ class JobConfig:
             "--optimizer.eps", type=float, default=1e-8, help="Epsilon value to use"
         )
         self.parser.add_argument(
-            "--optimizer.weight_decay", type=float, default=0.1, help="Weight decay value to use"
+            "--optimizer.weight_decay",
+            type=float,
+            default=0.1,
+            help="Weight decay value to use",
         )
         self.parser.add_argument(
             "--optimizer.is_light",
@@ -384,7 +435,7 @@ class JobConfig:
             "--optimizer.zeropower_backend",
             type=str,
             default="newtonschulz5",
-            choices=["newtonschulz5", "svd"],
+            choices=["newtonschulz5", "svd", "polar_express", "identity"],
             help="Which zeropower_backend to use",
         )
         self.parser.add_argument(
@@ -394,7 +445,10 @@ class JobConfig:
             help="Number of steps for the Scion backend",
         )
         self.parser.add_argument(
-            "--optimizer.momentum", type=float, default=0.95, help="Scion momentum to use",
+            "--optimizer.momentum",
+            type=float,
+            default=0.95,
+            help="Scion momentum to use",
         )
         self.parser.add_argument(
             "--optimizer.nesterov",
@@ -418,7 +472,7 @@ class JobConfig:
             help="String to match for unembedding layer parameter group",
         )
         self.parser.add_argument(
-            "--optimizer.gate_str_match",
+            "--optimizer.router_str_match",
             type=str,
             help="String to match for MoE gate layer parameter group",
         )
@@ -491,7 +545,10 @@ class JobConfig:
 
         # training configs
         self.parser.add_argument(
-            "--training.dataset", type=string_list, default=["c4_test"], help="Dataset to use"
+            "--training.dataset",
+            type=string_list,
+            default=["c4_test"],
+            help="Dataset to use",
         )
         self.parser.add_argument(
             "--training.dataset_path",
@@ -724,6 +781,16 @@ class JobConfig:
             help="Whether to apply async tensor parallel (currently only effective when compile is enabled)",
         )
         self.parser.add_argument(
+            "--parallelism.tensor_parallel_only_attention",
+            action="store_true",
+            help="If true, only apply tensor parallel to the attention part of the model",
+        )
+        self.parser.add_argument(
+            "--parallelism.enable_approx_mid_norm_for_tensor_parallel",
+            action="store_true",
+            help="If true, use approx mid-norm for tensor parallel",
+        )
+        self.parser.add_argument(
             "--parallelism.pipeline_parallel_degree",
             type=int,
             default=1,
@@ -952,6 +1019,17 @@ class JobConfig:
             help="""
                 Selective activation checkpointing options ['int', 'op'].
                 'int' (e.g., 2) for every nth layer, or 'op' for op level ac.
+            """,
+        )
+        self.parser.add_argument(
+            "--activation_checkpoint.per_op_sac_force_recompute_mm_shapes_by_fqns",
+            type=string_list,
+            default=["moe.router.gate"],
+            help="""
+             When per-op selective ac is used, this list of fully qualified names is used
+            to determine which mm shapes to force recompute, rather than being considered
+            by rest of the sac policy, e.g save every other mm. Only nn.Linear modules are
+            supported today.
             """,
         )
 

@@ -104,11 +104,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 tp=parallelism_config.tensor_parallel_degree,
                 pp=parallelism_config.pipeline_parallel_degree,
                 ep=parallelism_config.expert_parallel_degree,
-                ep_mode=parallelism_config.expert_parallel_mode,
                 world_size=world_size,
-                enable_loss_parallel=not parallelism_config.disable_loss_parallel,
             )
+
         else:
+            raise NotImplementedError("FT is not enabled")
+            """
+            This branch is removed at the main stream. Afater rebase we will not bother with `ft.FTParallelDims`
+            """
             self.parallel_dims = parallel_dims = ft.FTParallelDims(
                 dp_shard=parallelism_config.data_parallel_shard_degree,
                 dp_replicate=parallelism_config.data_parallel_replicate_degree,
@@ -124,7 +127,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         dist_utils.init_distributed(job_config, self.device)
 
         # build meshes
-        self.world_mesh = world_mesh = parallel_dims.build_mesh(device_type=device_type)
+        world_mesh = parallel_dims.world_mesh
         if parallel_dims.dp_enabled:
             dp_mesh = world_mesh["dp"]
             dp_degree, dp_rank = dp_mesh.size(), dp_mesh.get_local_rank()
@@ -359,8 +362,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.model_parts[0], enable_activation_offloading=False
         )
 
+        loss_parallel_enabled = (
+            parallel_dims.tp_enabled and not parallelism_config.disable_loss_parallel
+        )
         self.train_context = dist_utils.get_train_context(
-            parallel_dims.loss_parallel_enabled,
+            loss_parallel_enabled,
             parallelism_config.enable_compiled_autograd,
         )
 
@@ -429,9 +435,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         labels = labels.to(device_type)
         return input_dict, labels
 
-    def batch_backward(self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor):
+    def forward_backward_step(
+        self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor
+    ):
         model_parts = self.model_parts
-        world_mesh = self.world_mesh
         parallel_dims = self.parallel_dims
 
         aux_loss = None
@@ -442,7 +449,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         inputs = input_dict["input"]
         optional_context_parallel_ctx = (
             dist_utils.create_context_parallel_ctx(
-                cp_mesh=world_mesh["cp"],
+                cp_mesh=parallel_dims.world_mesh["cp"],
                 cp_buffers=[inputs, labels] + [m.freqs_cis for m in model_parts],
                 cp_seq_dims=[1, 1] + [0 for _ in model_parts],
                 cp_no_restore_buffers={inputs, labels},
@@ -501,21 +508,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
         model_parts = self.model_parts
-        world_mesh = self.world_mesh
         parallel_dims = self.parallel_dims
+
+        accumulated_losses = []
+        accumulated_aux_losses, accumulated_moe_entropy_per_layer = [], []
 
         for microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = self.next_batch(data_iterator)
-            loss, aux_loss, moe_entropy_per_layer = self.batch_backward(
+            loss, aux_loss, moe_entropy_per_layer = self.forward_backward_step(
                 input_dict, labels
             )
-            self.metrics_processor.accumulated_losses.append(loss.detach())
+            accumulated_losses.append(loss.detach())
             if aux_loss is not None:
-                self.metrics_processor.accumulated_aux_losses.append(aux_loss.detach())
+                accumulated_aux_losses.append(aux_loss.detach())
             if moe_entropy_per_layer is not None:
-                self.metrics_processor.accumulated_moe_entropy_per_layer.append(
-                    moe_entropy_per_layer,
-                )
+                accumulated_moe_entropy_per_layer.append(moe_entropy_per_layer)
 
         # for MoE model, update the gate bias
         token_selection_per_layer = []
@@ -530,7 +537,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 [p for m in model_parts for p in m.parameters()],
                 self.job_config.training.max_norm,
                 foreach=True,
-                pp_mesh=self.world_mesh["pp"] if parallel_dims.pp_enabled else None,
+                pp_mesh=(
+                    parallel_dims.world_mesh["pp"] if parallel_dims.pp_enabled else None
+                ),
             )
         self.checkpointer.maybe_wait_for_staging()
 
@@ -548,43 +557,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.
-        loss = torch.sum(torch.stack(self.metrics_processor.accumulated_losses))
-        self.metrics_processor.accumulated_losses.clear()
-        if len(self.metrics_processor.accumulated_aux_losses) > 0:
-            aux_loss = torch.sum(
-                torch.stack(self.metrics_processor.accumulated_aux_losses)
-            )
-            self.metrics_processor.accumulated_aux_losses.clear()
-        if len(self.metrics_processor.accumulated_moe_entropy_per_layer) > 0:
+        loss = torch.sum(torch.stack(accumulated_losses))
+        if len(accumulated_aux_losses) > 0:
+            aux_loss = torch.sum(torch.stack(accumulated_aux_losses))
+        if len(accumulated_moe_entropy_per_layer) > 0:
             moe_entropy_per_layer = {}
-            _list_of_dict = self.metrics_processor.accumulated_moe_entropy_per_layer
+            _list_of_dict = accumulated_moe_entropy_per_layer
             for layer_idx in _list_of_dict[0].keys():
                 moe_entropy_per_layer[layer_idx] = torch.sum(
                     torch.stack([d[layer_idx] for d in _list_of_dict]),
                 )
-
-            self.metrics_processor.accumulated_moe_entropy_per_layer.clear()
 
         # log metrics
         if not self.metrics_processor.should_log(self.step):
             return
 
         bias_dict = None
-        if (
-            parallel_dims.dp_replicate_enabled
-            or parallel_dims.dp_shard_enabled
-            or parallel_dims.cp_enabled
-        ):
+        if parallel_dims.dp_cp_enabled:
             loss = loss.detach()
             global_avg_loss, global_max_loss = (
-                dist_utils.dist_mean(loss, world_mesh["dp_cp"]),
-                dist_utils.dist_max(loss, world_mesh["dp_cp"]),
+                dist_utils.dist_mean(loss, parallel_dims.world_mesh["dp_cp"]),
+                dist_utils.dist_max(loss, parallel_dims.world_mesh["dp_cp"]),
             )
             if aux_loss is not None:
-                aux_loss = dist_utils.dist_mean(aux_loss, world_mesh["dp_cp"])
+                aux_loss = dist_utils.dist_mean(
+                    aux_loss, parallel_dims.world_mesh["dp_cp"]
+                )
             if moe_entropy_per_layer is not None:
                 moe_entropy_per_layer = {
-                    k: dist_utils.dist_mean(v, world_mesh["dp_cp"])
+                    k: dist_utils.dist_mean(v, parallel_dims.world_mesh["dp_cp"])
                     for (k, v) in moe_entropy_per_layer.items()
                 }
                 bias_dict = {}
@@ -672,7 +673,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         timeout=timedelta(
                             seconds=job_config.comm.train_timeout_seconds
                         ),
-                        world_mesh=self.world_mesh,
+                        world_mesh=self.parallel_dims.world_mesh,
                     )
 
         if torch.distributed.get_rank() == 0:

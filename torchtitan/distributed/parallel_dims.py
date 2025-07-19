@@ -4,13 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
 
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from torchtitan.tools.logging import logger
+from torchtitan.tools.utils import device_type
 
 
 __all__ = ["ParallelDims"]
@@ -24,9 +24,9 @@ class ParallelDims:
     tp: int
     pp: int
     ep: int
-    ep_mode: str
     world_size: int
-    enable_loss_parallel: bool
+
+    _world_mesh: DeviceMesh = None
 
     def __post_init__(self):
         self._validate()
@@ -54,45 +54,46 @@ class ParallelDims:
         )
 
         if ep > 1:
-            assert self.ep_mode in [
-                "naive_dp2ep",
-                "none",
-            ], "Invalid expert parallelism mode"
-            if self.ep_mode == "naive_dp2ep":
-                assert ep % cp == 0 and (dp_shard * cp) % ep == 0
+            # EP would borrow all cp and some dp_shard degree
+            assert ep % cp == 0 and (dp_shard * cp) % ep == 0
 
-    def build_mesh(self, device_type: str) -> DeviceMesh:
-        if self.ep_mode == "naive_dp2ep" and self.ep > 1:
-            return self._build_mesh_with_naive_dp2ep(device_type, init_device_mesh)
+    def build_mesh(self) -> DeviceMesh:
+        # TODO: Current implementation of ParallelDims for dp2ep Expert Parallel
+        #       is not very clean, due to the limited support from DeviceMesh
+        #       for creating two staggered meshes. Will improve.
+        if self.ep > 1:
+            return self._build_mesh_with_ep()
+        else:
+            return self._build_mesh_without_ep()
 
-        return self._build_mesh(device_type, init_device_mesh)
-
-    def _build_mesh_with_naive_dp2ep(
-            self,
-            device_type: str,
-            init_device_mesh_fn: Callable,
-    ):
-        # In dp2ep, dp_shard and ep are derived submeshes:
-        # dp_shard = dp_shard_1 * dp_shard_2
-        # ep = dp_shard_2 * cp
-        dp_shard_1 = self.dp_shard * self.cp // self.ep
-        dp_shard_2 = self.ep // self.cp
+    def _build_mesh_with_ep(self) -> DeviceMesh:
+        # With ep, dp_shard and ep are derived submeshes:
+        # dp_shard = dp_shard_mod_ep * dp_shard_in_ep
+        # ep = dp_shard_in_ep * cp
+        dp_shard_mod_ep = self.dp_shard * self.cp // self.ep
+        dp_shard_in_ep = self.ep // self.cp
 
         dims = []
         names = []
         for d, name in zip(
-            [self.pp, self.dp_replicate, dp_shard_1, dp_shard_2, self.cp, self.tp],
-            ["pp", "dp_replicate", "dp_shard_1", "dp_shard_2", "cp", "tp"],
+            [
+                self.pp,
+                self.dp_replicate,
+                dp_shard_mod_ep,
+                dp_shard_in_ep,
+                self.cp,
+                self.tp,
+            ],
+            ["pp", "dp_replicate", "dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp"],
         ):
-            # dp_shard_1 is needed even if it's 1, whose FSDP wrapping
+            # dp_shard_mod_ep is needed even if it's 1, whose FSDP wrapping
             # helps the MoE layers do mixed precision training
-            if d > 1 or name == "dp_shard_1":
+            if d > 1 or name == "dp_shard_mod_ep":
                 dims.append(d)
                 names.append(name)
 
         logger.info(f"Building {len(dims)}-D device mesh with {names}, {dims}")
-        names = tuple(names)
-        mesh = init_device_mesh_fn(device_type, dims, mesh_dim_names=names)
+        mesh = init_device_mesh(device_type, dims, mesh_dim_names=names)
 
         # Create all the submesh here to ensure all required process groups are
         # initialized:
@@ -108,15 +109,15 @@ class ParallelDims:
         if self.dp_replicate_enabled:
             dp_mesh_dim_names.append("dp_replicate")
             dp_cp_mesh_dim_names.append("dp_replicate")
-        # dp_shard_1 is always needed, even if it's 1
-        dp_mesh_dim_names.append("dp_shard_1")
-        dp_shard_cp_mesh_dim_names.append("dp_shard_1")
-        dp_cp_mesh_dim_names.append("dp_shard_1")
-        if "dp_shard_2" in names:
-            dp_mesh_dim_names.append("dp_shard_2")
-            dp_shard_cp_mesh_dim_names.append("dp_shard_2")
-            dp_cp_mesh_dim_names.append("dp_shard_2")
-            ep_mesh_dim_names.append("dp_shard_2")
+        # dp_shard_mod_ep is always needed, even if it's 1
+        dp_mesh_dim_names.append("dp_shard_mod_ep")
+        dp_shard_cp_mesh_dim_names.append("dp_shard_mod_ep")
+        dp_cp_mesh_dim_names.append("dp_shard_mod_ep")
+        if "dp_shard_in_ep" in names:
+            dp_mesh_dim_names.append("dp_shard_in_ep")
+            dp_shard_cp_mesh_dim_names.append("dp_shard_in_ep")
+            dp_cp_mesh_dim_names.append("dp_shard_in_ep")
+            ep_mesh_dim_names.append("dp_shard_in_ep")
         if self.cp_enabled:
             dp_shard_cp_mesh_dim_names.append("cp")
             dp_cp_mesh_dim_names.append("cp")
@@ -125,17 +126,11 @@ class ParallelDims:
         mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
         mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
         mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
-        # mesh[tuple(ep_mesh_dim_names)]._flatten(mesh_dim_name="ep")
-
         mesh[tuple(ep_mesh_dim_names)]._flatten(mesh_dim_name="ep")
+
         return mesh
 
-    def _build_mesh(
-        self,
-        device_type: str,
-        init_device_mesh_fn: Callable,
-    ) -> DeviceMesh:
-
+    def _build_mesh_without_ep(self) -> DeviceMesh:
         dims = []
         names = []
         for d, name in zip(
@@ -147,7 +142,7 @@ class ParallelDims:
                 names.append(name)
 
         logger.info(f"Building {len(dims)}-D device mesh with {names}, {dims}")
-        mesh = init_device_mesh_fn(device_type, dims, mesh_dim_names=names)
+        mesh = init_device_mesh(device_type, dims, mesh_dim_names=names)
 
         # Create all the submesh here to ensure all required process groups are
         # initialized:
@@ -181,6 +176,14 @@ class ParallelDims:
         return mesh
 
     @property
+    def world_mesh(self) -> str:
+        # doing late init so ParallelDims can still be used as a lightweight
+        # dataclass without having to initialize the world mesh
+        if self._world_mesh is None:
+            self._world_mesh = self.build_mesh()
+        return self._world_mesh
+
+    @property
     def dp_enabled(self):
         return self.dp_replicate > 1 or self.dp_shard > 1
 
@@ -197,6 +200,14 @@ class ParallelDims:
         return self.cp > 1
 
     @property
+    def dp_cp_enabled(self):
+        return self.dp_enabled or self.cp_enabled
+
+    @property
+    def fsdp_enabled(self):
+        return self.dp_shard_enabled or self.cp_enabled
+
+    @property
     def tp_enabled(self):
         return self.tp > 1
 
@@ -209,13 +220,24 @@ class ParallelDims:
         return self.ep > 1
 
     @property
-    def loss_parallel_enabled(self):
-        return self.tp > 1 and self.enable_loss_parallel
+    def loss_average_denominator(self) -> int:
+        return self.dp_replicate * self.dp_shard * self.cp
 
     @cached_property
     def non_data_parallel_size(self):
         return self.cp * self.tp * self.pp
 
-    @property
-    def loss_average_denominator(self) -> int:
-        return self.dp_replicate * self.dp_shard * self.cp
+    @cached_property
+    def seq_len_divisor(self):
+        # Sequence Parallel requires that seq_len be divisible by TP degree.
+        # https://github.com/pytorch/torchtitan/pull/640#discussion_r1849481001
+
+        # Context Parallel requires that seq_len be divisible by 2 * CP degree,
+        # when load balancing is enabled (by default).
+        # https://github.com/pytorch/pytorch/blob/4f62dcc/torch/distributed/tensor/experimental/_attention.py#L1246
+        return self.tp * (self.cp * 2)
+
+    @cached_property
+    def dense_params_mesh_ndim(self):
+        # Note: In dp2ep EP, EP params mesh ndim is 1 more due to the 'ep' mesh
+        return self.dp_replicate_enabled + self.fsdp_enabled + self.tp_enabled

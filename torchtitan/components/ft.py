@@ -82,39 +82,40 @@ def init_ft_manager(job: JobConfig) -> FTManager:
     )
 
 
-@dataclass
-class FTParallelDims(ParallelDims):
-    ft_manager: FTManager
+# This branch is removed at the main stream. Afater rebase we will not bother with `ft.FTParallelDims`
+# @dataclass
+# class FTParallelDims(ParallelDims):
+#     ft_manager: FTManager
 
-    def build_mesh(self, device_type: str) -> DeviceMesh:
-        def func(
-            device_type: str, mesh_shape: list[int], mesh_dim_names: list[str]
-        ) -> DeviceMesh:
-            from torchft.process_group import ft_init_device_mesh
+#     def build_mesh(self, device_type: str) -> DeviceMesh:
+#         def func(
+#             device_type: str, mesh_shape: list[int], mesh_dim_names: list[str]
+#         ) -> DeviceMesh:
+#             from torchft.process_group import ft_init_device_mesh
 
-            return ft_init_device_mesh(
-                device_type=device_type,
-                mesh_shape=mesh_shape,
-                mesh_dim_names=mesh_dim_names,
-                replicate_dim=mesh_dim_names.index("dp_replicate"),
-                manager=self.ft_manager.manager,
-            )
+#             return ft_init_device_mesh(
+#                 device_type=device_type,
+#                 mesh_shape=mesh_shape,
+#                 mesh_dim_names=mesh_dim_names,
+#                 replicate_dim=mesh_dim_names.index("dp_replicate"),
+#                 manager=self.ft_manager.manager,
+#             )
 
-        dims = []
-        names = []
-        for d, name in zip(
-            [self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp],
-            ["pp", "dp_replicate", "dp_shard", "cp", "tp"],
-        ):
-            if d > 1 or name == "dp_replicate":
-                dims.append(d)
-                names.append(name)
+#         dims = []
+#         names = []
+#         for d, name in zip(
+#             [self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp],
+#             ["pp", "dp_replicate", "dp_shard", "cp", "tp"],
+#         ):
+#             if d > 1 or name == "dp_replicate":
+#                 dims.append(d)
+#                 names.append(name)
 
-        return self._build_mesh(device_type, dims, names, func)
+#         return self._build_mesh(device_type, dims, names, func)
 
-    @property
-    def dp_replicate_enabled(self):
-        return True
+#     @property
+#     def dp_replicate_enabled(self):
+#         return True
 
 
 def ft_dist_reduce(

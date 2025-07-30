@@ -96,6 +96,7 @@ def orthogonal_(
         # tensor_data = distribute_tensor(
         #     temp_tensor, placements=tensor.placements, device_mesh=tensor.device_mesh,
         # )
+        # tensor.copy_(tensor_data)
 
         # ##########################################
         # Implementation-2: Use `DTensor.from_local`
@@ -104,14 +105,8 @@ def orthogonal_(
         for dim, (o, s) in enumerate(zip(offs, sizes)):
             temp_tensor = temp_tensor.narrow(dim, o, s)
 
-        tensor_data = DTensor.from_local(
-            temp_tensor.contiguous(),
-            placements=tensor.placements,
-            device_mesh=tensor.device_mesh,
-        )
+        tensor.data.to_local().copy_(temp_tensor)
 
-        # Copy values to original `DTensor`
-        tensor.copy_(tensor_data)
         return tensor
 
 

@@ -257,6 +257,23 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                         )
                         param_group["lr"] = prev_lr
 
+    def get_norms_at_current_step(self):
+        norms_at_current_step = {}
+        for i, _ in enumerate(self.model_parts):
+            # NB: assumes correspondences between model parts and optimizers
+            optimizer = self.optimizers[i]
+            if isinstance(optimizer, DistributedScion):
+                norms_at_current_step.update(optimizer.get_norms_at_current_step())
+            else:
+                norms_at_current_step.update(optimizer.get_parameter_norms())
+        return norms_at_current_step
+
+    def calculate_norm_at_next_step(self):
+        for i, _ in enumerate(self.model_parts):
+            optimizer = self.optimizers[i]
+            if isinstance(optimizer, DistributedScion):
+                optimizer.calculate_norm_at_next_step()
+
     @staticmethod
     def compute_grad(p, optimizer=None, **kwargs):
         if isinstance(optimizer, (Scion, DistributedScion)):

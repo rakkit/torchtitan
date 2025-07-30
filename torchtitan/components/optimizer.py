@@ -33,6 +33,7 @@ from torchtitan.optimizers import (
     remove_orig_mod_and_weight_for_p_name,
     Scion,
 )
+from torchtitan.optimizers.norm_helper import NORM_FUNCTIONS
 from torchtitan.tools.logging import logger
 
 __all__ = [
@@ -47,68 +48,6 @@ if has_torchft:
 
 
 T = TypeVar("T", bound=Optimizer)
-
-
-@torch.no_grad()
-def rms_to_rms_norm(W):
-    """
-    Note:
-        Be aware that ``fan_in`` and ``fan_out`` are calculated assuming
-        that the weight matrix is used in a transposed manner,
-        (i.e., ``x @ w.T`` in ``Linear`` layers, where ``w.shape = [fan_out, fan_in]``).
-        This is important for correct initialization.
-        If you plan to use ``x @ w``, where ``w.shape = [fan_in, fan_out]``,
-        pass in a transposed weight matrix, i.e. ``nn.init.xavier_uniform_(w.T, ...)``.
-    """
-    assert W.ndim == 2, "operator norm can only be applied to matrices"
-    norm = torch.linalg.norm(W.to(torch.float32), ord=2, dtype=torch.float32)
-    fan_out, fan_in = W.shape
-    scale = math.sqrt(fan_in / fan_out)
-    norm *= scale
-    return norm
-
-
-@torch.no_grad()
-def l1_to_rms_norm(W):
-    assert W.ndim == 2, "operator norm can only be applied to matrices"
-    norm = torch.max(
-        torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32)
-    )
-    scale = torch.sqrt(torch.tensor(W.shape[0], dtype=W.dtype, device=W.device))
-    norm /= scale
-    return norm
-
-
-@torch.no_grad()
-def rms_to_l1_norm(W):
-    assert W.ndim == 2, "operator norm can only be applied to matrices"
-    norm = torch.max(
-        torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32)
-    )
-    scale = torch.sqrt(torch.tensor(W.shape[1], dtype=W.dtype, device=W.device))
-    norm *= scale
-    return norm
-
-
-@torch.no_grad()
-def supremum_norm(x):
-    return x.abs().max()
-
-
-@torch.no_grad()
-def condition_number(W):
-    assert W.ndim == 2, "condition number calculation can only be applied to matrices"
-    S = torch.linalg.svdvals(W.to(torch.float32), driver="gesvd")
-    return S[0] / S[-1]
-
-
-NORM_FUNCTIONS = {
-    "rms_to_rms": rms_to_rms_norm,
-    "l1_to_rms": l1_to_rms_norm,
-    "rms_to_l1": rms_to_l1_norm,
-    "supremum": supremum_norm,
-    "condition_number": condition_number,
-}
 
 
 def _extract_param_groups(

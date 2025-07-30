@@ -114,8 +114,9 @@ def compute_grad(p, optimizer=None, **kwargs):
             # TODO(JSC): if we shard the MoE model, we need to remove the following code
             g = p.grad
 
-        assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
-        return g.redistribute(placements=[Replicate()] * g.device_mesh.ndim)
+        if isinstance(g, DTensor):
+            g = g.redistribute(placements=[Replicate()] * g.device_mesh.ndim)
+        return g
     else:
         raise TypeError(
             f"Optimizer {optimizer.__class__.__name__} does not support "

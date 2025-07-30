@@ -146,8 +146,8 @@ class DistributedScion(torch.optim.Optimizer):
         self.extra_reduce_for_HSDP = extra_reduce_for_HSDP
         logger.info(
             f"Distributed Scion optimizer (is_light={self.is_light}, is_unconstrained={self.is_unconstrained}) "
-            f"is enabled with world_mesh={self.world_mesh} | fsdp_enabled={self.fsdp_enabled} "
-            f"| expert_enabled={self.expert_enabled}"
+            f"is enabled with world_mesh={self.world_mesh} | fsdp={self.fsdp_enabled} "
+            f"| EP={self.expert_enabled} | TP={self.tp_enabled} | DP={self.dp_replicate_enabled} "
         )
 
         super().__init__(params, defaults)

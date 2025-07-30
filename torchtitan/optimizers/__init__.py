@@ -6,3 +6,4 @@
 
 from .distributed_scion import DistributedScion  # noqa: F401
 from .scion import Scion  # noqa: F401
+from .utils import remove_orig_mod_and_weight_for_p_name  # noqa: F401

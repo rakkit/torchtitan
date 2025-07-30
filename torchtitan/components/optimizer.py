@@ -418,6 +418,8 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                     """
                     cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(p_name)
                     g = self.compute_grad(p, optimizer, **param_kwargs)
+                    if g is None:
+                        continue
                     assert not torch.isnan(
                         g
                     ).any(), f"There is nan in the grad of {p_name}"

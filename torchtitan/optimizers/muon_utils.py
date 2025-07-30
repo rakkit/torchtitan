@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from itertools import repeat
 from typing import cast, List, Tuple
 
 import torch
@@ -33,6 +34,50 @@ def zeropower_via_svd(G, **kwargs):
     if transpose:
         X = X.T
     return X.to(original_dtype).contiguous()
+
+
+# Polar Express
+@torch.compile
+def zeropower_via_polar_express(G, steps=5, eps=1e-7):
+    # https://arxiv.org/abs/2505.16932
+    coeffs_base = [
+        (8.28721201814563, -23.595886519098837, 17.300387312530933),
+        (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+        (3.948690853482295, -2.908902115962949, 0.5518191394370137),
+        (3.318419657370602, -2.488488024314874, 0.51004894012372),
+        (2.300652019954817, -1.668903984574749, 0.4188073119525673),
+        (1.891301407787398, -1.267995827194587, 0.3768040894852483),
+        (1.875001480853448, -1.250001645399949, 0.3750001645474248),
+        (1.875000000000000, -1.250000000000000, 0.375000000000000),  # limit
+    ]
+
+    # apply the 1/1.01 stabiliser **only** to the first seven triples
+    coeffs_base = [
+        (a / 1.01, b / 1.01**3, c / 1.01**5) for (a, b, c) in coeffs_base[:-1]
+    ] + [coeffs_base[-1]]
+
+    # extend the list so that coeffs[k] is defined for every k < steps
+    coeffs = coeffs_base + list(
+        repeat(coeffs_base[-1], max(0, steps - len(coeffs_base)))
+    )
+
+    original_dtype = G.dtype
+    X = G.bfloat16()
+    if G.size(0) > G.size(1):
+        X = X.T
+    X = X / (torch.linalg.norm(X) + eps)  # ensure top singular value <= 1
+
+    # main loop
+    for k in range(steps):
+        a, b, c = coeffs[k]
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if G.size(0) > G.size(1):
+        X = X.T
+
+    return X.to(original_dtype)
 
 
 @torch.compile
@@ -80,6 +125,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
 zeropower_backends = dict(
     svd=zeropower_via_svd,
     newtonschulz5=zeropower_via_newtonschulz5,
+    polar_express=zeropower_via_polar_express,
     identity=lambda x, **kwargs: x,
 )
 

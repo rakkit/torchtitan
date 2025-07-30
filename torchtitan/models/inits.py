@@ -11,17 +11,6 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import distribute_tensor, DTensor
 
-INIT_FN_TYPES = [
-    "trunc_normal",
-    "normal",
-    "orthogonal",
-    "scaled_orthogonal",
-    "scion_normal",
-    "scion_normal_input",
-    "scion_normal_output",
-    "image_orthogonal",
-]
-
 
 # Deliberately throw away `mean` and `std` arguments.
 def _wrap_ignore_mean_std(fn):
@@ -165,6 +154,28 @@ def scion_normal_(
         tensor.mul_(scale)
 
 
+INIT_FN_MAP = {
+    "trunc_normal": nn.init.trunc_normal_,
+    "normal": nn.init.normal_,
+    "zeros": _wrap_ignore_generator(_wrap_ignore_mean_std(nn.init.zeros_)),
+    "orthogonal": _wrap_orthogonal(orthogonal_),
+    "scaled_orthogonal": _wrap_orthogonal(scaled_orthogonal_),
+    "image_orthogonal": _wrap_orthogonal(image_orthogonal_),
+    "scion_normal": scion_normal_,
+    "scion_normal_input": functools.partial(
+        scion_normal_,
+        scale_type="input",
+        norm_axis=1,
+    ),
+    "scion_normal_output": functools.partial(
+        scion_normal_,
+        scale_type="output",
+        norm_axis=1,
+    ),
+}
+INIT_FN_TYPES = list(INIT_FN_MAP.keys())
+
+
 def build_init_fn(init_fn_type: str):
     """
     Builds the specified initialization function based on `init_fn_type`.
@@ -181,31 +192,8 @@ def build_init_fn(init_fn_type: str):
     """
     init_fn_type = init_fn_type.lower()  # Normalize to lowercase
 
-    if init_fn_type == "trunc_normal":
-        return nn.init.trunc_normal_
-    elif init_fn_type == "normal":
-        return nn.init.normal_
-    elif init_fn_type == "zeros":
-        return _wrap_ignore_generator(_wrap_ignore_mean_std(nn.init.zeros_))
-    elif init_fn_type == "orthogonal":
-        return _wrap_orthogonal(orthogonal_)
-    elif init_fn_type == "scaled_orthogonal":
-        return _wrap_orthogonal(scaled_orthogonal_)
-    elif init_fn_type == "image_orthogonal":
-        return _wrap_orthogonal(image_orthogonal_)
-    elif init_fn_type == "scion_normal":
-        return scion_normal_
-    elif init_fn_type == "scion_normal_input":
-        return functools.partial(
-            scion_normal_,
-            scale_type="input",
-            norm_axis=1,
-        )
-    elif init_fn_type == "scion_normal_output":
-        return functools.partial(
-            scion_normal_,
-            scale_type="output",
-            norm_axis=1,
-        )
+    init_fn = INIT_FN_MAP.get(init_fn_type)
+    if init_fn is not None:
+        return init_fn
     else:
         raise NotImplementedError(f"Unknown `init_fn_type`: '{init_fn_type}'")

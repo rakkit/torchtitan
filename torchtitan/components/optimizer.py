@@ -28,7 +28,11 @@ from torch.optim import Optimizer
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.optimizers import DistributedScion, Scion
+from torchtitan.optimizers import (
+    DistributedScion,
+    remove_orig_mod_and_weight_for_p_name,
+    Scion,
+)
 from torchtitan.tools.logging import logger
 
 __all__ = [
@@ -105,14 +109,6 @@ NORM_FUNCTIONS = {
     "supremum": supremum_norm,
     "condition_number": condition_number,
 }
-
-
-def _remove_orig_mod_and_weight_for_p_name(name: str) -> str:
-    # Remove ._orig_mod and .weight anywhere in the parameter name
-    name = re.sub(r"\._orig_mod", "", name)
-    name = re.sub(r"\.weight", "", name)
-    name = re.sub(r"\._checkpoint_wrapped_module", "", name)
-    return name
 
 
 def _extract_param_groups(
@@ -411,12 +407,9 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                 FLAG_NEED_SYNC = False
                 moe_norms, fsdp_norms = {}, {}
                 for p_name, p in zip(group["param_names"], group["params"]):
-                    """
-                    the module name usally named
-                    track_update_condition_number/model_part_0/layers.0._orig_mod.attention.wo.weight
-                    we can remove '._orig_mod' and '.weight' to get the clean layer name
-                    """
-                    cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(p_name)
+                    # The module is usually named
+                    # `track_update_condition_number/model_part_0/layers.0._orig_mod.attention.wo.weight`
+                    cleaned_p_name = remove_orig_mod_and_weight_for_p_name(p_name)
                     g = self.compute_grad(p, optimizer, **param_kwargs)
                     if g is None:
                         continue

@@ -9,7 +9,7 @@ import math
 
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import distribute_tensor, DTensor
+from torch.distributed.tensor import DTensor
 
 
 # Deliberately throw away `mean` and `std` arguments.
@@ -69,8 +69,43 @@ def orthogonal_(
         temp_tensor = torch.empty(tensor.shape, device=tensor.device)  # full shape
         torch.nn.init.orthogonal_(temp_tensor, gain=gain, generator=generator)
 
-        tensor_data = distribute_tensor(
-            temp_tensor,
+        """
+        Impl-1 uses `distribute_tensor`, which explicitly does
+        communication that distributes the tensor weights from `src=0`
+        to the other ranks.
+        This can make sure that weights across "dp_replicate" are
+        initialized exactly the same.
+        [?is it really? will the communication cause the weights to be
+        different?]
+        Impl-1 works both when the (global) generator doesn't match
+        across ranks and when it does.
+        ---
+        Impl-2 uses `DTensor.from_local`, so that there will be no
+        communication.
+        But it maybe would cause the weights to be different across
+        `dp_replicate` due to indeterministic stuff.
+        Gonna use impl-2 for now to avoid the barrier.
+        # TODO(JSC): We shall do a benchmark later to see which one is
+        #            better.
+        Impl-2 does not works when the (global) generator doesn't match
+        across ranks.
+        """
+
+        # ##########################################
+        # Implementation-1: Use `distribute_tensor`
+        # tensor_data = distribute_tensor(
+        #     temp_tensor, placements=tensor.placements, device_mesh=tensor.device_mesh,
+        # )
+
+        # ##########################################
+        # Implementation-2: Use `DTensor.from_local`
+        chunk = tensor.__create_chunk_list__()[0]  # ChunkStorageMetadata
+        offs, sizes = chunk.offsets, chunk.sizes  # torch.Size objects
+        for dim, (o, s) in enumerate(zip(offs, sizes)):
+            temp_tensor = temp_tensor.narrow(dim, o, s)
+
+        tensor_data = DTensor.from_local(
+            temp_tensor.contiguous(),
             placements=tensor.placements,
             device_mesh=tensor.device_mesh,
         )

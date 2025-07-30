@@ -5,14 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
-import math
 import re
-import warnings
 from collections import OrderedDict
 from typing import Any, Generic, Iterator, TypeVar
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.distributed.checkpoint.state_dict import (
@@ -21,19 +18,12 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
 )
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Replicate
 from torch.optim import Optimizer
 
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.optimizers import (
-    DistributedScion,
-    remove_orig_mod_and_weight_for_p_name,
-    Scion,
-)
-from torchtitan.optimizers.norm_helper import NORM_FUNCTIONS
+from torchtitan.optimizers import DistributedScion, naive_param_norm, Scion
 from torchtitan.tools.logging import logger
 
 __all__ = [
@@ -96,43 +86,6 @@ def _extract_param_groups(
     )
     assert not param_dict
     return params
-
-
-def gather_and_merge(local_stats: dict, dst: int = 0):
-    world = dist.get_world_size()
-    rank = dist.get_rank()
-    dtype = torch.bfloat16
-
-    my_keys = list(local_stats.keys())
-
-    if len(my_keys) > 0:
-        val_tensor = torch.stack([local_stats[k].to(dtype) for k in my_keys])
-    else:
-        my_keys = "padding"
-        val_tensor = None
-
-    key_bucket = [None] * world if rank == dst else None
-    val_bucket = [None] * world if rank == dst else None
-
-    dist.gather_object(my_keys, key_bucket, dst=dst)
-    # dist.barrier()
-    dist.gather_object(val_tensor, val_bucket, dst=dst)
-    dist.barrier()
-
-    merged = {}
-    if rank == dst:
-        for peer, keys in enumerate(key_bucket):
-            if val_bucket[peer] is None:
-                continue
-            for k, v in zip(keys, val_bucket[peer]):
-                if k != "padding":
-                    merged[k] = v
-
-    dist.barrier()
-    if rank == dst:
-        return merged
-    else:
-        return {}
 
 
 class OptimizersContainer(Optimizer, Stateful, Generic[T]):
@@ -257,186 +210,30 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                         )
                         param_group["lr"] = prev_lr
 
-    def get_norms_at_current_step(self):
-        norms_at_current_step = {}
-        for i, _ in enumerate(self.model_parts):
-            # NB: assumes correspondences between model parts and optimizers
-            optimizer = self.optimizers[i]
-            if isinstance(optimizer, DistributedScion):
-                norms_at_current_step.update(optimizer.get_norms_at_current_step())
-            else:
-                norms_at_current_step.update(optimizer.get_parameter_norms())
-        return norms_at_current_step
-
     def calculate_norm_at_next_step(self):
+        # for Dist-scion, we tell the optimizer to calculate the norm at next step
+        # in the step() function
         for i, _ in enumerate(self.model_parts):
             optimizer = self.optimizers[i]
             if isinstance(optimizer, DistributedScion):
                 optimizer.calculate_norm_at_next_step()
 
-    @staticmethod
-    def compute_grad(p, optimizer=None, **kwargs):
-        if isinstance(optimizer, (Scion, DistributedScion)):
-            momentum = kwargs.pop("momentum")
-            nesterov = kwargs.pop("nesterov")
-            g = optimizer.get_momentum_or_grad(
-                p,
-                momentum,
-                nesterov,
-                update_buffer=False,
-                gather_to_local=optimizer.fsdp_enabled and p.ndim < 3,
-                # we do not gather the moe's grads
-            )
-            if g is None:
-                return None
-            else:
-                g = g.to_local() if isinstance(g, DTensor) else g
-                return optimizer.lmo(g, **kwargs)
-        elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
-            if p.ndim == 3:
-                warnings.warn(
-                    f"Optimizer {optimizer.__class__.__name__} does not support "
-                    f"gradient computation for 3D tensors for logging."
-                )
-                return None
-
-            eps = kwargs["eps"]
-            weight_decay = kwargs["weight_decay"]
-            beta1, beta2 = kwargs["betas"]
-            assert (
-                weight_decay == 0.0
-            ), "Weight decay not supported for grad computation."
-
-            param_optim_state = optimizer.state[p]
-            if "step" not in param_optim_state:
-                step = 0
-            else:
-                step = param_optim_state["step"].item()
-            if "exp_avg_sq" in param_optim_state and "exp_avg" in param_optim_state:
-                bias_correction1 = 1 - beta1**step
-                bias_correction2 = 1 - beta2**step
-                denom = (
-                    param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)
-                ) + eps
-                step_size = 1 / bias_correction1
-                g = step_size * param_optim_state["exp_avg"].div(denom)
-            else:
-                # TODO(JSC): if we shard the MoE model, we need to remove the following code
-                g = p.grad
-
-            assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
-            return g.redistribute(placements=[Replicate()] * g.device_mesh.ndim)
-        else:
-            raise TypeError(
-                f"Optimizer {optimizer.__class__.__name__} does not support "
-                f"gradient computation."
-            )
-
     def get_parameter_norms(self):
         all_norms = {}
-        for i, _ in enumerate(self.model_parts):
+        for i, model_part in enumerate(self.model_parts):
             # NB: assumes correspondences between model parts and optimizers
             optimizer = self.optimizers[i]
             for group in optimizer.param_groups:
-                if isinstance(optimizer, (Scion, DistributedScion)):
-                    param_kwargs = {
-                        "momentum": group["momentum"],
-                        "nesterov": group["nesterov"],
-                        "eps": group["eps"],
-                        "norm_factor": group["norm_factor"],
-                        "zeropower_backend": group["backend"],
-                        "backend_steps": group["backend_steps"],
-                    }
-                elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
-                    param_kwargs = {
-                        "eps": group["eps"],
-                        "betas": group["betas"],
-                        "weight_decay": group["weight_decay"],
-                    }
+                if isinstance(optimizer, DistributedScion):
+                    all_norms.update(optimizer.get_norms_at_current_step())
                 else:
-                    warnings.warn(
-                        f"Optimizer {optimizer.__class__.__name__} does not support "
-                        f"norm computation."
+                    all_norms.update(
+                        naive_param_norm.get_parameter_norms([model_part], [optimizer])
                     )
-                    continue
-
-                FLAG_NEED_SYNC = False
-                moe_norms, fsdp_norms = {}, {}
-                for p_name, p in zip(group["param_names"], group["params"]):
-                    # The module is usually named
-                    # `track_update_condition_number/model_part_0/layers.0._orig_mod.attention.wo.weight`
-                    cleaned_p_name = remove_orig_mod_and_weight_for_p_name(p_name)
-                    g = self.compute_grad(p, optimizer, **param_kwargs)
-                    if g is None:
-                        continue
-                    assert not torch.isnan(
-                        g
-                    ).any(), f"There is nan in the grad of {p_name}"
-                    if g is not None:
-                        if p.ndim < 3:
-                            p = p.redistribute(
-                                placements=[Replicate()] * p.device_mesh.ndim
-                            )
-                        else:
-                            FLAG_NEED_SYNC = True
-                            local_rank = dist.get_rank()
-                            world_size = dist.get_world_size()
-                            ep_per_rank = math.ceil(p.shape[0] / world_size)
-                            # We dont gather the parameters for 3D
-                            # tensors, which is [G, D_in, D_out] of
-                            # GroupedExperts
-                            pass
-                        p = p.to_local() if isinstance(p, DTensor) else p
-                        g = g.to_local() if isinstance(g, DTensor) else g
-                        update = -group["lr"] * g
-
-                        if "tok_embeddings" in p_name:
-                            p, update = p.T, update.T
-                        for norm_name, norm_func in NORM_FUNCTIONS.items():
-                            if norm_name != "supremum" and (
-                                p.ndim < 2 or update.ndim < 2
-                            ):
-                                # Operator norms require a matrix.
-                                continue
-                            elif p.ndim == 3 or update.ndim == 3:
-                                # Special handling for grouped MoE.
-                                # remember MoE's Paramters is [G, D_in, D_out]
-                                # But we expected to call norm_func for [D_out, D_in]
-                                for ep_idx in range(p.shape[0]):
-                                    actual_ep_idx = ep_idx + local_rank * ep_per_rank
-                                    moe_norms[
-                                        f"track_update_{norm_name}/model_part_{i}/"
-                                        f"ep_{actual_ep_idx}/{cleaned_p_name}"
-                                    ] = norm_func(update[ep_idx].transpose(0, 1))
-
-                                    moe_norms[
-                                        f"track_param_{norm_name}/model_part_{i}/"
-                                        f"ep_{actual_ep_idx}/{cleaned_p_name}"
-                                    ] = norm_func(p[ep_idx].transpose(0, 1))
-
-                            else:
-                                if p.ndim > 2 or update.ndim > 2:
-                                    warnings.warn(
-                                        f"Encountered parameter or update {cleaned_p_name} with "
-                                        f"shape {p.shape} or {update.shape}, respectively; "
-                                        f"this may not be an issue, but please ensure its "
-                                        f"norms are calculated correctly."
-                                    )
-                                fsdp_norms[
-                                    f"track_param_{norm_name}/model_part_{i}/{cleaned_p_name}"
-                                ] = norm_func(p)
-
-                                fsdp_norms[
-                                    f"track_update_{norm_name}/model_part_{i}/{cleaned_p_name}"
-                                ] = norm_func(update)
-
-                if FLAG_NEED_SYNC:
-                    # remove the comment below to gather the moe_norms on all ranks
-                    moe_norms = gather_and_merge(moe_norms)
-                    pass
-
-                all_norms.update(fsdp_norms)
-                all_norms.update(moe_norms)
+                # # To Debug, we can force using naive_param_norm
+                # all_norms.update(
+                #     naive_param_norm.get_parameter_norms([model_part], [optimizer])
+                # )
 
         return all_norms
 

@@ -316,7 +316,7 @@ class DistributedScion(torch.optim.Optimizer):
             else:
                 p.data.add_(u, alpha=-lr)
 
-            if momentum != 1 and self.is_light:
+            if momentum != 1 and self.is_light and p.grad is not None:
                 p.grad.mul_(1 - momentum)
 
     def step_sgd(self, sgd_params):
@@ -343,7 +343,7 @@ class DistributedScion(torch.optim.Optimizer):
                     p.data.mul_(1 - lr)
                 p.data.add_(u, alpha=-lr)
 
-            if momentum != 1 and self.is_light:
+            if momentum != 1 and self.is_light and g is not None:
                 g.mul_(1 - momentum)
 
     def step_ddp(self, ddp_params):

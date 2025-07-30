@@ -26,7 +26,13 @@ INIT_FN_TYPES = [
 # Deliberately throw away `mean` and `std` arguments.
 def _wrap_ignore_mean_std(fn):
     @functools.wraps(fn)
-    def wrapped_fn(tensor, mean=None, std=None, *args, **kwargs):
+    def wrapped_fn(
+        tensor: torch.Tensor,
+        mean: float | None = None,
+        std: float | None = None,
+        *args,
+        **kwargs,
+    ):
         return fn(tensor, *args, **kwargs)
 
     return wrapped_fn
@@ -35,33 +41,44 @@ def _wrap_ignore_mean_std(fn):
 # Deliberately throw away the `generator` argument.
 def _wrap_ignore_generator(fn):
     @functools.wraps(fn)
-    def wrapped_fn(tensor, *args, generator=None, **kwargs):
+    def wrapped_fn(
+        tensor: torch.Tensor,
+        *args,
+        generator: torch.Generator | None = None,
+        **kwargs,
+    ):
         return fn(tensor, *args, **kwargs)
 
     return wrapped_fn
 
 
-def orthogonal_(param, gain: float = 1.0, generator: torch.Generator | None = None):
+def orthogonal_(
+    tensor: torch.Tensor,
+    gain: float = 1.0,
+    generator: torch.Generator | None = None,
+):
     with torch.no_grad():
-        if not isinstance(param.data, DTensor):
-            return nn.init.orthogonal_(param, gain=gain, generator=generator)
+        if not isinstance(tensor.data, DTensor):
+            return nn.init.orthogonal_(tensor, gain=gain, generator=generator)
 
-        temp_tensor = torch.empty(param.shape, device=param.device)  # full shape
+        temp_tensor = torch.empty(tensor.shape, device=tensor.device)  # full shape
         torch.nn.init.orthogonal_(temp_tensor, gain=gain, generator=generator)
 
-        params_data = distribute_tensor(
+        tensor_data = distribute_tensor(
             temp_tensor,
-            placements=param.placements,
-            device_mesh=param.device_mesh,
+            placements=tensor.placements,
+            device_mesh=tensor.device_mesh,
         )
 
         # Copy values to original `DTensor`
-        param.copy_(params_data)
-        return param
+        tensor.copy_(tensor_data)
+        return tensor
 
 
 def scaled_orthogonal_(
-    param, gain: float = 1.0, generator: torch.Generator | None = None
+    tensor: torch.Tensor,
+    gain: float = 1.0,
+    generator: torch.Generator | None = None,
 ):
     """
     Note:
@@ -74,32 +91,34 @@ def scaled_orthogonal_(
     """
     with torch.no_grad():
         assert (
-            param.ndim == 2
+            tensor.ndim == 2
         ), "Fan in and fan out can not be computed for tensor with other than 2 dimensions"
-        fan_out, fan_in = param.shape
+        fan_out, fan_in = tensor.shape
         scale = math.sqrt(fan_out / fan_in)
         gain *= scale
 
-    return orthogonal_(param, gain, generator)
+    return orthogonal_(tensor, gain, generator)
 
 
 def image_orthogonal_(
-    param, gain: float = 1.0, generator: torch.Generator | None = None
+    tensor: torch.Tensor,
+    gain: float = 1.0,
+    generator: torch.Generator | None = None,
 ):
     """Image domain initialization as specified in the Scion paper."""
     with torch.no_grad():
         assert (
-            param.ndim == 2
+            tensor.ndim == 2
         ), "Fan in and fan out can not be computed for tensor with other than 2 dimensions"
-        fan_out, fan_in = param.shape
+        fan_out, fan_in = tensor.shape
         scale = max(math.sqrt(fan_out / fan_in), 1.0)
         gain *= scale
 
-    return orthogonal_(param, gain, generator)
+    return orthogonal_(tensor, gain, generator)
 
 
 def scion_normal_(
-    tensor,
+    tensor: torch.Tensor,
     mean: float = 0.0,
     std: float = 1.0,
     norm_axis: int = 1,
@@ -146,9 +165,17 @@ def build_init_fn(init_fn_type: str):
     """
     init_fn_type = init_fn_type.lower()  # Normalize to lowercase
 
+    # Deliberately throw away the `mean` argument and pass the `std`
+    # argument as `gain` to the wrapped function.
     def _wrap_orthogonal(fn):
         @functools.wraps(fn)
-        def wrapped_fn(tensor, mean=None, std=1, *args, **kwargs):
+        def wrapped_fn(
+            tensor: torch.Tensor,
+            mean: float | None = None,
+            std: float | None = 1,
+            *args,
+            **kwargs,
+        ):
             return fn(tensor, gain=std, *args, **kwargs)
 
         return wrapped_fn

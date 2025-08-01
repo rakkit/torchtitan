@@ -16,8 +16,8 @@ LossFunction: TypeAlias = Callable[..., torch.Tensor]
 
 
 def cross_entropy_loss(
-        pred: torch.Tensor | list[torch.Tensor] | TransformerInputsDict,
-        labels: torch.Tensor,
+    pred: torch.Tensor | list[torch.Tensor] | TransformerInputsDict,
+    labels: torch.Tensor,
 ) -> torch.Tensor:
     """Common cross-entropy loss function for Transformer models training."""
     if isinstance(pred, dict):
@@ -38,10 +38,10 @@ def build_cross_entropy_loss(job_config: JobConfig):
 
 
 def multi_token_cross_entropy_loss(
-        preds: list[torch.Tensor] | MTPInputsDict,
-        labels: torch.Tensor,
-        loss_fn: LossFunction,
-        job_config: JobConfig,
+    preds: list[torch.Tensor] | MTPInputsDict,
+    labels: torch.Tensor,
+    loss_fn: LossFunction,
+    job_config: JobConfig,
 ) -> torch.Tensor:
     """Multi-token cross-entropy loss function for Transformer model training.
 
@@ -50,13 +50,13 @@ def multi_token_cross_entropy_loss(
     if isinstance(preds, dict):
         preds = preds["tokens_list"]
     assert isinstance(preds, list)
-    main_loss = loss_fn(preds[0], labels[:, :job_config.training.seq_len])
+    main_loss = loss_fn(preds[0], labels[:, : job_config.training.seq_len])
 
     mtp_loss = 0
-    for (label_offset, pred) in enumerate(preds[1:], 1):
+    for label_offset, pred in enumerate(preds[1:], 1):
         loss = loss_fn(
             pred,
-            labels[:, label_offset:label_offset + job_config.training.seq_len],
+            labels[:, label_offset : label_offset + job_config.training.seq_len],
         )
         # Take average over MTP predictions.
         loss = loss / job_config.training.num_mtp_tokens
@@ -65,9 +65,9 @@ def multi_token_cross_entropy_loss(
 
 
 def moe_loss(
-        pred: MoEInputsDict,
-        labels: torch.Tensor,
-        loss_fn: LossFunction,
+    pred: MoEInputsDict,
+    labels: torch.Tensor,
+    loss_fn: LossFunction,
 ) -> torch.Tensor:
     """Sequence-wise auxiliary loss-enhanced loss function for MoE Transformer
     model training.

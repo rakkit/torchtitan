@@ -157,6 +157,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         with torch.device("meta"):
             model = self.train_spec.model_cls(model_args)
 
+        logger.info(f"model: {model}")
+
         # Build the collection of model converters. No-op if `model.converters` empty
         model_converters = build_model_converters(job_config, parallel_dims)
         model_converters.convert(model)
@@ -174,13 +176,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # calculate model size and flops per token
         (
+            model_active_param_count,
             model_param_count,
             self.metrics_processor.num_flops_per_token,
         ) = model_args.get_nparams_and_flops(model, job_config.training.seq_len)
 
         logger.info(
             f"{color.blue}Model {self.train_spec.name} {job_config.model.flavor} "
-            f"{color.red}size: {model_param_count:,} total parameters{color.reset}"
+            f"{color.red}size: {model_param_count:,} total parameters, "
+            f"{model_active_param_count:,} active parameters{color.reset}"
         )
 
         # move sharded model to CPU/GPU and initialize weights via DTensor
@@ -417,6 +421,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
             init_attention_mask(inputs, self.tokenizer.eos_id, cp_mesh)
 
+        aux_loss = None
+
         # apply context parallelism if cp is enabled
         # ensure CP handles the separate freqs_cis buffer for each pp stage
         optional_context_parallel_ctx = (
@@ -458,13 +464,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with self.train_context(optional_context_parallel_ctx):
                 assert len(model_parts) == 1
                 with self.maybe_enable_amp:
-                    pred = model_parts[0](inputs)
+                    output = model_parts[0](inputs)
+                    if isinstance(output, tuple):
+                        assert len(output) == 2
+                        pred, aux_loss = output
+                    else:
+                        pred = output
                     loss = self.loss_fn(pred, labels)
+                    if aux_loss is not None:
+                        if isinstance(aux_loss, float):
+                            aux_loss = torch.tensor(
+                                aux_loss, dtype=loss.dtype, device=loss.device
+                            )
+                        loss += aux_loss / self.gradient_accumulation_steps
                 # need to free to before bwd to avoid peaking memory
                 del pred
                 loss.backward()
 
-        return loss
+        return loss, aux_loss
 
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -478,12 +495,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         parallel_dims = self.parallel_dims
 
         accumulated_losses = []
+        accumulated_aux_losses = []
         # If data runs out during gradient accumulation, that
         # entire step will not be executed.
         for microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
-            loss = self.forward_backward_step(input_dict, labels)
+            loss, aux_loss = self.forward_backward_step(input_dict, labels)
             accumulated_losses.append(loss.detach())
+            if aux_loss is not None:
+                accumulated_aux_losses.append(aux_loss.detach())
 
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
@@ -500,6 +520,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
+        if len(accumulated_aux_losses) > 0:
+            aux_loss = torch.sum(torch.stack(accumulated_aux_losses))
 
         # log metrics
         if not self.metrics_processor.should_log(self.step):
@@ -519,6 +541,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     ft_pg,
                 ),
             )
+            if aux_loss is not None:
+                aux_loss = dist_utils.dist_mean(
+                    aux_loss, parallel_dims.world_mesh["dp_cp"], ft_pg
+                )
         else:
             global_avg_loss = global_max_loss = loss.detach().item()
             global_ntokens_seen = self.ntokens_seen
@@ -527,6 +553,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
+        if aux_loss is not None:
+            extra_metrics["loss_metrics/aux_loss"] = aux_loss
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,

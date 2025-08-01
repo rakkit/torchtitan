@@ -99,4 +99,4 @@ class TransformerModelArgs(BaseModelArgs):
         # 4. we follow the convention and do not account for sparsity in causal attention
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
 
-        return nparams, num_flops_per_token
+        return nparams, nparams, num_flops_per_token

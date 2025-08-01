@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from torch import nn
 
+from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config import JobConfig
 from torchtitan.protocols.train_spec import BaseModelArgs
 from torchtitan.tools.logging import logger
@@ -23,7 +24,7 @@ class TransformerModelArgs(BaseModelArgs):
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: int | None = None
-    vocab_size: int = 128256
+    vocab_size: int = 128256  # If -1, then take vocab size from tokenizer.
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: float | None = None
     norm_eps: float = 1e-5
@@ -39,6 +40,15 @@ class TransformerModelArgs(BaseModelArgs):
     eos_id: int = 0
 
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
+        if self.vocab_size == -1:
+            tokenizer = kwargs.get("tokenizer")
+            assert isinstance(tokenizer, BaseTokenizer), (
+                "Need a `BaseTokenizer` to be passed to `update_from_config` via the "
+                "`tokenizer` keyword argument to automatically set `vocab_size` "
+                "(since `vocab_size == -1`)."
+            )
+            self.vocab_size = tokenizer.get_vocab_size()
+
         if job_config.model.vocab_size_multiple_of:
             orig_vocab_size = self.vocab_size
             vocab_divisor = job_config.model.vocab_size_multiple_of

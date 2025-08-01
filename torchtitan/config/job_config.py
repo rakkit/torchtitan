@@ -78,6 +78,9 @@ class Model:
     flavor: str = "debugmodel"
     """Which model config to train"""
 
+    norm_type: str = "rmsnorm"
+    """Type of layer normalization to use [layernorm, np_layernorm, rmsnorm, np_rmsnorm]"""
+
     hf_assets_path: str = "./tests/assets/tokenizer"
     """
     Path to HF assets folder. This folder contains local copies of Hugging Face assets,

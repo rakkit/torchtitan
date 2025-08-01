@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from torchtitan.models.attention import build_attention
+from torchtitan.models.norms import build_norm
 from torchtitan.protocols.train_spec import ModelProtocol
 
 from .args import TransformerModelArgs
@@ -149,12 +150,14 @@ class Attention(nn.Module):
 
         self.qk_norm = model_args.qk_norm
         if self.qk_norm:
-            self.q_norm = nn.RMSNorm(
-                self.head_dim,
+            self.q_norm = build_norm(
+                model_args.norm_type,
+                dim=self.head_dim,
                 eps=model_args.norm_eps,
             )
-            self.k_norm = nn.RMSNorm(
-                self.head_dim,
+            self.k_norm = build_norm(
+                model_args.norm_type,
+                dim=self.head_dim,
                 eps=model_args.norm_eps,
             )
 
@@ -296,8 +299,16 @@ class TransformerBlock(nn.Module):
             multiple_of=model_args.multiple_of,
             ffn_dim_multiplier=model_args.ffn_dim_multiplier,
         )
-        self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.attention_norm = build_norm(
+            model_args.norm_type,
+            dim=model_args.dim,
+            eps=model_args.norm_eps,
+        )
+        self.ffn_norm = build_norm(
+            model_args.norm_type,
+            dim=model_args.dim,
+            eps=model_args.norm_eps,
+        )
 
         if model_args.depth_init:
             self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
@@ -369,7 +380,9 @@ class Transformer(nn.Module, ModelProtocol):
             self.layers[str(layer_id)] = self.transformer_block_cls(
                 layer_id, model_args
             )
-        self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.norm = build_norm(
+            model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
+        )
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
         self.init_weights()
 
@@ -475,7 +488,9 @@ class BitNetAttention(Attention):
 
     def __init__(self, model_args: TransformerModelArgs):
         super().__init__(model_args)
-        self.wo_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.wo_norm = build_norm(
+            model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
+        )
 
     def init_weights(self, init_std: float):
         self.wo_norm.reset_parameters()
@@ -542,6 +557,7 @@ class BitNetFeedForward(FeedForward):
         multiple_of (int): Value to ensure hidden dimension is a multiple of this value.
         ffn_dim_multiplier (float | None): Custom multiplier for hidden dimension. Defaults to None.
         norm_eps (float): Numerical stabilizer for norms.
+        norm_type (str): Which norm to use.
 
     Attributes:
         w1 (Linear): Linear transformation for the first layer.
@@ -558,9 +574,10 @@ class BitNetFeedForward(FeedForward):
         multiple_of: int,
         ffn_dim_multiplier: float | None,
         norm_eps: float,
+        norm_type: str,
     ):
         super().__init__(dim, hidden_dim, multiple_of, ffn_dim_multiplier)
-        self.w2_norm = nn.RMSNorm(self.w2.in_features, eps=norm_eps)
+        self.w2_norm = build_norm(norm_type, dim=self.w2.in_features, eps=norm_eps)
 
     def forward(self, x):
         return self.w2(self.w2_norm(F.silu(self.w1(x)) * self.w3(x)))
@@ -594,6 +611,11 @@ class BitNetTransformerBlock(TransformerBlock):
     feed_forward_cls = BitNetFeedForward
 
     def __init__(self, layer_id: int, model_args: TransformerModelArgs):
+        assert model_args.norm_type.lower() in [
+            "rmsnorm",
+            "np_rmsnorm",
+        ], "BitNet assumes RMSNorm"
+
         self._init_feed_forward_builder(model_args)
         super().__init__(layer_id, model_args)
 
@@ -612,6 +634,7 @@ class BitNetTransformerBlock(TransformerBlock):
                 multiple_of,
                 ffn_dim_multiplier,
                 norm_eps=model_args.norm_eps,
+                norm_type=model_args.norm_type,
             )
 
         self.feed_forward_cls = build_bitnet_feed_forward
@@ -639,4 +662,8 @@ class BitNetTransformer(Transformer):
     transformer_block_cls = BitNetTransformerBlock
 
     def __init__(self, model_args: TransformerModelArgs):
+        assert model_args.norm_type.lower() in [
+            "rmsnorm",
+            "np_rmsnorm",
+        ], "BitNet assumes RMSNorm"
         super().__init__(model_args)

@@ -34,6 +34,7 @@ class TransformerModelArgs(BaseModelArgs):
     # If `True`, then each transformer block init uses its layer ID, and if
     # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
+    norm_type: str = "rmsnorm"
     qk_norm: bool = False
 
     use_flex_attn: bool = False
@@ -41,6 +42,8 @@ class TransformerModelArgs(BaseModelArgs):
     eos_id: int = 0
 
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
+        self.norm_type = job_config.model.norm_type
+
         if self.vocab_size == -1:
             tokenizer = kwargs.get("tokenizer")
             assert isinstance(tokenizer, BaseTokenizer), (

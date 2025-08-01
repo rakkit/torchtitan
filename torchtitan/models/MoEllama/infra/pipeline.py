@@ -29,6 +29,7 @@ from torchtitan.protocols.train_spec import DeviceType, ParallelizeFunction
 from torchtitan.tools.logging import logger
 from torch.distributed.pipelining.schedules import PipelineScheduleSingle
 from ..model.args import MoEModelArgs
+from functools import partial
 
 
 def generate_module_names_per_stage(
@@ -164,12 +165,28 @@ def pipeline_llama(
     for i, stage_ms in enumerate(module_names_per_stage):
         logger.info(f"Stage {i}: {stage_ms}")
 
+    tp_size = parallel_dims.tp  # need tp_size for seq_len division
+    # for DDP only, hidden will be float32, otherwise BF16
+    ddp_only = not parallel_dims.dp_shard_enabled
+
+    pp_mbs = job_config.parallelism.pipeline_parallel_microbatch_size
+    seq_len = job_config.training.seq_len
+    tp_seq_len = seq_len // max(tp_size, 1)
+    loss_parallel_enabled = (
+        parallel_dims.tp_enabled and not job_config.parallelism.disable_loss_parallel
+    )
+
     stages, model_parts = pipeline_module_split(
         model,
         pp_mesh,
         job_config.parallelism.pipeline_parallel_schedule,
         device,
         module_names_per_stage,
+        pp_mbs,
+        seq_len,
+        tp_seq_len,
+        ddp_only,
+        loss_parallel_enabled,
     )
 
     # For PP with looped schedules, each item in model_parts is one stage-model-chunk.
@@ -203,6 +220,11 @@ def pipeline_module_split(
     pp_schedule: str,
     device: torch.device,
     module_names_per_stage: list[list[str]],
+    pp_mbs: int,
+    seq_len: int,
+    tp_seq_len: int,
+    ddp_only: bool,
+    loss_parallel_enabled: bool,
 ) -> tuple[list[PipelineStage], list[nn.Module]]:
     """
     This API creates pipeline stages based on specified module names for each stage.
@@ -233,6 +255,12 @@ def pipeline_module_split(
     """
     pp_rank = pp_mesh.get_local_rank()
     pp_size = pp_mesh.size()
+
+    dim = whole_model.tok_embeddings.weight.shape[1]
+    vocab_size = whole_model.tok_embeddings.weight.shape[0]
+
+    hidden_dtype = torch.bfloat16 if not ddp_only else torch.float32
+    empty_tensor = partial(torch.empty, dtype=hidden_dtype, device="meta")
 
     def _build_stage_from_modules(
         stage_idx: int, module_names: list[str], num_stages: int
@@ -279,12 +307,30 @@ def pipeline_module_split(
                 # Replace with None
                 setattr(model, module_name, None)
 
+        if stage_idx == 0:
+            # is first stage
+            example_input = empty_tensor((pp_mbs, seq_len), dtype=torch.long)
+            example_output = empty_tensor((pp_mbs, tp_seq_len, dim))
+        elif stage_idx == num_stages - 1:
+            # is last stage
+            # Why we dont need this?
+            # # output_dim = (
+            #     vocab_size if not loss_parallel_enabled else vocab_size // tp_size
+            # )
+            example_input = empty_tensor((pp_mbs, tp_seq_len, dim))
+            example_output = empty_tensor((pp_mbs, seq_len, vocab_size))
+        else:
+            example_input = empty_tensor((pp_mbs, tp_seq_len, dim))
+            example_output = empty_tensor((pp_mbs, tp_seq_len, dim))
+
         stage = PipelineStage(
             model,
             stage_idx,
             num_stages,
             device,
             group=pp_mesh.get_group("pp"),
+            input_args=(example_input,),
+            output_args=(example_output,),
         )
         return stage, model
 

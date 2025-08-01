@@ -9,6 +9,7 @@
 import copy
 
 import torch
+from torch.distributed.tensor.parallel import loss_parallel
 import torch.nn as nn
 from torch.distributed import DeviceMesh
 from torch.distributed.pipelining import PipelineStage
@@ -28,7 +29,7 @@ from torchtitan.distributed.pipeline import (
 )
 from torchtitan.protocols.train_spec import ParallelizeFunction
 from torchtitan.tools.logging import logger
-
+from functools import partial
 from ..model.args import TransformerModelArgs
 
 
@@ -92,6 +93,10 @@ def pipeline_llama_manual_split(
     pp_size = pp_mesh.size()
     parallelism_config = job_config.parallelism
 
+    tp_size = parallel_dims.tp  # need tp_size for seq_len division
+    # for DDP only, hidden will be float32, otherwise BF16
+    ddp_only = not parallel_dims.dp_shard_enabled
+
     if model_config.num_mtp_modules > 0:
         # lets disable MTP for now
         raise ValueError("MTP is not supported yet")
@@ -111,6 +116,9 @@ def pipeline_llama_manual_split(
         is_last: bool = False,
     ) -> tuple[PipelineStage, nn.Module]:
         model = copy.deepcopy(whole_model)
+        dim = model.tok_embeddings.weight.shape[1]
+        vocab_size = model.tok_embeddings.weight.shape[0]
+
         if not is_first:
             model.tok_embeddings = None
 
@@ -137,12 +145,41 @@ def pipeline_llama_manual_split(
             model.norm = None
             model.output = None
 
+        # ==== Here we infer the input and output shapes for the stage ====
+        # see https://github.com/pytorch/torchtitan/issues/1492
+        pp_mbs = job_config.parallelism.pipeline_parallel_microbatch_size
+        seq_len = job_config.training.seq_len
+        tp_seq_len = seq_len // max(tp_size, 1)
+        loss_parallel_enabled = (
+            parallel_dims.tp_enabled and not parallelism_config.disable_loss_parallel
+        )
+        # here is hard-coded for now, that we assume all hidden have Shard(1) placement on TP mesh
+
+        hidden_dtype = torch.bfloat16 if not ddp_only else torch.float32
+        empty_tensor = partial(torch.empty, dtype=hidden_dtype, device="meta")
+
+        if is_first:
+            example_input = empty_tensor((pp_mbs, seq_len), dtype=torch.long)
+            example_output = empty_tensor((pp_mbs, tp_seq_len, dim))
+        elif is_last:
+            # Why we dont need this?
+            # # output_dim = (
+            #     vocab_size if not loss_parallel_enabled else vocab_size // tp_size
+            # )
+            example_input = empty_tensor((pp_mbs, tp_seq_len, dim))
+            example_output = empty_tensor((pp_mbs, seq_len, vocab_size))
+        else:
+            example_input = empty_tensor((pp_mbs, tp_seq_len, dim))
+            example_output = empty_tensor((pp_mbs, tp_seq_len, dim))
+        # ============================================================
         stage = PipelineStage(
             model,
             stage_idx,
             num_stages,
             device,
             group=pp_mesh.get_group("pp"),
+            input_args=(example_input,),
+            output_args=(example_output,),
         )
         return stage, model
 

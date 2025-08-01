@@ -72,7 +72,11 @@ def moe_loss(
     """Sequence-wise auxiliary loss-enhanced loss function for MoE Transformer
     model training.
     """
-    assert isinstance(pred, dict)
     loss = loss_fn(pred, labels)
-    loss += pred["aux_loss"]
+    if not isinstance(pred, dict):
+        return loss
+
+    assert isinstance(pred, dict)
+    if "aux_loss" in pred:
+        loss += pred["aux_loss"]
     return loss

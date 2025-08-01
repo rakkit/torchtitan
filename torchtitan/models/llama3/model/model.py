@@ -818,13 +818,15 @@ class Transformer(nn.Module, ModelProtocol):
                 )
                 tokens_list[mtp_layer_id + 1] = output
 
-        # return tokens_list[0] # to make it compatible with PP
-        return {
-            "tokens_list": tokens_list,
-            "orig_tokens": orig_tokens,
-            "prev_embed": prev_embed,
-            "start_pos": start_pos,
-        }
+        if self.model_args.num_mtp_modules > 0:
+            return {
+                "tokens_list": tokens_list,
+                "orig_tokens": orig_tokens,
+                "prev_embed": prev_embed,
+                "start_pos": start_pos,
+            }
+        else:
+            return tokens_list[0]  # to make it compatible with PP
 
     @classmethod
     def from_model_args(cls, model_args: TransformerModelArgs) -> "Transformer":

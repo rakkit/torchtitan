@@ -294,6 +294,7 @@ class Transformer(nn.Module, ModelProtocol):
     """
 
     transformer_block_cls = TransformerBlock
+    apply_aux_loss = False
 
     def __init__(self, model_args: MoEModelArgs):
         if model_args.num_mtp_modules > 0:
@@ -336,6 +337,9 @@ class Transformer(nn.Module, ModelProtocol):
 
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
         self.init_weights()
+
+        if model_args.moe_aux_loss_alpha > 0:
+            self.apply_aux_loss = True
 
     def init_weights(
         self,
@@ -457,10 +461,13 @@ class Transformer(nn.Module, ModelProtocol):
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
-        return {
-            "tokens_list": [output],
-            "aux_loss": total_moe_aux_loss,
-        }
+        if self.apply_aux_loss:
+            return {
+                "tokens_list": [output],
+                "aux_loss": total_moe_aux_loss,
+            }
+        else:
+            return output
 
     @classmethod
     def from_model_args(cls, model_args: MoEModelArgs) -> "Transformer":

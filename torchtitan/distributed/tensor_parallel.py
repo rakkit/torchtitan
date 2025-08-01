@@ -16,7 +16,11 @@ def maybe_enable_async_tp(job_config: JobConfig, tp_mesh: DeviceMesh):
     if not job_config.parallelism.enable_async_tensor_parallel:
         return
 
-    if not (job_config.compile.enable and "model" in job_config.compile.components):
+    if not (
+        job_config.compile.enable
+        and "model" in job_config.compile.components
+        and job_config.parallelism.tensor_parallel_only_attention
+    ):
         raise RuntimeError("Async TP requires --training.compile")
 
     from torch.distributed._symmetric_memory import enable_symm_mem_for_group

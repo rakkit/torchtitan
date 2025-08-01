@@ -350,6 +350,12 @@ class Parallelism:
     enable_async_tensor_parallel: bool = False
     """Whether to apply async tensor parallel (currently only effective when compile is enabled)"""
 
+    tensor_parallel_only_attention: bool = False
+    """Whether to only apply tensor parallelism to the Attention part of the model."""
+
+    enable_approx_mid_norm_for_tensor_parallel: bool = False
+    """Whether to use an approximate mid-norm with tensor parallelism."""
+
     pipeline_parallel_degree: int = 1
     """
     Pipeline Parallelism degree, or number of ranks. 1 means disabled.

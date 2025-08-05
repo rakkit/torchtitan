@@ -25,6 +25,7 @@ from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.optimizers import DistributedScion, naive_param_norm, Scion
 from torchtitan.tools.logging import logger
+from torchtitan.tools.utils import Color
 
 __all__ = [
     "OptimizersContainer",
@@ -57,6 +58,7 @@ def _extract_param_groups(
     )
     params = []
 
+    color = Color()
     for param_group_config in param_groups_config:
         str_match = param_group_config.pop("param_str_match")
         filter_fn = functools.partial(re.search, str_match)
@@ -69,8 +71,8 @@ def _extract_param_groups(
 
         if len(param_names) == 0:
             logger.warning(
-                f'Notice: No parameters found for `str_match` "{str_match}" on '
-                f"global rank {torch.distributed.get_rank()}"
+                f'{color.red}Notice: No parameters found for `str_match` "{str_match}" on '
+                f"global rank {torch.distributed.get_rank()}{color.reset}"
             )
             continue
         group_params.update(param_group_config)

@@ -84,6 +84,16 @@ class TransformerModelArgs(BaseModelArgs):
         self.num_mtp_modules = job_config.training.num_mtp_tokens
         assert self.num_mtp_modules >= 0
 
+        # Normalize `depth_init`.
+        depth_init = job_config.model.depth_init.lower()
+        if depth_init == ["true", "depth"]:
+            depth_init = True
+        elif depth_init == ["false", "total_depth"]:
+            depth_init = False
+        elif depth_init in ["none", "null", "identity"]:
+            depth_init = None
+        self.depth_init = depth_init
+
         if self.vocab_size == -1:
             tokenizer = kwargs.get("tokenizer")
             assert isinstance(tokenizer, BaseTokenizer), (

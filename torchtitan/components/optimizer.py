@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
+import os
 import re
 from collections import OrderedDict
 from typing import Any, Generic, Iterator, TypeVar
@@ -454,6 +455,15 @@ def build_optimizers(
         nesterov = optimizer_config.nesterov
         is_light = optimizer_config.is_light
         is_unconstrained = optimizer_config.is_unconstrained
+        if os.environ.get("SCION_DEBUG_GRAD") == "1":
+            # only if we want to debug the gradient, we dont run SVD
+            norm_factor = "none"
+            zeropower_backend_algorithm = "identity"
+            logger.warning(
+                '`SCION_DEBUG_GRAD` is set to 1, we will not run SVD and use the "identity" backend'
+            )
+        else:
+            norm_factor = "spectral"
 
         optimizer_kwargs = {
             "is_light": is_light,
@@ -462,7 +472,7 @@ def build_optimizers(
             "momentum": momentum,
             "nesterov": nesterov,
             "eps": eps,
-            "norm_factor": "spectral",
+            "norm_factor": norm_factor,
             "backend": zeropower_backend_algorithm,
             "backend_steps": backend_steps,
         }

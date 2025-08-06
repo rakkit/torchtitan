@@ -38,6 +38,7 @@ from torchtitan.config import ConfigManager, JobConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.models.attention import init_attention_mask
 from torchtitan.models.MoEllama.model.model import Transformer as MoETransformer
+from torchtitan.optimizers import norm_helper
 from torchtitan.protocols.model_converter import build_model_converters
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
@@ -337,6 +338,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         self.metrics_processor.optimizers = self.optimizers
         self.metrics_processor.model_parts = self.model_parts
+        self.optimizers.norms_to_log = norm_helper.get_norms_to_log(
+            job_config.metrics.norms_to_log
+        )
 
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.

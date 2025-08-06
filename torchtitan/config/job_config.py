@@ -52,6 +52,17 @@ class Metrics:
     log_norm_freq: int = 0
     """How often to log parameter norm metrics to TensorBoard, in iterations"""
 
+    norms_to_log: list[str] = field(default_factory=lambda: ["default"])
+    """
+    Which parameter norms to log. If "all" or "everything" is specified,
+    log all available norms. If "default" is specified, use the following:
+    - "rms_to_rms"
+    - "l1_to_rms"
+    - "rms_to_l1"
+    - "supremum"
+    - "condition_number"
+    """
+
     enable_tensorboard: bool = False
     """Whether to log metrics to TensorBoard"""
 

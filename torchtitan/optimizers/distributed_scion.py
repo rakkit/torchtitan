@@ -159,6 +159,7 @@ class DistributedScion(torch.optim.Optimizer):
         extra_reduce_for_HSDP=False,
     ):
         self.need_to_calculate_norm = False
+        self.norms_to_log: list[str] = list(NORM_FUNCTIONS.keys())
         self.norms_at_current_step = {}
         self.extra_reduce_for_HSDP = False
         self.log_parameters_types = True
@@ -230,8 +231,9 @@ class DistributedScion(torch.optim.Optimizer):
                     "Please set nesterov=False."
                 )
 
-    def calculate_norm_at_next_step(self):
+    def calculate_norm_at_next_step(self, norms_to_log: list[str]):
         self.need_to_calculate_norm = True
+        self.norms_to_log = norms_to_log
         self.norms_at_current_step = {}
 
     def get_norms_at_current_step(self):
@@ -537,9 +539,13 @@ class DistributedScion(torch.optim.Optimizer):
                 p = p.full_tensor()
 
             norm_need_transpose = "tok_embeddings" in p_name
-            norms_of_update = calculate_norm(-lr * u, transpose=norm_need_transpose)
+            norms_of_update = calculate_norm(
+                -lr * u, self.norms_to_log, transpose=norm_need_transpose
+            )
             if apply_on_weight:
-                norms_of_weight: dict = calculate_norm(p, transpose=norm_need_transpose)
+                norms_of_weight: dict = calculate_norm(
+                    p, self.norms_to_log, transpose=norm_need_transpose
+                )
             else:
                 norms_of_weight = None
 
@@ -547,7 +553,7 @@ class DistributedScion(torch.optim.Optimizer):
             # will be interpolated later.
             embed_norm_key_template = "track_{task_name}_{norm_name}/{cleaned_p_name}"
             cleaned_p_name = remove_orig_mod_and_weight_for_p_name(p_name)
-            for norm_name in NORM_FUNCTIONS.keys():
+            for norm_name in self.norms_to_log:
                 final_norms[
                     embed_norm_key_template.format(
                         task_name="update",
@@ -607,7 +613,9 @@ class DistributedScion(torch.optim.Optimizer):
                 assert u.ndim == 3
                 for ep_idx in range(u.shape[0]):
                     actual_ep_idx = ep_idx + local_rank * ep_per_rank
-                    update_norms = calculate_norm(u[ep_idx], transpose=True)
+                    update_norms = calculate_norm(
+                        u[ep_idx], self.norms_to_log, transpose=True
+                    )
                     # Template for MoE norm keys
                     norms_of_update.update(
                         {
@@ -652,7 +660,7 @@ class DistributedScion(torch.optim.Optimizer):
         norms_of_update, norms_of_weight, final_norms = [], [], {}
         padding_norms = {
             norm_name: torch.tensor(0.0, device=device)
-            for norm_name in NORM_FUNCTIONS.keys()
+            for norm_name in self.norms_to_log
         }
         apply_on_weight = apply_on_weight and need_to_calculate_norm
 
@@ -713,12 +721,16 @@ class DistributedScion(torch.optim.Optimizer):
                 lr, *_ = self.groups_info[self.parameters_to_groups[id(p)]]
 
                 if current_rank_idx < end_idx:
-                    norms_of_update.extend(calculate_norm(-lr * u).values())
+                    norms_of_update.extend(
+                        calculate_norm(-lr * u, self.norms_to_log).values()
+                    )
                 else:
                     norms_of_update.extend(padding_norms.values())
                 if apply_on_weight:
                     if current_rank_idx < end_idx:
-                        norms_of_weight.extend(calculate_norm(p).values())
+                        norms_of_weight.extend(
+                            calculate_norm(p, self.norms_to_log).values()
+                        )
                     else:
                         norms_of_weight.extend(padding_norms.values())
 
@@ -759,12 +771,12 @@ class DistributedScion(torch.optim.Optimizer):
                             ddp_param_names[param_idx]
                         )
                         reordered_names.append(cleaned_p_name)
-                valid_norms = len(ddp_params) * len(NORM_FUNCTIONS.keys())
+                valid_norms = len(ddp_params) * len(self.norms_to_log)
                 gathered_update_norms = gathered_update_norms[:valid_norms]
                 count = 0
                 for param_idx in range(len(ddp_params)):
                     cleaned_p_name = reordered_names[param_idx]
-                    for norm_name in NORM_FUNCTIONS.keys():
+                    for norm_name in self.norms_to_log:
                         final_norms[
                             ddp_norm_key_template.format(
                                 task_name="update",
@@ -828,7 +840,7 @@ class DistributedScion(torch.optim.Optimizer):
 
         padding_norms = {
             norm_name: torch.tensor(0.0, device=device)
-            for norm_name in NORM_FUNCTIONS.keys()
+            for norm_name in self.norms_to_log
         }
 
         apply_on_weight = apply_on_weight and need_to_calculate_norm
@@ -931,7 +943,7 @@ class DistributedScion(torch.optim.Optimizer):
                     lr, *_ = self.groups_info[
                         self.parameters_to_groups[id(fsdp_params[start_idx + rank])]
                     ]
-                    norms = calculate_norm(-lr * u)
+                    norms = calculate_norm(-lr * u, self.norms_to_log)
                 else:
                     norms = padding_norms
                 norms_of_update.extend(norms.values())
@@ -968,7 +980,7 @@ class DistributedScion(torch.optim.Optimizer):
                     full_weight = torch.cat(recv_list, dim=0)
 
                     if start_idx + rank < end_idx:
-                        norms = calculate_norm(full_weight)
+                        norms = calculate_norm(full_weight, self.norms_to_log)
                     else:
                         norms = padding_norms
                     norms_of_weight.extend(norms.values())
@@ -976,7 +988,7 @@ class DistributedScion(torch.optim.Optimizer):
         # Below we need to all-gather the norms of update to rank-0
         if need_to_calculate_norm and len(norms_of_update) > 0:
             # Convert norms_of_update to a flat tensor for all-gather
-            # Each rank has bucket_size * len(NORM_FUNCTIONS) norm values
+            # Each rank has bucket_size * len(self.norms_to_log) norm values
             norms_tensor = torch.stack(norms_of_update).to(device=device).float()
             gathered_update_norms = torch.empty(
                 world_size * norms_tensor.shape[0],
@@ -1012,7 +1024,7 @@ class DistributedScion(torch.optim.Optimizer):
                         )
                         reordered_names.append(cleaned_p_name)
 
-                valid_norms = len(fsdp_params) * len(NORM_FUNCTIONS.keys())
+                valid_norms = len(fsdp_params) * len(self.norms_to_log)
                 gathered_update_norms = gathered_update_norms[:valid_norms]
 
                 count = 0
@@ -1024,7 +1036,7 @@ class DistributedScion(torch.optim.Optimizer):
 
                 for param_idx in range(len(fsdp_params)):
                     cleaned_p_name = reordered_names[param_idx]
-                    for norm_name in NORM_FUNCTIONS.keys():
+                    for norm_name in self.norms_to_log:
                         final_norms[
                             fsdp_norm_key_template.format(
                                 task_name="update",

@@ -131,7 +131,7 @@ def compute_grad(p, optimizer=None, **kwargs):
         )
 
 
-def get_parameter_norms(model_parts, optimizers):
+def get_parameter_norms(model_parts, optimizers, norms_to_log):
     all_norms = {}
     for i, _ in enumerate(model_parts):
         # NB: assumes correspondences between model parts and optimizers
@@ -195,7 +195,7 @@ def get_parameter_norms(model_parts, optimizers):
                         for ep_idx in range(matrix.shape[0]):
                             actual_ep_idx = ep_idx + local_rank * ep_per_rank
                             update_norms = calculate_norm(
-                                matrix[ep_idx], transpose=True
+                                matrix[ep_idx], norms_to_log, transpose=True
                             )
                             # Template for MoE norm keys
                             moe_norms.update(
@@ -217,7 +217,11 @@ def get_parameter_norms(model_parts, optimizers):
                             )
 
                         transpose = "tok_embeddings" in p_name
-                        update_norms = calculate_norm(matrix, transpose=transpose)
+                        update_norms = calculate_norm(
+                            matrix,
+                            norms_to_log,
+                            transpose=transpose,
+                        )
 
                         # Template for FSDP norm keys
                         fsdp_norm_key_template = (

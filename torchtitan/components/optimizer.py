@@ -132,6 +132,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         param_groups_config = optimizer_kwargs.get("param_groups", None)
         # Whether to keep old LR values when loading.
         self.preserve_lrs_when_loading = False
+        self.norms_to_log: list[str] | None = None
 
         for model in self.model_parts:
             # copy parts we will pop from to preserve settings across model parts
@@ -219,7 +220,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         for i, _ in enumerate(self.model_parts):
             optimizer = self.optimizers[i]
             if isinstance(optimizer, DistributedScion):
-                optimizer.calculate_norm_at_next_step()
+                optimizer.calculate_norm_at_next_step(self.norms_to_log)
 
     def get_parameter_norms(self):
         all_norms = {}
@@ -231,7 +232,11 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                     all_norms.update(optimizer.get_norms_at_current_step())
                 else:
                     all_norms.update(
-                        naive_param_norm.get_parameter_norms([model_part], [optimizer])
+                        naive_param_norm.get_parameter_norms(
+                            [model_part],
+                            [optimizer],
+                            self.norms_to_log,
+                        )
                     )
                 # # To Debug, we can force using naive_param_norm
                 # all_norms.update(

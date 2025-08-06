@@ -141,6 +141,14 @@ class Model:
     Exponent applied to the final output layer's input dimensionality to obtain its init std factor.
     """
 
+    residual_scale: Literal["identity", "depth_scale", "complete_p"] = "identity"
+    """
+    Which method to use for scaling residual connections in the forward pass.
+    - "identity": no scaling
+    - "depth_scale": see Modular Norms paper (arXiv:2405.14813)
+    - "complete_p": see CompleteP paper (arXiv:2505.01618)
+    """
+
     norm_type: str = "rmsnorm"
     """
     Type of layer normalization to use

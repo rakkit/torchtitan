@@ -52,6 +52,7 @@ class TransformerModelArgs(BaseModelArgs):
     # Exponent applied to the final output layer's input dimensionality
     # to obtain its init std factor.
     final_out_exp: float = -0.5
+    residual_scale: str = "identity"
     norm_type: str = "rmsnorm"
     qk_norm: bool = False
     # If this is True, it implies `qk_norm=True`.
@@ -77,6 +78,7 @@ class TransformerModelArgs(BaseModelArgs):
             "final_out_init_fn_type",
             "final_out_init_std",
             "final_out_exp",
+            "residual_scale",
             "norm_type",
         ]:
             value = getattr(job_config.model, name)

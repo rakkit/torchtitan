@@ -437,6 +437,19 @@ class TransformerBlock(nn.Module):
             self.residual_div = (2 * model_args.n_layers) ** 0.5
         self.init_gate_as_residual = model_args.init_gate_as_residual
 
+        # x = identity_scale * x + block_scale * block(x)
+        if model_args.residual_scale == "depth_scale":
+            total_depth = 2 * model_args.n_layers
+            self.block_scale = 1 / total_depth
+            self.identity_scale = (total_depth - 1) / total_depth
+        elif model_args.residual_scale == "complete_p":
+            total_depth = 2 * model_args.n_layers
+            self.block_scale = 1 / total_depth
+            self.identity_scale = 1.0
+        elif model_args.residual_scale == "identity":
+            self.block_scale = 1.0
+            self.identity_scale = 1.0
+
     def forward(
         self,
         x: torch.Tensor,
@@ -454,8 +467,12 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(self.attention_norm(x), freqs_cis, start_pos=start_pos)
-        out = h + self.feed_forward(self.ffn_norm(h))
+        h = self.identity_scale * x + self.block_scale * self.attention(
+            self.attention_norm(x), freqs_cis, start_pos=start_pos
+        )
+        out = self.identity_scale * h + self.block_scale * self.feed_forward(
+            self.ffn_norm(h)
+        )
         return out
 
     def init_weights(self):

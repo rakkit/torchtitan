@@ -677,6 +677,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if aux_loss is not None:
             extra_metrics["loss_metrics/aux_loss"] = aux_loss
 
+        for model_part in self.model_parts:
+            for layer in model_part.layers.values():
+                if not hasattr(layer.feed_forward, "_log_expert_metrics"):
+                    continue
+                extra_metrics.update(layer.feed_forward._log_expert_metrics)
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,

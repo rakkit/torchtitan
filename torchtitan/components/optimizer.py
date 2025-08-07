@@ -507,7 +507,19 @@ def build_optimizers(
             # param_group_config["backend"] = "identity"
             param_group_config["norm_factor"] = "spectral"
             param_group_config["backend"] = zeropower_backend_algorithm
+        param_groups_config.append(param_group_config)
 
+    # We automatically scale the SSNorm's scalar factor.
+    ss_norm_str_match = "ssnorm_scale"
+    if ss_norm_str_match:
+        param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
+        param_group_config = {
+            "param_str_match": ss_norm_str_match,
+            "lr": lr,
+        }
+        if is_scion:
+            param_group_config["norm_factor"] = "sign"
+            param_group_config["backend"] = "identity"
         param_groups_config.append(param_group_config)
 
     optimizer_kwargs["extra_kwargs"] = {

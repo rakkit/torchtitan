@@ -208,6 +208,34 @@ llama3_configs = {
         norm_type="np_rmsnorm",
         norm_everywhere=True,
     ),
+    "1B-Proxy-8layers-4heads": TransformerModelArgs(
+        dim=256,
+        n_layers=8,
+        n_heads=4,
+        n_kv_heads=4,  # need KV_head > TP for TP debugging
+        ffn_dim_multiplier=1,  # need to check
+        multiple_of=64,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init=False,
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+    ),
+    "1B-Proxy-24layers-4heads": TransformerModelArgs(
+        dim=256,
+        n_layers=24,
+        n_heads=4,
+        n_kv_heads=4,  # need KV_head > TP for TP debugging
+        ffn_dim_multiplier=1,  # need to check
+        multiple_of=64,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init=False,
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+    ),
     "1B-Proxy-64layers": TransformerModelArgs(
         dim=256,
         n_layers=64,
@@ -322,6 +350,21 @@ llama3_configs = {
         n_kv_heads=8,
         ffn_dim_multiplier=1.3,
         multiple_of=4096,
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        depth_init=False,
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+    ),
+    "40B": TransformerModelArgs(
+        # this one is mapping of DPSKv3
+        dim=7168,
+        n_layers=61,
+        n_heads=128,
+        n_kv_heads=8,
+        ffn_dim_multiplier=1.3,
+        multiple_of=256,
         qk_norm=True,
         norm_eps=1e-20,
         rope_theta=10000,

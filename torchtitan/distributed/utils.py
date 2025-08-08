@@ -214,6 +214,28 @@ def get_train_context(
     return context
 
 
+def get_param_dtype(module: torch.nn.Module) -> torch.dtype | None:
+    """Return the dtype of the parameters of the given module in the
+    forward call, based on its mixed-precision policy or its first
+    parameter as per `module.parameters()`. If the module has no
+    parameters, return `None`.
+    """
+    fsdp_state_fn = getattr(module, "_get_fsdp_state", None)
+    param_dtype = None
+    if fsdp_state_fn is not None:
+        fsdp_state = fsdp_state_fn()
+        param_dtype = fsdp_state._mp_policy.param_dtype
+    # In the non-FSDP case or if the mixed-precision policy didn't set a
+    # `param_dtype`, check via model parameters.
+    if param_dtype is None:
+        first_param = next(module.parameters(), None)
+        if first_param is None:
+            param_dtype = None
+        else:
+            param_dtype = first_param.dtype
+    return param_dtype
+
+
 def maybe_enable_amp(
     parallel_dims: ParallelDims, mixed_precision_param: str, device_type: torch.device
 ) -> Generator[None, None, None]:

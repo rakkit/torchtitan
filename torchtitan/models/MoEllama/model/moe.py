@@ -179,6 +179,7 @@ class MoE(nn.Module):
 
     def __init__(
         self,
+        layer_id: int,
         dim: int,
         multiple_of: int = 256,
         n_shared_experts: int = 1,
@@ -211,6 +212,8 @@ class MoE(nn.Module):
         Saying the dense model have the 'hidden_size' of 1024,
         Then "actual_dim * activate_experts = hidden_size" should be satisfied.
         """
+
+        self.layer_id = layer_id
 
         if match_dim_with_dense:
             ratio = 1.0 / (activate_experts + n_shared_experts)
@@ -263,6 +266,7 @@ class MoE(nn.Module):
         # Routed Experts (only used when selected)
         if n_routed_experts > 0:
             self.experts = GroupedExperts(
+                layer_id,
                 dim_in=dim,
                 dim_hidden=hidden_dim,
                 num_experts=n_routed_experts,

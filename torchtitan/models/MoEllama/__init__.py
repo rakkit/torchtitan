@@ -10,10 +10,10 @@ from torchtitan.components.optimizer import build_optimizers_with_moe_load_balan
 from torchtitan.components.tokenizer import build_hf_byte_tokenizer, build_hf_tokenizer
 from torchtitan.components.validate import build_validator
 from torchtitan.datasets.hf_datasets import build_hf_dataloader
+from torchtitan.models.llama3.infra.pipeline import pipeline_llama
 from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
 from .infra.parallelize import parallelize_llama
-from .infra.pipeline import pipeline_llama
 from .model.args import MoEModelArgs
 from .model.model import Transformer
 

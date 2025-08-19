@@ -121,6 +121,7 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, layer_id: int, model_args: MoEModelArgs):
         super().__init__()
+        self.layer_id = layer_id
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
         self.attention = self.attention_cls(model_args)

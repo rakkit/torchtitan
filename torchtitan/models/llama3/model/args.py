@@ -83,6 +83,7 @@ class TransformerModelArgs(BaseModelArgs):
         ]:
             value = getattr(job_config.model, name)
             setattr(self, name, value)
+
         self.num_mtp_modules = job_config.training.num_mtp_tokens
         assert self.num_mtp_modules >= 0
 

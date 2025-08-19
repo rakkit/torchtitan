@@ -32,8 +32,7 @@ class MoEModelArgs(BaseModelArgs):
     # If `True`, then each transformer block init uses its layer ID, and
     # if `False`, each uses the total number of transformer blocks. If
     # `None`, do not apply any depth scaling.
-    depth_init: str = "total_depth"
-    residual_scale: str = "identity"
+    depth_init: bool | None = True
     first_in_init_fn_type: str = "normal"
     first_in_init_std: float = 1.0
     # Exponent applied to the first input layer's input dimensionality
@@ -52,6 +51,7 @@ class MoEModelArgs(BaseModelArgs):
     # Exponent applied to the final output layer's input dimensionality
     # to obtain its init std factor.
     final_out_exp: float = -0.5
+    residual_scale: str = "identity"
     norm_type: str = "rmsnorm"
     qk_norm: bool = False
     # If this is True, it implies `qk_norm=True`.
@@ -91,14 +91,24 @@ class MoEModelArgs(BaseModelArgs):
             "final_out_init_fn_type",
             "final_out_init_std",
             "final_out_exp",
-            "norm_type",
-            "use_flex_attn",
-            "attn_mask_type",
-            "depth_init",
             "residual_scale",
+            "norm_type",
         ]:
             value = getattr(job_config.model, name)
             setattr(self, name, value)
+
+        self.num_mtp_modules = job_config.training.num_mtp_tokens
+        assert self.num_mtp_modules >= 0
+
+        # Normalize `depth_init`.
+        depth_init = job_config.model.depth_init.lower()
+        if depth_init == ["true", "depth"]:
+            depth_init = True
+        elif depth_init == ["false", "total_depth"]:
+            depth_init = False
+        elif depth_init in ["none", "null", "identity"]:
+            depth_init = None
+        self.depth_init = depth_init
 
         if self.vocab_size == -1:
             tokenizer = kwargs.get("tokenizer")
@@ -108,6 +118,18 @@ class MoEModelArgs(BaseModelArgs):
                 "(since `vocab_size == -1`)."
             )
             self.vocab_size = tokenizer.get_vocab_size()
+            # `eos_id` is not part of the `Tokenizer` interface, so keep it
+            # optional.
+            if hasattr(tokenizer, "eos_id"):
+                self.eos_id = tokenizer.eos_id
+            # `pad_id` is not part of the `Tokenizer` interface, so keep it
+            # optional.
+            if hasattr(tokenizer, "pad_id"):
+                self.pad_id = tokenizer.pad_id
+            # Add an additional vocab element if we are explicitly
+            # supporting a pad token.
+            if self.pad_id >= 0:
+                self.vocab_size += 1
 
         if job_config.model.vocab_size_multiple_of:
             orig_vocab_size = self.vocab_size
@@ -140,7 +162,6 @@ class MoEModelArgs(BaseModelArgs):
                 "PP + block causal FlexAttention support will be fixed soon."
             )
         self.max_seq_len = seq_len
-
         self.qk_norm = self.qk_norm or self.norm_everywhere
 
     def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:

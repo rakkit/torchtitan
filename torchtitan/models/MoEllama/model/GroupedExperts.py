@@ -7,7 +7,6 @@
 from typing import Callable
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -170,15 +169,23 @@ class GroupedExperts(nn.Module):
         else:
             expert_init_fn = init_all_experts_different
 
-        expert_init_fn(init_fn, self.w1.data, init_std)
-        expert_init_fn(init_fn, self.w3.data, gate_init_std)
-        expert_init_fn(init_fn, self.w2.data, init_std / residual_div)
+        expert_init_fn(init_fn, self.w1.data, init_std, slot=0, layer_id=self.layer_id)
+        expert_init_fn(
+            init_fn, self.w3.data, gate_init_std, slot=2, layer_id=self.layer_id
+        )
+        expert_init_fn(
+            init_fn,
+            self.w2.data,
+            init_std / residual_div,
+            slot=1,
+            layer_id=self.layer_id,
+        )
 
         if not isinstance(self.out_norm, nn.Identity):
             self.out_norm.reset_parameters()
 
 
-def init_all_experts_same(init_fn, w, init_std):
+def init_all_experts_same(init_fn, w, init_std, slot=None, layer_id=None):
     """
     Notice that the weights are in the shape of [G, D_in, D_out]
     But we expected the weights to be [D_out, D_in] for `init_fn`
@@ -198,21 +205,35 @@ def init_all_experts_same(init_fn, w, init_std):
         w.copy_(local_tensor)
 
 
-def init_all_experts_different(init_fn, w, init_std):
+def make_seed_from_global(
+    layer_id: int, slot: int, expert_id: int, total_experts: int
+) -> int:
+    # 3 slots per expert: w1, w2, w3
+    return layer_id * (3 * total_experts) + slot * total_experts + expert_id
+
+
+def init_all_experts_different(init_fn, w, init_std, slot, layer_id):
+    # we can remove `init_all_experts_same` at some point,
+    # because it seems bit of pointless to have it
+    # we should expect the experts to have same norms, rather than same weights
+    assert layer_id is not None, "layer_id must be set "
+    total_experts = w.shape[0]
     if isinstance(w, torch.distributed.tensor.DTensor):
+        # we assume the DTensor is already sharded on dim 0
         local_tensor = w.to_local()
+        shard_chunk = w.__create_chunk_list__()[0]
+        offsets = shard_chunk.offsets[0]
     else:
         local_tensor = w
+        offsets = 0
 
     for e in range(local_tensor.shape[0]):
-        rank = dist.get_rank()
-        rand_offset = torch.randint(0, 10000, size=(), device="cpu").item()
-        seed = rank * 50000 + e * 100 + rand_offset
-        # for each rank, layer, expert, [w1, w2, w3], we need to set a different seed
-        if w.device.type == "meta":
+        expert_id = e + offsets
+        seed = make_seed_from_global(layer_id, slot, expert_id, total_experts)
+        if local_tensor.device.type == "meta":
             rng = None
         else:
-            rng = torch.Generator(device=w.device)
+            rng = torch.Generator(device=local_tensor.device)
             rng.manual_seed(seed)
 
         init_fn(local_tensor[e].transpose(0, 1), mean=0.0, std=init_std, generator=rng)

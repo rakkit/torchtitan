@@ -584,6 +584,19 @@ def build_optimizers_with_moe_load_balancing(
         ft_manager=ft_manager,
     )
 
+    def lmo_for_moe_bias(
+        g,
+        norm_factor="sign",
+    ):
+        if norm_factor == "sign":
+            g = torch.sign(g)
+        elif norm_factor == "spectral":
+            g = g / torch.sqrt(g.pow(2).sum())
+        return g
+
+    def need_rescale_stats(module):
+        return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
+
     # for MoE auxiliary-loss-free load balancing
     def _is_recomputation_enabled(module):
         return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
@@ -595,54 +608,107 @@ def build_optimizers_with_moe_load_balancing(
         dp_cp_mesh = (
             parallel_dims.world_mesh["dp_cp"] if parallel_dims.dp_cp_enabled else None
         )
-        # TODO: Currently this sync is blocking (thus exposed) and happens on the
-        # default compute stream. Need to assess if this is OK performance-wise.
-        tokens_per_expert_list = []
-        for model_part in model_parts:
-            for transformer_block in model_part.layers.values():
-                if not transformer_block.moe_enabled:
-                    continue
-                if transformer_block.moe.load_balance_coeff is None:
-                    return
-                tokens_per_expert = transformer_block.moe.tokens_per_expert
-                if _is_recomputation_enabled(transformer_block):
-                    # TODO: This is a hack, we assume with full AC, the tokens_per_expert is counted twice.
-                    # This does not affect to expert choice, but affects the experts usage metrics.
-                    # We divide by 2 to correct for this double-counting due to recomputation
-                    # TODO: new API to help determine if AC is enabled https://github.com/pytorch/pytorch/pull/160888
-                    tokens_per_expert = tokens_per_expert // 2
-                tokens_per_expert_list.append(tokens_per_expert)
+        # # TODO: Currently this sync is blocking (thus exposed) and happens on the
+        # # default compute stream. Need to assess if this is OK performance-wise.
+        # for model_part in model_parts:
+        #     for transformer_block in model_part.layers.values():
+        #         if transformer_block.moe_enabled:
+        #             moe = transformer_block.moe
+        #             if moe.load_balance_coeff is None:
+        #                 return
 
-        tokens_per_expert_by_layer = torch.vstack(tokens_per_expert_list)
+        #             if dp_cp_mesh is not None:
+        #                 torch.distributed.all_reduce(
+        #                     moe.tokens_per_expert, group=dp_cp_mesh.get_group()
+        #                 )
+
+        #             with torch.no_grad():
+        #                 expert_bias_delta = moe.load_balance_coeff * torch.sign(
+        #                     moe.tokens_per_expert.mean() - moe.tokens_per_expert
+        #                 )
+        #                 expert_bias_delta = expert_bias_delta - expert_bias_delta.mean()
+        #                 moe.expert_bias.add_(expert_bias_delta)
+        #                 moe.tokens_per_expert.zero_()
+
+        # above is adapted from the upstream code
+        # below is the optimized version that only uses 2 all_reduce calls
+        tok_buf, ent_buf, sizes = [], [], []  # sizes = #experts per layer
+        for part in model_parts:
+            for block in part.layers.values():
+                if not block.moe_enabled:
+                    continue
+                moe = getattr(block, "moe", block.feed_forward)
+
+                tok_buf.append(moe.tokens_per_expert)  # vector (int32)
+                if hasattr(moe, "router_entropy"):
+                    ent_buf.append(moe.router_entropy)  # scalar (float32)
+                sizes.append(tok_buf[-1].numel())
+
+                if need_rescale_stats(moe) or need_rescale_stats(block):
+                    # because of the re-computation, these data might be added twice
+                    # dont have very good way to handle this, so this take this ad-hoc approach
+                    # remember to check both moe and block, incases of its OP-LEVEL checkpointing
+                    tok_buf[-1] /= 2
+                    if len(ent_buf) > 0:
+                        ent_buf[-1] /= 2
+
+        flat_tok = torch.cat(tok_buf, 0)  # int32
+        flat_ent = torch.stack(ent_buf, 0) if len(ent_buf) > 0 else None  # float32
 
         if dp_cp_mesh is not None:
-            # Perform single all-reduce to get global statistics across all processes
             pg = dp_cp_mesh.get_group()
             torch.distributed.all_reduce(
-                tokens_per_expert_by_layer, group=pg, op=torch.distributed.ReduceOp.SUM
+                flat_tok, group=pg, op=torch.distributed.ReduceOp.SUM
             )
+            if flat_ent is not None:
+                torch.distributed.all_reduce(
+                    flat_ent, group=pg, op=torch.distributed.ReduceOp.AVG
+                )
 
-        moe_layer_idx = 0
+        layer_ptr = 0  # index into sizes / flat_ent
+        tok_ptr = 0  # offset into flat_tok
         with torch.no_grad():
-            for model_part in model_parts:
-                for transformer_block in model_part.layers.values():
-                    if not transformer_block.moe_enabled:
+            for part in model_parts:
+                for block in part.layers.values():
+                    if not block.moe_enabled:
                         continue
-                    moe = transformer_block.moe
+                    moe = getattr(block, "moe", block.feed_forward)
+                    moe._log_expert_metrics = {}
 
-                    tokens_per_expert = tokens_per_expert_by_layer[
-                        moe_layer_idx
-                    ].float()
-                    moe_layer_idx += 1
+                    n_expert = sizes[layer_ptr]
+                    tokens = flat_tok[tok_ptr : tok_ptr + n_expert].float()
+                    entropy = flat_ent[layer_ptr] if flat_ent is not None else None
+                    layer_ptr += 1
+                    tok_ptr += n_expert
 
-                    # update the expert bias
-                    # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
-                    expert_bias_delta = moe.load_balance_coeff * torch.sign(
-                        tokens_per_expert.mean() - tokens_per_expert
+                    delta = tokens.mean() - tokens
+                    # TODO(JSC): here we have options to use Row-wise norm rather than Sign
+                    update = lmo_for_moe_bias(
+                        delta, norm_factor=moe.bias_update_norm_factor
                     )
-                    expert_bias_delta = expert_bias_delta - expert_bias_delta.mean()
-                    moe.expert_bias.add_(expert_bias_delta)
+                    moe.expert_bias.add_(moe.bias_update_speed * update)
+
+                    total = tokens.sum().clamp(min=1.0)
+                    layer_id = block.layer_id
+                    moe._log_expert_metrics.update(
+                        {
+                            f"moe_ep_usage/L-{layer_id}_EP-{i}": c / total
+                            for i, c in enumerate(tokens)
+                        },
+                        **{
+                            f"moe_bias/L-{layer_id}_EP-{i}": moe.expert_bias[i].mean()
+                            for i in range(moe.expert_bias.shape[0])
+                        },
+                        # **{f"moe_entropy/moe_entropy_per_layer_{layer_id}": entropy},
+                    )
+                    if entropy is not None:
+                        moe._log_expert_metrics.update(
+                            {f"moe_entropy/L-{layer_id}": entropy},
+                        )
+
                     moe.tokens_per_expert.zero_()
+                    if hasattr(moe, "router_entropy"):
+                        moe.router_entropy.zero_()
 
     optimizers.register_step_pre_hook(
         lambda *args, **kwargs: _update_expert_bias(

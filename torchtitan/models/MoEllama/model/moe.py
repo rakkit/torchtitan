@@ -15,12 +15,6 @@ from torchtitan.models.norms import build_norm
 
 from .GroupedExperts import GroupedExperts
 
-try:
-    from grouped_gemm.ops import permute, unpermute
-except ImportError:
-    permute = None
-    unpermute = None
-
 
 class FeedForward(nn.Module):
     def __init__(
@@ -152,25 +146,73 @@ class TokenChoiceTopKRouter(nn.Module):
             max=self.experts,
         )
 
-        # Reorder the token indices to match the order of the experts
-        # token_indices_experts_sorted shape (bs*slen*top_k,)
-
-        token_indices_experts_sorted = None
-        token_indices_experts_sorted = torch.argsort(
-            selected_experts_indices.view(-1), stable=True
-        )
-
-        # reorder the scores to match the order of the token indices
-        top_scores = top_scores.view(-1)[token_indices_experts_sorted]
-        token_indices_experts_sorted = token_indices_experts_sorted // self.topk
-
         return (
             top_scores,
             scores,
             selected_experts_indices,
-            token_indices_experts_sorted,
             num_tokens_per_expert,
             experts_entropy,
+        )
+
+
+# NOTE: the reason we make this a stateless module is to support
+#       expert_tensor_parallel_degree=1 with consistent TP/EP APIs.
+class TokenReorderer(nn.Module):
+    """
+    This module reorders token indices to match the order of experts, enabling
+    efficient parallel processing of tokens by experts.
+
+    Args:
+        num_experts (int): Number of experts in the MoE layer.
+        top_k (int): Number of experts each token will be routed to.
+    """
+
+    def __init__(self, num_experts: int, top_k: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+
+    def forward(
+        self,
+        top_scores: torch.Tensor,
+        selected_experts_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Reorders token indices to match the order of experts for MoE routing.
+
+        Args:
+            top_scores (torch.Tensor): Routing scores for selected experts,
+                shape (batch_size*seq_len, top_k)
+            selected_experts_indices (torch.Tensor): Expert indices selected for each token,
+                shape (batch_size*seq_len, top_k)
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - top_scores_experts_sorted: Scores reordered to match expert ordering
+                - token_indices_experts_sorted: Token indices reordered to match expert ordering
+                - num_tokens_per_expert: Number of tokens assigned to each expert
+        """
+        # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
+        num_tokens_per_expert = torch.histc(
+            selected_experts_indices.view(-1),
+            bins=self.num_experts,
+            min=0,
+            max=self.num_experts,
+        )
+
+        # Reorder the token indices to match the order of the experts
+        # token_indices_experts_sorted shape (bs*slen*top_k,)
+        token_indices_experts_sorted = torch.argsort(
+            selected_experts_indices.view(-1), stable=True
+        )
+
+        top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
+        token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
+
+        return (
+            top_scores_experts_sorted,
+            token_indices_experts_sorted,
+            num_tokens_per_expert,
         )
 
 
@@ -197,13 +239,6 @@ class MoE(nn.Module):
         norm_type: Optional[str] = None,
         norm_eps: Optional[float] = None,
     ):
-        if permute is None or unpermute is None:
-            raise ImportError(
-                "Functions from `grouped_gemm` package could not be imported. "
-                "Please install the package like\n`python -m pip install "
-                "git+https://github.com/fanshiqing/grouped_gemm@"
-                "5c1d831ecf91b225abc91689683e7de67fbee7ef`"
-            )
 
         super().__init__()
         """
@@ -236,9 +271,10 @@ class MoE(nn.Module):
 
         # Use updated Gate with DeepSeekMoE-style routing and bias balancing
         self.router = TokenChoiceTopKRouter(
-            hidden_size=dim,
-            experts=n_routed_experts,
-            topk=activate_experts,
+            hidden_size=dim, experts=n_routed_experts, topk=activate_experts
+        )
+        self.reorderer = TokenReorderer(
+            num_experts=n_routed_experts, top_k=activate_experts
         )
 
         # Shared Experts (applies to all tokens)
@@ -264,20 +300,17 @@ class MoE(nn.Module):
             self.shared_experts = None
 
         # Routed Experts (only used when selected)
-        if n_routed_experts > 0:
-            self.experts = GroupedExperts(
-                layer_id,
-                dim_in=dim,
-                dim_hidden=hidden_dim,
-                num_experts=n_routed_experts,
-                moe_init_all_experts_same=moe_init_all_experts_same,
-                norm_everywhere=norm_everywhere,
-                norm_type=norm_type,
-                norm_eps=norm_eps,
-            )
-
-        else:
-            self.experts = None
+        assert n_routed_experts > 0, "n_routed_experts must be greater than 0"
+        self.experts = GroupedExperts(
+            layer_id,
+            dim_in=dim,
+            dim_hidden=hidden_dim,
+            num_experts=n_routed_experts,
+            moe_init_all_experts_same=moe_init_all_experts_same,
+            norm_everywhere=norm_everywhere,
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+        )
 
         self.register_buffer(
             "expert_bias", torch.zeros(n_routed_experts, dtype=torch.float32)
@@ -295,13 +328,12 @@ class MoE(nn.Module):
         init_fn_type: str,
         router_init_fn_type: str,
     ):
-        if self.experts is not None:
-            self.experts.init_weights(
-                init_std,
-                residual_div=residual_div,
-                init_gate_as_residual=init_gate_as_residual,
-                init_fn_type=init_fn_type,
-            )
+        self.experts.init_weights(
+            init_std,
+            residual_div=residual_div,
+            init_gate_as_residual=init_gate_as_residual,
+            init_fn_type=init_fn_type,
+        )
         if self.shared_experts is not None:
             self.shared_experts.init_weights(
                 init_std,
@@ -317,67 +349,51 @@ class MoE(nn.Module):
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         bz, slen, dim = x.shape
-        x_flat = x.view(bz * slen, dim)
+        x = x.view(-1, dim)
         # TODO@JSC: check if we want to use FP32 remix
 
         if self.shared_experts is not None:
-            out = self.shared_experts(x_flat)
+            out = self.shared_experts(x)
         else:
-            out = torch.zeros(x_flat.shape, device=x_flat.device, dtype=x_flat.dtype)
+            out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
 
-        # total_tokens = bz * slen * self.topk
+        (
+            top_scores,
+            sigmoid_scores,
+            selected_experts_indices,
+            num_tokens_per_expert,
+            experts_entropy,
+        ) = self.router(x, self.expert_bias)
+        self.router_entropy.add_(experts_entropy)
+        if self.training and self.use_bias_for_routing:
+            with torch.no_grad():
+                self.tokens_per_expert.add_(num_tokens_per_expert)
 
-        if self.topk > 0:
-            # (B*S, K), (B*S, K)
-            (
-                top_scores,
-                sigmoid_scores,
-                indices,
-                token_indices_experts_sorted,
-                num_tokens_per_expert,
-                experts_entropy,
-            ) = self.router(x_flat, self.expert_bias)
-            self.router_entropy.add_(experts_entropy)
-            if self.training and self.use_bias_for_routing:
-                with torch.no_grad():
-                    self.tokens_per_expert.add_(num_tokens_per_expert)
+        (
+            top_scores_experts_sorted,
+            token_indices_experts_sorted,
+            num_tokens_per_expert,
+        ) = self.reorderer(top_scores, selected_experts_indices)
 
-            # if self.experts_parallel_enabled:
-            #     permute_func = permute
-            #     unpermute_func = unpermute
-            # else:
-            #     permute_func = permute_fallback
-            #     unpermute_func = unpermute_fallback
-            # permute_func = permute_fallback
-            # unpermute_func = unpermute_fallback
+        token_indices_experts_sorted = token_indices_experts_sorted.reshape(
+            -1, 1
+        ).expand(-1, dim)
 
-            # permuted_inputs, row_id_map = permute_func(x_flat, indices.to(torch.int32))
-            # output = self.experts(x_flat, num_tokens_per_expert)
-            # routed_output = unpermute_func(
-            #     output, row_id_map, top_scores * self.router_scaling_factor
-            # )
-            # out += routed_output
+        # shape (bs*slen*top_k, dim)
+        routed_input = torch.gather(x, dim=0, index=token_indices_experts_sorted)
 
-            token_indices_experts_sorted = token_indices_experts_sorted.reshape(
-                -1, 1
-            ).expand(-1, dim)
+        routed_output = self.experts(routed_input, num_tokens_per_expert)
+        routed_output = (
+            routed_output.to(torch.float32) * top_scores_experts_sorted.reshape(-1, 1)
+        ).to(x.dtype)
 
-            # shape (bs*slen*top_k, dim)
-            permuted_inputs = torch.gather(
-                x_flat, dim=0, index=token_indices_experts_sorted
-            )
-            permuted_inputs = (
-                permuted_inputs.to(torch.float32)
-                * top_scores.reshape(-1, 1)
-                * self.router_scaling_factor
-            ).to(x.dtype)
-
-            output = self.experts(permuted_inputs, num_tokens_per_expert)
-            out = out.scatter_add(dim=0, index=token_indices_experts_sorted, src=output)
+        out = out.scatter_add(
+            dim=0, index=token_indices_experts_sorted, src=routed_output
+        )
 
         if self.training:
             aux_loss = self.sequence_wise_aux_loss(
-                indices.long(), sigmoid_scores, bz, slen
+                selected_experts_indices.long(), sigmoid_scores, bz, slen
             )
         else:
             aux_loss = torch.tensor(0.0, device=x.device)
@@ -385,7 +401,7 @@ class MoE(nn.Module):
         output = out.reshape(bz, slen, dim).to(x.dtype)
         return output, aux_loss
 
-    # @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True)
     def sequence_wise_aux_loss(
         self,
         indices: torch.Tensor,  # Shape (B*S, K_val), type long
@@ -503,44 +519,3 @@ class MoE(nn.Module):
         aux_loss = loss_per_sequence.mean() * self.aux_loss_alpha
 
         return aux_loss
-
-
-# @torch.compile(fullgraph=True)
-def permute_fallback(tokens, indices, expand_factor: int = 1):
-    expand_factor = indices.size(1)
-    flatten_indices = indices.view(-1)
-    sorted_indices = torch.argsort(flatten_indices, stable=True)
-    permuted_tokens = tokens.index_select(0, sorted_indices // expand_factor)
-    return permuted_tokens, sorted_indices
-
-
-# @torch.compile(fullgraph=True)
-def unpermute_fallback(
-    permuted_tokens, sorted_indices, probs: torch.Tensor = None, merge_factor: int = 1
-):
-    # This line is redundant if merge_factor is passed correctly, but we'll keep it
-    if probs is not None:
-        merge_factor = probs.size(1)
-
-    # Invert the permutation
-    unpermuted_tokens = torch.empty_like(permuted_tokens)
-    unpermuted_tokens.index_copy_(0, sorted_indices.long(), permuted_tokens)
-
-    # Reshape to [num_tokens, top_k, model_dim]
-    unpermuted_tokens = unpermuted_tokens.reshape(
-        -1, merge_factor, permuted_tokens.size(-1)
-    )
-
-    if probs is not None:
-        # 1. Multiply. Result is in the higher precision of `probs` (e.g., float32).
-        weighted_tokens = unpermuted_tokens * probs.unsqueeze(-1)
-        # 2. Sum in that higher precision for better accuracy.
-        unpermuted_tokens = weighted_tokens.sum(dim=1)
-    else:
-        # Fallback if no probabilities are provided
-        unpermuted_tokens = unpermuted_tokens.sum(dim=1)
-
-    # The final tensor's dtype will be the result of the sum (e.g., float32).
-    # You can cast it back to a lower precision *after* the call if necessary,
-    # for example: `out += routed_output.to(x_flat.dtype)`
-    return unpermuted_tokens

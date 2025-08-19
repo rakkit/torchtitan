@@ -78,13 +78,16 @@ def parallelize_llama(
         # all-gather happens in high precision.
         enable_float8_tensorwise_tp = enable_float8_linear and not float8_is_rowwise
 
+        enable_approx_mid_norm_for_tensor_parallel = (
+            job_config.parallelism.enable_approx_mid_norm_for_tensor_parallel
+        )
         apply_non_moe_tp(
             model,
             world_mesh["tp"],
             loss_parallel=not job_config.parallelism.disable_loss_parallel,
             enable_float8_tensorwise_tp=enable_float8_tensorwise_tp,
-            enable_approx_mid_norm_for_tensor_parallel=job_config.parallelism.enable_approx_mid_norm_for_tensor_parallel,
             tensor_parallel_only_attention=job_config.parallelism.tensor_parallel_only_attention,
+            enable_approx_mid_norm_for_tensor_parallel=enable_approx_mid_norm_for_tensor_parallel,
         )
         maybe_enable_async_tp(job_config, world_mesh["tp"])
     tp_only_attention = job_config.parallelism.tensor_parallel_only_attention
@@ -97,7 +100,9 @@ def parallelize_llama(
             ep_mesh=world_mesh["ep"] if parallel_dims.ep_enabled else None,
             ep_tp_mesh=(
                 world_mesh["ep", "tp"]
-                if parallel_dims.tp_enabled and parallel_dims.ep_enabled
+                if parallel_dims.tp_enabled
+                and parallel_dims.ep_enabled
+                and parallel_dims.etp_enabled
                 else None
             ),
             tp_only_attention=tp_only_attention,
@@ -111,16 +116,14 @@ def parallelize_llama(
     )
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if model_compile_enabled:
-        apply_compile(model)
+        apply_compile(model, ep_enabled=parallel_dims.ep_enabled)
 
-    dp_mesh: DeviceMesh | None = None
     if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
         # apply FSDP or HSDP, potentially with Context Parallel
         if parallel_dims.dp_replicate_enabled:
             dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
         else:
             dp_mesh_dim_names = ("dp_shard_cp",)
-        dp_mesh = world_mesh[tuple(dp_mesh_dim_names)]
 
         # the mesh dim names of which the MoE params are sharded on via FSDP/HSDP
         dp_mod_ep_mesh_dim_names = []
@@ -131,12 +134,13 @@ def parallelize_llama(
 
         apply_fsdp(
             model,
-            dp_mesh,
+            world_mesh[tuple(dp_mesh_dim_names)],
             param_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param],
             reduce_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce],
             pp_enabled=parallel_dims.pp_enabled,
             cpu_offload=job_config.training.enable_cpu_offload,
             reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
+            ep_degree=parallel_dims.ep,
             dp_mod_ep_mesh=(
                 world_mesh[tuple(dp_mod_ep_mesh_dim_names)]
                 if dp_mod_ep_mesh_dim_names
@@ -158,10 +162,9 @@ def parallelize_llama(
     elif parallel_dims.dp_replicate_enabled:
         if world_mesh.ndim > 1:
             raise RuntimeError("DDP has not supported > 1D parallelism")
-        dp_mesh = world_mesh
         apply_ddp(
             model,
-            dp_mesh,
+            world_mesh,
             enable_compile=model_compile_enabled,
             enable_compiled_autograd=job_config.parallelism.enable_compiled_autograd,
         )
@@ -174,8 +177,8 @@ def apply_non_moe_tp(
     tp_mesh: DeviceMesh,
     loss_parallel: bool,
     enable_float8_tensorwise_tp: bool,
-    enable_approx_mid_norm_for_tensor_parallel: bool = False,
     tensor_parallel_only_attention: bool = False,
+    enable_approx_mid_norm_for_tensor_parallel: bool = False,
 ):
     """Apply tensor parallelism."""
     # 1. Parallelize the embedding and shard its outputs (which are the first
@@ -367,21 +370,19 @@ def apply_moe_ep_tp(
             )
 
 
-def apply_compile(model: nn.Module):
+def apply_compile(model: nn.Module, ep_enabled: bool):
     """
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
-    import torch._dynamo
+    torch._dynamo.config.capture_scalar_outputs = True
 
     for layer_id, transformer_block in model.layers.named_children():
-        torch._dynamo.config.capture_scalar_outputs = True
-        # torch._dynamo.config.suppress_errors = True
-        # torch._dynamo.config.cache_size_limit = 16
-        transformer_block = torch.compile(
-            transformer_block,
-            fullgraph=True,
-        )
+        # we dont do compile when EP enabled
+        fullgraph = True and not ep_enabled
+        # if transformer_block.moe_enabled:
+        #     fullgraph = False
+        transformer_block = torch.compile(transformer_block, fullgraph=fullgraph)
         model.layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
@@ -395,6 +396,7 @@ def apply_fsdp(
     pp_enabled: bool,
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
+    ep_degree: int = 1,
     dp_mod_ep_mesh: DeviceMesh | None = None,
     gradient_divide_factor: int | None = None,
 ):
@@ -420,28 +422,32 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    for layer_id, transformer_block in model.layers.items():
-        if reshard_after_forward_policy == "always":
+    match reshard_after_forward_policy:
+        case "always":
             reshard_after_forward = True
-        elif reshard_after_forward_policy == "never":
+        case "never":
             reshard_after_forward = False
-        elif reshard_after_forward_policy == "default":
-            if pp_enabled:
-                # For PP, do not reshard after forward to avoid per-microbatch
-                # all-gathers, which can be expensive and non-overlapped
-                reshard_after_forward = False
-            else:
-                # As an optimization, do not reshard after forward for the last
-                # transformer block since FSDP would prefetch it immediately
-                reshard_after_forward = int(layer_id) < len(model.layers) - 1
-        else:
+        case "default":
+            # For PP, by default do not reshard after forward to avoid per-microbatch
+            # all-gathers, which can be expensive and non-overlapped
+            reshard_after_forward = not pp_enabled
+        case _:
             raise ValueError(
                 f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
             )
 
-        # NOTE: in an MoE layer, the router and the shared experts
-        #       are sharded together with the TransformerBlock
-        if transformer_block.moe_enabled and dp_mod_ep_mesh:
+    if model.tok_embeddings is not None:
+        fully_shard(
+            model.tok_embeddings,
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+    for layer_id, transformer_block in model.layers.items():
+        # NOTE: When EP is enabled, In an MoE layer, we use the following FSDP wrapping
+        # - the router and the shared experts are sharded together with the TransformerBlock
+        # - the routed experts are sharded with the remaining dp_mod_ep_mesh
+        if transformer_block.moe_enabled and ep_degree > 1:
             fsdp_mod_ep_config = fsdp_config.copy()
             fsdp_mod_ep_config["mesh"] = dp_mod_ep_mesh
             fully_shard(
@@ -463,4 +469,12 @@ def apply_fsdp(
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
         )
-    fully_shard(model, **fsdp_config, reshard_after_forward=not pp_enabled)
+    # As an optimization, do not reshard_after_forward the last layers by default
+    # since FSDP would prefetch them immediately after the forward pass
+    if model.norm is not None and model.output is not None:
+        fully_shard(
+            [model.norm, model.output],
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward_policy == "always",
+        )
+    fully_shard(model, **fsdp_config)

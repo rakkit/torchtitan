@@ -48,11 +48,6 @@ class GroupedExperts(nn.Module):
         activation (nn.Module): Activation function to use. Default is F.silu.
     """
 
-    # when ep is enabled, these are set in parallelize.py
-    ep_enable = False
-    expert_per_rank = -1
-    ep_size = -1
-
     def __init__(
         self,
         layer_id: int,
@@ -81,6 +76,8 @@ class GroupedExperts(nn.Module):
 
         self.init_all_experts_same = moe_init_all_experts_same
 
+        # when ep is enabled, this is set in parallelize.py
+        self.ep_enable = False
         self.expert_per_rank = num_experts
         self.ep_size = 1
 

@@ -15,9 +15,8 @@ from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecision
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
-    # parallelize_module, # we wrap it at the end of this file
+    parallelize_module,
     PrepareModuleInput,
-    PrepareModuleOutput,
     RowwiseParallel,
     SequenceParallel,
 )
@@ -210,28 +209,16 @@ def apply_non_moe_tp(
             PrepareFloat8ModuleInput,
         )
 
-        (
-            rowwise_parallel,
-            colwise_parallel,
-            prepare_module_input,
-            prepare_module_output,
-        ) = (
+        rowwise_parallel, colwise_parallel, prepare_module_input = (
             Float8RowwiseParallel,
             Float8ColwiseParallel,
             PrepareFloat8ModuleInput,
-            None,
         )
     else:
-        (
-            rowwise_parallel,
-            colwise_parallel,
-            prepare_module_input,
-            prepare_module_output,
-        ) = (
+        rowwise_parallel, colwise_parallel, prepare_module_input = (
             RowwiseParallel,
             ColwiseParallel,
             PrepareModuleInput,
-            PrepareModuleOutput,
         )
 
     # Apply tensor + sequence parallelism to every transformer block
@@ -477,161 +464,3 @@ def apply_fsdp(
             reshard_after_forward=reshard_after_forward,
         )
     fully_shard(model, **fsdp_config, reshard_after_forward=not pp_enabled)
-
-
-from typing import Optional, Union
-
-# this is missing at pytorch 2.6
-# for pytorch 2.7, we can import from pytorch directly
-# https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/parallel/style.py#L704
-from torch.distributed.tensor.parallel.style import ParallelStyle
-from torch.distributed.tensor.placement_types import Placement
-
-
-class PrepareModuleInputOutput(ParallelStyle):
-    def __init__(
-        self,
-        *,
-        input_layouts: Optional[Union[Placement, tuple[Optional[Placement]]]] = None,
-        desired_input_layouts: Optional[
-            Union[Placement, tuple[Optional[Placement]]]
-        ] = None,
-        input_kwarg_layouts: Optional[dict[str, Placement]] = None,
-        desired_input_kwarg_layouts: Optional[dict[str, Placement]] = None,
-        use_local_input: bool = False,
-        output_layouts: Union[Placement, tuple[Placement]],
-        desired_output_layouts: Union[Placement, tuple[Placement]],
-        use_local_output: bool = True,
-    ):
-        self.prepare_module_input = PrepareModuleInput(
-            input_layouts=input_layouts,
-            desired_input_layouts=desired_input_layouts,
-            input_kwarg_layouts=input_kwarg_layouts,
-            desired_input_kwarg_layouts=desired_input_kwarg_layouts,
-            use_local_output=use_local_input,
-        )
-        self.prepare_module_output = PrepareModuleOutput(
-            output_layouts=output_layouts,
-            desired_output_layouts=desired_output_layouts,
-            use_local_output=use_local_output,
-        )
-
-    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        self.prepare_module_input._apply(module, device_mesh)
-        self.prepare_module_output._apply(module, device_mesh)
-
-        return module
-
-    def __repr__(self) -> str:
-        tmpstr = self.__class__.__name__ + "("
-        tmpstr += f"input_layouts={self.prepare_module_input.input_layouts}, "
-        tmpstr += (
-            f"desired_input_layouts={self.prepare_module_input.desired_input_layouts}, "
-        )
-        tmpstr += (
-            f"input_kwarg_layouts={self.prepare_module_input.input_kwarg_layouts}, "
-        )
-        tmpstr += f"desired_input_kwarg_layouts={self.prepare_module_input.desired_input_kwarg_layouts}, "
-        tmpstr += f"use_local_input={self.prepare_module_input.use_local_output}, "
-        tmpstr += f"output_layouts={self.prepare_module_output.output_layouts}, "
-        tmpstr += f"desired_output_layouts={self.prepare_module_output.desired_output_layouts}, "
-        tmpstr += f"use_local_output={self.prepare_module_output.use_local_output}"
-        tmpstr += ")"
-        return tmpstr
-
-
-# https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/parallel/api.py
-# see commit https://github.com/pytorch/pytorch/commit/5633283574c458bd6a3cbb6a0a890f0cb9c8b2b5
-# There is a werid bugs in `parallelize_module` for a while that it call the function `_validate_tp_mesh_dim`,
-# how ever this function only exam the "master" mesh, but did not check the 'sub-mesh'
-# thereforce, if we wana `parallelize_module` to work on device_mesh that is a sub-mesh, it will raise the error.
-
-import warnings
-from fnmatch import fnmatch
-from typing import Optional, Union
-
-import torch
-import torch.nn as nn
-from torch.distributed.device_mesh import _mesh_resources, DeviceMesh
-from torch.distributed.tensor.parallel.style import ParallelStyle
-
-
-def parallelize_module(  # type: ignore[return]
-    module: nn.Module,
-    device_mesh: Optional[DeviceMesh] = None,
-    parallelize_plan: Optional[Union[ParallelStyle, dict[str, ParallelStyle]]] = None,
-    *,
-    src_data_rank: Optional[int] = 0,
-) -> nn.Module:
-    # torch._C._log_api_usage_once("torch.distributed.tensor.parallel.parallelize_module")
-
-    device_mesh = device_mesh or _mesh_resources.get_current_mesh()
-
-    if parallelize_plan is None:
-        warnings.warn(
-            "No parallelize_plan is provided and auto-parallel is not supported "
-            "at the moment, so this parallelize_module call will do nothing."
-        )
-        return module
-
-    # note: The RNG tracker will be initialized in distribute_tensor() call if it hasn't
-    # been initialized.
-
-    if isinstance(parallelize_plan, ParallelStyle):
-        parallelize_plan.src_data_rank = src_data_rank
-        return parallelize_plan._apply(module, device_mesh)
-    elif isinstance(parallelize_plan, dict):
-        for module_path, parallelize_style in parallelize_plan.items():
-            if module_path == "":
-                # shortcut: empty string means to apply the plan to the current module
-                parallelize_module(module, device_mesh, parallelize_style)
-                continue
-
-            path_splits = module_path.split(".")
-            # Instead of blindly popping tokens, first check the match,
-            # we only consume/pop the token if we found a match.
-            token = path_splits[0]
-
-            matched_children = list(
-                filter(
-                    # `t[0]` is child name
-                    lambda t: fnmatch(t[0], token),
-                    module.named_children(),
-                )
-            )
-            if not matched_children:
-                # No match at this level. Log a warning and process next plan entry.
-                warnings.warn(
-                    f"Parallelize plan key '{module_path}' could not be resolved: "
-                    f"no submodule matching token '{token}' in module {module}, "
-                    f"skipping this plan entry."
-                )
-                continue
-
-            # Now that we have a match, we can consume the token.
-            path_splits.pop(0)
-            # apply the plan to all matched submodules
-            for _, submodule in matched_children:
-                if path_splits:
-                    # we haven't reached the leaf, apply in dict style
-                    leaf_path = ".".join(path_splits)  # rest of the path after `token`
-                    parallelize_module(
-                        submodule,
-                        device_mesh,
-                        {leaf_path: parallelize_style},
-                        src_data_rank=src_data_rank,
-                    )
-                else:
-                    # otherwise, directly apply style to this submodule
-                    parallelize_module(
-                        submodule,
-                        device_mesh,
-                        parallelize_style,
-                        src_data_rank=src_data_rank,
-                    )
-        return module
-    else:
-        raise TypeError(  # pyre-ignore[7]
-            "Expect Union[ParallelStyle, Dict[str, ParallelStyle]] for"
-            f" parallelize_plan, {type(parallelize_plan)} found!"
-        )

@@ -55,6 +55,7 @@ class GroupedExperts(nn.Module):
 
     def __init__(
         self,
+        layer_id: int,
         *,
         dim_in: int,
         dim_hidden: int,
@@ -66,6 +67,7 @@ class GroupedExperts(nn.Module):
         norm_eps: float | None = None,
     ):
         super().__init__()
+        self.layer_id = layer_id
         self.dim_in = dim_in
         self.dim_hidden = dim_hidden
         self.num_experts = num_experts

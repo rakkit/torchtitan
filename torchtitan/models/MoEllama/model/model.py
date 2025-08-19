@@ -151,6 +151,7 @@ class TransformerBlock(nn.Module):
 
         if self.moe_enabled:
             self.feed_forward = MoE(
+                layer_id,
                 dim=model_args.dim,
                 multiple_of=model_args.multiple_of,
                 ffn_dim_multiplier=model_args.ffn_dim_multiplier,
@@ -175,8 +176,6 @@ class TransformerBlock(nn.Module):
             hidden_dim = int(hidden_dim - hidden_dim % model_args.multiple_of)
 
             self.feed_forward = FeedForward(dim=model_args.dim, hidden_dim=hidden_dim)
-
-        self.feed_forward.experts.layer_id = layer_id
 
         self.attention_norm = build_norm(
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps

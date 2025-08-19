@@ -10,28 +10,30 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-# from ..infra.expert_parallel import expert_parallel
-
-from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
-
+from torchtitan.distributed.expert_parallel import expert_parallel
 from torchtitan.models.inits import build_init_fn
 from torchtitan.models.norms import build_norm
 
-try:
-    from grouped_gemm.ops import gmm as grouped_gemm
-except ImportError:
 
-    def mock_grouped_gemm(x, w, m_sizes):
-        out = x.new_zeros(x.shape[0], w.shape[2])
-        # G = m_sizes.shape[0]
-        shift = 0
-        for g, n_tokens in enumerate(m_sizes):
-            input_tokens = x[shift : shift + n_tokens]
-            out[shift : shift + n_tokens] = input_tokens @ w[g]
-            shift += n_tokens
-        return out
+@expert_parallel
+def _run_experts_grouped_mm(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+    activation: Callable,
+    out_norm: nn.Module,
+) -> torch.Tensor:
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    # grouped mm between a 2D tensor and a 3D tensor
+    assert x.dim() == 2
 
-    grouped_gemm = mock_grouped_gemm
+    h = activation(torch._grouped_mm(x, w1, offs=offsets))
+    h = h * torch._grouped_mm(x, w3, offs=offsets)
+    out = torch._grouped_mm(out_norm(h), w2, offs=offsets)
+
+    return out
 
 
 class GroupedExperts(nn.Module):
@@ -107,50 +109,17 @@ class GroupedExperts(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        m_sizes: torch.LongTensor,
+        num_tokens_per_expert: torch.LongTensor,
     ) -> torch.Tensor:
-
-        if not self.ep_enable:
-            m_sizes = m_sizes.long()
-            h = grouped_gemm(x, self.w1, m_sizes)
-            h = self.act_fn(h) * grouped_gemm(x, self.w3, m_sizes)
-            h = grouped_gemm(self.out_norm(h), self.w2, m_sizes)
-            return h
-
-        # ###### BELOW IS THE EP REGIME #######
-        # TODO(JSC): For now, EP does not work with compile
-        ALIGN_SIZE_M = 16
-        # ALIGN_SIZE_M = 1
-
-        if ALIGN_SIZE_M > 1:
-            max_len = x.shape[0] + self.expert_per_rank * ALIGN_SIZE_M
-        else:
-            max_len = x.shape[0]
-
-        with torch.no_grad():
-            (permuted_indices, m_sizes, _,) = generate_permute_indices(  # offsets,
-                m_sizes,
-                self.expert_per_rank,
-                self.ep_size,
-                max_len,
-                ALIGN_SIZE_M,
-                use_cpu=True,
-            )
-
-        if ALIGN_SIZE_M > 1:
-            x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
-        input_shape = x.shape
-        x = x[permuted_indices, :]
-        m_sizes = m_sizes.long()
-
-        out = grouped_gemm(x, self.w1.to_local(), m_sizes)
-        out = self.act_fn(out) * grouped_gemm(x, self.w3.to_local(), m_sizes)
-        out = grouped_gemm(self.out_norm(out), self.w2.to_local(), m_sizes)
-
-        out_unpermuted = out.new_empty(input_shape)
-        out_unpermuted[permuted_indices, :] = out
-        out = out_unpermuted[:-1]
-        return out
+        return _run_experts_grouped_mm(
+            self.w1,
+            self.w2,
+            self.w3,
+            x,
+            num_tokens_per_expert,
+            activation=self.act_fn,
+            out_norm=self.out_norm,
+        )
 
     def init_weights(
         self,

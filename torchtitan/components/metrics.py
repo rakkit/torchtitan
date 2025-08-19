@@ -358,6 +358,8 @@ class MetricsProcessor:
         )
         self.ntokens_since_last_log = 0
         self.data_loading_times = []
+        self.optim_step_times = []
+        self.fwd_bwd_times = []
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
 
@@ -399,6 +401,26 @@ class MetricsProcessor:
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
+        # Lets also compute the "tps and mfu" without the data loading time and optim step time
+        time_optim_step = sum(self.optim_step_times) / len(self.optim_step_times)
+        time_optim_step_pct = 100 * sum(self.optim_step_times) / time_delta
+
+        time_fwd_bwd = sum(self.fwd_bwd_times) / len(self.fwd_bwd_times)
+        time_fwd_bwd_pct = 100 * sum(self.fwd_bwd_times) / time_delta
+
+        # dont use this for now, because due to some overlap, the total percentage is already over 100%
+        # so `others` here is not really meaningful
+        # others_time_pct = (
+        #     100 - time_data_loading_pct - time_optim_step_pct - time_fwd_bwd_pct
+        # )
+        # others_time = time_end_to_end * others_time_pct / 100
+
+        iso_tps = self.ntokens_since_last_log / (
+            sum(self.fwd_bwd_times) * self.parallel_dims.non_data_parallel_size
+        )
+        iso_tflops = self.num_flops_per_token * iso_tps / 1e12
+        iso_mfu = 100 * self.num_flops_per_token * iso_tps / self.gpu_peak_flops
+
         metrics = {
             "loss_metrics/global_avg_loss": global_avg_loss,
             "loss_metrics/global_max_loss": global_max_loss,
@@ -406,9 +428,18 @@ class MetricsProcessor:
             "throughput(tps)": tps,
             "tflops": tflops,
             "mfu(%)": mfu,
+            "iso_throughput(tps)": iso_tps,
+            "iso_tflops": iso_tflops,
+            "iso_mfu(%)": iso_mfu,
             "time_metrics/end_to_end(s)": time_end_to_end,
             "time_metrics/data_loading(s)": time_data_loading,
             "time_metrics/data_loading(%)": time_data_loading_pct,
+            "time_metrics/optim_step(s)": time_optim_step,
+            "time_metrics/optim_step(%)": time_optim_step_pct,
+            "time_metrics/fwd_bwd(s)": time_fwd_bwd,
+            "time_metrics/fwd_bwd(%)": time_fwd_bwd_pct,
+            # "time_metrics/others(s)": others_time,
+            # "time_metrics/others(%)": others_time_pct,
             "memory/max_active(GiB)": device_mem_stats.max_active_gib,
             "memory/max_active(%)": device_mem_stats.max_active_pct,
             "memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
@@ -437,12 +468,17 @@ class MetricsProcessor:
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
-            f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
+            f"{color.magenta}mfu: {mfu:.2f}% | "
+            f"{color.yellow}iso_tps: {round(iso_tps):,}  "
+            f"{color.cyan}iso_tflops: {iso_tflops:,.2f}  "
+            f"{color.magenta}iso_mfu: {iso_mfu:.2f}%{color.reset}"
             f"{extra_print_data}"
         )
 
         self.ntokens_since_last_log = 0
         self.data_loading_times.clear()
+        self.optim_step_times.clear()
+        self.fwd_bwd_times.clear()
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
 

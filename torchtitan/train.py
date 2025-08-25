@@ -683,6 +683,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if aux_loss is not None:
             extra_metrics["loss_metrics/aux_loss"] = aux_loss
 
+        self.optimizers.join_log_queue()
         for model_part in self.model_parts:
             for layer in model_part.layers.values():
                 if not hasattr(layer.feed_forward, "_log_expert_metrics"):
@@ -794,6 +795,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.checkpointer.close()
         if self.metrics_processor:
             self.metrics_processor.close()
+
+        optimizers = getattr(self, "optimizers", None)
+        if optimizers is not None and hasattr(optimizers, "close"):
+            optimizers.close()
 
 
 if __name__ == "__main__":

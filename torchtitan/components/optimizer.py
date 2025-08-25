@@ -6,9 +6,11 @@
 
 import functools
 import os
+import queue
 import re
+import threading
 from collections import OrderedDict
-from typing import Any, Generic, Iterator, TypeVar
+from typing import Any, Callable, Generic, Iterator, TypeVar
 
 import torch
 import torch.nn as nn
@@ -133,6 +135,8 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         # Whether to keep old LR values when loading.
         self.preserve_lrs_when_loading = False
         self.norms_to_log: list[str] | None = None
+        self.log_queue: queue.Queue | None = None
+        self.log_thread: threading.Thead | None = None
 
         for model in self.model_parts:
             # copy parts we will pop from to preserve settings across model parts
@@ -157,6 +161,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         # optimizer defaults.
         optimizer_kwargs.pop("param_groups", None)
         optimizer_kwargs.update(optimizer_kwargs.pop("extra_kwargs", {}))
+
         self._post_init(all_params, optimizer_kwargs)
 
     def __iter__(self) -> Iterator[T]:
@@ -257,6 +262,22 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             "Must pass one optimizer per model part or per param if "
             "using OptimizersInBackwardContainer."
         )
+
+    def set_up_async_logging(self, log_fn: Callable):
+        self.log_queue = queue.Queue()
+        self.log_thread = threading.Thread(target=log_fn, args=(self.log_queue,))
+        self.log_thread.start()
+        return self.log_queue
+
+    def close(self):
+        if self.log_queue is not None:
+            self.log_queue.put(None)
+        if self.log_thread is not None:
+            self.log_thread.join()
+
+    def join_log_queue(self):
+        if self.log_queue is not None:
+            self.log_queue.join()
 
     def _post_init(
         self, all_params: list[nn.Parameter], optimizer_kwargs: dict[str, Any]
@@ -571,6 +592,46 @@ def build_optimizers(
     return OptimizersContainer(model_parts, optimizer_cls, optimizer_kwargs)
 
 
+def moe_metrics_worker(log_queue: queue.Queue):
+    """
+    This function runs in the background. It waits for data,
+    does the slow CPU work, and assigns the final dictionary.
+    """
+    while True:
+        # 1. Wait for data from the main thread
+        data = log_queue.get()
+        if data is None:  # Sentinel to stop the thread
+            break
+
+        (
+            moe_layers_info,
+            all_usages_cpu,
+            all_biases_cpu,
+            all_entropies_cpu,
+            num_experts,
+        ) = data
+
+        usage_offset = bias_offset = 0
+        for i, info in enumerate(moe_layers_info):
+            moe = info["module"]
+            layer_id = info["layer_id"]
+
+            metrics = {f"moe_entropy/L-{layer_id}": all_entropies_cpu[i]}
+            layer_usages = all_usages_cpu[usage_offset : usage_offset + num_experts]
+            layer_biases = all_biases_cpu[bias_offset : bias_offset + num_experts]
+
+            pre_usage = f"moe_ep_usage/L-{layer_id}_EP-"
+            pre_bias = f"moe_bias/L-{layer_id}_EP-"
+            metrics.update({f"{pre_usage}{j}": v for j, v in enumerate(layer_usages)})
+            metrics.update({f"{pre_bias}{j}": v for j, v in enumerate(layer_biases)})
+
+            moe._log_expert_metrics = metrics
+            usage_offset += num_experts
+            bias_offset += num_experts
+
+        log_queue.task_done()
+
+
 def build_optimizers_with_moe_load_balancing(
     model_parts: list[nn.Module],
     optimizer_config: OptimizerConfig,
@@ -584,15 +645,22 @@ def build_optimizers_with_moe_load_balancing(
         ft_manager=ft_manager,
     )
 
+    log_queue = optimizers.set_up_async_logging(moe_metrics_worker)
+
     def lmo_for_moe_bias(
         g,
         norm_factor="sign",
+        epsilon=1e-32,
     ):
-        if norm_factor == "sign" or norm_factor == "sign_zero_mean":
-            g = torch.sign(g)
-        elif norm_factor == "spectral" or norm_factor == "spectral_zero_mean":
-            g = g / torch.sqrt(g.pow(2).sum())
-        return g
+        if norm_factor in ["sign", "sign_zero_mean"]:
+            return torch.sign(g)
+        elif norm_factor in ["spectral", "spectral_zero_mean"]:
+            is_flat = g.dim() == 1
+            g = g.unsqueeze(0) if is_flat else g
+            norms = torch.linalg.norm(g, ord=2, dim=1, keepdim=True)
+            g = g / torch.clamp(norms, min=epsilon)
+            g = g.squeeze(0) if is_flat else g
+            return g
 
     def need_rescale_stats(module):
         return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
@@ -605,89 +673,122 @@ def build_optimizers_with_moe_load_balancing(
         model_parts: list[nn.Module],
         parallel_dims: ParallelDims,
     ):
+        """
+        Lets assume all MoE layers have same amount of experts.
+        """
+
         dp_cp_mesh = (
             parallel_dims.world_mesh["dp_cp"] if parallel_dims.dp_cp_enabled else None
         )
-        # below is the optimized version that only uses 2 all_reduce calls
-        tok_buf, ent_buf, sizes = [], [], []  # sizes = #experts per layer
+        # TODO: Currently this sync is blocking (thus exposed) and happens on the
+        # default compute stream. Need to assess if this is OK performance-wise.
+
+        moe_layers_info = []
+        tok_buffers, ent_buffers = [], []
+        scale_factor = 1
+        num_experts = 0
+
         for part in model_parts:
             for block in part.layers.values():
                 if not block.moe_enabled:
                     continue
                 moe = getattr(block, "moe", block.feed_forward)
-
-                tok_buf.append(moe.tokens_per_expert)  # vector (int32)
-                if hasattr(moe, "router_entropy"):
-                    ent_buf.append(moe.router_entropy)  # scalar (float32)
-                sizes.append(tok_buf[-1].numel())
-
+                # Assuming num_experts is the same for all, so we can just grab it once
+                num_experts = moe.tokens_per_expert.numel()
+                moe_layers_info.append(
+                    {
+                        "module": moe,
+                        "layer_id": block.layer_id,
+                    }
+                )
+                tok_buffers.append(moe.tokens_per_expert)
+                ent_buffers.append(moe.router_entropy)
                 if need_rescale_stats(moe) or need_rescale_stats(block):
-                    # because of the re-computation, these data might be added twice
-                    # dont have very good way to handle this, so this take this ad-hoc approach
-                    # remember to check both moe and block, incases of its OP-LEVEL checkpointing
-                    tok_buf[-1] /= 2
-                    if len(ent_buf) > 0:
-                        ent_buf[-1] /= 2
+                    scale_factor = 0.5
 
-        flat_tok = torch.cat(tok_buf, 0)  # int32
-        flat_ent = torch.stack(ent_buf, 0) if len(ent_buf) > 0 else None  # float32
+        # Early exit if no MoE layers were found
+        if not moe_layers_info:
+            return
+
+        all_tokens = torch.cat(tok_buffers)
+        all_entropies = torch.cat(ent_buffers)
+
+        if scale_factor != 1:
+            all_tokens *= scale_factor
+            all_entropies *= scale_factor
 
         if dp_cp_mesh is not None:
             pg = dp_cp_mesh.get_group()
             torch.distributed.all_reduce(
-                flat_tok, group=pg, op=torch.distributed.ReduceOp.SUM
+                all_tokens, group=pg, op=torch.distributed.ReduceOp.SUM
             )
-            if flat_ent is not None:
-                torch.distributed.all_reduce(
-                    flat_ent, group=pg, op=torch.distributed.ReduceOp.AVG
-                )
+            torch.distributed.all_reduce(
+                all_entropies, group=pg, op=torch.distributed.ReduceOp.AVG
+            )
 
-        layer_ptr = 0  # index into sizes / flat_ent
-        tok_ptr = 0  # offset into flat_tok
+        num_layers = len(moe_layers_info)
+        lens = torch.full(
+            (num_layers,), num_experts, device=all_tokens.device, dtype=torch.long
+        )
+        grp = torch.repeat_interleave(
+            torch.arange(num_layers, device=all_tokens.device, dtype=torch.long), lens
+        )
+
+        layer_sums = torch.zeros(
+            num_layers, dtype=all_tokens.dtype, device=all_tokens.device
+        )
+        layer_sums.index_add_(0, grp, all_tokens)
+        layer_means = layer_sums / num_experts
+
+        # Vectorised deltas and usage
+        delta_flat = layer_means[grp] - all_tokens
+        recip = torch.clamp(layer_sums, min=1.0).reciprocal()
+        usage_flat = all_tokens * recip[grp]
+
+        # Vectorized bias update calculation (replaces the loop)
         with torch.no_grad():
-            for part in model_parts:
-                for block in part.layers.values():
-                    if not block.moe_enabled:
-                        continue
-                    moe = getattr(block, "moe", block.feed_forward)
-                    moe._log_expert_metrics = {}
+            # Get norm factor and speed from the first MoE layer (assuming they are all the same)
+            first_moe = moe_layers_info[0]["module"]
+            norm_factor = first_moe.bias_update_norm_factor
+            bias_update_speed = first_moe.bias_update_speed
 
-                    n_expert = sizes[layer_ptr]
-                    tokens = flat_tok[tok_ptr : tok_ptr + n_expert].float()
-                    entropy = flat_ent[layer_ptr] if flat_ent is not None else None
-                    layer_ptr += 1
-                    tok_ptr += n_expert
+            # Reshape for batched, per-layer operations
+            delta_2d = delta_flat.view(num_layers, num_experts)
 
-                    delta = tokens.mean() - tokens
-                    # TODO(JSC): here we have options to use Row-wise norm rather than Sign
-                    update = lmo_for_moe_bias(
-                        delta, norm_factor=moe.bias_update_norm_factor
-                    )
-                    if moe.bias_update_norm_factor.endswith("zero_mean"):
-                        update = update - update.mean()
-                    moe.expert_bias.add_(moe.bias_update_speed * update)
+            # Calculate updates for all layers at once
+            updates_2d = lmo_for_moe_bias(delta_2d, norm_factor=norm_factor)
 
-                    total = tokens.sum().clamp(min=1.0)
-                    layer_id = block.layer_id
-                    moe._log_expert_metrics.update(
-                        {
-                            f"moe_ep_usage/L-{layer_id}_EP-{i}": c / total
-                            for i, c in enumerate(tokens)
-                        },
-                        **{
-                            f"moe_bias/L-{layer_id}_EP-{i}": moe.expert_bias[i].mean()
-                            for i in range(moe.expert_bias.shape[0])
-                        },
-                        # **{f"moe_entropy/moe_entropy_per_layer_{layer_id}": entropy},
-                    )
-                    if entropy is not None:
-                        moe._log_expert_metrics.update(
-                            {f"moe_entropy/L-{layer_id}": entropy},
-                        )
+            if norm_factor.endswith("zero_mean"):
+                updates_2d = updates_2d - updates_2d.mean(dim=1, keepdim=True)
 
-                    moe.tokens_per_expert.zero_()
-                    if hasattr(moe, "router_entropy"):
-                        moe.router_entropy.zero_()
+            # Collect all bias parameters and update them with a single multi-tensor op
+            bias_params = [info["module"].expert_bias for info in moe_layers_info]
+            updates_list = list(updates_2d.flatten().split(num_experts))
+
+            torch._foreach_add_(bias_params, updates_list, alpha=bias_update_speed)
+
+            # Reset router stats in bulk
+            try:
+                torch._foreach_mul_(tok_buffers, 0)
+                torch._foreach_mul_(ent_buffers, 0.0)
+            except Exception:
+                for t in tok_buffers:
+                    t.zero_()
+                for t in ent_buffers:
+                    t.zero_()
+
+            all_usages_cpu = usage_flat.cpu().tolist()
+            all_biases_cpu = torch.cat(bias_params).cpu().tolist()
+            all_entropies_cpu = all_entropies.cpu().float().tolist()
+
+            payload = (
+                moe_layers_info,
+                all_usages_cpu,
+                all_biases_cpu,
+                all_entropies_cpu,
+                num_experts,
+            )
+            log_queue.put(payload)
 
     optimizers.register_step_pre_hook(
         lambda *args, **kwargs: _update_expert_bias(

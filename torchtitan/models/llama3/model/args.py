@@ -24,7 +24,7 @@ class TransformerModelArgs(BaseModelArgs):
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: int | None = None
-    vocab_size: int = 128256  # If -1, then take vocab size from tokenizer.
+    vocab_size: int = -1  # If -1, then take vocab size from tokenizer.
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: float | None = None
     norm_eps: float = 1e-5

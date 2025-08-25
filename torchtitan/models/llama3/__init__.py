@@ -30,13 +30,17 @@ __all__ = [
 
 llama3_configs = {
     "debugmodel": TransformerModelArgs(
-        dim=256, n_layers=6, n_heads=16, vocab_size=2000, rope_theta=500000
+        dim=256,
+        n_layers=6,
+        n_heads=16,
+        # vocab_size=2000,
+        rope_theta=500000,
     ),
     "debugmodel_flex_attn": TransformerModelArgs(
         dim=256,
         n_layers=6,
         n_heads=16,
-        vocab_size=2000,
+        # vocab_size=2000,
         rope_theta=500000,
         use_flex_attn=True,
         attn_mask_type="block_causal",
@@ -452,7 +456,7 @@ llama2_configs = {
         dim=4096,
         n_layers=32,
         n_heads=32,
-        vocab_size=32000,
+        # vocab_size=32000,
     ),
 }
 

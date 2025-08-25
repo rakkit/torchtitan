@@ -25,77 +25,6 @@ from .moe import FeedForward, MoE
 from .moe_utils import calc_gate_scaling_factor
 
 
-# # @torch.compile(fullgraph=True)
-# def prepare_qkv(
-#     xq, xk, xv, q_norm, k_norm, v_norm, freqs_cis, bs, seqlen, head_dim, n_rep
-# ):
-#     xq = xq.view(bs, seqlen, -1, head_dim)
-#     xk = xk.view(bs, seqlen, -1, head_dim)
-#     xv = xv.view(bs, seqlen, -1, head_dim)
-#     xq = q_norm(xq)
-#     xk = k_norm(xk)
-#     xv = v_norm(xv)
-
-#     xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-
-#     # ! @@@@  dont need kv_cahce for training, but need to bring it back for inference
-#     # if self._kv_cache is not None and start_pos >= 0:
-#     #     xk, xv = self._kv_cache.update(start_pos, xk, xv)
-
-#     # repeat k/v heads if n_kv_heads < n_heads
-#     keys = repeat_kv(xk, n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-#     values = repeat_kv(xv, n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-
-#     xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-#     xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-#     xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-
-#     return xq, xk, xv
-
-
-# # @torch.compile(fullgraph=True)
-# def post_attn_output(output, o_norm, wo, bs, seqlen):
-#     output = output.transpose(
-#         1, 2
-#     ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
-#     output = output.view(bs, seqlen, -1)
-#     output = o_norm(output)
-#     return wo(output)
-
-
-# class FusedAttention(Attention):
-#     def __init__(self, model_args: MoEModelArgs):
-#         super().__init__(model_args)
-
-#     # @torch.compile(fullgraph=True)
-#     def forward(
-#         self,
-#         x: torch.Tensor,
-#         freqs_cis: torch.Tensor,
-#         start_pos: int = -1,
-#     ):
-#         bs, seqlen, _ = x.shape
-#         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-#         xq, xk, xv = prepare_qkv(
-#             xq,
-#             xk,
-#             xv,
-#             self.q_norm,
-#             self.k_norm,
-#             self.v_norm,
-#             freqs_cis,
-#             bs,
-#             seqlen,
-#             self.head_dim,
-#             self.n_rep,
-#         )
-
-#         output = self.sdpa(xq, xk, xv)
-
-#         output = post_attn_output(output, self.o_norm, self.wo, bs, seqlen)
-#         return output
-
-
 class TransformerBlock(nn.Module):
     """
     TransformerBlock Module
@@ -116,7 +45,6 @@ class TransformerBlock(nn.Module):
 
     """
 
-    # attention_cls = FusedAttention
     attention_cls = Attention
 
     def __init__(self, layer_id: int, model_args: MoEModelArgs):
@@ -216,10 +144,6 @@ class TransformerBlock(nn.Module):
         else:
             raise ValueError(f"Invalid residual_scale: {model_args.residual_scale}")
 
-    # @torch.compile(fullgraph=True)
-    def _apply_norm(self, norm, x):
-        return norm(x)
-
     def forward(
         self,
         x: torch.Tensor,
@@ -238,15 +162,13 @@ class TransformerBlock(nn.Module):
         """
 
         h = self.identity_scale * x + self.block_scale * self.attention(
-            self._apply_norm(self.attention_norm, x), freqs_cis
+            self.attention_norm(x), freqs_cis
         )
 
         if self.moe_enabled:
-            mlp_output, moe_aux_loss = self.feed_forward(
-                self._apply_norm(self.ffn_norm, h)
-            )
+            mlp_output, moe_aux_loss = self.feed_forward(self.ffn_norm(h))
         else:
-            mlp_output = self.feed_forward(self._apply_norm(self.ffn_norm, h))
+            mlp_output = self.feed_forward(self.ffn_norm(h))
             moe_aux_loss = torch.tensor(0.0, device=x.device, pin_memory=True)
 
         out = self.identity_scale * h + self.block_scale * mlp_output

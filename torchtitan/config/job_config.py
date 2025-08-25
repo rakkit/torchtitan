@@ -160,6 +160,11 @@ class Model:
     - "complete_p": see CompleteP paper (arXiv:2505.01618)
     """
 
+    activation_type: str = "silu"
+    """Type of activation function to use
+    [silu, squared_relu, elu, relu, selu, gelu, approx_gelu, quick_gelu, sigmoid]
+    """
+
     norm_type: str = "rmsnorm"
     """
     Type of layer normalization to use

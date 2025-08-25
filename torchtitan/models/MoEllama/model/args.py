@@ -76,7 +76,6 @@ class MoEModelArgs(BaseModelArgs):
     moe_router_scaling_factor: float | None = None
     moe_router_bias_update_norm_factor: str = "sign"  # sign or spectral
     # dpskv3 2.5, moonlight 2.446, set None to auto-compute
-    moe_router_use_bias_for_routing: bool = True
 
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
         for name in [

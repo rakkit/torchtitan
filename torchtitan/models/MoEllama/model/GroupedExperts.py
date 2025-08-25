@@ -57,7 +57,6 @@ class GroupedExperts(nn.Module):
         dim_hidden: int,
         num_experts: int = 1,
         activation_type: str = "silu",
-        moe_init_all_experts_same: bool = False,
         norm_everywhere: bool = False,
         norm_type: str | None = None,
         norm_eps: float | None = None,
@@ -74,8 +73,6 @@ class GroupedExperts(nn.Module):
         self.w3 = nn.Parameter(torch.empty(num_experts, dim_in, dim_hidden))
 
         self.act_fn = build_activation(activation_type)
-
-        self.init_all_experts_same = moe_init_all_experts_same
 
         # when ep is enabled, this is set in parallelize.py
         self.ep_enable = False
@@ -132,11 +129,8 @@ class GroupedExperts(nn.Module):
         init_fn = build_init_fn(init_fn_type)
         gate_init_std = init_std / residual_div if init_gate_as_residual else init_std
 
-        if self.init_all_experts_same:
-            expert_init_fn = init_all_experts_same
-
-        else:
-            expert_init_fn = init_all_experts_different
+        # lets always use different experts
+        expert_init_fn = init_all_experts_different
 
         expert_init_fn(init_fn, self.w1.data, init_std, slot=0, layer_id=self.layer_id)
         expert_init_fn(
@@ -154,26 +148,6 @@ class GroupedExperts(nn.Module):
             self.out_norm.reset_parameters()
 
 
-def init_all_experts_same(init_fn, w, init_std, slot=None, layer_id=None):
-    """
-    Notice that the weights are in the shape of [G, D_in, D_out]
-    But we expected the weights to be [D_out, D_in] for `init_fn`
-    """
-    if isinstance(w, torch.distributed.tensor.DTensor):
-        local_tensor = w.to_local()
-    else:
-        local_tensor = w
-
-    init_fn(local_tensor[0].transpose(0, 1), mean=0.0, std=init_std)
-    for e in range(1, local_tensor.shape[0]):
-        local_tensor[e].data.copy_(local_tensor[0].data)
-
-    if isinstance(w, torch.distributed.tensor.DTensor):
-        w.to_local().copy_(local_tensor)
-    else:
-        w.copy_(local_tensor)
-
-
 def make_seed_from_global(
     layer_id: int, slot: int, expert_id: int, total_experts: int
 ) -> int:
@@ -182,8 +156,6 @@ def make_seed_from_global(
 
 
 def init_all_experts_different(init_fn, w, init_std, slot, layer_id):
-    # we can remove `init_all_experts_same` at some point,
-    # because it seems bit of pointless to have it
     # we should expect the experts to have same norms, rather than same weights
     assert layer_id is not None, "layer_id must be set "
     total_experts = w.shape[0]

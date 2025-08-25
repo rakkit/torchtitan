@@ -236,7 +236,6 @@ class MoE(nn.Module):
         aux_loss_alpha: float = 0.001,  # Small weight for sequence-wise auxiliary loss
         bias_update_norm_factor: str = "sign",
         router_scaling_factor: float = 1.0,
-        moe_init_all_experts_same: bool = False,
         norm_everywhere: bool = False,
         norm_type: Optional[str] = None,
         norm_eps: Optional[float] = None,
@@ -310,7 +309,6 @@ class MoE(nn.Module):
             dim_hidden=hidden_dim,
             num_experts=n_routed_experts,
             activation_type=activation_type,
-            moe_init_all_experts_same=moe_init_all_experts_same,
             norm_everywhere=norm_everywhere,
             norm_type=norm_type,
             norm_eps=norm_eps,

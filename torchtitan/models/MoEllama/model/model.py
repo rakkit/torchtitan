@@ -93,7 +93,6 @@ class TransformerBlock(nn.Module):
                 bias_update_norm_factor=model_args.moe_router_bias_update_norm_factor,
                 match_dim_with_dense=True,
                 router_scaling_factor=router_scaling_factor,
-                moe_init_all_experts_same=model_args.moe_init_all_experts_same,
                 norm_everywhere=model_args.norm_everywhere,
                 norm_type=model_args.norm_type,
                 norm_eps=model_args.norm_eps,

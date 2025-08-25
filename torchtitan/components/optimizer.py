@@ -588,9 +588,9 @@ def build_optimizers_with_moe_load_balancing(
         g,
         norm_factor="sign",
     ):
-        if norm_factor == "sign":
+        if norm_factor == "sign" or norm_factor == "sign_zero_mean":
             g = torch.sign(g)
-        elif norm_factor == "spectral":
+        elif norm_factor == "spectral" or norm_factor == "spectral_zero_mean":
             g = g / torch.sqrt(g.pow(2).sum())
         return g
 
@@ -663,6 +663,8 @@ def build_optimizers_with_moe_load_balancing(
                     update = lmo_for_moe_bias(
                         delta, norm_factor=moe.bias_update_norm_factor
                     )
+                    if moe.bias_update_norm_factor.endswith("zero_mean"):
+                        update = update - update.mean()
                     moe.expert_bias.add_(moe.bias_update_speed * update)
 
                     total = tokens.sum().clamp(min=1.0)

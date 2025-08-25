@@ -442,10 +442,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 json.dump(config_dict, f, indent=4)
 
             clean_config_dict = {}
-            for (header, subdict) in config_dict.items():
+            for header, subdict in config_dict.items():
                 clean_subdict = {}
                 clean_config_dict[header] = clean_subdict
-                for (key, value) in subdict.items():
+                for key, value in subdict.items():
                     if value is not None:
                         clean_subdict[key] = value
 
@@ -567,7 +567,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 assert len(model_parts) == 1
                 with self.maybe_enable_amp:
                     pred = model_parts[0](inputs)
-
+                    if isinstance(pred, torch.Tensor):
+                        pred = {"tokens_list": [pred]}
                     aux_loss = pred.get("aux_loss", None)
 
                     loss = self.loss_fn(pred, labels)

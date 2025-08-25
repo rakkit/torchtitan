@@ -392,7 +392,10 @@ class Transformer(nn.Module, ModelProtocol):
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
         # PP compatibility hack
-        if self.model_args.moe_aux_loss_alpha > 0:
+        if (
+            self.model_args.moe_aux_loss_alpha is not None
+            and self.model_args.moe_aux_loss_alpha > 0
+        ):
             return {
                 "tokens_list": [output],
                 "aux_loss": total_moe_aux_loss,

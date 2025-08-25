@@ -391,7 +391,7 @@ class MoE(nn.Module):
         )
 
         if self.training:
-            aux_loss = self.sequence_wise_aux_loss(
+            aux_loss = MoE.sequence_wise_aux_loss(
                 selected_experts_indices.long(),
                 sigmoid_scores,
                 bz,
@@ -448,10 +448,11 @@ class MoE(nn.Module):
             return torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
 
         # If not training, alpha is zero, or no experts are selected (K_val=0)
-        if not (aux_loss_alpha > 0 and K_val > 0):
+        if aux_loss_alpha is None or aux_loss_alpha <= 0:
             return torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
 
-        # If batch or sequence length is zero, no tokens to process.
+        # # If batch or sequence length is zero, no tokens to process.
+
         if B == 0 or S == 0:
             return torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
 

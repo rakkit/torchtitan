@@ -54,7 +54,7 @@ def multi_token_cross_entropy_loss(
     main_loss = loss_fn(preds[0], labels[:, : job_config.training.seq_len])
 
     mtp_loss = 0
-    for (label_offset, pred) in enumerate(preds[1:], 1):
+    for label_offset, pred in enumerate(preds[1:], 1):
         loss = loss_fn(
             pred,
             labels[:, label_offset : label_offset + job_config.training.seq_len],
@@ -73,9 +73,13 @@ def moe_loss(
     """Sequence-wise auxiliary loss-enhanced loss function for MoE Transformer
     model training.
     """
-    assert isinstance(pred, dict)
     loss = loss_fn(pred, labels)
-    loss += pred["aux_loss"]
+    if not isinstance(pred, dict):
+        return loss
+
+    assert isinstance(pred, dict)
+    if "aux_loss" in pred:
+        loss += pred["aux_loss"]
     return loss
 
 

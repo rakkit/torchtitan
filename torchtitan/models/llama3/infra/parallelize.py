@@ -85,6 +85,8 @@ def parallelize_llama(
             world_mesh["tp"],
             loss_parallel=not job_config.parallelism.disable_loss_parallel,
             enable_float8_tensorwise_tp=enable_float8_tensorwise_tp,
+            tensor_parallel_only_attention=job_config.parallelism.tensor_parallel_only_attention,
+            enable_approx_mid_norm_for_tensor_parallel=job_config.parallelism.enable_approx_mid_norm_for_tensor_parallel,
         )
         maybe_enable_async_tp(job_config, world_mesh["tp"])
 
@@ -143,6 +145,8 @@ def apply_tp(
     tp_mesh: DeviceMesh,
     loss_parallel: bool,
     enable_float8_tensorwise_tp: bool,
+    tensor_parallel_only_attention: bool = False,
+    enable_approx_mid_norm_for_tensor_parallel: bool = False,
 ):
     """Apply tensor parallelism."""
     # 1. Parallelize the embedding and shard its outputs (which are the first
@@ -219,6 +223,28 @@ def apply_tp(
                     "feed_forward.w2_norm": SequenceParallel(),
                 }
             )
+
+        """
+        PrepareMidNormInputOutput() is the "correct" way to do it,
+        We need to either  disable the Async TP and compile together.
+        Or use tensor_parallel_only_attention + compile + no_async_tp.
+
+        SequenceParallel(sequence_dim=-1) is a hack to make it work with Async TP and compile together.
+        This is an "approximate" solution, and might lead to error at some point.
+        """
+        if not isinstance(transformer_block.attention.o_norm, nn.Identity):
+            if enable_approx_mid_norm_for_tensor_parallel:
+                layer_plan["attention.o_norm"] = SequenceParallel(sequence_dim=-1)
+            else:
+                layer_plan["attention.o_norm"] = PrepareMidNormInputOutput()
+
+        if not tensor_parallel_only_attention and not isinstance(
+            transformer_block.feed_forward.out_norm, nn.Identity
+        ):
+            if enable_approx_mid_norm_for_tensor_parallel:
+                layer_plan["feed_forward.out_norm"] = SequenceParallel(sequence_dim=-1)
+            else:
+                layer_plan["feed_forward.out_norm"] = PrepareMidNormInputOutput()
 
         parallelize_module(
             module=transformer_block,
@@ -466,3 +492,59 @@ def apply_ddp(
     replicate(model, device_mesh=dp_mesh, bucket_cap_mb=100)
 
     logger.info("Applied DDP to the model")
+
+
+class PrepareMidNormInputOutput(torch.distributed.tensor.parallel.ParallelStyle):
+    """
+    when `norm_everywhere=True`, we need to particularly handle
+    the mid-norm in mid of FFN. (and norm before out-proj in attention)
+
+    We need to
+    1. Replicate[gather] the input to the norm layer,
+    2. Run the norm layer
+    3. Shard the output back
+
+    But it does not work with async TP and compile together. (for FFN)
+
+    ###########
+    Insteard, Can we use SequenceParallel(dim=-1) here?
+    it seems to be working + loss and norm are aligned
+    """
+
+    def __init__(
+        self,
+        shard_dim: int = -1,
+    ):
+        # fixed layouts for the MLP mid-norm case
+        self._in_layout = (Shard(shard_dim),)
+        self._desired_in = (Replicate(),)
+        self._out_layout = (Replicate(),)
+        self._desired_out = (Shard(shard_dim),)
+
+    def _prep_in(self, inputs, mesh):
+        x, *rest = inputs
+        if not isinstance(x, torch.distributed.tensor.DTensor):
+            x = torch.distributed.tensor.DTensor.from_local(
+                x, mesh, self._in_layout, run_check=False
+            )
+        if self._in_layout != self._desired_in:
+            x = x.redistribute(placements=self._desired_in)
+        return (x.to_local(), *rest)  # hand local tensor to module
+
+    def _prep_out(self, outputs, mesh):
+        if not isinstance(outputs, torch.distributed.tensor.DTensor):
+            outputs = torch.distributed.tensor.DTensor.from_local(
+                outputs, mesh, self._out_layout, run_check=False
+            )
+        if self._out_layout != self._desired_out:
+            outputs = outputs.redistribute(placements=self._desired_out)
+        return outputs.to_local()  # keep local shard
+
+    def _apply(self, module: nn.Module, mesh: DeviceMesh) -> nn.Module:
+        module.register_forward_pre_hook(  # gather before norm
+            lambda m, i: self._prep_in(i, mesh)
+        )
+        module.register_forward_hook(  # re-shard after norm
+            lambda m, i, o: self._prep_out(o, mesh)
+        )
+        return module

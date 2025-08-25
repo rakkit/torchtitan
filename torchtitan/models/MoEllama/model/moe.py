@@ -391,8 +391,14 @@ class MoE(nn.Module):
         )
 
         if self.training:
-            aux_loss = self.sequence_wise_aux_loss(
-                selected_experts_indices.long(), sigmoid_scores, bz, slen
+            aux_loss = MoE.sequence_wise_aux_loss(
+                selected_experts_indices.long(),
+                sigmoid_scores,
+                bz,
+                slen,
+                self.n_routed_experts,
+                self.topk,
+                self.aux_loss_alpha,
             )
         else:
             aux_loss = torch.tensor(0.0, device=x.device)
@@ -400,13 +406,16 @@ class MoE(nn.Module):
         output = out.reshape(bz, slen, dim).to(x.dtype)
         return output, aux_loss
 
+    @staticmethod
     @torch.compile(fullgraph=True)
     def sequence_wise_aux_loss(
-        self,
         indices: torch.Tensor,  # Shape (B*S, K_val), type long
         scores: torch.Tensor,  # Shape (B*S, N_r_val), type float
         B: int,  # Batch size
         S: int,  # Sequence length
+        total_experts: int,
+        activate_experts: int,
+        aux_loss_alpha: float,
         eps: float = 1e-15,
         force_flip: bool = False,  # If True, clamps f_i^(b) and P_i^(b) to [0,1]
     ) -> torch.Tensor:
@@ -430,8 +439,8 @@ class MoE(nn.Module):
 
         """
 
-        N_r = self.n_routed_experts  # Total number of routed experts (N_r in formulas)
-        K_val = self.topk  # Number of experts selected per token (K in formulas)
+        N_r = total_experts  # Total number of routed experts (N_r in formulas)
+        K_val = activate_experts  # Number of experts selected per token (K in formulas)
 
         # Conditional returns based on your original code's logic
         # If topk == N_r, original code returned 0. This implies perfect load balancing by design.
@@ -439,7 +448,7 @@ class MoE(nn.Module):
             return torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
 
         # If not training, alpha is zero, or no experts are selected (K_val=0)
-        if not (self.aux_loss_alpha > 0 and K_val > 0):
+        if not (aux_loss_alpha > 0 and K_val > 0):
             return torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
 
         # If batch or sequence length is zero, no tokens to process.
@@ -515,6 +524,6 @@ class MoE(nn.Module):
         loss_per_sequence = (f_i_b_all * P_i_b_all).sum(dim=1)
 
         # 4. Final auxiliary loss:
-        aux_loss = loss_per_sequence.mean() * self.aux_loss_alpha
+        aux_loss = loss_per_sequence.mean() * aux_loss_alpha
 
         return aux_loss

@@ -75,7 +75,8 @@ class MoEModelArgs(BaseModelArgs):
     moe_aux_loss_alpha: float = 0.01  # OLMoE, default 0.01
     # dpskv3 2.5, moonlight 2.446, set None to auto-compute
     moe_router_scaling_factor: float | None = None
-    moe_router_bias_update_norm_factor: str = "sign"  # sign or spectral
+    # "sign" or "spectral", optionally with "_zero_mean" suffix
+    moe_router_bias_update_norm_factor: str = "sign"
 
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
         for name in [

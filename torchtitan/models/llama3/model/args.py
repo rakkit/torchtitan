@@ -53,6 +53,7 @@ class TransformerModelArgs(BaseModelArgs):
     # to obtain its init std factor.
     final_out_exp: float = -0.5
     residual_scale: str = "identity"
+    activation_type: str = "silu"
     norm_type: str = "rmsnorm"
     qk_norm: bool = False
     # If this is True, it implies `qk_norm=True`.
@@ -79,6 +80,7 @@ class TransformerModelArgs(BaseModelArgs):
             "final_out_init_std",
             "final_out_exp",
             "residual_scale",
+            "activation_type",
             "norm_type",
         ]:
             value = getattr(job_config.model, name)

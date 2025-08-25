@@ -83,6 +83,7 @@ class TransformerBlock(nn.Module):
                 dim=model_args.dim,
                 multiple_of=model_args.multiple_of,
                 ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+                activation_type=model_args.activation_type,
                 n_shared_experts=model_args.n_shared_experts,
                 n_routed_experts=model_args.n_routed_experts,
                 activate_experts=model_args.activate_experts,
@@ -103,7 +104,11 @@ class TransformerBlock(nn.Module):
                 hidden_dim = model_args.ffn_dim_multiplier * hidden_dim
             hidden_dim = int(hidden_dim - hidden_dim % model_args.multiple_of)
 
-            self.feed_forward = FeedForward(dim=model_args.dim, hidden_dim=hidden_dim)
+            self.feed_forward = FeedForward(
+                dim=model_args.dim,
+                hidden_dim=hidden_dim,
+                activation_type=model_args.activation_type,
+            )
 
         self.attention_norm = build_norm(
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps

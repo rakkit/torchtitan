@@ -107,6 +107,9 @@ class TransformerBlock(nn.Module):
                 dim=model_args.dim,
                 hidden_dim=hidden_dim,
                 activation_type=model_args.activation_type,
+                norm_everywhere=model_args.norm_everywhere,
+                norm_type=model_args.norm_type,
+                norm_eps=model_args.norm_eps,
             )
 
         self.attention_norm = build_norm(

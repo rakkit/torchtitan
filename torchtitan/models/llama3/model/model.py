@@ -809,7 +809,11 @@ class Transformer(nn.Module, ModelProtocol):
                 )
                 tokens_list[mtp_layer_id + 1] = output
 
-        return {
-            "tokens_list": tokens_list,
-            "prev_embed": prev_embed,
-        }
+        # PP compatibility hack
+        if self.model_args.num_mtp_modules > 0:
+            return {
+                "tokens_list": tokens_list,
+                "prev_embed": prev_embed,
+            }
+        else:
+            return tokens_list[0]

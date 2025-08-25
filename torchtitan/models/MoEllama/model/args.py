@@ -97,6 +97,19 @@ class MoEModelArgs(BaseModelArgs):
             value = getattr(job_config.model, name)
             setattr(self, name, value)
 
+        for name in [
+            "moe_router_bias_update_norm_factor",
+            "moe_router_scaling_factor",
+        ]:
+            value = getattr(job_config.model, name)
+            if value is not None:
+                setattr(self, name, value)
+
+        for name in ["moe_aux_loss_alpha", "moe_router_bias_update_speed"]:
+            value = getattr(job_config.training, name)
+            if value is not None:
+                setattr(self, name, value)
+
         self.num_mtp_modules = job_config.training.num_mtp_tokens
         assert self.num_mtp_modules >= 0
 

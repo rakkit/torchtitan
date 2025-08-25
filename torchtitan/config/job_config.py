@@ -199,6 +199,12 @@ class Model:
     converters have been applied.
     """
 
+    moe_router_bias_update_norm_factor: str | None = None
+    """MoE bias update norm factor to use"""
+
+    moe_router_scaling_factor: float | None = None
+    """MoE router scaling factor to use"""
+
 
 @dataclass
 class Optimizer:
@@ -379,6 +385,12 @@ class Training:
 
     mtp_loss_weight: float = 0.3
     """Weight of multi-token prediction loss term."""
+
+    moe_aux_loss_alpha: float | None = None
+    """Weight of MoE auxiliary loss term."""
+
+    moe_router_bias_update_speed: float = 0.001
+    """Speed of MoE router bias update."""
 
     max_norm: float | int = 1.0
     """Max norm for gradient clipping"""

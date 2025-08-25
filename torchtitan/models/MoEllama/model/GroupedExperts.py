@@ -7,10 +7,10 @@
 from typing import Callable
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from torchtitan.distributed.expert_parallel import expert_parallel
+from torchtitan.models.activations import build_activation
 from torchtitan.models.inits import build_init_fn
 from torchtitan.models.norms import build_norm
 
@@ -46,7 +46,7 @@ class GroupedExperts(nn.Module):
         dim_hidden (int): SwiGLU hidden dimension.
         num_experts (int): Number of experts in this grouped experts layer. Default is 1.
         swiglu (bool): Whether to use gated linear unit. Default is True.
-        activation (nn.Module): Activation function to use. Default is F.silu.
+        activation_type (str): Activation function to use. Default is F.silu.
     """
 
     def __init__(
@@ -56,7 +56,7 @@ class GroupedExperts(nn.Module):
         dim_in: int,
         dim_hidden: int,
         num_experts: int = 1,
-        activation: Callable = F.silu,
+        activation_type: str = "silu",
         moe_init_all_experts_same: bool = False,
         norm_everywhere: bool = False,
         norm_type: str | None = None,
@@ -73,7 +73,7 @@ class GroupedExperts(nn.Module):
         self.w2 = nn.Parameter(torch.empty(num_experts, dim_hidden, dim_in))
         self.w3 = nn.Parameter(torch.empty(num_experts, dim_in, dim_hidden))
 
-        self.act_fn = activation
+        self.act_fn = build_activation(activation_type)
 
         self.init_all_experts_same = moe_init_all_experts_same
 

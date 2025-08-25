@@ -4,12 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 import torch.distributed.tensor
 from torch import nn
 
+from torchtitan.models.activations import build_activation
 from torchtitan.models.inits import build_init_fn
 from torchtitan.models.norms import build_norm
 
@@ -21,7 +22,7 @@ class FeedForward(nn.Module):
         self,
         dim: int,
         hidden_dim: int,
-        activation: Callable = torch.nn.functional.silu,
+        activation_type: str = "silu",
         norm_everywhere: bool = False,
         norm_type: Optional[str] = None,
         norm_eps: Optional[float] = None,
@@ -30,7 +31,7 @@ class FeedForward(nn.Module):
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
-        self.act_fn = activation
+        self.act_fn = build_activation(activation_type)
 
         if norm_everywhere:
             assert (
@@ -224,6 +225,7 @@ class MoE(nn.Module):
         layer_id: int,
         dim: int,
         multiple_of: int = 256,
+        activation_type: str = "silu",
         n_shared_experts: int = 1,
         n_routed_experts: int = 8,
         activate_experts: int = 2,
@@ -291,6 +293,7 @@ class MoE(nn.Module):
             self.shared_experts = FeedForward(
                 dim,
                 hidden_dim,
+                activation_type=activation_type,
                 norm_everywhere=norm_everywhere,
                 norm_type=norm_type,
                 norm_eps=norm_eps,
@@ -306,6 +309,7 @@ class MoE(nn.Module):
             dim_in=dim,
             dim_hidden=hidden_dim,
             num_experts=n_routed_experts,
+            activation_type=activation_type,
             moe_init_all_experts_same=moe_init_all_experts_same,
             norm_everywhere=norm_everywhere,
             norm_type=norm_type,

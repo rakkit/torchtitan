@@ -87,7 +87,6 @@ class TransformerBlock(nn.Module):
                 n_shared_experts=model_args.n_shared_experts,
                 n_routed_experts=model_args.n_routed_experts,
                 activate_experts=model_args.activate_experts,
-                use_bias_for_routing=model_args.moe_router_use_bias_for_routing,
                 bias_update_speed=model_args.moe_router_bias_update_speed,
                 aux_loss_alpha=model_args.moe_aux_loss_alpha,
                 bias_update_norm_factor=model_args.moe_router_bias_update_norm_factor,

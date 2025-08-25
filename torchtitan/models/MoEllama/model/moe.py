@@ -231,7 +231,6 @@ class MoE(nn.Module):
         activate_experts: int = 2,
         ffn_dim_multiplier: Optional[float] = None,
         match_dim_with_dense: bool = True,
-        use_bias_for_routing: bool = True,
         bias_update_speed: float = 0.001,  # Bias adjustment speed
         aux_loss_alpha: float = 0.001,  # Small weight for sequence-wise auxiliary loss
         bias_update_norm_factor: str = "sign",
@@ -266,7 +265,6 @@ class MoE(nn.Module):
         self.n_shared_experts = n_shared_experts
         self.aux_loss_alpha = aux_loss_alpha  # Loss coefficient
         self.router_scaling_factor = router_scaling_factor
-        self.use_bias_for_routing = use_bias_for_routing
         self.bias_update_speed = bias_update_speed
         self.bias_update_norm_factor = bias_update_norm_factor
 
@@ -367,10 +365,9 @@ class MoE(nn.Module):
             experts_entropy,
         ) = self.router(x, self.expert_bias)
         self.router_entropy.add_(experts_entropy)
-        if self.training and self.use_bias_for_routing:
+        if self.training:
             with torch.no_grad():
                 self.tokens_per_expert.add_(num_tokens_per_expert)
-
         (
             top_scores_experts_sorted,
             token_indices_experts_sorted,

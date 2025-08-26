@@ -233,9 +233,6 @@ class Optimizer:
     is_light: bool = False
     """Whether to use Scion's light (memory-saving) version"""
 
-    is_unconstrained: bool = False
-    """Whether to use Scion's unconstrained version"""
-
     zeropower_backend: str = "newtonschulz5"
     "Which `zeropower_backend` to use."
 

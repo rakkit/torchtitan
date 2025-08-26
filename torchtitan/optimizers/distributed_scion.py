@@ -101,7 +101,7 @@ class DistributedScion(torch.optim.Optimizer):
         self,
         params,
         is_light,
-        is_unconstrained,
+        weight_decay,
         lr,
         momentum,
         nesterov,
@@ -112,6 +112,7 @@ class DistributedScion(torch.optim.Optimizer):
         parallel_dims,
         communication_dtype=torch.bfloat16,
         extra_reduce_for_HSDP=False,
+        experts_weights_layout="G-D_in-D_out",
     ):
         self.need_to_calculate_norm = False
         self.norms_to_log: list[str] = list(NORM_FUNCTIONS.keys())
@@ -122,6 +123,7 @@ class DistributedScion(torch.optim.Optimizer):
         defaults = dict(
             lr=lr,
             momentum=momentum,
+            weight_decay=weight_decay,
             nesterov=nesterov,
             eps=eps,
             norm_factor=norm_factor,
@@ -130,7 +132,8 @@ class DistributedScion(torch.optim.Optimizer):
         )
         self.is_light = is_light
 
-        self.is_unconstrained = is_unconstrained
+        is_unconstrained = weight_decay == 0
+
         self.world_mesh = parallel_dims.world_mesh
 
         self.fsdp_enabled = parallel_dims.fsdp_enabled
@@ -138,11 +141,16 @@ class DistributedScion(torch.optim.Optimizer):
         self.dp_replicate_enabled = parallel_dims.dp_replicate_enabled
         self.tp_enabled = parallel_dims.tp_enabled
 
+        assert experts_weights_layout in [
+            "G-D_in-D_out",
+            "G-D_out-D_in",
+        ], f"Unknown experts weights layout: {experts_weights_layout}"
+        self.experts_need_transpose = experts_weights_layout == "G-D_in-D_out"
         self.extra_reduce_for_HSDP = extra_reduce_for_HSDP
 
         logger.info(
             f"Distributed Scion optimizer "
-            f"(is_light={self.is_light}, is_unconstrained={self.is_unconstrained}) "
+            f"(is_light={self.is_light}, is_unconstrained={is_unconstrained}) "
             f"is enabled with world_mesh={self.world_mesh} | fsdp_enabled={self.fsdp_enabled} | "
             f"EP={self.expert_enabled} | TP={self.tp_enabled} | DP={self.dp_replicate_enabled}"
         )
@@ -167,13 +175,14 @@ class DistributedScion(torch.optim.Optimizer):
             lr = group["lr"]
             nesterov = group["nesterov"]
             momentum = group["momentum"]
+            wd = group["weight_decay"]
             param_kwargs = {
                 "eps": group["eps"],
                 "norm_factor": group["norm_factor"],
                 "zeropower_backend": group["backend"],
                 "backend_steps": group["backend_steps"],
             }
-            self.groups_info[group_idx] = [lr, nesterov, momentum, param_kwargs]
+            self.groups_info[group_idx] = [lr, nesterov, momentum, wd, param_kwargs]
             for param in group["params"]:
                 self.parameters_to_groups[id(param)] = group_idx
 
@@ -209,13 +218,14 @@ class DistributedScion(torch.optim.Optimizer):
             lr = group["lr"]
             nesterov = group["nesterov"]
             momentum = group["momentum"]
+            wd = group["weight_decay"]
             param_kwargs = {
                 "eps": group["eps"],
                 "norm_factor": group["norm_factor"],
                 "zeropower_backend": group["backend"],
                 "backend_steps": group["backend_steps"],
             }
-            self.groups_info[group_idx] = [lr, nesterov, momentum, param_kwargs]
+            self.groups_info[group_idx] = [lr, nesterov, momentum, wd, param_kwargs]
 
             for p_name, p in zip(group["param_names"], group["params"]):
                 norm_factor = group["norm_factor"]
@@ -315,10 +325,8 @@ class DistributedScion(torch.optim.Optimizer):
             g = self.normalise_grad(g, norm_factor=norm_factor, eps=eps)
             return g if not need_transpose else g.transpose(0, 1)
 
-        is_grouped_experts = g.ndim == 3
-
         if g.ndim == 2:
-            g = _lmo_for_2d_tensor(g, need_transpose=is_grouped_experts)
+            g = _lmo_for_2d_tensor(g, need_transpose=False)
         elif g.ndim == 3:
             if g.shape[0] > 0:
                 # When world_size [fsdp x EP] > Total number of experts,
@@ -326,13 +334,29 @@ class DistributedScion(torch.optim.Optimizer):
                 # We should return the original grad here and **do not** do stack
                 g = torch.stack(
                     [
-                        _lmo_for_2d_tensor(g[i], need_transpose=is_grouped_experts)
+                        _lmo_for_2d_tensor(
+                            g[i], need_transpose=self.experts_need_transpose
+                        )
                         for i in range(g.shape[0])
                     ],
                     dim=0,
                 )
             else:
                 pass
+        elif g.ndim == 1:
+            if zeropower_backend != "identity":
+                g_diag = torch.diag_embed(g).contiguous()
+                result_diag = _lmo_for_2d_tensor(g_diag)
+                g = result_diag.diagonal().contiguous()
+            else:
+                g = _lmo_for_2d_tensor(g)
+
+            # TODO(JSC): JUST HARD CODE IT TO USE 'identity' backend and 'bias_rms' norm_factor for
+            # now until we add regex to extra the norm's weights
+            # zeropower_backend = "identity"
+            # norm_factor = "bias_rms"
+            # g = _lmo_for_2d_tensor(g)
+
         else:
             raise ValueError(f"Unknown grad shape: {g.shape}")
 
@@ -365,6 +389,9 @@ class DistributedScion(torch.optim.Optimizer):
                 raise ValueError(f"Unknown norm_factor: {norm_factor}")
         elif norm_factor == "sign":
             g = torch.sign(g)
+        elif norm_factor == "bias_rms":
+            rms_value = torch.sqrt(g.pow(2).mean())
+            g = g / (rms_value + eps)
         elif norm_factor == "none":
             pass
         else:
@@ -400,13 +427,13 @@ class DistributedScion(torch.optim.Optimizer):
             shift = idx_in_bucket - start_idx
             p = params[idx_in_bucket]
             u = updates[shift]
-            lr, nesterov, momentum, param_kwargs = self.groups_info[
+            lr, nesterov, momentum, wd, param_kwargs = self.groups_info[
                 self.parameters_to_groups[id(p)]
             ]
 
-            if not self.is_unconstrained:
-                # p.data.mul_(1 - lr)
-                p.mul_(1 - lr)
+            if wd != 0:
+                # p.data.mul_(1 - wd*lr)
+                p.mul_(1 - wd * lr)
 
             if isinstance(p, DTensor) and self.tp_enabled:
                 original_placements = p.placements
@@ -450,8 +477,8 @@ class DistributedScion(torch.optim.Optimizer):
 
         for param_idx in range(len(scalar_params)):
             p = scalar_params[param_idx]
-            lr, nesterov, momentum, param_kwargs = self.groups_info[
-                self.paramters_to_groups[id(p)]
+            lr, nesterov, momentum, wd, param_kwargs = self.groups_info[
+                self.parameters_to_groups[id(p)]
             ]
             g = self.get_momentum_or_grad(
                 p, momentum, nesterov, update_buffer=True, gather_to_local=False
@@ -501,7 +528,7 @@ class DistributedScion(torch.optim.Optimizer):
 
         for param_idx in range(len(embed_params)):
             p = embed_params[param_idx]
-            lr, nesterov, momentum, param_kwargs = self.groups_info[
+            lr, nesterov, momentum, wd, param_kwargs = self.groups_info[
                 self.parameters_to_groups[id(p)]
             ]
             g = self.get_momentum_or_grad(
@@ -528,7 +555,7 @@ class DistributedScion(torch.optim.Optimizer):
         # for the embedding, if we want to calculate the norm, we need to gather the gradient
         for param_idx in range(len(embed_params)):
             p, p_name = embed_params[param_idx], embed_param_names[param_idx]
-            lr, nesterov, momentum, param_kwargs = self.groups_info[
+            lr, nesterov, momentum, wd, param_kwargs = self.groups_info[
                 self.parameters_to_groups[id(p)]
             ]
             # this is important, *Do NOT* update buffer twice here
@@ -610,9 +637,10 @@ class DistributedScion(torch.optim.Optimizer):
         # globally, its [[g0-ep0, g0-ep1, g0-ep2, ...], [g1-ep0, g1-ep1, g1-ep2, ...], ...] on each
         # rank
 
+        transpose = self.experts_need_transpose
         for param_idx in range(len(expert_params)):
             p = expert_params[param_idx]
-            lr, nesterov, momentum, param_kwargs = self.groups_info[
+            lr, nesterov, momentum, wd, param_kwargs = self.groups_info[
                 self.parameters_to_groups[id(p)]
             ]
             g = self.get_momentum_or_grad(
@@ -630,13 +658,13 @@ class DistributedScion(torch.optim.Optimizer):
                 assert u.ndim == 3
                 for ep_idx in range(u.shape[0]):
                     update_norms = calculate_norm(
-                        u[ep_idx], self.norms_to_log, transpose=True
+                        u[ep_idx], self.norms_to_log, transpose=transpose
                     )
                     # Template for MoE norm keys
                     norms_of_update.extend(update_norms.values())
                     if apply_on_weight:
                         weight_norms = calculate_norm(
-                            p.to_local()[ep_idx], self.norms_to_log, transpose=True
+                            p.to_local()[ep_idx], self.norms_to_log, transpose=transpose
                         )
                         norms_of_weight.extend(weight_norms.values())
 
@@ -751,7 +779,7 @@ class DistributedScion(torch.optim.Optimizer):
         # for DDP, we need to first update the buffer
         for param_idx in range(len(ddp_params)):
             p = ddp_params[param_idx]
-            _, nesterov, momentum, param_kwargs = self.groups_info[
+            _, nesterov, momentum, wd, param_kwargs = self.groups_info[
                 self.parameters_to_groups[id(p)]
             ]
             g = self.get_momentum_or_grad(
@@ -766,7 +794,7 @@ class DistributedScion(torch.optim.Optimizer):
             if current_rank_idx < len(ddp_params):
                 p = ddp_params[current_rank_idx]
                 # Step 1: Get the gradient
-                _, nesterov, momentum, param_kwargs = self.groups_info[
+                _, nesterov, momentum, wd, param_kwargs = self.groups_info[
                     self.parameters_to_groups[id(p)]
                 ]
                 g = self.get_momentum_or_grad(
@@ -781,7 +809,7 @@ class DistributedScion(torch.optim.Optimizer):
                 # To avoid idle stream, we pad the last rank
                 p = ddp_params[end_idx - 1]
                 g = zero_tensor(p.shape)
-                _, nesterov, momentum, param_kwargs = self.groups_info[
+                _, nesterov, momentum, wd, param_kwargs = self.groups_info[
                     self.parameters_to_groups[id(p)]
                 ]
 
@@ -969,7 +997,7 @@ class DistributedScion(torch.optim.Optimizer):
 
                 if current_rank_idx < len(fsdp_params):
                     p = fsdp_params[current_rank_idx]
-                    _, nesterov, momentum, param_kwargs = self.groups_info[
+                    _, nesterov, momentum, wd, param_kwargs = self.groups_info[
                         self.parameters_to_groups[id(p)]
                     ]
 

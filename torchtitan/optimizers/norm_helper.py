@@ -206,6 +206,12 @@ def calculate_norm(
         norms_to_log = list(NORM_FUNCTIONS.keys())
 
     W = W.to_local() if isinstance(W, DTensor) else W
+
+    if W.ndim == 1 and W.numel() > 1:
+        # we will expand the 1D tensor to a diagonal matrix
+        original_shape = W.shape
+        W = torch.diag_embed(W)
+
     if transpose:
         W = W.transpose(0, 1)
     if use_fused_metrics:

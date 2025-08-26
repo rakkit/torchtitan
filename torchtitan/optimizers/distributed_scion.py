@@ -141,6 +141,9 @@ class DistributedScion(torch.optim.Optimizer):
         self.dp_replicate_enabled = parallel_dims.dp_replicate_enabled
         self.tp_enabled = parallel_dims.tp_enabled
 
+        # this is used to ensure only the DP or FSDP rank 0 will have norms
+        self.is_dp_rank_0 = dist.get_rank(self.world_mesh["dp_cp"].get_group()) == 0
+
         assert experts_weights_layout in [
             "G-D_in-D_out",
             "G-D_out-D_in",
@@ -198,7 +201,10 @@ class DistributedScion(torch.optim.Optimizer):
         self.norms_at_current_step = {}
 
     def get_norms_at_current_step(self):
-        return self.norms_at_current_step
+        if self.is_dp_rank_0:
+            return self.norms_at_current_step
+        else:
+            return {}
 
     @torch.no_grad()
     def step(self, closure=None):

@@ -80,6 +80,11 @@ class Metrics:
     only stage that computes loss metrics.
     """
 
+    save_for_only_fist_rank: bool = False
+    """
+    Whether to save metrics only for rank 0. | mainly used for PP
+    """
+
     enable_wandb: bool = False
     """Whether to log metrics to Weights & Biases"""
 

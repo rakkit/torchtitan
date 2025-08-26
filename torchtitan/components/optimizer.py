@@ -680,11 +680,16 @@ def build_optimizers_with_moe_load_balancing(
         dp_cp_mesh = (
             parallel_dims.world_mesh["dp_cp"] if parallel_dims.dp_cp_enabled else None
         )
+        if dp_cp_mesh is not None:
+            is_dp_rank_0 = torch.distributed.get_rank(dp_cp_mesh.get_group()) == 0
+        else:
+            is_dp_rank_0 = True
         # TODO: Currently this sync is blocking (thus exposed) and happens on the
         # default compute stream. Need to assess if this is OK performance-wise.
 
         moe_layers_info = []
         tok_buffers, ent_buffers = [], []
+        acc_fwd_times_buffers = []
         scale_factor = 1
         num_experts = 0
 
@@ -703,9 +708,13 @@ def build_optimizers_with_moe_load_balancing(
                 )
                 tok_buffers.append(moe.tokens_per_expert)
                 ent_buffers.append(moe.router_entropy)
-                if need_rescale_stats(moe) or need_rescale_stats(block):
-                    scale_factor = 0.5
+                # if need_rescale_stats(moe) or need_rescale_stats(block):
+                #     scale_factor = 0.5
+                acc_fwd_times_buffers.append(moe.acc_fwd_times)
+                moe.acc_fwd_times = 0
 
+        # assume all MoE layers are same
+        scale_factor = 1 / acc_fwd_times_buffers[-1]
         # Early exit if no MoE layers were found
         if not moe_layers_info:
             return
@@ -788,7 +797,8 @@ def build_optimizers_with_moe_load_balancing(
                 all_entropies_cpu,
                 num_experts,
             )
-            log_queue.put(payload)
+            if is_dp_rank_0:
+                log_queue.put(payload)
 
     optimizers.register_step_pre_hook(
         lambda *args, **kwargs: _update_expert_bias(

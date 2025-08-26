@@ -480,7 +480,7 @@ def build_optimizers(
         momentum = optimizer_config.momentum
         nesterov = optimizer_config.nesterov
         is_light = optimizer_config.is_light
-        is_unconstrained = optimizer_config.is_unconstrained
+        weight_decay = optimizer_config.weight_decay
         if os.environ.get("SCION_DEBUG_GRAD") == "1":
             # only if we want to debug the gradient, we dont run SVD
             norm_factor = "none"
@@ -493,7 +493,7 @@ def build_optimizers(
 
         optimizer_kwargs = {
             "is_light": is_light,
-            "is_unconstrained": is_unconstrained,
+            "weight_decay": weight_decay,
             "lr": lr,
             "momentum": momentum,
             "nesterov": nesterov,

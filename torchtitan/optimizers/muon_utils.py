@@ -13,6 +13,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.optim.optimizer import _device_dtype_check_for_fused, _get_scalar_dtype
 
+from .newton_schulz_triton import newton_schulz_triton, polar_express_triton
 
 # def zeropower_via_svd(G, **kwargs):
 #     U, S, V = G.svd()
@@ -126,6 +127,8 @@ zeropower_backends = dict(
     svd=zeropower_via_svd,
     newtonschulz5=zeropower_via_newtonschulz5,
     polar_express=zeropower_via_polar_express,
+    newtonschulz5_triton=newton_schulz_triton,
+    polar_express_triton=polar_express_triton,
     identity=lambda x, **kwargs: x,
 )
 

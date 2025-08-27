@@ -685,6 +685,7 @@ def build_optimizers_with_moe_load_balancing(
 
         moe_layers_info = []
         tok_buffers, ent_buffers = [], []
+        acc_fwd_times_buffers = []
         scale_factor = 1
         num_experts = 0
 
@@ -703,9 +704,13 @@ def build_optimizers_with_moe_load_balancing(
                 )
                 tok_buffers.append(moe.tokens_per_expert)
                 ent_buffers.append(moe.router_entropy)
-                if need_rescale_stats(moe) or need_rescale_stats(block):
-                    scale_factor = 0.5
+                # if need_rescale_stats(moe) or need_rescale_stats(block):
+                #     scale_factor = 0.5
+                acc_fwd_times_buffers.append(moe.acc_fwd_times)
+                moe.acc_fwd_times = 0
 
+        # assume all MoE layers are same
+        scale_factor = 1 / acc_fwd_times_buffers[-1]
         # Early exit if no MoE layers were found
         if not moe_layers_info:
             return

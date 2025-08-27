@@ -72,7 +72,7 @@ class MoEModelArgs(BaseModelArgs):
     activate_experts: int = 0
     moe_router_bias_update_speed: float = 0.001  # dpskv3, 0.001
     # TODO(JSC): Need ablation about the learning rate of the router bias
-    moe_aux_loss_alpha: float = 0.01  # OLMoE, default 0.01
+    moe_aux_loss_alpha: float = 0.0  # OLMoE, default 0.01
     # dpskv3 2.5, moonlight 2.446, set None to auto-compute
     moe_router_scaling_factor: float | None = None
     # "sign" or "spectral", optionally with "_zero_mean" suffix

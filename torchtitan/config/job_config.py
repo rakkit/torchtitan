@@ -80,9 +80,10 @@ class Metrics:
     only stage that computes loss metrics.
     """
 
-    save_for_first_dp_ranks: bool = False
+    save_first_dp_and_tp: bool = False
     """
-    Whether to save metrics only for DP+CP rank 0. Mainly used for PP.
+    Whether to save metrics only for DP+CP+TP rank 0, meaning that the
+    0th rank of all PP stages will end up saving metrics.
     """
 
     enable_wandb: bool = False

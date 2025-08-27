@@ -259,12 +259,17 @@ def _build_metric_logger(
         metrics_rank = _get_metrics_rank(parallel_dims, job_config)
         should_log = torch.distributed.get_rank() == metrics_rank
 
-    if metrics_config.save_for_first_dp_ranks and should_log:
-        is_fsdp_rank_0 = (
+    if metrics_config.save_first_dp_and_tp and should_log:
+        # The first data-parallel group
+        is_dp_rank_0 = (
             torch.distributed.get_rank(parallel_dims.world_mesh["dp_cp"].get_group())
             == 0
         ) if parallel_dims.dp_cp_enabled else True
-        should_log = is_fsdp_rank_0
+        is_tp_rank_0 = (
+            torch.distributed.get_rank(parallel_dims.world_mesh["tp"].get_group())
+            == 0
+        ) if parallel_dims.tp_enabled else True
+        should_log = is_dp_rank_0 and is_tp_rank_0
 
     logger.debug(
         f"Logging decision: has_logging_enabled={has_logging_enabled}, should_log={should_log}"

@@ -80,6 +80,11 @@ class Metrics:
     only stage that computes loss metrics.
     """
 
+    save_for_first_dp_ranks: bool = False
+    """
+    Whether to save metrics only for DP+CP rank 0. Mainly used for PP.
+    """
+
     enable_wandb: bool = False
     """Whether to log metrics to Weights & Biases"""
 

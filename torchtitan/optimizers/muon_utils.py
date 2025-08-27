@@ -66,7 +66,7 @@ def zeropower_via_polar_express(G, steps=5, eps=1e-7):
     X = G.bfloat16()
     if G.size(0) > G.size(1):
         X = X.T
-    X = X / (torch.linalg.norm(X) + eps)  # ensure top singular value <= 1
+    X = X / (torch.linalg.norm(X) * 1.01 + eps)  # ensure top singular value <= 1
 
     # main loop
     for k in range(steps):

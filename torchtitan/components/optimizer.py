@@ -680,6 +680,11 @@ def build_optimizers_with_moe_load_balancing(
         dp_cp_mesh = (
             parallel_dims.world_mesh["dp_cp"] if parallel_dims.dp_cp_enabled else None
         )
+        is_dp_rank_0 = (
+            torch.distributed.get_rank(dp_cp_mesh.get_group()) == 0
+            if dp_cp_mesh is not None
+            else True
+        )
         # TODO: Currently this sync is blocking (thus exposed) and happens on the
         # default compute stream. Need to assess if this is OK performance-wise.
 
@@ -782,18 +787,19 @@ def build_optimizers_with_moe_load_balancing(
                 for t in ent_buffers:
                     t.zero_()
 
-            all_usages_cpu = usage_flat.cpu().tolist()
-            all_biases_cpu = torch.cat(bias_params).cpu().tolist()
-            all_entropies_cpu = all_entropies.cpu().float().tolist()
+            if is_dp_rank_0:
+                all_usages_cpu = usage_flat.cpu().tolist()
+                all_biases_cpu = torch.cat(bias_params).cpu().tolist()
+                all_entropies_cpu = all_entropies.cpu().float().tolist()
 
-            payload = (
-                moe_layers_info,
-                all_usages_cpu,
-                all_biases_cpu,
-                all_entropies_cpu,
-                num_experts,
-            )
-            log_queue.put(payload)
+                payload = (
+                    moe_layers_info,
+                    all_usages_cpu,
+                    all_biases_cpu,
+                    all_entropies_cpu,
+                    num_experts,
+                )
+                log_queue.put(payload)
 
     optimizers.register_step_pre_hook(
         lambda *args, **kwargs: _update_expert_bias(

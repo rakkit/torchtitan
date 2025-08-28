@@ -124,6 +124,8 @@ class MoEModelArgs(BaseModelArgs):
             depth_init = None
         self.depth_init = depth_init
 
+        if job_config.model.vocab_size is not None:
+            self.vocab_size = job_config.model.vocab_size
         if self.vocab_size == -1:
             tokenizer = kwargs.get("tokenizer")
             assert isinstance(tokenizer, BaseTokenizer), (

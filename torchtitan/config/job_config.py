@@ -188,6 +188,12 @@ class Model:
     """DEPRECATED: Use hf_assets_path instead."""
     """Tokenizer path"""
 
+    vocab_size: int | None = None
+    """
+    Whether to set the vocabulary size to the given value. If -1, take
+    the value from the tokenizer.
+    """
+
     vocab_size_multiple_of: int = 1
     """
     Whether to pad the vocabulary size so it becomes divisible by the

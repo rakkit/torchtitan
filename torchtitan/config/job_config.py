@@ -188,8 +188,11 @@ class Model:
     """DEPRECATED: Use hf_assets_path instead."""
     """Tokenizer path"""
 
-    vocab_size_multiple_of: int = 128
-    """Whether to pad the vocabulary size so it becomes divisible by the given value."""
+    vocab_size_multiple_of: int = 1
+    """
+    Whether to pad the vocabulary size so it becomes divisible by the
+    given value (e.g., 128).
+    """
 
     converters: list[str] = field(default_factory=list)
     """

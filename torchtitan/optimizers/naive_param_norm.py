@@ -195,7 +195,7 @@ def get_parameter_norms(model_parts, optimizers, norms_to_log):
                         for ep_idx in range(matrix.shape[0]):
                             actual_ep_idx = ep_idx + local_rank * ep_per_rank
                             update_norms = calculate_norm(
-                                matrix[ep_idx], norms_to_log, transpose=True
+                                matrix[ep_idx], norms_to_log, transpose=False
                             )
                             # Template for MoE norm keys
                             moe_norms.update(

@@ -201,6 +201,8 @@ def calculate_norm(
     """
     It is important to note that the order of the norms is the same
     as the order of `norms_to_log`.
+
+    we expect the weights to be [D_out, D_in], otherwise, we need to set `transpose` to True
     """
     if norms_to_log is None:
         norms_to_log = list(NORM_FUNCTIONS.keys())

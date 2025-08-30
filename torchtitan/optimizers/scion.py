@@ -135,32 +135,24 @@ class Scion(torch.optim.Optimizer):
         norm_factor,
         zeropower_backend,
         backend_steps,
-        is_grouped_experts=False,
     ):
         # NB: make sure this function does not modify the grad inplace
         #     since it is also called during the log of gradients
-        def _lmo_for_2d_tensor(g, need_transpose=False):
-            g = g if not need_transpose else g.transpose(0, 1)
+        def _lmo_for_2d_tensor(g):
+            g = g
             g = zeropower_backends[zeropower_backend](g, steps=backend_steps, eps=eps)
             g = self.normalise_grad(g, norm_factor=norm_factor, eps=eps)
-            return g if not need_transpose else g.transpose(0, 1)
-
-        if not is_grouped_experts:
-            # double check if the grad is grouped experts
-            is_grouped_experts = g.ndim == 3
+            return g
 
         if g.ndim == 2:
-            g = _lmo_for_2d_tensor(g, need_transpose=is_grouped_experts)
+            g = _lmo_for_2d_tensor(g)
         elif g.ndim == 3:
             if g.shape[0] > 0:
                 # When world_size [fsdp x EP] > Total number of experts,
                 # some ranks may have 0 experts that shape will be [0, d-in, d-out]
                 # We should return the original grad here and **do not** do stack
                 g = torch.stack(
-                    [
-                        _lmo_for_2d_tensor(g[i], need_transpose=is_grouped_experts)
-                        for i in range(g.shape[0])
-                    ],
+                    [_lmo_for_2d_tensor(g[i]) for i in range(g.shape[0])],
                     dim=0,
                 )
             else:

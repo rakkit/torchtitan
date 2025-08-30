@@ -112,7 +112,7 @@ class DistributedScion(torch.optim.Optimizer):
         parallel_dims,
         communication_dtype=torch.bfloat16,
         extra_reduce_for_HSDP=False,
-        experts_weights_layout="G-D_in-D_out",
+        experts_weights_layout="G-D_out-D_in",
     ):
         self.need_to_calculate_norm = False
         self.norms_to_log: list[str] = list(NORM_FUNCTIONS.keys())

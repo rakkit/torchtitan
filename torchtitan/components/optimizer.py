@@ -714,7 +714,7 @@ def build_optimizers_with_moe_load_balancing(
                 acc_fwd_times_buffers.append(moe.acc_fwd_times)
 
         # assume all MoE layers are same
-        scale_factor = 1 / acc_fwd_times_buffers[-1]
+        scale_factor = acc_fwd_times_buffers[-1]
         # Early exit if no MoE layers were found
         if not moe_layers_info:
             return
@@ -723,8 +723,8 @@ def build_optimizers_with_moe_load_balancing(
         all_entropies = torch.cat(ent_buffers)
 
         if scale_factor != 1:
-            all_tokens *= scale_factor
-            all_entropies *= scale_factor
+            all_tokens = all_tokens // scale_factor
+            all_entropies = all_entropies // scale_factor
 
         if dp_cp_mesh is not None:
             pg = dp_cp_mesh.get_group()

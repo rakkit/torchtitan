@@ -29,9 +29,9 @@ def _run_experts_grouped_mm(
     # grouped mm between a 2D tensor and a 3D tensor
     assert x.dim() == 2
 
-    h = activation(torch._grouped_mm(x, w1, offs=offsets))
-    h = h * torch._grouped_mm(x, w3, offs=offsets)
-    out = torch._grouped_mm(out_norm(h), w2, offs=offsets)
+    h = activation(torch._grouped_mm(x, w1.transpose(-2, -1), offs=offsets))
+    h = h * torch._grouped_mm(x, w3.transpose(-2, -1), offs=offsets)
+    out = torch._grouped_mm(out_norm(h), w2.transpose(-2, -1), offs=offsets)
 
     return out
 
@@ -68,9 +68,9 @@ class GroupedExperts(nn.Module):
         self.num_experts = num_experts
         self.expert_per_rank = num_experts
 
-        self.w1 = nn.Parameter(torch.empty(num_experts, dim_in, dim_hidden))
-        self.w2 = nn.Parameter(torch.empty(num_experts, dim_hidden, dim_in))
-        self.w3 = nn.Parameter(torch.empty(num_experts, dim_in, dim_hidden))
+        self.w1 = nn.Parameter(torch.empty(num_experts, dim_hidden, dim_in))
+        self.w2 = nn.Parameter(torch.empty(num_experts, dim_in, dim_hidden))
+        self.w3 = nn.Parameter(torch.empty(num_experts, dim_hidden, dim_in))
 
         self.act_fn = build_activation(activation_type)
 
@@ -177,7 +177,7 @@ def init_all_experts_different(init_fn, w, init_std, slot, layer_id):
             rng = torch.Generator(device=local_tensor.device)
             rng.manual_seed(seed)
 
-        init_fn(local_tensor[e].transpose(0, 1), mean=0.0, std=init_std, generator=rng)
+        init_fn(local_tensor[e], mean=0.0, std=init_std, generator=rng)
 
     if isinstance(w, torch.distributed.tensor.DTensor):
         w.to_local().copy_(local_tensor)

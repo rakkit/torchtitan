@@ -316,10 +316,10 @@ class MoE(nn.Module):
             "expert_bias", torch.zeros(n_routed_experts, dtype=torch.float32)
         )
         self.register_buffer(
-            "tokens_per_expert", torch.zeros(n_routed_experts, dtype=torch.float32)
+            "tokens_per_expert", torch.zeros(n_routed_experts, dtype=torch.long)
         )
         self.register_buffer("router_entropy", torch.zeros(1, dtype=torch.float32))
-        self.acc_fwd_times = 0
+        self.register_buffer("acc_fwd_times", torch.zeros(1, dtype=torch.int8))
 
     def init_weights(
         self,
@@ -347,7 +347,7 @@ class MoE(nn.Module):
         self.expert_bias.zero_()
         self.tokens_per_expert.zero_()
         self.router_entropy.zero_()
-        self.acc_fwd_times = 0
+        self.acc_fwd_times.zero_()
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         bz, slen, dim = x.shape
@@ -367,7 +367,7 @@ class MoE(nn.Module):
             experts_entropy,
         ) = self.router(x, self.expert_bias)
         self.router_entropy.add_(experts_entropy)
-        self.acc_fwd_times += 1
+        self.acc_fwd_times.add_(1)
         if self.training:
             with torch.no_grad():
                 self.tokens_per_expert.add_(num_tokens_per_expert)

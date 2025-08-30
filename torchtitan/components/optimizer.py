@@ -712,7 +712,6 @@ def build_optimizers_with_moe_load_balancing(
                 # if need_rescale_stats(moe) or need_rescale_stats(block):
                 #     scale_factor = 0.5
                 acc_fwd_times_buffers.append(moe.acc_fwd_times)
-                moe.acc_fwd_times = 0
 
         # assume all MoE layers are same
         scale_factor = 1 / acc_fwd_times_buffers[-1]
@@ -781,10 +780,13 @@ def build_optimizers_with_moe_load_balancing(
             try:
                 torch._foreach_mul_(tok_buffers, 0)
                 torch._foreach_mul_(ent_buffers, 0.0)
+                torch._foreach_mul_(acc_fwd_times_buffers, 0)
             except Exception:
                 for t in tok_buffers:
                     t.zero_()
                 for t in ent_buffers:
+                    t.zero_()
+                for t in acc_fwd_times_buffers:
                     t.zero_()
 
             if is_dp_rank_0:

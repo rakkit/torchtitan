@@ -723,8 +723,8 @@ def build_optimizers_with_moe_load_balancing(
         all_entropies = torch.cat(ent_buffers)
 
         if scale_factor != 1:
-            all_tokens = all_tokens // scale_factor
-            all_entropies = all_entropies // scale_factor
+            all_tokens = all_tokens // scale_factor  # tokens count are integers
+            all_entropies = all_entropies / scale_factor  # entropies are floats
 
         if dp_cp_mesh is not None:
             pg = dp_cp_mesh.get_group()

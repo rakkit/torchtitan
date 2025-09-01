@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from typing import Optional
 
 import torch
@@ -86,13 +87,27 @@ class TokenChoiceTopKRouter(nn.Module):
         self.gate = nn.Linear(hidden_size, experts, bias=False)
         # Expert embeddings
 
+        self.debug_force_load_balanced = bool(
+            int(os.getenv("DEBUG_FORCE_LOAD_BALANCED", "0"))
+        )
+
     def __repr__(self):
-        return f"Gate(experts={self.experts}, topk={self.topk}"
+        return f"Gate(experts={self.experts}, topk={self.topk} | DEBUG_FORCE_LOAD_BALANCED: {self.debug_force_load_balanced})"
 
     def init_weights(self, init_std: float, init_fn_type: str):
         # nn.init.xavier_uniform_(self.expert_embeddings)
         init_fn = build_init_fn(init_fn_type)
         init_fn(self.gate.weight, mean=0.0, std=init_std)
+
+    @staticmethod
+    def uniform_indices(
+        n_tokens: int, top_k: int, num_experts: int, device
+    ) -> torch.Tensor:
+        """Round-robin expert assignment with exact balance each step.
+        Returns LongTensor of shape (n_tokens, top_k)."""
+        i = torch.arange(n_tokens, device=device)[:, None]  # [N,1]
+        k = torch.arange(top_k, device=device)[None, :]  # [1,K]
+        return ((i * top_k + k) % num_experts).long()  # [N,K]
 
     # @torch.compile(fullgraph=True)
     def forward(
@@ -122,7 +137,12 @@ class TokenChoiceTopKRouter(nn.Module):
         # top scores shape (bs*slen, top_k)
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
-        if expert_bias is not None:
+        if self.debug_force_load_balanced:
+            selected_experts_indices = self.uniform_indices(
+                x.size(0), self.topk, self.experts, x.device
+            )
+            top_scores = scores.gather(dim=1, index=selected_experts_indices)
+        elif expert_bias is not None:
             _, selected_experts_indices = torch.topk(
                 scores + expert_bias, k=self.topk, dim=-1
             )

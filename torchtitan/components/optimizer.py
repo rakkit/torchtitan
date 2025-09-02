@@ -5,11 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
-import os
 import queue
-import re
 import threading
-from collections import OrderedDict
 from typing import Any, Callable, Generic, Iterator, TypeVar
 
 import torch
@@ -26,9 +23,14 @@ from torch.optim import Optimizer
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config import Optimizer as OptimizerConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.optimizers import DistributedScion, naive_param_norm, Scion
+from torchtitan.optimizers import (
+    create_scion_optimizer_kwargs_from_optimizer_config,
+    create_scion_param_groups,
+    DistributedScion,
+    naive_param_norm,
+)
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import Color
+
 
 __all__ = [
     "OptimizersContainer",
@@ -42,55 +44,6 @@ if has_torchft:
 
 
 T = TypeVar("T", bound=Optimizer)
-
-
-def _extract_param_groups(
-    model: torch.nn.Module,
-    optimizer_config: dict[str, Any] | None = None,
-):
-    param_groups_config: list[dict[str, Any]] | None = (
-        optimizer_config.pop("param_groups", None)
-        if optimizer_config is not None
-        else None
-    )
-    if param_groups_config is None:
-        param_groups_config = []
-
-    param_dict = OrderedDict(
-        (n, p) for n, p in model.named_parameters() if p.requires_grad
-    )
-    params = []
-
-    color = Color()
-    for param_group_config in param_groups_config:
-        str_match = param_group_config.pop("param_str_match")
-        filter_fn = functools.partial(re.search, str_match)
-        param_names = [n for n in param_dict.keys() if filter_fn(n)]
-        group_params = {
-            "params": [param_dict.pop(n) for n in param_names],
-            "param_names": param_names,
-        }
-        assert len(group_params["params"]) == len(group_params["param_names"])
-
-        if len(param_names) == 0:
-            logger.warning(
-                f'{color.red}Notice: No parameters found for `str_match` "{str_match}" on '
-                f"global rank {torch.distributed.get_rank()}{color.reset}"
-            )
-            continue
-        group_params.update(param_group_config)
-        params.append(group_params)
-
-    param_names = list(param_dict.keys())
-    params.insert(
-        0,
-        {
-            "params": [param_dict.pop(n) for n in param_names],
-            "param_names": param_names,
-        },
-    )
-    assert not param_dict
-    return params
 
 
 class OptimizersContainer(Optimizer, Stateful, Generic[T]):
@@ -131,7 +84,6 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         all_params = []
         self.optimizers = []
         self.model_parts = model_parts
-        param_groups_config = optimizer_kwargs.get("param_groups", None)
         # Whether to keep old LR values when loading.
         self.preserve_lrs_when_loading = False
         self.norms_to_log: list[str] | None = None
@@ -139,29 +91,15 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         self.log_thread: threading.Thead | None = None
 
         for model in self.model_parts:
-            # copy parts we will pop from to preserve settings across model parts
-            kwargs = optimizer_kwargs.copy()
-            if "param_groups" in optimizer_kwargs:
-                kwargs["param_groups"] = (
-                    param_groups_config.copy()
-                    if param_groups_config is not None
-                    else None
+            if issubclass(optimizer_cls, (DistributedScion)):
+                params, optimizer_kwargs = create_scion_param_groups(
+                    model, optimizer_kwargs
                 )
-
-            extra_kwargs = kwargs.pop("extra_kwargs")
-            params = _extract_param_groups(model, kwargs)
-
-            is_scion = issubclass(optimizer_cls, (Scion, DistributedScion))
-            if is_scion:
-                kwargs.update(extra_kwargs)
-            self.optimizers.append(optimizer_cls(params, **kwargs))
+            else:
+                params = [p for p in model.parameters() if p.requires_grad]
+            self.optimizers.append(optimizer_cls(params, **optimizer_kwargs))
             all_params.extend(params)
         self._validate_length(len(self.model_parts))
-        # Do not separately save the external settings in
-        # optimizer defaults.
-        optimizer_kwargs.pop("param_groups", None)
-        optimizer_kwargs.update(optimizer_kwargs.pop("extra_kwargs", {}))
-
         self._post_init(all_params, optimizer_kwargs)
 
     def __iter__(self) -> Iterator[T]:
@@ -176,12 +114,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
 
     def zero_grad(self, *args, **kwargs) -> None:
         for optimizer in self.optimizers:
-            if not (
-                isinstance(optimizer, (Scion, DistributedScion))
-                and optimizer.is_light
-                and optimizer.use_momentum
-            ):
-                optimizer.zero_grad(*args, **kwargs)
+            optimizer.zero_grad(*args, **kwargs)
 
     def state_dict(self) -> dict[str, Any]:
         func = functools.partial(
@@ -440,16 +373,12 @@ def build_optimizers(
                 "TorchFT is not supported with optimizers in backward."
             )
 
-    extra_kwargs = extra_kwargs if extra_kwargs is not None else {}
-
     name = optimizer_config.name
     lr = optimizer_config.lr
     beta1 = optimizer_config.beta1
     beta2 = optimizer_config.beta2
     eps = optimizer_config.eps
     weight_decay = optimizer_config.weight_decay
-
-    is_scion = name == "Scion" or name == "DistributedScion"
 
     width_multiplier = 1
     if name in ["Adam", "AdamW"]:
@@ -458,10 +387,6 @@ def build_optimizers(
 
         fused = optim_implementation == "fused"
         foreach = optim_implementation == "foreach"
-
-        if parallel_dims.ep_enabled:
-            # Because for Expert Parallel, we have two different device meshes.
-            fused, foreach = False, False
 
         width_multiplier = optimizer_config.mup_width_multiplier
 
@@ -474,101 +399,16 @@ def build_optimizers(
             "fused": fused,
             "foreach": foreach,
         }
-    elif is_scion:
-        backend_steps = optimizer_config.backend_steps
-        zeropower_backend_algorithm = optimizer_config.zeropower_backend
-        momentum = optimizer_config.momentum
-        nesterov = optimizer_config.nesterov
-        is_light = optimizer_config.is_light
-        weight_decay = optimizer_config.weight_decay
-        if os.environ.get("SCION_DEBUG_GRAD") == "1":
-            # only if we want to debug the gradient, we dont run SVD
-            norm_factor = "none"
-            zeropower_backend_algorithm = "identity"
-            logger.warning(
-                '`SCION_DEBUG_GRAD` is set to 1, we will not run SVD and use the "identity" backend'
-            )
-        else:
-            norm_factor = "spectral"
-
-        optimizer_kwargs = {
-            "is_light": is_light,
-            "weight_decay": weight_decay,
-            "lr": lr,
-            "momentum": momentum,
-            "nesterov": nesterov,
-            "eps": eps,
-            "norm_factor": norm_factor,
-            "backend": zeropower_backend_algorithm,
-            "backend_steps": backend_steps,
-        }
+    elif name in ["DistributedScion"]:
+        optimizer_kwargs = create_scion_optimizer_kwargs_from_optimizer_config(
+            optimizer_config, parallel_dims
+        )
     else:
         raise NotImplementedError(f"Optimizer {name} not added.")
-
-    # Configure parameter group settings
-    embed_lr = optimizer_config.embed_lr
-    embed_str_match = optimizer_config.embed_str_match
-    if embed_lr is not None and embed_str_match:
-        param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
-        param_group_config = {
-            "param_str_match": embed_str_match,
-            "lr": embed_lr,
-        }
-        if is_scion:
-            param_group_config["norm_factor"] = "embed_sqrt"
-            param_group_config["backend"] = "identity"
-        param_groups_config.append(param_group_config)
-    unembed_lr = optimizer_config.unembed_lr
-    unembed_str_match = optimizer_config.unembed_str_match
-    if unembed_lr is not None and unembed_str_match:
-        param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
-        param_group_config = {
-            "param_str_match": unembed_str_match,
-            "lr": unembed_lr / width_multiplier,
-        }
-        if is_scion:
-            param_group_config["norm_factor"] = "unembed_sqrt"
-            param_group_config["backend"] = "identity"
-        param_groups_config.append(param_group_config)
-
-    router_str_match = optimizer_config.router_str_match
-    if router_str_match:
-        param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
-        param_group_config = {
-            "param_str_match": router_str_match,
-            "lr": lr,
-        }
-        if is_scion:
-            # param_group_config["norm_factor"] = "image_spectral"
-            # param_group_config["backend"] = zeropower_backend_algorithm
-            # param_group_config["norm_factor"] = "none"
-            # param_group_config["backend"] = "identity"
-            param_group_config["norm_factor"] = "spectral"
-            param_group_config["backend"] = zeropower_backend_algorithm
-        param_groups_config.append(param_group_config)
-
-    # We automatically scale the SSNorm's scalar factor.
-    ss_norm_str_match = "ssnorm_scale"
-    if ss_norm_str_match:
-        param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
-        param_group_config = {
-            "param_str_match": ss_norm_str_match,
-            "lr": lr,
-        }
-        if is_scion:
-            param_group_config["norm_factor"] = "sign"
-            param_group_config["backend"] = "identity"
-        param_groups_config.append(param_group_config)
-
-    optimizer_kwargs["extra_kwargs"] = {
-        "parallel_dims": parallel_dims,
-        **extra_kwargs,
-    }
 
     optimizer_classes = {
         "Adam": torch.optim.Adam,
         "AdamW": torch.optim.AdamW,
-        "Scion": Scion,
         "DistributedScion": DistributedScion,
     }
     if name not in optimizer_classes:

@@ -132,6 +132,8 @@ class DistributedScion(torch.optim.Optimizer):
         )
         self.is_light = is_light
 
+        assert is_light is False, "is_light must be False"
+
         is_unconstrained = weight_decay == 0
 
         self.world_mesh = parallel_dims.world_mesh
@@ -205,6 +207,12 @@ class DistributedScion(torch.optim.Optimizer):
             return self.norms_at_current_step
         else:
             return {}
+
+    def zero_grad(self, *args, **kwargs):
+        if self.is_light:
+            pass
+        else:
+            super().zero_grad(*args, **kwargs)
 
     @torch.no_grad()
     def step(self, closure=None):

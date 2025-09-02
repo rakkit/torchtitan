@@ -4,8 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import ast
 import importlib
 import os
+import re
 import sys
 
 from dataclasses import field, fields, is_dataclass, make_dataclass
@@ -21,6 +23,70 @@ except ModuleNotFoundError:
 from torchtitan.tools.logging import logger
 
 from .job_config import JobConfig
+
+
+def _deep_set(d: dict, path: list[str], value):
+    """Set d[path]=value; path segments support 'a' and 'a[3]'. Creates dicts/lists as needed."""
+    cur = d
+    for i, seg in enumerate(path):
+        m = re.fullmatch(r"([A-Za-z0-9_]+)(?:\[(\d+)\])?", seg)
+        if not m:
+            raise ValueError(f"Bad path segment: {seg}")
+        name, idx = m.group(1), m.group(2)
+        last = i == len(path) - 1
+
+        if idx is None:
+            if last:
+                cur[name] = value
+            else:
+                nxt = cur.get(name)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    cur[name] = nxt
+                cur = nxt
+        else:
+            j = int(idx)
+            seq = cur.get(name)
+            if not isinstance(seq, list):
+                seq = []
+                cur[name] = seq
+            while len(seq) <= j:
+                seq.append({})
+            if last:
+                seq[j] = value
+            else:
+                if not isinstance(seq[j], dict):
+                    seq[j] = {}
+                cur = seq[j]
+
+
+def _extract_indexed_overrides(raw_args: list[str]):
+    """
+    Capture tokens like:
+      --optimizer.extra-splits-rules[0].lr=1e-3
+      --optimizer.extra_splits_rules[1].backend=identity
+    Return (remaining_args, overrides) where overrides = [(path_segments, value), ...].
+
+    We only intercept tokens that have both '[' and '=' to avoid stealing normal flags.
+    We also normalise '-' to '_' in keys to match your Python/TOML keys.
+    """
+
+    def _literal_eval_safe(s: str):
+        try:
+            return ast.literal_eval(s)
+        except Exception:
+            return s  # keep string if not a Python literal
+
+    remaining, overrides = [], []
+    for a in raw_args:
+        if a.startswith("-") and "[" in a and "=" in a:
+            key, val = a.lstrip("-").split("=", 1)
+            key = key.replace("-", "_")  # normalise hyphens to underscores
+            path = key.split(".")
+            overrides.append((path, _literal_eval_safe(val)))
+        else:
+            remaining.append(a)
+    return remaining, overrides
 
 
 class ConfigManager:
@@ -44,7 +110,16 @@ class ConfigManager:
         self.register_tyro_rules(custom_registry)
 
     def parse_args(self, args: list[str] = sys.argv[1:]) -> JobConfig:
+        args, idx_overrides = _extract_indexed_overrides(args)
+
         toml_values = self._maybe_load_toml(args)
+
+        if toml_values is None:
+            toml_values = {}
+
+        for path, val in idx_overrides:
+            _deep_set(toml_values, path, val)
+
         config_cls = self._maybe_add_custom_args(args, toml_values)
 
         base_config = (

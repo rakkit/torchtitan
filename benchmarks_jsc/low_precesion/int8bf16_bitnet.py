@@ -4,16 +4,17 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# these code are AI-Generated
+# Benchmark BF16 vs BitNet (torchao) training throughput for a simple
+# RMSNorm->Linear block. Mirrored from fp8.py with BitNet conversion.
+
 import argparse
 import csv
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
-
 
 try:  # plotting deps are optional
     import matplotlib
@@ -27,66 +28,51 @@ except Exception:
     HAS_PLOTTING = False
 
 try:
-    from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+    # BitNet conversion utilities from torchao
+    from torchao import quantize_ as _quantize
+    from torchao.prototype.quantized_training import bitnet_training as _bitnet_training
 
     TORCHAO_AVAILABLE = True
 except Exception:
-    convert_to_float8_training = None  # type: ignore
-    Float8LinearConfig = None  # type: ignore
+    _quantize = None  # type: ignore
+    _bitnet_training = None  # type: ignore
     TORCHAO_AVAILABLE = False
 
 
 def _assert_cuda_bf16():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA device is required for this benchmark.")
-    # BF16 on Ampere+ GPUs is widely available; we don't hard-fail but warn if unsupported
     if not torch.cuda.is_bf16_supported():
         print("Warning: CUDA BF16 not reported as supported on this device.")
-
-
-def _can_use_fp8_dims(d_in: int, d_out: int) -> bool:
-    # FP8 kernels typically require K/N dims divisible by 16 for best perf/compat
-    return (d_in % 16 == 0) and (d_out % 16 == 0)
 
 
 class RMSNormLinear(nn.Module):
     def __init__(self, d_in: int, d_out: int):
         super().__init__()
+        # Keeping model minimal: Linear only, to match fp8.py baseline
         self.fc = nn.Linear(d_in, d_out, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc(x)
-        return x
+        return self.fc(x)
 
 
 def build_model(
     d_in: int,
     d_out: int,
     precision: str,
-    recipe: Optional[str],
     use_compile: bool,
     device: torch.device,
 ) -> nn.Module:
-    # Use RMSNorm (no parameters) followed by Linear, per request
     m = RMSNormLinear(d_in, d_out).to(device).bfloat16()
 
-    if precision == "fp8":
+    if precision == "int8bf16_bitnet":
         if not TORCHAO_AVAILABLE:
             raise RuntimeError(
-                "torchao.float8 is not available. Install torchao to run FP8 benchmarks."
+                "torchao is not available. Install torchao to run BitNet benchmarks."
             )
-        if recipe is None:
-            raise ValueError("FP8 precision requires a recipe name.")
-        if not _can_use_fp8_dims(d_in, d_out):
-            raise ValueError(
-                f"FP8 requires d_in and d_out divisible by 16, got {d_in}, {d_out}"
-            )
+        # Mutates in-place: replace nn.Linear with BitNetLinear
+        _quantize(m, _bitnet_training())  # type: ignore[misc]
 
-        # Configure and convert
-        cfg = Float8LinearConfig.from_recipe_name(recipe)  # type: ignore[attr-defined]
-        m = convert_to_float8_training(m, config=cfg)
-
-    # Optional compile for performance
     if use_compile:
         try:
             try:
@@ -106,18 +92,16 @@ def benchmark_once(
     bs: int,
     seq_len: int,
     precision: str,
-    recipe: Optional[str],
     steps: int,
     warmup: int,
     use_compile: bool,
     device: torch.device,
-    lr: float = 0.1,
 ) -> Tuple[float, float]:
     """
-    Measures GPU kernel time for fwd+bwd of RMSNorm->Linear.
-    Returns tokens/sec and avg step time (ms) based on GPU event timing.
+    Measures GPU kernel time for fwd+bwd of Linear.
+    Returns tokens/sec and avg step time (ms).
     """
-    model = build_model(d_in, d_out, precision, recipe, use_compile, device)
+    model = build_model(d_in, d_out, precision, use_compile, device)
 
     M = bs * seq_len
     x = torch.randn(M, d_in, device=device, dtype=torch.bfloat16).requires_grad_()
@@ -131,7 +115,7 @@ def benchmark_once(
             x.grad = None
     torch.cuda.synchronize()
 
-    # GPU event timing for measured steps
+    # Timed steps
     start_ev = torch.cuda.Event(enable_timing=True)
     end_ev = torch.cuda.Event(enable_timing=True)
     start_ev.record()
@@ -162,92 +146,41 @@ def run_grid(
     device: torch.device,
 ) -> List[Dict[str, object]]:
     results: List[Dict[str, object]] = []
-    precisions = ["bf16", "fp8"]
-    recipes = [None, "tensorwise", "rowwise", "rowwise_with_gw_hp"]
+    precisions = ["bf16", "int8bf16_bitnet"]
 
     for d_in in d_in_list:
         for d_out in d_out_list:
             for bs in bs_list:
                 for prec in precisions:
-                    if prec == "bf16":
-                        recipe = None
-                        try:
-                            thr, step_ms = benchmark_once(
-                                d_in,
-                                d_out,
-                                bs,
-                                seq_len,
-                                precision=prec,
-                                recipe=recipe,
-                                steps=steps,
-                                warmup=warmup,
-                                use_compile=use_compile,
-                                device=device,
-                            )
-                        except Exception as e:
-                            print(
-                                f"BF16 benchmark failed for d_in={d_in}, d_out={d_out}, bs={bs}: {e}"
-                            )
-                            thr, step_ms = float("nan"), float("nan")
-                        results.append(
-                            {
-                                "precision": prec,
-                                "recipe": recipe or "-",
-                                "d_in": d_in,
-                                "d_out": d_out,
-                                "bs": bs,
-                                "seq_len": seq_len,
-                                "throughput_tokens_per_s": thr,
-                                "avg_step_ms": step_ms,
-                            }
+                    try:
+                        thr, step_ms = benchmark_once(
+                            d_in,
+                            d_out,
+                            bs,
+                            seq_len,
+                            precision=prec,
+                            steps=steps,
+                            warmup=warmup,
+                            use_compile=use_compile,
+                            device=device,
                         )
-                    else:
-                        for recipe in ["tensorwise", "rowwise", "rowwise_with_gw_hp"]:
-                            if not _can_use_fp8_dims(d_in, d_out):
-                                # record but skip running
-                                results.append(
-                                    {
-                                        "precision": prec,
-                                        "recipe": recipe,
-                                        "d_in": d_in,
-                                        "d_out": d_out,
-                                        "bs": bs,
-                                        "seq_len": seq_len,
-                                        "throughput_tokens_per_s": float("nan"),
-                                        "avg_step_ms": float("nan"),
-                                    }
-                                )
-                                continue
-                            try:
-                                thr, step_ms = benchmark_once(
-                                    d_in,
-                                    d_out,
-                                    bs,
-                                    seq_len,
-                                    precision=prec,
-                                    recipe=recipe,
-                                    steps=steps,
-                                    warmup=warmup,
-                                    use_compile=use_compile,
-                                    device=device,
-                                )
-                            except Exception as e:
-                                print(
-                                    f"FP8[{recipe}] benchmark failed for d_in={d_in}, d_out={d_out}, bs={bs}: {e}"
-                                )
-                                thr, step_ms = float("nan"), float("nan")
-                            results.append(
-                                {
-                                    "precision": prec,
-                                    "recipe": recipe,
-                                    "d_in": d_in,
-                                    "d_out": d_out,
-                                    "bs": bs,
-                                    "seq_len": seq_len,
-                                    "throughput_tokens_per_s": thr,
-                                    "avg_step_ms": step_ms,
-                                }
-                            )
+                    except Exception as e:
+                        print(
+                            f"{prec.upper()} benchmark failed for d_in={d_in}, d_out={d_out}, bs={bs}: {e}"
+                        )
+                        thr, step_ms = float("nan"), float("nan")
+                    results.append(
+                        {
+                            "precision": prec,
+                            "recipe": ("-" if prec == "bf16" else "int8bf16_bitnet"),
+                            "d_in": d_in,
+                            "d_out": d_out,
+                            "bs": bs,
+                            "seq_len": seq_len,
+                            "throughput_tokens_per_s": thr,
+                            "avg_step_ms": step_ms,
+                        }
+                    )
     return results
 
 
@@ -256,7 +189,6 @@ def save_results(out_dir: str, results: List[Dict[str, object]]) -> None:
     sysname = os.environ.get("SYSTEMNAME", "unknown")
     tag = f"{sysname}__" if sysname else ""
 
-    # Detailed results CSV
     detailed_path = os.path.join(out_dir, f"{tag}throughput_detailed.csv")
     fieldnames = [
         "precision",
@@ -300,7 +232,7 @@ def save_results(out_dir: str, results: List[Dict[str, object]]) -> None:
         speedup = (thr / base) if (base and base == base) else float("nan")
         speedup_rows.append(
             {
-                "recipe": r["recipe"],
+                "recipe": "int8bf16_bitnet",
                 "d_in": r["d_in"],
                 "d_out": r["d_out"],
                 "bs": r["bs"],
@@ -322,7 +254,7 @@ def save_results(out_dir: str, results: List[Dict[str, object]]) -> None:
     # Per-recipe matrices: rows = bs, cols = f"{d_in}x{d_out}"
     by_recipe: Dict[str, Dict[Tuple[int, int, int], float]] = {}
     for r in speedup_rows:
-        recipe = str(r["recipe"])  # e.g., tensorwise
+        recipe = str(r["recipe"])  # type: ignore[index]
         d_in = int(r["d_in"])  # type: ignore[arg-type]
         d_out = int(r["d_out"])  # type: ignore[arg-type]
         bs = int(r["bs"])  # type: ignore[arg-type]
@@ -335,22 +267,18 @@ def save_results(out_dir: str, results: List[Dict[str, object]]) -> None:
     for recipe, data in by_recipe.items():
         matrix_path = os.path.join(out_dir, f"{tag}speedup_matrix_{recipe}.csv")
         with open(matrix_path, "w", newline="") as f:
-            # header: bs, then each dim label
             header = ["bs"] + [f"{d_in}x{d_out}" for (d_in, d_out) in dims_labels]
             w = csv.writer(f)
             w.writerow(header)
             for bs in bs_vals:
                 row: List[object] = [bs]
                 for d_in, d_out in dims_labels:
-                    val = data.get((d_in, d_out, bs), float("nan"))
-                    row.append(val)
+                    row.append(data.get((d_in, d_out, bs), float("nan")))
                 w.writerow(row)
 
     print(f"Saved detailed throughput to: {detailed_path}")
     print(f"Saved speedups to: {speedup_path}")
-    print(f"Saved per-recipe matrices to: {out_dir}/{tag}speedup_matrix_*.csv")
 
-    # Plot heatmaps per recipe if plotting is available
     if HAS_PLOTTING:
         try:
             plot_speedup_heatmaps(out_dir, results)
@@ -373,12 +301,12 @@ def _compute_speedups_from_results(results: List[Dict[str, object]]):
             )
             bf16_index[key] = val
 
-    # Compute per-recipe speedups
+    # Compute per-recipe speedups (single recipe: "int8bf16_bitnet")
     by_recipe: Dict[str, Dict[Tuple[int, int, int], float]] = {}
     d_in_set, d_out_set, bs_set, seq_set = set(), set(), set(), set()
     for r in results:
         if r["precision"] != "bf16":
-            recipe = str(r["recipe"])  # type: ignore
+            recipe = "int8bf16_bitnet"
             d_in = int(r["d_in"])  # type: ignore
             d_out = int(r["d_out"])  # type: ignore
             bs = int(r["bs"])  # type: ignore
@@ -433,30 +361,24 @@ def plot_speedup_heatmaps(out_dir: str, results: List[Dict[str, object]]):
                     data.get((d_in, d_out, bs), float("nan")) for d_out in d_out_list
                 ]
                 rows.append(row)
-                # Label the first row of each block with the token count + d_in
                 if d_in == d_in_list[0]:
                     row_labels.append(f"bs={bs:02d}| seq_len={seq_len}, {d_in}")
                 else:
                     row_labels.append(str(d_in))
 
         mat = np.array(rows, dtype=float) if rows else np.zeros((0, 0), dtype=float)
-
-        # Create RGBA image using sign-based colors and alpha for magnitude
         H, W = mat.shape
         if H == 0 or W == 0:
             continue
 
         rgba = np.ones((H, W, 4), dtype=float)
-        # base colors
         green = np.array([0.0, 0.6, 0.0])
         red = np.array([0.8, 0.0, 0.0])
         gray = np.array([0.7, 0.7, 0.7])
 
-        # Compute alphas from |log2(speedup)|, clamp to percentile to avoid outliers
         vals = mat[np.isfinite(mat) & (mat > 0)]
         if vals.size:
             mags = np.abs(np.log2(vals))
-            # clamp alpha scale to 95th percentile or at least 1.0 (i.e., 2x)
             max_mag = max(np.percentile(mags, 95), 1.0)
         else:
             max_mag = 1.0
@@ -469,8 +391,7 @@ def plot_speedup_heatmaps(out_dir: str, results: List[Dict[str, object]]):
                     rgba[i, j, 3] = 0.3
                     continue
                 if math.isclose(v, 1.0, rel_tol=1e-3, abs_tol=1e-3):
-                    # near parity -> nearly transparent
-                    base = green  # arbitrary; alpha ~0 will make it invisible
+                    base = green
                     a = 0.05
                 elif v > 1.0:
                     base = green
@@ -481,7 +402,6 @@ def plot_speedup_heatmaps(out_dir: str, results: List[Dict[str, object]]):
                 rgba[i, j, :3] = base
                 rgba[i, j, 3] = a
 
-        # Plot
         fig_w = max(6.0, 0.6 * W + 2.0)
         fig_h = max(4.0, 0.35 * H + 1.0)
         fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
@@ -498,7 +418,6 @@ def plot_speedup_heatmaps(out_dir: str, results: List[Dict[str, object]]):
         for k in range(1, len(bs_list)):
             y = k * block_height - 0.5
             ax.axhline(y, color="black", linewidth=0.5)
-        # No separate token labels; encoded in the first row label of each block
 
         # Per-cell text with speedup value
         for i in range(H):
@@ -517,7 +436,6 @@ def plot_speedup_heatmaps(out_dir: str, results: List[Dict[str, object]]):
                     alpha=0.9,
                 )
 
-        # Title with system info
         gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
         try:
             import torchao as _torchao_pkg
@@ -527,11 +445,10 @@ def plot_speedup_heatmaps(out_dir: str, results: List[Dict[str, object]]):
             torchao_ver = "unavailable"
         subtitle = f"{sysname} | GPU {gpu_name} \n PyTorch {torch.__version__}+cu{torch.version.cuda} \n torchao {torchao_ver}"
         ax.set_title(
-            f"FP8 speedup vs BF16 \n  Linear fwd+bwd \n recipe={recipe}\n{subtitle}"
+            f"int8bf16_bitnet speedup vs BF16 \n  Linear fwd+bwd \n recipe={recipe}\n{subtitle}"
         )
         ax.grid(False)
 
-        # Add a small legend-like annotation
         ax.text(
             1.02,
             1.0,
@@ -541,7 +458,6 @@ def plot_speedup_heatmaps(out_dir: str, results: List[Dict[str, object]]):
             fontsize=8,
         )
 
-        # Tighten layout with a standard left margin now that labels are compact
         plt.tight_layout(rect=[0.12, 0.06, 0.98, 0.95])
         out_path = os.path.join(out_dir, f"{tag}speedup_heatmap_{recipe}.png")
         fig.savefig(out_path)
@@ -551,13 +467,10 @@ def plot_speedup_heatmaps(out_dir: str, results: List[Dict[str, object]]):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="BF16 vs FP8 Linear training throughput benchmark"
+        description="BF16 vs int8bf16_bitnet Linear training throughput benchmark"
     )
     p.add_argument(
-        "--seq-len",
-        type=int,
-        default=4096,
-        help="Sequence length (fixed: suggested 4096)",
+        "--seq-len", type=int, default=4096, help="Sequence length (suggested 4096)"
     )
     p.add_argument(
         "--max-bs",
@@ -569,20 +482,20 @@ def parse_args() -> argparse.Namespace:
         "--d-in-list",
         type=str,
         default="2048,4096,8192",
-        help="Comma-separated d_in list (multiples of 16)",
+        help="Comma-separated d_in list",
     )
     p.add_argument(
         "--d-out-list",
         type=str,
-        default="2048,4096,8192, 16384",
-        help="Comma-separated d_out list (multiples of 16)",
+        default="2048,4096,8192,16384",
+        help="Comma-separated d_out list",
     )
     p.add_argument("--steps", type=int, default=20, help="Measured steps per config")
     p.add_argument("--warmup", type=int, default=5, help="Warmup steps per config")
     p.add_argument(
         "--out-dir",
         type=str,
-        default="./fp8_bench_results",
+        default="./int8bf16_bitnet_bench_results",
         help="Output directory for CSVs",
     )
     return p.parse_args()
@@ -591,7 +504,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     _assert_cuda_bf16()
     # torch.backends.cuda.matmul.allow_tf32 = True
-    # i think we should force FP32 matmul precision to high for FP8
     try:
         torch.set_float32_matmul_precision("high")  # type: ignore[attr-defined]
     except Exception:
@@ -600,18 +512,12 @@ def main() -> None:
     args = parse_args()
 
     seq_len = args.seq_len
-    max_tokens = 40960  # cap as per request (bs <= 10 when seq_len=4096)
+    max_tokens = 40960  # cap like fp8
     max_bs = min(args.max_bs, max_tokens // seq_len)
     bs_list = list(range(1, max_bs + 1))
 
     d_in_list = [int(x) for x in args.d_in_list.split(",") if x.strip()]
     d_out_list = [int(x) for x in args.d_out_list.split(",") if x.strip()]
-
-    # Ensure divisibility by 16 for FP8-friendly configs (we still run BF16 otherwise)
-    if not all((x % 16 == 0) for x in d_in_list + d_out_list):
-        print(
-            "Warning: Some dims are not divisible by 16; FP8 results will be NaN for those."
-        )
 
     device = torch.device("cuda")
     results = run_grid(
@@ -630,4 +536,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    # python torchtitan/benchmarks_jsc/low_precesion/fp8.py --out-dir ./benchmarks/fp8
+    # Example:
+    # python resources/torchtitan/benchmarks_jsc/low_precesion/int8bf16_bitnet.py --out-dir ./benchmarks/int8bf16_bitnet

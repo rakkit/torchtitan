@@ -11,3 +11,4 @@ import torchtitan.components.quantization  # noqa: F401
 # will be called.
 # import torchtitan.experiments  # noqa: F401
 import torchtitan.models  # noqa: F401
+import torchtitan.patch_ao  # noqa: F401

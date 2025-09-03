@@ -192,7 +192,7 @@ class BitNetConverter(ModelConverter):
         quantize_(
             model.layers,
             bitnet_training(),
-            set_inductor_config=False,
+            # set_inductor_config=False,
         )
         logger.info("Swapped to BitNetLinear layers")
 

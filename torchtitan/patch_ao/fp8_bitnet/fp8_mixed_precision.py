@@ -15,25 +15,12 @@ from typing import Any, Optional, Tuple, Union
 import torch
 import torch.utils._pytree as pytree
 from torch import nn, Tensor
-from torch.utils._triton import has_triton
 
 from torchao.core.config import AOBaseConfig
 from torchao.quantization.transform_module import register_quantize_module_handler
 from torchao.utils import TorchAOBaseTensor
 
-from .int8 import quantize_int8_rowwise
-
-if has_triton():
-    from .fp8_mm import scaled_fp8_mm
-
-else:
-    # This is less performant than the explicit hand-written Triton kernel, though things might
-    # change in the future.
-    # Multiplying col_scale first is faster than the other way round.
-    def scaled_fp8_mm(
-        A: Tensor, B: Tensor, row_scale: Tensor, col_scale: Tensor
-    ) -> Tensor:
-        return torch._int_mm(A, B) * col_scale.view(-1) * row_scale.view(-1, 1)
+from .fp8 import quantize_fp8_rowwise
 
 
 @dataclass
@@ -208,9 +195,9 @@ def _dynamic_fp8_mm(A: Tensor, B: Tensor) -> Tensor:
     TODO: check if transpose+quantize are actually fused.
     """
     # A may have more than 2 dims, while B must be exactly 2-dim
-    A_fp8, A_scale_rowwise = quantize_int8_rowwise(A.view(-1, A.shape[-1]))
-    B_t_fp8, B_scale_colwise = quantize_int8_rowwise(B.T)
-    out = scaled_fp8_mm(
+    A_fp8, A_scale_rowwise = quantize_fp8_rowwise(A.view(-1, A.shape[-1]))
+    B_t_fp8, B_scale_colwise = quantize_fp8_rowwise(B.T)
+    out = torch._scaled_mm(
         A_fp8.contiguous(),
         B_t_fp8.contiguous().T,
         A_scale_rowwise.contiguous(),

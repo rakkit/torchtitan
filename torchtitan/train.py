@@ -442,10 +442,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 json.dump(config_dict, f, indent=4)
 
             clean_config_dict = {}
-            for (header, subdict) in config_dict.items():
+            for header, subdict in config_dict.items():
                 clean_subdict = {}
                 clean_config_dict[header] = clean_subdict
-                for (key, value) in subdict.items():
+                for key, value in subdict.items():
                     if value is not None:
                         clean_subdict[key] = value
 

@@ -27,20 +27,6 @@ from torchao.core.config import AOBaseConfig
 from torchao.quantization.transform_module import register_quantize_module_handler
 from torchao.utils import TorchAOBaseTensor
 
-from .fp8 import quantize_fp8_rowwise
-
-if has_triton():
-    from .fp8_mm import scaled_fp8_mm
-
-else:
-    # This is less performant than the explicit hand-written Triton kernel, though things might
-    # change in the future.
-    # Multiplying col_scale first is faster than the other way round.
-    def scaled_fp8_mm(
-        A: Tensor, B: Tensor, row_scale: Tensor, col_scale: Tensor
-    ) -> Tensor:
-        return torch._int_mm(A, B) * col_scale.view(-1) * row_scale.view(-1, 1)
-
 
 aten = torch.ops.aten
 
@@ -163,6 +149,55 @@ def quantize_fp8_bitnet_weight(w: Tensor, scale: Tensor, eps: float = 1e-5) -> T
     return w
 
 
+def _quantize_rowwise_to_fp8(x: Tensor, eps: float = 1e-5):
+    """Quantize a 2D tensor row-wise into float8 using INT8-like calibration.
+
+    Returns (x_fp8, scale_a), where:
+      - x_fp8: torch.float8_e4m3fn with values approximately in [-128, 127]
+      - scale_a: torch.float32 of shape (M, 1), contiguous
+    """
+    x2d = x.view(-1, x.shape[-1]).float()
+    scale = (x2d.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(eps).to(torch.float32).contiguous()
+    q = (x2d / scale).round().clamp(-128, 127)
+    x_fp8 = q.to(torch.float8_e4m3fn)
+    return x_fp8, scale
+
+
+def _quantize_tensorwise_bitnet_to_fp8(w: Tensor, eps: float = 1e-5):
+    """BitNet-style tensorwise quantization to float8: q in {-1, 0, 1}.
+
+    Returns (w_fp8, s_w32), where s_w32 is FP32 scalar.
+    """
+    s_w = w.float().abs().mean().clamp_min(eps)
+    q = (w.float() / s_w).round().clamp(-1, 1)
+    w_fp8 = q.to(torch.float8_e4m3fn)
+    return w_fp8, s_w.to(torch.float32)
+
+
+def _quantize_colwise_to_fp8(x: Tensor, eps: float = 1e-5):
+    """Quantize a 2D tensor column-wise into float8 using INT8-like calibration.
+
+    Returns (x_fp8, scale_b), where:
+      - x_fp8: torch.float8_e4m3fn
+      - scale_b: torch.float32 of shape (1, N), contiguous
+    """
+    x2d = x.view(-1, x.shape[-1]).float()
+    scale = (x2d.abs().amax(dim=0, keepdim=True) / 127.0).clamp_min(eps).to(torch.float32).contiguous()
+    q = (x2d / scale).round().clamp(-128, 127)
+    x_fp8 = q.to(torch.float8_e4m3fn)
+    return x_fp8, scale
+
+
+def _as_column_major(B: Tensor) -> Tensor:
+    """Return a 2D tensor with the same shape/values but column-major strides.
+    If already column-major (stride(0) == 1) return as-is; otherwise use T.contiguous().T trick.
+    """
+    assert B.dim() == 2
+    if B.stride(0) == 1:
+        return B
+    return B.t().contiguous().t()
+
+
 @torch.no_grad()
 def precompute_fp8_bitnet_scale_for_fsdp(module: nn.Module):
     """Calculate scale for all FP8BitNetTrainingLinearWeight parameters.
@@ -197,51 +232,76 @@ class _FP8BitNetTrainingLinear(torch.autograd.Function):
         weight: FP8BitNetTrainingLinearWeight,
         bias: Optional[Tensor] = None,
     ):
+        # reshape input to 2D [M, K]
         batch_dims = input.shape[:-1]
-        input = input.view(-1, weight.shape[1])
+        input_2d = input.view(-1, weight.shape[1]).to(torch.bfloat16)
 
-        # https://github.com/microsoft/unilm/blob/master/bitnet/The-Era-of-1-bit-LLMs__Training_Tips_Code_FAQ.pdf
-        # Figure 3
-        input_fp8, row_scale = quantize_fp8_rowwise(input, eps=1e-5)
+        # Quantize activations row-wise to FP8 + get (M,1) FP32 scale
+        a_fp8, scale_a = _quantize_rowwise_to_fp8(input_2d)
 
-        # NOTE: use FP32 scale for weight quantization, but cast scale to possibly lower precision
-        # for matmul and backward
-        tensor_scale = get_fp8_bitnet_scale(weight._data)
-        weight_fp8 = quantize_fp8_bitnet_weight(weight._data, tensor_scale)
-        tensor_scale = tensor_scale.to(weight.dtype)
+        # Quantize BitNet weights tensorwise to FP8 {-1,0,1} + scalar FP32 scale
+        w_fp8, s_w32 = _quantize_tensorwise_bitnet_to_fp8(weight._data)
 
-        ctx.save_for_backward(input_fp8, row_scale, weight_fp8, tensor_scale)
+        # B for matmul is [K, N] = [in, out]
+        B = _as_column_major(w_fp8.T)
+        scale_b = s_w32.expand(1, B.shape[1]).contiguous()
 
-        # use fp8 tensor cores
-        out = scaled_fp8_mm(
-            input_fp8.contiguous(), weight_fp8.contiguous().T, row_scale, tensor_scale
+        # Save tensors for backward
+        ctx.save_for_backward(input_2d, w_fp8, s_w32)
+        ctx.has_bias = bias is not None
+
+        out2d = torch._scaled_mm(
+            a_fp8.contiguous(),
+            B,
+            out_dtype=input_2d.dtype,
+            scale_a=scale_a,
+            scale_b=scale_b,
         )
-        out = out.view(*batch_dims, weight.shape[0])
 
-        out = out + bias if bias is not None else out
+        out = out2d.view(*batch_dims, weight.shape[0])
+        if bias is not None:
+            out = out + bias
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_fp8, row_scale, weight_fp8, tensor_scale = ctx.saved_tensors
+        input_2d, w_fp8, s_w32 = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
 
         batch_dims = grad_output.shape[:-1]
-        grad_output = grad_output.view(-1, weight_fp8.shape[0])
+        grad_output_2d = grad_output.view(-1, w_fp8.shape[0]).to(input_2d.dtype)
 
-        # NOTE: we can potentially speedup training by also quantizing the backward pass
-        # to use FP8 tensor cores
+        # 1) grad_input = grad_output @ W
         if ctx.needs_input_grad[0]:
-            # mixed mm
-            grad_input = (grad_output @ weight_fp8.to(grad_output.dtype)) * tensor_scale
-            grad_input = grad_input.view(*batch_dims, weight_fp8.shape[1])
+            go_fp8, go_scale = _quantize_rowwise_to_fp8(grad_output_2d)
+            B = _as_column_major(w_fp8)  # [out, in] column-major view
+            scale_b = s_w32.expand(1, B.shape[1]).contiguous()
+            grad_input_2d = torch._scaled_mm(
+                go_fp8.contiguous(),
+                B,
+                out_dtype=grad_output_2d.dtype,
+                scale_a=go_scale,
+                scale_b=scale_b,
+            )
+            grad_input = grad_input_2d.view(*batch_dims, w_fp8.shape[1])
 
+        # 2) grad_weight = grad_output.T @ input
         if ctx.needs_input_grad[1]:
-            # NOTE: we use quantized activation for this calculation
-            grad_weight = grad_output.T @ (input_fp8 * row_scale.view(-1, 1))
+            go_t = grad_output_2d.T
+            go_t_fp8, go_t_scale = _quantize_rowwise_to_fp8(go_t)
 
-        if ctx.needs_input_grad[2]:
-            grad_bias = grad_output.sum(0)
+            # Quantize input column-wise to FP8 for B
+            input_fp8, input_col_scale = _quantize_colwise_to_fp8(input_2d)
+            grad_weight = torch._scaled_mm(
+                go_t_fp8.contiguous(),
+                _as_column_major(input_fp8),
+                out_dtype=input_2d.dtype,
+                scale_a=go_t_scale,
+                scale_b=input_col_scale,
+            )
+
+        if ctx.needs_input_grad[2] and ctx.has_bias:
+            grad_bias = grad_output_2d.sum(0)
 
         return grad_input, grad_weight, grad_bias
 
@@ -374,26 +434,29 @@ class _FP8BitNetPacked2bitLinear(torch.autograd.Function):
         batch_dims = input.shape[:-1]
         input_2d = input.view(-1, weight.shape[1])
 
-        # 1. Quantize input activations row-wise (per-token quantization)
-        input_fp8, row_scale = quantize_fp8_rowwise(input_2d, eps=1e-5)
-
-        # 2. Get quantized weights and their per-tensor scale
         weight_f2, tensor_scale = weight.int_data, weight.scale
+        # Unpack 2-bit weights to int8 values in {-1,0,1}, then cast to FP8
+        weight_fp8 = _unpack_f2_in_f8(weight_f2).to(torch.float8_e4m3fn)
 
-        # 3. Unpack 2-bit weights to 8-bit for the GEMM kernel
-        weight_fp8 = _unpack_f2_in_f8(weight_f2)
-
-        # Save tensors for the backward pass
-        ctx.save_for_backward(input, weight_fp8, tensor_scale, bias)
+        # Save tensors for backward
+        ctx.save_for_backward(input_2d, weight_fp8, tensor_scale)
         ctx.batch_dims = batch_dims
+        ctx.has_bias = bias is not None
 
-        # 4. Perform scaled FP8 matrix multiplication
-        output = scaled_fp8_mm(
-            input_fp8.contiguous(), weight_fp8.contiguous().T, row_scale, tensor_scale
+        # Quantize activations row-wise to FP8 and construct FP32 scales
+        a_fp8, scale_a = _quantize_rowwise_to_fp8(input_2d)
+        B = _as_column_major(weight_fp8.T)
+        scale_b = tensor_scale.to(torch.float32).expand(1, B.shape[1]).contiguous()
+        output2d = torch._scaled_mm(
+            a_fp8.contiguous(),
+            B,
+            out_dtype=input_2d.dtype,
+            scale_a=scale_a,
+            scale_b=scale_b,
         )
 
         # Reshape output to original batch dimensions
-        output = output.view(*batch_dims, weight.shape[0])
+        output = output2d.view(*batch_dims, weight.shape[0])
 
         if bias is not None:
             output = output + bias
@@ -401,57 +464,42 @@ class _FP8BitNetPacked2bitLinear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        """
-        Backward pass using FP8 GEMM for both gradient computations.
-        """
-        input, weight_fp8, tensor_scale, bias = ctx.saved_tensors
+        """Backward pass using FP8 GEMM if available; fall back otherwise."""
+        input_2d, weight_fp8, tensor_scale = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
 
         # Reshape grad_output to 2D for matrix multiplication
-        grad_output_2d = grad_output.view(-1, weight_fp8.shape[0])
+        grad_output_2d = grad_output.view(-1, weight_fp8.shape[0]).to(input_2d.dtype)
 
-        # === 1. Calculate grad_input = grad_output @ W ===
+        # grad_input = grad_output @ W
         if ctx.needs_input_grad[0]:
-            # Quantize grad_output row-wise
-            grad_output_fp8, grad_output_scale = quantize_fp8_rowwise(grad_output_2d)
-
-            # Perform scaled FP8 matmul using the weight's tensor_scale
-            grad_input_dequant = scaled_fp8_mm(
-                grad_output_fp8.contiguous(),
-                weight_fp8.contiguous(),  # Note: kernel expects W, not W.T
-                grad_output_scale.view(-1, 1),
-                tensor_scale,  # Reusing the weight's scale
+            go_fp8, go_scale = _quantize_rowwise_to_fp8(grad_output_2d)
+            B = _as_column_major(weight_fp8)
+            scale_b = tensor_scale.to(torch.float32).expand(1, B.shape[1]).contiguous()
+            grad_input_2d = torch._scaled_mm(
+                go_fp8.contiguous(),
+                B,
+                out_dtype=grad_output_2d.dtype,
+                scale_a=go_scale,
+                scale_b=scale_b,
             )
-            # Reshape to original input shape
-            grad_input = grad_input_dequant.view(*ctx.batch_dims, weight_fp8.shape[1])
+            grad_input = grad_input_2d.view(*ctx.batch_dims, weight_fp8.shape[1])
 
-        # === 2. Calculate grad_weight = grad_output.T @ input ===
+        # grad_weight = grad_output.T @ input
         if ctx.needs_input_grad[1]:
-            input_2d = input.view(-1, input.shape[-1])
-            # For A @ B, A is grad_output.T and B is input
-            # A has shape (out_features, batch_size)
-            # B has shape (batch_size, in_features)
-
-            # Quantize grad_output.T row-wise for matrix A
-            grad_output_t_fp8, grad_output_t_scale = quantize_fp8_rowwise(
-                grad_output_2d.T
+            go_t = grad_output_2d.T
+            go_t_fp8, go_t_scale = _quantize_rowwise_to_fp8(go_t)
+            input_fp8, input_col_scale = _quantize_colwise_to_fp8(input_2d)
+            grad_weight = torch._scaled_mm(
+                go_t_fp8.contiguous(),
+                _as_column_major(input_fp8),
+                out_dtype=input_2d.dtype,
+                scale_a=go_t_scale,
+                scale_b=input_col_scale,
             )
 
-            # To get the correct column-wise scale for input (matrix B),
-            # we quantize its transpose row-wise.
-            input_t_fp8, input_col_scale = quantize_fp8_rowwise(input_2d.T)
-            input_fp8 = input_t_fp8.T
-
-            # Perform scaled FP8 matmul: A @ B
-            grad_weight = scaled_fp8_mm(
-                grad_output_t_fp8.contiguous(),  # A = grad_output.T (quantized)
-                input_fp8.contiguous(),  # B = input (quantized)
-                grad_output_t_scale.view(-1, 1),  # Row scales for A
-                input_col_scale,  # Column scales for B
-            )
-
-        # === 3. Calculate grad_bias ===
-        if bias is not None and ctx.needs_input_grad[2]:
+        # grad_bias
+        if ctx.has_bias and ctx.needs_input_grad[2]:
             grad_bias = grad_output_2d.sum(0)
 
         return grad_input, grad_weight, grad_bias

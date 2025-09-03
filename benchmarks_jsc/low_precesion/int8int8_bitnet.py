@@ -30,7 +30,11 @@ except Exception:
 try:
     # BitNet conversion utilities from torchao
     from torchao import quantize_ as _quantize
-    from torchao.prototype.quantized_training import bitnet_training as _bitnet_training
+
+    # from torchao.prototype.quantized_training import bitnet_training as _bitnet_training
+    from torchtitan.patch_ao.int8int8_bitnet import (
+        int8int8_bitnet_training as _bitnet_training,
+    )
 
     TORCHAO_AVAILABLE = True
 except Exception:
@@ -65,7 +69,7 @@ def build_model(
 ) -> nn.Module:
     m = RMSNormLinear(d_in, d_out).to(device).bfloat16()
 
-    if precision == "int8bf16_bitnet":
+    if precision == "int8int8_bitnet":
         if not TORCHAO_AVAILABLE:
             raise RuntimeError(
                 "torchao is not available. Install torchao to run BitNet benchmarks."
@@ -146,7 +150,7 @@ def run_grid(
     device: torch.device,
 ) -> List[Dict[str, object]]:
     results: List[Dict[str, object]] = []
-    precisions = ["bf16", "int8bf16_bitnet"]
+    precisions = ["bf16", "int8int8_bitnet"]
 
     for d_in in d_in_list:
         for d_out in d_out_list:
@@ -172,7 +176,7 @@ def run_grid(
                     results.append(
                         {
                             "precision": prec,
-                            "recipe": ("-" if prec == "bf16" else "int8bf16_bitnet"),
+                            "recipe": ("-" if prec == "bf16" else "int8int8_bitnet"),
                             "d_in": d_in,
                             "d_out": d_out,
                             "bs": bs,
@@ -232,7 +236,7 @@ def save_results(out_dir: str, results: List[Dict[str, object]]) -> None:
         speedup = (thr / base) if (base and base == base) else float("nan")
         speedup_rows.append(
             {
-                "recipe": "int8bf16_bitnet",
+                "recipe": "int8int8_bitnet",
                 "d_in": r["d_in"],
                 "d_out": r["d_out"],
                 "bs": r["bs"],
@@ -301,12 +305,12 @@ def _compute_speedups_from_results(results: List[Dict[str, object]]):
             )
             bf16_index[key] = val
 
-    # Compute per-recipe speedups (single recipe: "int8bf16_bitnet")
+    # Compute per-recipe speedups (single recipe: "int8int8_bitnet")
     by_recipe: Dict[str, Dict[Tuple[int, int, int], float]] = {}
     d_in_set, d_out_set, bs_set, seq_set = set(), set(), set(), set()
     for r in results:
         if r["precision"] != "bf16":
-            recipe = "int8bf16_bitnet"
+            recipe = "int8int8_bitnet"
             d_in = int(r["d_in"])  # type: ignore
             d_out = int(r["d_out"])  # type: ignore
             bs = int(r["bs"])  # type: ignore
@@ -445,7 +449,7 @@ def plot_speedup_heatmaps(out_dir: str, results: List[Dict[str, object]]):
             torchao_ver = "unavailable"
         subtitle = f"{sysname} | GPU {gpu_name} \n PyTorch {torch.__version__}+cu{torch.version.cuda} \n torchao {torchao_ver}"
         ax.set_title(
-            f"int8bf16_bitnet speedup vs BF16 \n  Linear fwd+bwd \n recipe={recipe}\n{subtitle}"
+            f"int8int8_bitnet speedup vs BF16 \n  Linear fwd+bwd \n recipe={recipe}\n{subtitle}"
         )
         ax.grid(False)
 
@@ -467,7 +471,7 @@ def plot_speedup_heatmaps(out_dir: str, results: List[Dict[str, object]]):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="BF16 vs int8bf16_bitnet Linear training throughput benchmark"
+        description="BF16 vs int8int8_bitnet Linear training throughput benchmark"
     )
     p.add_argument(
         "--seq-len", type=int, default=4096, help="Sequence length (suggested 4096)"
@@ -495,7 +499,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--out-dir",
         type=str,
-        default="./int8bf16_bitnet_bench_results",
+        default="./int8int8_bitnet_bench_results",
         help="Output directory for CSVs",
     )
     return p.parse_args()
@@ -537,4 +541,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
     # Example:
-    # python resources/torchtitan/benchmarks_jsc/low_precesion/int8bf16_bitnet.py --out-dir ./benchmarks/int8bf16_bitnet
+    # python resources/torchtitan/benchmarks_jsc/low_precesion/int8int8_bitnet.py --out-dir ./benchmarks/int8int8_bitnet

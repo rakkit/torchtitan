@@ -41,11 +41,9 @@ class Int8Int8BitNetConverter(ModelConverter):
         self.enabled = True
 
         # for `precompute_bitnet_scale_for_fsdp`
-        self.precompute_scale = (
-            int8int8_bitnet_config.precompute_int8int8_bitnet_scale_for_fsdp
-        )
+        self.precompute_scale = bitnet_config.precompute_bitnet_scale_for_fsdp
 
-        logger.info("BitNet training active")
+        logger.info("Int8Int8 BitNet training active")
 
     def _patch_pytorch(self):
         # We manually apply PyTorch commit

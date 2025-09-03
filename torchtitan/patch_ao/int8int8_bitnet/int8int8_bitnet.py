@@ -208,7 +208,8 @@ class _INT8INT8BitNetTrainingLinear(torch.autograd.Function):
         weight_i8 = quantize_bitnet_weight(weight._data, tensor_scale)
         tensor_scale = tensor_scale.to(weight.dtype)
 
-        ctx.save_for_backward(input_i8, row_scale, weight_i8, tensor_scale)
+        # Save original input for accurate re-quantization in backward
+        ctx.save_for_backward(input, input_i8, row_scale, weight_i8, tensor_scale)
 
         # use int8 tensor cores
         out = scaled_int8int8_mm(
@@ -221,25 +222,51 @@ class _INT8INT8BitNetTrainingLinear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_i8, row_scale, weight_i8, tensor_scale = ctx.saved_tensors
+        input, input_i8, row_scale, weight_i8, tensor_scale = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
 
         batch_dims = grad_output.shape[:-1]
-        grad_output = grad_output.view(-1, weight_i8.shape[0])
+        grad_output_2d = grad_output.view(-1, weight_i8.shape[0])
 
-        # NOTE: we can potentially speedup training by also quantizing the backward pass
-        # to use INT8 tensor cores
+        # INT8 GEMM for grad_input
         if ctx.needs_input_grad[0]:
-            # mixed mm
-            grad_input = (grad_output @ weight_i8.to(grad_output.dtype)) * tensor_scale
-            grad_input = grad_input.view(*batch_dims, weight_i8.shape[1])
+            # Quantize grad_output row-wise
+            grad_output_i8, grad_output_scale = quantize_int8_rowwise(
+                grad_output_2d, eps=1e-5
+            )
 
+            # Perform scaled INT8 matmul using the weight's tensor_scale (per-tensor)
+            grad_input_dequant = scaled_int8int8_mm(
+                grad_output_i8.contiguous(),
+                weight_i8.contiguous(),
+                grad_output_scale.view(-1, 1),
+                tensor_scale,
+            )
+            grad_input = grad_input_dequant.view(*batch_dims, weight_i8.shape[1])
+
+        # INT8 GEMM for grad_weight
         if ctx.needs_input_grad[1]:
-            # NOTE: we use quantized activation for this calculation
-            grad_weight = grad_output.T @ (input_i8 * row_scale.view(-1, 1))
+            # Flatten input to 2D
+            input_2d = input.view(-1, input.shape[-1])
+
+            # Quantize grad_output.T row-wise
+            grad_output_t_i8, grad_output_t_scale = quantize_int8_rowwise(
+                grad_output_2d.T, eps=1e-5
+            )
+
+            # To obtain column-wise scale for input, quantize input.T row-wise
+            input_t_i8, input_col_scale = quantize_int8_rowwise(input_2d.T, eps=1e-5)
+            input_i8_col = input_t_i8.T
+
+            grad_weight = scaled_int8int8_mm(
+                grad_output_t_i8.contiguous(),
+                input_i8_col.contiguous(),
+                grad_output_t_scale.view(-1, 1),
+                input_col_scale,
+            )
 
         if ctx.needs_input_grad[2]:
-            grad_bias = grad_output.sum(0)
+            grad_bias = grad_output_2d.sum(0)
 
         return grad_input, grad_weight, grad_bias
 
@@ -388,7 +415,7 @@ class _INT8INT8BitNetPacked2bitLinear(torch.autograd.Function):
         ctx.batch_dims = batch_dims
 
         # 4. Perform scaled INT8 matrix multiplication
-        output = scaled_int8_mm(
+        output = scaled_int8int8_mm(
             input_i8.contiguous(), weight_i8.contiguous().T, row_scale, tensor_scale
         )
 

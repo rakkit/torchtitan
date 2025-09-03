@@ -14,6 +14,7 @@ from typing import Any, Optional, Tuple
 import torch
 from torch import Tensor
 from torch.utils._python_dispatch import return_and_correct_aliasing
+from torch.utils._triton import has_triton
 
 from torchao.core.config import AOBaseConfig
 from torchao.quantization.transform_module import register_quantize_module_handler
@@ -22,6 +23,16 @@ from torchao.utils import TorchAOBaseTensor
 aten = torch.ops.aten
 c10d_functional = torch.ops.c10d_functional
 _c10d_functional = torch.ops._c10d_functional
+
+# INT8 matmul kernel (with Triton fallback)
+if has_triton():
+    from .int8int8_mm import scaled_int8int8_mm
+else:
+    # Fallback: use torch._int_mm and apply scales in FP
+    def scaled_int8int8_mm(
+        A: Tensor, B: Tensor, row_scale: Tensor, col_scale: Tensor
+    ) -> Tensor:
+        return torch._int_mm(A, B) * col_scale.view(-1) * row_scale.view(-1, 1)
 
 
 @torch.no_grad()
@@ -161,8 +172,18 @@ class _INT8INT8BitNetWeightOnlyLinear(torch.autograd.Function):
         ctx.save_for_backward(input, weight)
         ctx.bias = bias is not None
 
-        # NOTE: we have to .T before .to(input.dtype) for torch.compile() mixed matmul to work
-        out = (input @ weight.int_data.T.to(input.dtype)) * weight.scale
+        # Use INT8 GEMM: quantize input row-wise; weights are already int8
+        batch_dims = input.shape[:-1]
+        input_2d = input.view(-1, weight.shape[1])
+        input_i8, row_scale = quantize_int8_rowwise(input_2d)
+
+        out = scaled_int8int8_mm(
+            input_i8.contiguous(),
+            weight.int_data.contiguous().T,
+            row_scale.contiguous(),
+            weight.scale.contiguous(),
+        )
+        out = out.view(*batch_dims, weight.shape[0])
         out = out + bias if bias is not None else out
         return out
 
@@ -170,13 +191,41 @@ class _INT8INT8BitNetWeightOnlyLinear(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, weight = ctx.saved_tensors
 
-        grad_input = (grad_output * weight.scale) @ weight.int_data.to(
-            grad_output.dtype
-        )
-        grad_weight = grad_output.view(-1, weight.shape[0]).T @ input.view(
-            -1, weight.shape[1]
-        )
-        grad_bias = grad_output.view(-1, weight.shape[0]).sum(0) if ctx.bias else None
+        grad_input = grad_weight = grad_bias = None
+
+        # Reshape for matmuls
+        batch_dims = grad_output.shape[:-1]
+        grad_output_2d = grad_output.view(-1, weight.shape[0])
+
+        # grad_input = grad_output @ W  (INT8 GEMM)
+        if ctx.needs_input_grad[0]:
+            grad_output_i8, grad_output_scale = quantize_int8_rowwise(grad_output_2d)
+            grad_input_dequant = scaled_int8int8_mm(
+                grad_output_i8.contiguous(),
+                weight.int_data.contiguous(),  # W
+                grad_output_scale.view(-1, 1).contiguous(),
+                weight.scale.contiguous(),
+            )
+            grad_input = grad_input_dequant.view(*batch_dims, weight.shape[1])
+
+        # grad_weight = grad_output.T @ input  (INT8 GEMM)
+        if ctx.needs_input_grad[1]:
+            input_2d = input.view(-1, weight.shape[1])
+            grad_output_t_i8, grad_output_t_scale = quantize_int8_rowwise(
+                grad_output_2d.T
+            )
+            input_t_i8, input_col_scale = quantize_int8_rowwise(input_2d.T)
+            input_i8 = input_t_i8.T
+            grad_weight = scaled_int8int8_mm(
+                grad_output_t_i8.contiguous(),
+                input_i8.contiguous(),
+                grad_output_t_scale.view(-1, 1).contiguous(),
+                input_col_scale.contiguous(),
+            )
+
+        if ctx.needs_input_grad[2] and ctx.bias:
+            grad_bias = grad_output_2d.sum(0)
+
         return grad_input, grad_weight, grad_bias
 
 

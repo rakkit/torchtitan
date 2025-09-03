@@ -435,7 +435,7 @@ def plot_speedup_heatmaps(out_dir: str, results: List[Dict[str, object]]):
                 rows.append(row)
                 # Label the first row of each block with the token count + d_in
                 if d_in == d_in_list[0]:
-                    row_labels.append(f"bs={bs:02d}| seq_len={seq_len}, {d_in}")
+                    row_labels.append(f"T={tokens}| seq_len={seq_len}, {d_in}")
                 else:
                     row_labels.append(str(d_in))
 
@@ -482,7 +482,7 @@ def plot_speedup_heatmaps(out_dir: str, results: List[Dict[str, object]]):
                 rgba[i, j, 3] = a
 
         # Plot
-        fig_w = max(6.0, 0.6 * W + 2.0)
+        fig_w = max(8.0, 0.6 * W + 2.0)
         fig_h = max(4.0, 0.35 * H + 1.0)
         fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
         ax.imshow(rgba, aspect="auto", interpolation="nearest")

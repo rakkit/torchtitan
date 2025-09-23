@@ -70,9 +70,10 @@ class AbstractDiSCO(torch.optim.Optimizer):
                 param.grad = None
 
     # ----- Step norm tracking -----
-    def calculate_norm_at_next_step(self, norms_to_log: list[str]):
+    def calculate_norm_at_next_step(self, norms_to_log: list[str] = None):
         self.need_to_calculate_norm = True
-        self.norms_to_log = norms_to_log
+        if norms_to_log is not None:
+            self.norms_to_log = norms_to_log
         self.norms_at_current_step = {}
 
     def _is_logging_rank(self) -> bool:

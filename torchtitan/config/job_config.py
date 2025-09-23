@@ -110,11 +110,11 @@ class Model:
     flavor: str = "debugmodel"
     """Which model config to train"""
 
-    depth_init: Literal["identity", "depth", "total_depth"] = "identity"
+    depth_init: Literal["identity", "relative_depth", "total_depth"] = "identity"
     """
     Method to use for depth-wise residual initialization of Transformer blocks.
     - "identity": disable depth-wise initialization.
-    - "depth": scale each block's initialization by its own depth in the model.
+    - "relative_depth": scale each block's initialization by its own depth in the model.
     - "total_depth": scale each block's initialization by the total number of layers.
     """
 

@@ -434,11 +434,16 @@ class TransformerBlock(nn.Module):
             * model_args.dim**model_args.intermediate_exp
         )
         if model_args.depth_init is None:
-            self.residual_div = 1.0
-        elif model_args.depth_init:
-            self.residual_div = (2 * (layer_id + 1)) ** 0.5
+            self.residual_div_attn = 1.0
+            self.residual_div_ffn = 1.0
+        elif model_args.depth_init == "relative_depth":
+            self.residual_div_attn = (2 * (layer_id + 1)) ** 0.5
+            self.residual_div_ffn = (2 * (layer_id + 2)) ** 0.5
+        elif model_args.depth_init == "total_depth":
+            self.residual_div_attn = (2 * model_args.n_layers) ** 0.5
+            self.residual_div_ffn = (2 * model_args.n_layers) ** 0.5
         else:
-            self.residual_div = (2 * model_args.n_layers) ** 0.5
+            raise ValueError(f"Invalid depth_init: {model_args.depth_init}")
         self.init_gate_as_residual = model_args.init_gate_as_residual
 
         # x = identity_scale * x + block_scale * block(x)
@@ -484,12 +489,12 @@ class TransformerBlock(nn.Module):
             norm.reset_parameters()
         self.attention.init_weights(
             self.weight_init_std,
-            residual_div=self.residual_div,
+            residual_div=self.residual_div_attn,
             init_fn_type=self.weight_init_fn_type,
         )
         self.feed_forward.init_weights(
             self.weight_init_std,
-            residual_div=self.residual_div,
+            residual_div=self.residual_div_ffn,
             init_gate_as_residual=self.init_gate_as_residual,
             init_fn_type=self.weight_init_fn_type,
         )

@@ -20,7 +20,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate
 
-from torchtitan.optimizers.distributed_scion import DiSCO
+from torchtitan.optimizers.disco import DiSCO
 from torchtitan.optimizers.norm_helper import calculate_norm
 from torchtitan.optimizers.scion import Scion
 

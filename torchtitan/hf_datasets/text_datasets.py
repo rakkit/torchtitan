@@ -11,8 +11,7 @@ from random import Random
 from typing import Any, Callable
 
 import torch
-
-from datasets import Dataset, load_dataset
+from datasets import Dataset, Features, Value, interleave_datasets, load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
@@ -127,38 +126,94 @@ def _validate_dataset(
 class HuggingFaceDataset(IterableDataset, Stateful):
     def __init__(
         self,
-        dataset_name: str,
-        dataset_path: str | None,
+        dataset_name: list[str] | str,
+        job_config: JobConfig,
+        dataset_path: list[str] | str | None,
         tokenizer: BaseTokenizer,
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
-        dataset_inner_name: str | None = None,
+        dataset_inner_name: list[str] | str | None = None,
         dataset_files: str | Sequence[str] | None = None,
-        dataset_split: str = "train",
+        dataset_split: list[str] | str = "train",
         dataset_streaming: bool = False,
-        dataset_key: str = "text",
+        dataset_key: list[str] | str = "text",
     ) -> None:
-        # Force lowercase for consistent comparison
-        dataset_name = dataset_name.lower()
 
-        path, dataset_loader, text_processor = _validate_dataset(
-            dataset_name=dataset_name,
-            dataset_path=dataset_path,
-            dataset_inner_name=dataset_inner_name,
-            dataset_files=dataset_files,
-            dataset_split=dataset_split,
-            dataset_streaming=dataset_streaming,
-            dataset_key=dataset_key,
+        dataset_name = (
+            dataset_name if isinstance(dataset_name, list) else [dataset_name]
         )
-        ds = dataset_loader(path)
+        # Force lowercase for consistent comparison
+        dataset_name = [dn.lower() for dn in dataset_name]
+        dataset_path = (
+            dataset_path if isinstance(dataset_path, list) else [dataset_path]
+        )
+        dataset_inner_name = (
+            dataset_inner_name
+            if isinstance(dataset_inner_name, list)
+            else [dataset_inner_name]
+        )
+        dataset_split = (
+            dataset_split if isinstance(dataset_split, list) else [dataset_split]
+        )
+        dataset_key = dataset_key if isinstance(dataset_key, list) else [dataset_key]
 
+        assert (
+            len(dataset_name)
+            == len(dataset_path)
+            == len(dataset_inner_name)
+            == len(dataset_split)
+            == len(dataset_key)
+        )
+        ds_list = []
+        text_processor_list = []
+        for dataset in range(len(dataset_name)):
+            (
+                d_path,
+                load_fn,
+                text_processor,
+            ) = _validate_dataset(
+                dataset_name[dataset],
+                dataset_path[dataset],
+                dataset_inner_name[dataset],
+                dataset_files,
+                dataset_split[dataset],
+                dataset_streaming,
+                dataset_key[dataset],
+            )
+            ds_list.append(load_fn(d_path))
+            text_processor_list.append(text_processor)
+
+        dataset_weights = job_config.training.dataset_weights
+        dataset_weights = (
+            [1.0] * len(dataset_path)
+            if dataset_weights is None
+            # Convert to floats.
+            else list(map(float, dataset_weights))
+        )
+
+        # Define the explicit schema
+        new_features = ds_list[0].features.copy()
+        new_features["text"] = Value("large_string")
+
+        # Apply to all
+        ds_list = [ds.cast(new_features) for ds in ds_list]
+
+        ds = interleave_datasets(
+            ds_list,
+            probabilities=dataset_weights,
+            seed=job_config.training.dataset_seed,
+            stopping_strategy="all_exhausted",
+        )
+
+        logger.info("Splitting dataset by data parallel rank and world size")
         self.dataset_name = dataset_name
         self.dataset_path = dataset_path
         self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
         self._tokenizer = tokenizer
         self.infinite = infinite
-        self._text_processor = text_processor
+        # TODO Need to pick one processor since after interleaving
+        self._text_processor = text_processor[0]
 
         # Variables for checkpointing
         self._sample_idx = 0
@@ -242,111 +297,6 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             _state_dict["data"] = self._data.state_dict()
 
         return _state_dict
-
-
-class MixedDataset(IterableDataset, Stateful):
-    def __init__(self, datasets: list[IterableDataset], weights: list[float] | None):
-        self.datasets = datasets
-
-        _initial_weights = [1.0] * len(self.datasets) if weights is None else weights
-        self.weights = torch.tensor(
-            _initial_weights, dtype=torch.float64
-        ).share_memory_()
-
-        self.num_sampled_per_dataset = torch.zeros(
-            len(self.datasets), dtype=torch.int64
-        ).share_memory_()
-
-        self._dataset_indices = list(range(len(self.datasets)))
-        self._sample_idx = 0
-        self._data_iters = None
-        self._rng = Random(self._sample_idx)
-
-    @property
-    def normed_weights(self):
-        weights_sum = sum(self.weights)
-        return [w / weights_sum for w in self.weights]
-
-    def _init_data_iters(self):
-        self._data_iters = [iter(dataset) for dataset in self.datasets]
-
-    def _sample_dataset(self, sample_idx: int):
-        self._rng.seed(sample_idx)
-        dataset_index = self._rng.choices(
-            self._dataset_indices, weights=self.weights.tolist()
-        )[0]
-        return dataset_index
-
-    def set_weights(self, weights: list[float]):
-        assert len(weights) == len(
-            self.datasets
-        ), "weights must have the same length as datasets"
-        self.weights.copy_(torch.tensor(weights, dtype=torch.float64))
-
-    def _get_next(self, dataset_index: int):
-        data_iter = self._data_iters[dataset_index]
-        try:
-            return next(data_iter)
-        except StopIteration:
-            dataset = self.datasets[dataset_index]
-            logger.warning(
-                f"Removing {dataset.dataset_name} | {dataset.dataset_path} from data mix."
-            )
-            self.weights[dataset_index] = 0.0
-            return None
-
-    def __iter__(self):
-        if self._data_iters is None:
-            self._init_data_iters()
-        while True:
-            sample = None
-            # Handle exhausted data iterators.
-            while sample is None:
-                if all(w == 0.0 for w in self.weights):
-                    self._data_iters = None
-                    return
-                dataset_index = self._sample_dataset(self._sample_idx)
-                sample = self._get_next(dataset_index)
-
-            self.num_sampled_per_dataset[dataset_index] += 1
-            self._sample_idx += 1
-            yield sample
-
-            if all(w == 0.0 for w in self.weights):
-                logger.warning(
-                    "Data mix is empty (all sampling weights have been set to zero); "
-                    "stopping iteration."
-                )
-                break
-        # Unset data iterators so they will be re-initialized.
-        self._data_iters = None
-
-    def load_state_dict(self, state_dict):
-        self._sample_idx = state_dict["sample_idx"]
-        loaded_weights = state_dict["weights"]
-        if isinstance(loaded_weights, torch.Tensor):
-            self.weights.copy_(loaded_weights)
-        else:
-            self.weights.copy_(torch.tensor(loaded_weights, dtype=torch.float64))
-        self.num_sampled_per_dataset.copy_(state_dict["num_sampled_per_dataset"])
-
-        # Restore sub-datasets.
-        dataset_dicts = state_dict["datasets"]
-        for dataset in self.datasets:
-            dataset.load_state_dict(dataset_dicts[dataset.dataset_name])
-
-        # Unset data iterators so they will be re-initialized.
-        self._data_iters = None
-
-    def state_dict(self):
-        return {
-            "sample_idx": self._sample_idx,
-            "weights": self.weights.tolist(),
-            "num_sampled_per_dataset": self.num_sampled_per_dataset,
-            "datasets": {
-                dataset.dataset_name: dataset.state_dict() for dataset in self.datasets
-            },
-        }
 
 
 class GreedyPackedDataset(IterableDataset, Stateful):
@@ -615,40 +565,25 @@ def build_text_dataloader(
         assert (
             len(d) == normed_list_length
         ), f"list {d} does not match length of list of datasets (length = {normed_list_length})"
-    hf_datasets = []
-    for d_name, d_path, d_inner_name, d_split, d_key in zip(
-        dataset_name,
-        dataset_path,
-        dataset_inner_name,
-        dataset_split,
-        dataset_key,
-    ):
-        hf_ds = HuggingFaceDataset(
-            dataset_name=d_name,
-            dataset_path=d_path,
-            tokenizer=tokenizer,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            infinite=infinite,
-            dataset_inner_name=d_inner_name,
-            dataset_files=dataset_files,
-            dataset_split=d_split,
-            dataset_streaming=dataset_streaming,
-            dataset_key=d_key,
-        )
-        if not dataset_mix_in_seq:
-            hf_ds = GreedyPackedDataset(
-                dataset=hf_ds,
-                seq_len=seq_len,
-                infinite=infinite,
-                num_mtp_tokens=num_mtp_tokens,
-            )
-        hf_datasets.append(hf_ds)
+
+    hf_ds = HuggingFaceDataset(
+        dataset_name=dataset_name,
+        job_config=job_config,
+        dataset_path=dataset_path,
+        tokenizer=tokenizer,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        infinite=infinite,
+        dataset_inner_name=dataset_inner_name,
+        dataset_files=dataset_files,
+        dataset_split=dataset_split,
+        dataset_streaming=dataset_streaming,
+        dataset_key=dataset_key,
+    )
 
     # First pack, then mix → data is only mixed in batch dimension.
     # First mix, then pack → data is also mixed inside packed sample.
-    hf_ds = MixedDataset(hf_datasets, dataset_weights)
-    if dataset_mix_in_seq:
+    if not dataset_mix_in_seq:
         hf_ds = GreedyPackedDataset(
             dataset=hf_ds,
             seq_len=seq_len,

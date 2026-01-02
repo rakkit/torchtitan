@@ -38,8 +38,7 @@ class BaseDataLoader(Stateful, ABC):
     """
 
     @abstractmethod
-    def __iter__(self):
-        ...
+    def __iter__(self): ...
 
 
 class ParallelAwareDataloader(StatefulDataLoader, BaseDataLoader):
@@ -107,4 +106,36 @@ class ParallelAwareDataloader(StatefulDataLoader, BaseDataLoader):
         )
         # We don't have to use pickle as DCP will serialize the state_dict. However, we have to
         # keep this for backward compatibility.
-        super().load_state_dict(pickle.loads(state_dict[self._rank_id]))
+
+        rank_state = pickle.loads(state_dict[self._rank_id])
+
+        snap = rank_state["_snapshot"]
+        main = snap["_main_snapshot"]
+        w0 = snap["_worker_snapshots"]["worker_0"]
+
+        datasets_state = w0["dataset_state"]["datasets"]
+
+        if isinstance(datasets_state, dict):
+            # reset dataloader progress
+            snap["_snapshot_step"] = 0
+            main["_sampler_iter_yielded"] = 0
+            if (
+                main.get("_sampler_iter_state")
+                and "samples_yielded" in main["_sampler_iter_state"]
+            ):
+                main["_sampler_iter_state"]["samples_yielded"] = 0
+
+            # reset outer bookkeeping (often matters for “hang on first batch”)
+            rank_state["_steps_since_snapshot"] = 0
+            rank_state["_iterator_finished"] = False
+
+            # reset worker fetcher state (if present)
+            if "fetcher_state" in w0:
+                w0["fetcher_state"]["dataset_iter_state"] = None
+                w0["fetcher_state"]["fetcher_ended"] = False
+
+            logger.info(
+                f"Dataloader checkpoint state for dp rank {self.dp_rank} has been monkey patched"
+            )
+
+        super().load_state_dict(rank_state)

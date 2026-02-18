@@ -14,6 +14,91 @@ __all__ = [
     "AbstractDiSCO",
 ]
 
+_LMO_COMPILED_CACHE: dict[tuple[str, int, float, str], object] = {}
+
+
+def _get_or_make_compiled_lmo(
+    zeropower_backend: str,
+    backend_steps: int,
+    eps: float,
+    norm_factor: str,
+):
+    key = (zeropower_backend, backend_steps, eps, norm_factor)
+    compiled = _LMO_COMPILED_CACHE.get(key)
+    if compiled is not None:
+        return compiled
+
+    backend_fn = zeropower_backends[zeropower_backend]
+
+    @torch.compile(dynamic=False, fullgraph=True)
+    def run_and_compile(x):
+        x = backend_fn(x, steps=backend_steps, eps=eps)
+        x = AbstractDiSCO.normalise_grad(x, norm_factor=norm_factor, eps=eps)
+        return x
+
+    _LMO_COMPILED_CACHE[key] = run_and_compile
+    return run_and_compile
+
+
+# @torch.compile(dynamic=False, fullgraph=True)
+def fused_embed_linear(g: torch.Tensor, eps: float):
+    # dim=-1 / size(-1): works for both 2-D [D_out, D_in] and
+    # batched 3-D [N, D_out, D_in] (per-row L2 along last dim).
+    rms_values = torch.sqrt(g.pow(2).sum(dim=-1, keepdim=True))
+    dim = g.size(-1)
+    g = g / (rms_values + eps) * dim
+    return g
+
+
+# @torch.compile(dynamic=False, fullgraph=True)
+def fused_embed_sqrt(g: torch.Tensor, eps: float):
+    rms_values = torch.sqrt(g.pow(2).sum(dim=-1, keepdim=True))
+    dim = g.size(-1)
+    g = g / (rms_values + eps) * (dim**0.5)
+    return g
+
+
+# @torch.compile(dynamic=False, fullgraph=True)
+def fused_unembed_linear(g: torch.Tensor, eps: float):
+    rms_values = torch.sqrt(g.pow(2).sum(dim=-1, keepdim=True))
+    dim = g.size(-1)
+    g = g / (rms_values + eps) / dim
+    return g
+
+
+# @torch.compile(dynamic=False, fullgraph=True)
+def fused_unembed_sqrt(g: torch.Tensor, eps: float):
+    rms_values = torch.sqrt(g.pow(2).sum(dim=-1, keepdim=True))
+    dim = g.size(-1)
+    g = g / (rms_values + eps) / (dim**0.5)
+    return g
+
+
+# @torch.compile(dynamic=False, fullgraph=True)
+def fused_spectral(g: torch.Tensor, eps: float):
+    g = g * (g.size(-2) / g.size(-1)) ** 0.5
+    return g
+
+
+# @torch.compile(dynamic=False, fullgraph=True)
+def fused_image_spectral(g: torch.Tensor, eps: float):
+    ratio = (g.size(-2) / g.size(-1)) ** 0.5
+    g = g * (ratio if ratio > 1 else 1)
+    return g
+
+
+# @torch.compile(dynamic=False, fullgraph=True)
+def fused_bias_rms(g: torch.Tensor, eps: float):
+    rms_value = torch.sqrt(g.pow(2).mean())
+    g = g / (rms_value + eps)
+    return g
+
+
+# @torch.compile(dynamic=False, fullgraph=True)
+def fused_conv_spectral(g: torch.Tensor, out_ch: int, in_ch: int, spatial: int):
+    g = g * (out_ch / in_ch) ** 0.5 / spatial
+    return g
+
 
 class AbstractDiSCO(torch.optim.Optimizer):
     """
@@ -101,40 +186,28 @@ class AbstractDiSCO(torch.optim.Optimizer):
         """
         if norm_factor == "spectral":
             # Use the last two dims so this works for 2-D and batched 3-D
-            g = g * (g.size(-2) / g.size(-1)) ** 0.5
+            g = fused_spectral(g, eps)
 
         elif norm_factor == "image_spectral":
-            ratio = (g.size(-2) / g.size(-1)) ** 0.5
-            g = g * (ratio if ratio > 1 else 1)
+            g = fused_image_spectral(g, eps)
 
         elif norm_factor.startswith("embed"):
             # Handle 2-D and batched 3-D consistently
-            assert g.ndim == 2
-            if g.ndim == 2:
-                rms_values = torch.sqrt(g.pow(2).sum(dim=1, keepdim=True))
-                dim = g.size(1)
-            else:
-                raise ValueError("embed* expects 2-D ")
-            g = g / (rms_values + eps)
+            assert g.ndim in (2, 3), f"embed* expects 2-D or 3-D, got {g.ndim}-D"
+
             if norm_factor == "embed_linear":
-                g = g * dim
+                g = fused_embed_linear(g, eps)
             elif norm_factor == "embed_sqrt":
-                g = g * dim**0.5
+                g = fused_embed_sqrt(g, eps)
             else:
                 raise ValueError(f"Unknown norm_factor: {norm_factor}")
 
         elif norm_factor.startswith("unembed"):
-            assert g.ndim == 2
-            if g.ndim == 2:
-                rms_values = torch.sqrt(g.pow(2).sum(dim=1, keepdim=True))
-                dim = g.size(1)
-            else:
-                raise ValueError("unembed* expects 2-D ")
-            g = g / (rms_values + eps)
+            assert g.ndim in (2, 3), f"unembed* expects 2-D or 3-D, got {g.ndim}-D"
             if norm_factor == "unembed_linear":
-                g = g / dim
+                g = fused_unembed_linear(g, eps)
             elif norm_factor == "unembed_sqrt":
-                g = g / dim**0.5
+                g = fused_unembed_sqrt(g, eps)
             else:
                 raise ValueError(f"Unknown norm_factor: {norm_factor}")
 
@@ -142,8 +215,7 @@ class AbstractDiSCO(torch.optim.Optimizer):
             g = torch.sign(g)
 
         elif norm_factor == "bias_rms":
-            rms_value = torch.sqrt(g.pow(2).mean())
-            g = g / (rms_value + eps)
+            g = fused_bias_rms(g, eps)
 
         elif norm_factor == "conv_spectral":
             # Properly handle Conv2D (4-D) and Conv3D (5-D)
@@ -155,7 +227,7 @@ class AbstractDiSCO(torch.optim.Optimizer):
                 spatial = kh * kw * kd
             else:
                 raise ValueError("conv_spectral expects 4-D or 5-D conv weights")
-            g *= (out_ch / in_ch) ** 0.5 / spatial
+            g = fused_conv_spectral(g, out_ch, in_ch, spatial)
 
         elif norm_factor == "none":
             pass
@@ -204,22 +276,33 @@ class AbstractDiSCO(torch.optim.Optimizer):
 
         # NB: make sure this function does not modify the grad inplace
         #     since it is also called during the log of gradients
+        # def _orth_and_norm(x):
+        #     with torch._dynamo.config.patch(recompile_limit=128, cache_size_limit=128):
+        #         x = zeropower_backends[zeropower_backend](
+        #             x, steps=backend_steps, eps=eps
+        #         )
+        #         x = AbstractDiSCO.normalise_grad(x, norm_factor=norm_factor, eps=eps)
+        #     return x
+
+        compiled_lmo = _get_or_make_compiled_lmo(
+            zeropower_backend=zeropower_backend,
+            backend_steps=backend_steps,
+            eps=eps,
+            norm_factor=norm_factor,
+        )
+
         def _orth_and_norm(x):
             with torch._dynamo.config.patch(recompile_limit=128, cache_size_limit=128):
-                x = zeropower_backends[zeropower_backend](
-                    x, steps=backend_steps, eps=eps
-                )
-                x = AbstractDiSCO.normalise_grad(x, norm_factor=norm_factor, eps=eps)
-            return x
+                return compiled_lmo(x)
 
         if g.ndim == 2:
             if splits_into is not None and splits_dim is not None:
                 # it only supports for 2D tensors for now.
                 assert splits_dim in [0, 1], "splits_dim must be 0 or 1 for 2D tensors"
                 assert splits_into > 1, "splits_into must be greater than 1"
-                assert (
-                    g.shape[splits_dim] % splits_into == 0
-                ), "splits_into must be a divisor of the dimension to split"
+                assert g.shape[splits_dim] % splits_into == 0, (
+                    "splits_into must be a divisor of the dimension to split"
+                )
                 d_out, d_in = g.shape
                 if splits_dim == 0:
                     # Split rows: [d_out, d_in] -> [Group, d_out/Group, d_in]

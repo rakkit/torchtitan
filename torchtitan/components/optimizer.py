@@ -452,14 +452,22 @@ def moe_metrics_worker(log_queue: queue.Queue):
 
         (
             moe_layers_info,
-            all_usages_cpu,
-            all_biases_cpu,
-            all_entropies_cpu,
-            all_load_balance_losses_cpu,
-            all_maxvio_batch_cpu,
-            all_maxvio_global_cpu,
+            usage_t,
+            bias_t,
+            ent_t,
+            lb_t,
+            maxvio_batch_t,
+            maxvio_global_t,
             num_experts,
+            cuda_event,
         ) = data
+        cuda_event.synchronize()
+        all_usages_cpu = usage_t.tolist()
+        all_biases_cpu = bias_t.tolist()
+        all_entropies_cpu = ent_t.tolist()
+        all_load_balance_losses_cpu = lb_t.tolist()
+        all_maxvio_batch_cpu = maxvio_batch_t.tolist()
+        all_maxvio_global_cpu = maxvio_global_t.tolist()
 
         usage_offset = bias_offset = 0
         for i, info in enumerate(moe_layers_info):
@@ -556,6 +564,38 @@ def fused_hier_reduce_loss_stats(
     all_load_balance_losses.copy_((out_lb / ws_loss).to(all_load_balance_losses.dtype))
 
 
+def lmo_for_moe_bias(
+    g,
+    norm_factor="sign",
+    epsilon=1e-32,
+):
+    if norm_factor in ["sign", "sign_zero_mean"]:
+        return torch.sign(g)
+    elif norm_factor in ["spectral", "spectral_zero_mean"]:
+        is_flat = g.dim() == 1
+        g = g.unsqueeze(0) if is_flat else g
+        norms = torch.linalg.norm(g, ord=2, dim=1, keepdim=True)
+        g = g / torch.clamp(norms, min=epsilon)
+        g = g.squeeze(0) if is_flat else g
+        return g
+    elif norm_factor in ["rms", "rms_zero_mean"]:
+        is_flat = g.dim() == 1
+        g = g.unsqueeze(0) if is_flat else g
+        rms = torch.sqrt(torch.mean(g.square(), dim=1, keepdim=True))
+        g = g / torch.clamp(rms, min=epsilon)
+        g = g.squeeze(0) if is_flat else g
+        return g
+
+
+def need_rescale_stats(module):
+    return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
+
+
+# for MoE auxiliary-loss-free load balancing
+def _is_recomputation_enabled(module):
+    return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
+
+
 def build_optimizers_with_moe_load_balancing(
     model_parts: list[nn.Module],
     optimizer_config: OptimizerConfig,
@@ -571,206 +611,6 @@ def build_optimizers_with_moe_load_balancing(
 
     log_queue = optimizers.set_up_async_logging(moe_metrics_worker)
 
-    def lmo_for_moe_bias(
-        g,
-        norm_factor="sign",
-        epsilon=1e-32,
-    ):
-        if norm_factor in ["sign", "sign_zero_mean"]:
-            return torch.sign(g)
-        elif norm_factor in ["spectral", "spectral_zero_mean"]:
-            is_flat = g.dim() == 1
-            g = g.unsqueeze(0) if is_flat else g
-            norms = torch.linalg.norm(g, ord=2, dim=1, keepdim=True)
-            g = g / torch.clamp(norms, min=epsilon)
-            g = g.squeeze(0) if is_flat else g
-            return g
-        elif norm_factor in ["rms", "rms_zero_mean"]:
-            is_flat = g.dim() == 1
-            g = g.unsqueeze(0) if is_flat else g
-            rms = torch.sqrt(torch.mean(g.square(), dim=1, keepdim=True))
-            g = g / torch.clamp(rms, min=epsilon)
-            g = g.squeeze(0) if is_flat else g
-            return g
-
-    def need_rescale_stats(module):
-        return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
-
-    # for MoE auxiliary-loss-free load balancing
-    def _is_recomputation_enabled(module):
-        return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
-
-    def _update_expert_bias(
-        model_parts: list[nn.Module],
-        parallel_dims: ParallelDims,
-    ):
-        """
-        Lets assume all MoE layers have same amount of experts.
-        """
-
-        loss_mesh = parallel_dims.get_optional_mesh("loss")
-
-        # above is adapted from the upstream code
-        is_dp_rank_0 = (
-            torch.distributed.get_rank(loss_mesh.get_group()) == 0
-            if loss_mesh is not None
-            else True
-        )
-        # TODO: Currently this sync is blocking (thus exposed) and happens on the
-        # default compute stream. Need to assess if this is OK performance-wise.
-
-        moe_layers_info = []
-        tok_buffers, ent_buffers, load_balance_loss_buffers = [], [], []
-        cumul_buffers = []
-        acc_fwd_times_buffers = []
-        scale_factor = 1
-        num_experts = 0
-
-        for part in model_parts:
-            for block in part.layers.values():
-                if not block.moe_enabled:
-                    continue
-                moe = block.moe
-                # Assuming num_experts is the same for all, so we can just grab it once
-                num_experts = moe.tokens_per_expert.numel()
-                moe_layers_info.append(
-                    {
-                        "module": moe,
-                        "layer_id": block.layer_id,
-                    }
-                )
-                tok_buffers.append(moe.tokens_per_expert)
-                cumul_buffers.append(moe.tokens_per_expert_cumul)
-                ent_buffers.append(moe.router_entropy)
-                # if need_rescale_stats(moe) or need_rescale_stats(block):
-                #     scale_factor = 0.5
-                acc_fwd_times_buffers.append(moe.acc_fwd_times)
-                load_balance_loss_buffers.append(moe.load_balance_loss)
-        # Early exit if no MoE layers were found
-        if not moe_layers_info:
-            return
-
-        # assume all MoE layers are same
-        scale_factor = acc_fwd_times_buffers[-1]
-
-        all_tokens = torch.cat(tok_buffers)
-        all_entropies = torch.cat(ent_buffers)
-        all_load_balance_losses = torch.cat(load_balance_loss_buffers)
-        if scale_factor != 1:
-            all_tokens = all_tokens // scale_factor  # tokens count are integers
-            all_entropies = all_entropies / scale_factor  # entropies are floats
-
-        if loss_mesh is not None:
-            # pg = loss_mesh.get_group()
-            # torch.distributed.all_reduce(
-            #     all_tokens, group=pg, op=torch.distributed.ReduceOp.SUM
-            # )
-            # torch.distributed.all_reduce(
-            #     all_entropies, group=pg, op=torch.distributed.ReduceOp.AVG
-            # )
-            # torch.distributed.all_reduce(
-            #     all_load_balance_losses, group=pg, op=torch.distributed.ReduceOp.AVG
-            # )
-            fused_hier_reduce_loss_stats(
-                parallel_dims, all_tokens, all_entropies, all_load_balance_losses
-            )
-        num_layers = len(moe_layers_info)
-        lens = torch.full(
-            (num_layers,), num_experts, device=all_tokens.device, dtype=torch.long
-        )
-        grp = torch.repeat_interleave(
-            torch.arange(num_layers, device=all_tokens.device, dtype=torch.long), lens
-        )
-
-        layer_sums = torch.zeros(
-            num_layers, dtype=all_tokens.dtype, device=all_tokens.device
-        )
-        layer_sums.index_add_(0, grp, all_tokens)
-        layer_means = layer_sums / num_experts
-
-        # Accumulate globally-reduced counts into per-layer cumulative buffers.
-        # No extra all-reduce: all ranks have identical all_tokens after fused reduce.
-        all_tokens_split = list(all_tokens.view(num_layers, num_experts).unbind(0))
-        torch._foreach_add_(cumul_buffers, all_tokens_split)
-
-        # MaxVio_batch: worst-case overload in current step window
-        layer_means_f = layer_means.float()
-        max_per_layer = (
-            all_tokens.view(num_layers, num_experts).max(dim=1).values.float()
-        )
-        maxvio_batch = (max_per_layer - layer_means_f) / layer_means_f.clamp(min=1.0)
-
-        # MaxVio_global: worst-case overload over the full training run (cumulative)
-        all_cumul = torch.cat(cumul_buffers).view(num_layers, num_experts).float()
-        cumul_means = all_cumul.sum(dim=1) / num_experts
-        maxvio_global = (all_cumul.max(dim=1).values - cumul_means) / cumul_means.clamp(
-            min=1.0
-        )
-
-        # Vectorised deltas and usage
-        delta_flat = layer_means[grp] - all_tokens
-        recip = torch.clamp(layer_sums, min=1.0).reciprocal()
-        usage_flat = all_tokens * recip[grp]
-
-        # Vectorized bias update calculation (replaces the loop)
-        with torch.no_grad():
-            # Get norm factor and load_balance_coeff from the first MoE layer (assuming they are all the same)
-            first_moe = moe_layers_info[0]["module"]
-            norm_factor = first_moe.bias_update_norm_factor
-            load_balance_coeff = first_moe.load_balance_coeff
-
-            # Reshape for batched, per-layer operations
-            delta_2d = delta_flat.view(num_layers, num_experts)
-
-            # Calculate updates for all layers at once
-            updates_2d = lmo_for_moe_bias(delta_2d, norm_factor=norm_factor)
-
-            if norm_factor.endswith("zero_mean"):
-                updates_2d = updates_2d - updates_2d.mean(dim=1, keepdim=True)
-
-            # Collect all bias parameters and update them with a single multi-tensor op
-            bias_params = [info["module"].expert_bias for info in moe_layers_info]
-            updates_list = list(updates_2d.flatten().split(num_experts))
-
-            torch._foreach_add_(bias_params, updates_list, alpha=load_balance_coeff)
-
-            # Reset router stats in bulk
-            try:
-                torch._foreach_mul_(tok_buffers, 0)
-                torch._foreach_mul_(ent_buffers, 0.0)
-                torch._foreach_mul_(acc_fwd_times_buffers, 0)
-                torch._foreach_mul_(load_balance_loss_buffers, 0.0)
-            except Exception:
-                for t in tok_buffers:
-                    t.zero_()
-                for t in ent_buffers:
-                    t.zero_()
-                for t in acc_fwd_times_buffers:
-                    t.zero_()
-                for t in load_balance_loss_buffers:
-                    t.zero_()
-
-            if is_dp_rank_0:
-                all_usages_cpu = usage_flat.cpu().tolist()
-                all_biases_cpu = torch.cat(bias_params).cpu().tolist()
-                all_entropies_cpu = all_entropies.cpu().float().tolist()
-                all_load_balance_losses_cpu = (
-                    all_load_balance_losses.cpu().float().tolist()
-                )
-                all_maxvio_batch_cpu = maxvio_batch.cpu().tolist()
-                all_maxvio_global_cpu = maxvio_global.cpu().tolist()
-                payload = (
-                    moe_layers_info,
-                    all_usages_cpu,
-                    all_biases_cpu,
-                    all_entropies_cpu,
-                    all_load_balance_losses_cpu,
-                    all_maxvio_batch_cpu,
-                    all_maxvio_global_cpu,
-                    num_experts,
-                )
-                log_queue.put(payload)
-
     def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
         for model_part in model_parts:
             for transformer_block in model_part.layers.values():
@@ -778,11 +618,246 @@ def build_optimizers_with_moe_load_balancing(
                     return True
         return False
 
+    # if _should_register_moe_balancing_hook(model_parts):
+    #     optimizers.register_step_pre_hook(
+    #         lambda *args, **kwargs: _update_expert_bias(
+    #             model_parts, parallel_dims=parallel_dims
+    #         )
+    #     )
+
     if _should_register_moe_balancing_hook(model_parts):
-        optimizers.register_step_pre_hook(
-            lambda *args, **kwargs: _update_expert_bias(
-                model_parts, parallel_dims=parallel_dims
-            )
+        # ------------------------------------------------------------------ #
+        # P1 / P2: one-time pre-computation at registration time.             #
+        # We discover MoE layers once and pre-allocate / pre-compute the      #
+        # tensors that were previously re-created on every optimizer step.    #
+        # ------------------------------------------------------------------ #
+
+        # Collect stable buffer references (values change per step; tensors
+        # are fixed after model build — safe as closure-captured variables).
+        _tok_bufs: list[torch.Tensor] = []
+        _ent_bufs: list[torch.Tensor] = []
+        _lb_bufs: list[torch.Tensor] = []
+        _acc_bufs: list[torch.Tensor] = []
+        _cumul_bufs: list[torch.Tensor] = []
+        _moe_layers_static: list[dict] = []
+        for _part in model_parts:
+            for _block in _part.layers.values():
+                if not _block.moe_enabled:
+                    continue
+                _moe = _block.moe
+                _moe_layers_static.append({"module": _moe, "layer_id": _block.layer_id})
+                _tok_bufs.append(_moe.tokens_per_expert)
+                _cumul_bufs.append(_moe.tokens_per_expert_cumul)
+                _ent_bufs.append(_moe.router_entropy)
+                _lb_bufs.append(_moe.load_balance_loss)
+                _acc_bufs.append(_moe.acc_fwd_times)
+
+        _num_experts: int = _tok_bufs[0].numel()
+        _num_layers: int = len(_moe_layers_static)
+        _device: torch.device = _tok_bufs[0].device
+
+        # P1: Pre-allocate flat concatenation buffers.
+        # Each step we fill them in-place via _foreach_copy_ instead of
+        # allocating new tensors with torch.cat (eliminates 3 allocs/step).
+        _buf_tokens = torch.empty(
+            _num_layers * _num_experts, device=_device, dtype=_tok_bufs[0].dtype
+        )
+        _buf_ent = torch.empty(
+            _num_layers * _num_experts, device=_device, dtype=_ent_bufs[0].dtype
+        )
+        _buf_lb = torch.empty(
+            _num_layers * _num_experts, device=_device, dtype=_lb_bufs[0].dtype
+        )
+        # Per-layer views used by _foreach_copy_ to fill slots in one dispatch.
+        _E = _num_experts
+        _buf_views_tok = [
+            _buf_tokens[i * _E : (i + 1) * _E] for i in range(_num_layers)
+        ]
+        _buf_views_ent = [_buf_ent[i * _E : (i + 1) * _E] for i in range(_num_layers)]
+        _buf_views_lb = [_buf_lb[i * _E : (i + 1) * _E] for i in range(_num_layers)]
+
+        # P2: Pre-compute static index / reduction tensors.
+        # grp is the same every step: [0,0,...,0, 1,1,...,1, ..., L-1,...,L-1]
+        # with _num_experts copies of each layer index.
+        _grp = torch.repeat_interleave(
+            torch.arange(_num_layers, device=_device, dtype=torch.long), _E
+        )
+        # Scratch buffer for per-layer token sums; reused in-place each step.
+        _layer_sums_buf = torch.zeros(
+            _num_layers, device=_device, dtype=_tok_bufs[0].dtype
         )
 
+        # Evaluate rank once at registration (rank never changes).
+        _loss_mesh = parallel_dims.get_optional_mesh("loss")
+        _is_dp_rank_0: bool = (
+            torch.distributed.get_rank(_loss_mesh.get_group()) == 0
+            if _loss_mesh is not None
+            else True
+        )
+
+        # P4: Dedicated side stream for bias compute + stats reset.
+        # After fused_hier_reduce_loss_stats() completes on the default stream,
+        # we switch to _bias_stream so that optimizer.step() can proceed on the
+        # default stream concurrently.  The training loop waits for the
+        # _optim_pre_hook_ev before the NEXT forward pass to ensure expert_bias
+        # is updated and router stats are zeroed before they are read/written.
+        # Safety: fused_hier_reduce_loss_stats uses dist.all_reduce with FSDP /
+        # DP communicators that are also used by DiSCO's optimizer.  We keep
+        # the NCCL call on the default stream to avoid multi-stream collectives
+        # on shared communicators (which can deadlock).  Only the pure-GPU
+        # compute after NCCL moves to _bias_stream.
+        _bias_stream = torch.cuda.Stream()
+        optimizers._optim_pre_hook_ev = None  # written by hook, read by train loop
+
+        def _update_expert_bias_fast(*args, **kwargs) -> None:
+            """
+            Optimised replacement for _update_expert_bias.
+
+            Changes vs. the original:
+              P1 – fills pre-allocated flat buffers via _foreach_copy_ instead
+                   of calling torch.cat(tok_buffers / ent_buffers / lb_buffers).
+              P2 – reuses pre-computed _grp and _layer_sums_buf instead of
+                   re-creating them with torch.full / arange / repeat_interleave
+                   / zeros on every step.
+              P3 – non-blocking D-H copies + CUDA event; the background worker
+                   syncs the event before calling .tolist().
+              P4 – bias compute + stats reset + logging enqueued on _bias_stream
+                   so the hook returns before they complete, letting
+                   optimizer.step() run concurrently on the default stream.
+            """
+            # P1: Fill pre-allocated buffers in-place (no torch.cat alloc).
+            # Must run on the default stream so it sees the latest values from
+            # the backward pass before we fork to _bias_stream.
+            torch._foreach_copy_(_buf_views_tok, _tok_bufs)
+            torch._foreach_copy_(_buf_views_ent, _ent_bufs)
+            torch._foreach_copy_(_buf_views_lb, _lb_bufs)
+
+            all_tokens = _buf_tokens
+            all_entropies = _buf_ent
+            all_load_balance_losses = _buf_lb
+
+            scale_factor = _acc_bufs[-1]
+            if scale_factor != 1:
+                # Rare path (gradient accumulation > 1): must allocate new
+                # tensors because dtype/value changes from integer division.
+                all_tokens = all_tokens // scale_factor
+                all_entropies = all_entropies / scale_factor
+
+            # NCCL stays on the default stream to avoid sharing communicators
+            # across streams (P4 safety constraint — see comment above).
+            if _loss_mesh is not None:
+                fused_hier_reduce_loss_stats(
+                    parallel_dims,
+                    all_tokens,
+                    all_entropies,
+                    all_load_balance_losses,
+                )
+
+            # P4: Fork to _bias_stream for all post-NCCL GPU compute.
+            # _bias_stream.wait_stream ensures it sees the NCCL result and the
+            # filled buffers before starting.  The hook then returns immediately
+            # so optimizer.step() can proceed on the default stream.
+            _bias_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(_bias_stream):
+                # P2: Reuse pre-allocated scratch buffer for per-layer sums.
+                _layer_sums_buf.zero_()
+                _layer_sums_buf.index_add_(0, _grp, all_tokens)
+                layer_means = _layer_sums_buf / _num_experts
+
+                # MaxVio: accumulate global counts, then compute batch and global
+                _tok_split = list(all_tokens.view(_num_layers, _num_experts).unbind(0))
+                torch._foreach_add_(_cumul_bufs, _tok_split)
+                _layer_means_f = layer_means.float()
+                _max_per_layer = (
+                    all_tokens.view(_num_layers, _num_experts).max(dim=1).values.float()
+                )
+                maxvio_batch = (_max_per_layer - _layer_means_f) / _layer_means_f.clamp(
+                    min=1.0
+                )
+                _all_cumul_f = (
+                    torch.cat(_cumul_bufs).view(_num_layers, _num_experts).float()
+                )
+                _cumul_means = _all_cumul_f.sum(dim=1) / _num_experts
+                maxvio_global = (
+                    _all_cumul_f.max(dim=1).values - _cumul_means
+                ) / _cumul_means.clamp(min=1.0)
+
+                delta_flat = layer_means[_grp] - all_tokens
+                recip = torch.clamp(_layer_sums_buf, min=1.0).reciprocal()
+                usage_flat = all_tokens * recip[_grp]
+
+                with torch.no_grad():
+                    first_moe = _moe_layers_static[0]["module"]
+                    norm_factor = first_moe.bias_update_norm_factor
+                    load_balance_coeff = first_moe.load_balance_coeff
+
+                    delta_2d = delta_flat.view(_num_layers, _num_experts)
+                    updates_2d = lmo_for_moe_bias(delta_2d, norm_factor=norm_factor)
+
+                    if norm_factor.endswith("zero_mean"):
+                        updates_2d = updates_2d - updates_2d.mean(dim=1, keepdim=True)
+
+                    bias_params = [
+                        info["module"].expert_bias for info in _moe_layers_static
+                    ]
+                    updates_list = list(updates_2d.flatten().split(_num_experts))
+                    torch._foreach_add_(
+                        bias_params, updates_list, alpha=load_balance_coeff
+                    )
+
+                    # Reset router stats in bulk.
+                    try:
+                        torch._foreach_mul_(_tok_bufs, 0)
+                        torch._foreach_mul_(_ent_bufs, 0.0)
+                        torch._foreach_mul_(_acc_bufs, 0)
+                        torch._foreach_mul_(_lb_bufs, 0.0)
+                    except Exception:
+                        for t in _tok_bufs:
+                            t.zero_()
+                        for t in _ent_bufs:
+                            t.zero_()
+                        for t in _acc_bufs:
+                            t.zero_()
+                        for t in _lb_bufs:
+                            t.zero_()
+
+                    if _is_dp_rank_0:
+                        # P3: Non-blocking D-H copies — enqueue DMA transfers
+                        # and record a CUDA event.  moe_metrics_worker syncs
+                        # the event before calling .tolist().
+                        usage_t = usage_flat.to("cpu", non_blocking=True)
+                        bias_t = torch.cat(bias_params).to("cpu", non_blocking=True)
+                        ent_t = all_entropies.to(
+                            dtype=torch.float32, device="cpu", non_blocking=True
+                        )
+                        lb_t = all_load_balance_losses.to(
+                            dtype=torch.float32, device="cpu", non_blocking=True
+                        )
+                        maxvio_batch_t = maxvio_batch.to("cpu", non_blocking=True)
+                        maxvio_global_t = maxvio_global.to("cpu", non_blocking=True)
+                        log_cuda_event = torch.cuda.Event()
+                        log_cuda_event.record()
+                        payload = (
+                            _moe_layers_static,
+                            usage_t,
+                            bias_t,
+                            ent_t,
+                            lb_t,
+                            maxvio_batch_t,
+                            maxvio_global_t,
+                            _num_experts,
+                            log_cuda_event,
+                        )
+                        log_queue.put(payload)
+
+                # Record the event that signals all bias/reset work is done.
+                # The training loop waits for this before the next forward pass.
+                _optim_pre_hook_ev = torch.cuda.Event()
+                _optim_pre_hook_ev.record()
+
+            # Expose the event so the training loop can sync on it.
+            optimizers._optim_pre_hook_ev = _optim_pre_hook_ev
+            # Return without waiting — optimizer.step() proceeds immediately.
+
+        optimizers.register_step_pre_hook(_update_expert_bias_fast)
     return optimizers

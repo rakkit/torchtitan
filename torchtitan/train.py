@@ -348,6 +348,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.prev_data_sampled_tensor = None
 
+        # Pre-cache references to MoE sub-modules that expose
+        # _log_expert_metrics so the per-log-step loop avoids a
+        # double-nested hasattr scan over all transformer blocks.
+        self._moe_log_layers = [
+            layer.moe
+            for part in self.model_parts
+            for layer in part.layers.values()
+            if hasattr(layer, "moe")
+        ]
+
         self.checkpointer = CheckpointManager(
             dataloader=self.dataloader,
             model_parts=self.model_parts,
@@ -568,9 +578,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         attn_type = getattr(self.model_args, "attn_type", "sdpa")
         if attn_type in ["flex", "varlen"]:
-            assert (
-                self.tokenizer is not None
-            ), "tokenizer is required for flex/varlen attention"
+            assert self.tokenizer is not None, (
+                "tokenizer is required for flex/varlen attention"
+            )
             model = cast(ModelProtocol, self.model_parts[0])
             extra_kwargs["attention_masks"] = model.get_attention_masks(
                 input_batch=inputs,
@@ -660,6 +670,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
+        # Async MoE bias update
+        _optim_pre_hook_ev = getattr(self.optimizers, "_optimizer_pre_hook_event", None)
+        if _optim_pre_hook_ev is not None:
+            torch.cuda.current_stream().wait_event(_optim_pre_hook_ev)
+
         self.optimizers.zero_grad()
         # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
@@ -789,18 +804,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if self.prev_data_sampled_tensor is None:
                 self.prev_data_sampled_tensor = torch.zeros_like(sum_data_sampled)
             delta_data_sampled = sum_data_sampled - self.prev_data_sampled_tensor
-            self.prev_data_sampled_tensor = sum_data_sampled.clone()
+            self.prev_data_sampled_tensor.copy_(sum_data_sampled)
 
             total_data_sampled = delta_data_sampled.sum() / 100 + 1e-20
 
-            data_sampled = {
-                k: int(sum_data_sampled[i].item()) for i, k in enumerate(keys)
-            }
             actual_sample_ratio = delta_data_sampled / total_data_sampled
-            actual_sample_ratio_dict = {
-                k: actual_sample_ratio[i].item()
-                for i, k in enumerate(keys_actual_sample_ratio)
-            }
+            # T2: Batch D-H transfer — one .cpu() call per tensor instead of
+            # N per-element .item() calls inside dict comprehensions.
+            _sum_data_cpu = sum_data_sampled.to(torch.int64).cpu().tolist()
+            _ratio_cpu = actual_sample_ratio.cpu().tolist()
+            data_sampled = dict(zip(keys, _sum_data_cpu))
+            actual_sample_ratio_dict = dict(zip(keys_actual_sample_ratio, _ratio_cpu))
 
         else:
             global_avg_loss = global_max_loss = loss.detach().item()
@@ -829,6 +843,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     continue
                 extra_metrics.update(layer.moe._log_expert_metrics)
 
+        for moe in self._moe_log_layers:
+            if hasattr(moe, "_log_expert_metrics"):
+                extra_metrics.update(moe._log_expert_metrics)
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
@@ -836,6 +854,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             grad_norm.item() if grad_norm is not None else grad_norm,
             extra_metrics=extra_metrics,
         )
+
+        self.optimizers.join_log_queue()
 
     @record
     def train(self):
@@ -876,9 +896,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
 
                 # Run validation if validator is available
-                if (
-                    self.job_config.validation.enable
-                    and self.validator.should_validate(self.step)
+                if self.job_config.validation.enable and self.validator.should_validate(
+                    self.step
                 ):
                     self.validator.validate(self.model_parts, self.step)
 
@@ -955,12 +974,12 @@ def main(trainer_class: type[Trainer]) -> None:
             return
 
         if config.checkpoint.create_seed_checkpoint:
-            assert (
-                int(os.environ["WORLD_SIZE"]) == 1
-            ), "Must create seed checkpoint using a single device, to disable sharding."
-            assert (
-                config.checkpoint.enable
-            ), "Must enable checkpointing when creating a seed checkpoint."
+            assert int(os.environ["WORLD_SIZE"]) == 1, (
+                "Must create seed checkpoint using a single device, to disable sharding."
+            )
+            assert config.checkpoint.enable, (
+                "Must enable checkpointing when creating a seed checkpoint."
+            )
             trainer.checkpointer.save(curr_step=0, last_step=True)
             logger.info("Created seed checkpoint")
         else:

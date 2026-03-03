@@ -240,6 +240,27 @@ moe_llama_configs = {
         intermediate_size=1280,
         moe_intermediate_size=160,
     ),
+    "bsc-1B-7B-opt-g-proxy-8layers": MoEModelArgs(
+        dim=512,
+        n_layers=8,
+        n_dense_layers=1,
+        n_heads=8,
+        n_kv_heads=1,
+        head_dim=128,
+        moe_args=MoEArgs(
+            num_experts=64,
+            num_shared_experts=1,
+            top_k=8,
+            scaling_factor=2.8232,  # 8 of 64 experts
+        ),
+        qk_norm=True,
+        norm_eps=1e-20,
+        rope_theta=10000,
+        norm_type="np_rmsnorm",
+        norm_everywhere=True,
+        intermediate_size=1280,
+        moe_intermediate_size=160,
+    ),
     "test": MoEModelArgs(
         dim=256,
         n_layers=8,

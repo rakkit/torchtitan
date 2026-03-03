@@ -3244,7 +3244,6 @@ class DiSCO(AbstractDiSCO):
                 norms_of_update,
                 norms_of_weight,
                 fsdp_mesh,
-                rank,
                 device,
                 fsdp_param_names,
                 world_size,

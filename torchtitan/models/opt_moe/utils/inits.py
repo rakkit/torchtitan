@@ -162,10 +162,11 @@ def scion_normal_(
     generator: torch.Generator | None = None,
 ):
     assert tensor.ndim == 2, "Tensor for scion_normal_ init must have 2 dimensions"
+
     nn.init.normal_(
         tensor,
         mean=mean,
-        std=std,
+        std=1.0,
         generator=generator,
     )
     if scale_type is None:
@@ -173,15 +174,14 @@ def scion_normal_(
     elif scale_type == "input":
         scale = math.sqrt(tensor.shape[norm_axis])
     elif scale_type == "output":
-        scale = 1 / math.sqrt(tensor.shape[norm_axis])
+        scale = 1.0 / math.sqrt(tensor.shape[norm_axis])
     else:
         raise ValueError(f"Unknown scale_type: {scale_type}")
 
     with torch.no_grad():
-        scale = scale / (
-            torch.sqrt(tensor.pow(2).sum(axis=norm_axis, keepdim=True)) + eps
-        )
-        tensor.mul_(scale)
+        norm = torch.sqrt(tensor.pow(2).sum(dim=norm_axis, keepdim=True))
+
+        tensor.mul_(scale * std / (norm + eps))
 
 
 def sign_(tensor: torch.Tensor, generator: torch.Generator | None = None):

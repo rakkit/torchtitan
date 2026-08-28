@@ -37,6 +37,7 @@ class GatedNormSWAttention(BaseAttention):
         head_dim: int | None = None
         qk_norm: bool = False
         mid_norm: bool = False
+        v_norm: bool = False
         norm_everywhere: bool = False
         gated_attention_type: str | None = None  # "none", "head-wise", "element-wise"
         gate_only: bool = False
@@ -119,7 +120,7 @@ class GatedNormSWAttention(BaseAttention):
         if config.qk_norm or config.norm_everywhere:
             self.q_norm = build_attention_norm(dim=self.head_dim)
             self.k_norm = build_attention_norm(dim=self.head_dim)
-        if config.norm_everywhere:
+        if config.v_norm or config.norm_everywhere:
             self.v_norm = build_attention_norm(dim=self.head_dim)
         if config.mid_norm or config.norm_everywhere:
             if self.mid_norm_position == "after" and not self.head_wise_mid_norm:

@@ -326,7 +326,7 @@ def set_init_fn_type(config):
 
         if "init_fn_type" in name:
             setattr(config, name, "normal")
-            print(f"Set {name} = normal")
+            # print(f"Set {name} = normal")
 
         elif type(value).__name__ == "Config":
             set_init_fn_type(value)

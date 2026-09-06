@@ -252,10 +252,14 @@ def build_init_fn(init_fn_type: str):
 
 
 def parse_depth_init(depth_init):
-    if depth_init in ["true", "relative_depth"]:
-        depth_init = "relative_depth"
-    elif depth_init in ["false", "total_depth"]:
-        depth_init = "total_depth"
+    if depth_init in ["true", "relative_depth", "relative_depth_R"]:
+        depth_init = "relative_depth_R"
+    elif depth_init in ["relative_depth_N"]:
+        depth_init = "relative_depth_N"
+    elif depth_init in ["false", "total_depth", "total_depth_R"]:
+        depth_init = "total_depth_R"
+    elif depth_init in ["total_depth_N"]:
+        depth_init = "total_depth_N"
     elif depth_init in ["none", "null", "identity"]:
         depth_init = None
     else:
@@ -266,13 +270,21 @@ def parse_depth_init(depth_init):
 def setup_depth_init(depth_init: str | None, layer_id: int, n_layers: int):
     residual_div_attn = 1.0
     residual_div_ffn = 1.0
+    # N = number of transformer blocks, or layers
+    # R = 2 * N = actual Residual blocks
     match depth_init:
-        case "relative_depth":
+        case "relative_depth_R":
             residual_div_attn = (2 * (layer_id + 1)) ** 0.5
             residual_div_ffn = (2 * (layer_id + 2)) ** 0.5
-        case "total_depth":
+        case "relative_depth_N":
+            residual_div_attn = (layer_id + 1) ** 0.5
+            residual_div_ffn = (layer_id + 1) ** 0.5
+        case "total_depth_R":
             residual_div_attn = (2 * n_layers) ** 0.5
             residual_div_ffn = (2 * n_layers) ** 0.5
+        case "total_depth_N":
+            residual_div_attn = n_layers**0.5
+            residual_div_ffn = n_layers**0.5
         case None:
             residual_div_attn = 1.0
             residual_div_ffn = 1.0
@@ -283,18 +295,34 @@ def setup_depth_init(depth_init: str | None, layer_id: int, n_layers: int):
 
 def setup_residual_scale(residual_scale: str, n_layers: int):
     block_scale, identity_scale = 1.0, 1.0
+
+    # N = number of Transformer layers
+    # R = 2 * N = number of attention/FFN residual sub-blocks
+    N = n_layers
+    R = 2 * n_layers
+
     match residual_scale:
-        case "depth_scale":
-            total_depth = 2 * n_layers
-            block_scale = 1 / total_depth
-            identity_scale = (total_depth - 1) / total_depth
-        case "complete_p":
-            total_depth = 2 * n_layers
-            block_scale = 1 / total_depth
-            identity_scale = 1.0
         case "identity":
             block_scale = 1.0
             identity_scale = 1.0
+
+        case "depth_scale_R":
+            block_scale = 1 / R
+            identity_scale = (R - 1) / R
+
+        case "depth_scale_N":
+            block_scale = 1 / N
+            identity_scale = (N - 1) / N
+
+        case "complete_p_R":
+            block_scale = 1 / R
+            identity_scale = 1.0
+
+        case "complete_p_N":
+            block_scale = 1 / N
+            identity_scale = 1.0
+
         case _:
             raise ValueError(f"Invalid residual_scale: {residual_scale}")
+
     return block_scale, identity_scale

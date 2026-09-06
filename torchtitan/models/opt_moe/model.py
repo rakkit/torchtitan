@@ -241,6 +241,7 @@ class OPTMoEModel(Decoder):
         final_out_init_fn_type: str = "scion_normal_output"
         final_out_init_std: float = 1.0
 
+        use_embeddings_norm: bool = False
         # --- Flexible per-layer attention configuration ---
 
         rope_of_swa: RoPE.Config | None = None
@@ -364,7 +365,12 @@ class OPTMoEModel(Decoder):
     def __init__(self, config: Config):
         super().__init__(config)
         self.norm = build_norm(config.norm_type, dim=config.dim, eps=config.norm_eps)
-
+        if config.use_embeddings_norm:
+            self.embeddings_norm = build_norm(
+                config.norm_type, dim=config.dim, eps=config.norm_eps
+            )
+        else:
+            self.embeddings_norm = nn.Identity()
         n_layers = config.n_layers
         base_attn = config.layer.attention
         assert isinstance(base_attn, GatedNormSWAttention.Config)
@@ -496,6 +502,8 @@ class OPTMoEModel(Decoder):
         if self.norm is not None:
             self.norm.reset_parameters()
 
+        if not isinstance(self.embeddings_norm, nn.Identity):
+            self.embeddings_norm.reset_parameters()
         skip_init = kwargs.get("skip_init", False)
 
         first_in_init_fn = build_init_fn(self.config.first_in_init_fn_type)
@@ -543,6 +551,7 @@ class OPTMoEModel(Decoder):
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
+        h = self.embeddings_norm(h)
         # Collect per-layer load-balance losses; accumulation happens after the loop
         # so we never thread a running tensor through every layer's signature.
         local_lbl_loss: torch.Tensor | None = None

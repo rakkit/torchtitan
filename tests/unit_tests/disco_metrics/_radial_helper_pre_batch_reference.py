@@ -5,6 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 """
+VERBATIM COPY of radial_helper.py taken immediately BEFORE the batched-expert
+refactor, kept so the unit suite can assert the 2-D path still matches the
+code that was already validated end-to-end. Do not edit by hand; if
+radial_helper changes intentionally, re-snapshot and say why.
+
 Whole-tensor "radial dynamics" metrics -- how a weight's norm and direction
 evolve under training. Unlike gram_helper.py's row-wise Gram-matrix
 framework (which needs the raw momentum/gradient `V_raw` and is gated
@@ -196,14 +201,11 @@ def _axis_radiality(
     first maximal row/column at a tie -- one valid subgradient selection at a
     non-smooth point.
     """
-    # Reductions are over the LAST axis only, so any leading dims (the expert
-    # axis, when called from the batched path) broadcast through untouched.
-    # For an unbatched 1-D input this is identical to a flat argmax/max.
-    idx = torch.argmax(sq_W, dim=-1, keepdim=True)
-    max_W = sq_W.gather(-1, idx).squeeze(-1).clamp_min(0).sqrt()
-    max_U = sq_U.max(dim=-1).values.clamp_min(0).sqrt()
+    idx = torch.argmax(sq_W)
+    max_W = sq_W[idx].clamp_min(0).sqrt()
+    max_U = sq_U.max().clamp_min(0).sqrt()
     tiny = torch.finfo(sq_W.dtype).tiny
-    raw = dot.gather(-1, idx).squeeze(-1) / (max_W * max_U).clamp_min(tiny)
+    raw = dot[idx] / (max_W * max_U).clamp_min(tiny)
     return _guarded_radiality(raw, max_W, max_U), max_W, max_U
 
 
@@ -223,12 +225,8 @@ def _axis_aus(
     tiny = torch.finfo(sq_W.dtype).tiny
     a = max_W.clamp_min(tiny)
     b = max_U.clamp_min(tiny)
-    # `a`/`b` carry the leading batch dims but not the reduced axis, so they
-    # need a trailing singleton to broadcast against the per-axis vectors.
-    a = a.unsqueeze(-1)
-    b = b.unsqueeze(-1)
     per_axis = sq_W / (a * a) + sq_U / (b * b) - 2.0 * dot / (a * b)
-    raw = per_axis.clamp_min(0.0).max(dim=-1).values.sqrt()
+    raw = per_axis.clamp_min(0.0).max().sqrt()
     return _guarded_radiality(raw, max_W, max_U)
 
 
@@ -258,7 +256,6 @@ def calculate_radial_metrics(
     *,
     spectral: "SpectralInputs | None" = None,
     transpose: bool = False,
-    batch_ndim: int = 0,
 ) -> dict[str, torch.Tensor]:
     """
     Returns all of `RADIAL_METRIC_NAMES` as a flat dict of 0-d tensors.
@@ -281,20 +278,6 @@ def calculate_radial_metrics(
     metrics take the same deterministic 0 sentinel as the other degenerate
     cases here. disco.py sizes its flat logging buffers from
     `len(RADIAL_METRIC_NAMES)`, so the arity must not depend on the input.
-
-    `batch_ndim` runs many independent tensors through in one call: with
-    `batch_ndim=1` and `W_before` of shape `[E, m, n]`, every reduction is
-    taken over the trailing matrix dims only and every returned metric is
-    `[E]`, one entry per expert. `state`'s accumulators must then be `[E]`
-    too -- which is exactly what `new_radial_state(shape=(num_local_experts,))`
-    already produces, so expert params need no state change to use this.
-    `batch_ndim=0` (the default) is the original single-tensor behaviour and
-    is bit-identical to it; the unit suite asserts both that equivalence and
-    that batched results match looping the scalar path.
-
-    The whole point of one function with a batch axis, rather than a separate
-    batched implementation, is that the 26 metrics and their degeneracy
-    guards cannot drift apart between the two.
     """
     if isinstance(W_before, torch.nn.Parameter):
         W_before = W_before.data
@@ -308,21 +291,10 @@ def calculate_radial_metrics(
     dtype = W_before.dtype
     tiny = torch.finfo(dtype).tiny
 
-    # Reduce over the trailing (matrix) dims, leaving the leading `batch_ndim`
-    # dims intact. For batch_ndim=0 this is every dim, i.e. the original
-    # whole-tensor scalars.
-    mat_ndim = W_before.ndim - batch_ndim
-    mdims = tuple(range(-mat_ndim, 0))
-
     U = W_after - W_before
-    # `linalg.vector_norm`, not `Tensor.norm(dim=...)`: the latter routes a
-    # 2-tuple of dims to `matrix_norm` and rejects anything else, so a 3-D
-    # tensor with batch_ndim=0 (mdims == (-3,-2,-1)) would raise. vector_norm
-    # is the flatten-then-L2 that the original bare `.norm()` computed, for
-    # any number of dims.
-    r_t = torch.linalg.vector_norm(W_before, dim=mdims)
-    r_next = torch.linalg.vector_norm(W_after, dim=mdims)
-    a_t = torch.linalg.vector_norm(U, dim=mdims)
+    r_t = W_before.norm()
+    r_next = W_after.norm()
+    a_t = U.norm()
 
     # Relative (not absolute/exact-zero) floor on a_t: an update whose
     # magnitude is numerically negligible compared to the weight's own
@@ -340,7 +312,7 @@ def calculate_radial_metrics(
 
     relative_step = a_t / r_t.clamp_min(tiny)
 
-    dot_wu = (W_before * U).sum(dim=mdims)
+    dot_wu = (W_before * U).sum()
     radial_cosine_raw = (dot_wu / (r_t * a_t).clamp_min(tiny)).clamp(-1.0, 1.0)
     # Explicit degenerate-case sentinel (0, an undefined angle) rather than
     # letting the tiny floor alone produce an arbitrary non-zero value --
@@ -373,7 +345,7 @@ def calculate_radial_metrics(
     # the acos formula instead of atan2) -- not fed into the accumulators,
     # kept purely to catch a geometry/implementation bug if it ever
     # meaningfully diverges from `angle`.
-    dot_ww = (W_before * W_after).sum(dim=mdims)
+    dot_ww = (W_before * W_after).sum()
     cos_angle = (dot_ww / (r_t * r_next).clamp_min(tiny)).clamp(-1.0, 1.0)
     angle_from_cos = torch.where(
         valid_ww, torch.arccos(cos_angle), torch.zeros_like(cos_angle)
@@ -426,19 +398,13 @@ def calculate_radial_metrics(
         (2.0 - 2.0 * radial_cosine).clamp_min(0.0).sqrt(), r_t, a_t
     )
 
-    if mat_ndim == 2:
-        # `.T` is only valid for a strictly-2-D tensor; transposing the two
-        # trailing dims works for both the batched and unbatched cases.
-        Wm, Um = (
-            (W_before, U)
-            if not transpose
-            else (W_before.transpose(-2, -1), U.transpose(-2, -1))
-        )
+    if W_before.ndim == 2:
+        Wm, Um = (W_before, U) if not transpose else (W_before.T, U.T)
         # rows of the (possibly transposed) matrix -> the rms->inf geometry;
         # columns -> the l1->rms geometry. Both sets of reductions are shared
         # between that axis's radiality and its aus norm.
-        row_sq_W, row_sq_U, row_dot = _axis_reductions(Wm, Um, -1)
-        col_sq_W, col_sq_U, col_dot = _axis_reductions(Wm, Um, -2)
+        row_sq_W, row_sq_U, row_dot = _axis_reductions(Wm, Um, 1)
+        col_sq_W, col_sq_U, col_dot = _axis_reductions(Wm, Um, 0)
 
         rad_row, row_max_W, row_max_U = _axis_radiality(row_sq_W, row_sq_U, row_dot)
         rad_col, col_max_W, col_max_U = _axis_radiality(col_sq_W, col_sq_U, col_dot)
@@ -473,29 +439,15 @@ def calculate_radial_metrics(
                 extra["spectral_relative_step"] = torch.where(
                     sig_w > 0, sig_u / sig_w.clamp_min(tiny), torch.zeros_like(sig_w)
                 )
-                if u1 is not None and v1 is not None and mat_ndim == 2:
+                if u1 is not None and v1 is not None and W_before.ndim == 2:
                     # rms->rms radiality. A norming covector of
                     # N(W) = sqrt(d_in/d_out)*||W||_op is
                     # sqrt(d_in/d_out)*u1 v1^T; the dimension factor cancels
                     # against N(U), leaving u1^T U v1 / ||U||_op.
                     u1 = u1.to(dtype)
                     v1 = v1.to(dtype)
-                    # u1^T U v1. The unbatched form is kept verbatim so this
-                    # already-validated series stays bit-identical: both
-                    # einsum and a singleton-padded matmul route to a
-                    # different BLAS kernel than the plain matvec and shift
-                    # the last fp32 digit. A perf refactor must not move
-                    # values that are already being logged.
-                    if batch_ndim == 0:
-                        quad = u1 @ (U @ v1)
-                    else:
-                        quad = (
-                            (u1.unsqueeze(-2) @ (U @ v1.unsqueeze(-1)))
-                            .squeeze(-1)
-                            .squeeze(-1)
-                        )
                     extra["radiality_rms_to_rms"] = _guarded_radiality(
-                        quad / sig_u.clamp_min(tiny), sig_w, sig_u
+                        (u1 @ (U @ v1)) / sig_u.clamp_min(tiny), sig_w, sig_u
                     )
         elif sig_next is not None:
             extra["spectral_radius_next"] = sig_next.to(dtype)

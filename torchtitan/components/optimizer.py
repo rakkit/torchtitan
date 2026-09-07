@@ -238,6 +238,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         self.gram_level: int = 0
         self.log_queue: queue.Queue | None = None
         self.log_thread: threading.Thread | None = None
+        # Set by the trainer from MetricsProcessor.Config.save_all_shard_ranks;
+        # False keeps the historical gather-to-one-rank behaviour.
+        self.log_metrics_locally: bool = False
         self.spectrum_logging_config = spectrum_logging.SpectrumLoggingConfig(
             enable_plot=config.enable_spectrum_plot,
             enable_export=config.enable_spectrum_export,
@@ -318,7 +321,20 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             optimizer = self.optimizers[i]
             if isinstance(optimizer, DiSCO):
                 optimizer.calculate_norm_at_next_step(
-                    self.norms_to_log, self.gram_level
+                    self.norms_to_log,
+                    self.gram_level,
+                    # The spectra are only ever consumed by
+                    # process_norms_for_logging, which drops them unless one of
+                    # these is on. Telling the optimizer up front lets it skip
+                    # computing, packing and all-gathering them entirely.
+                    track_spectrum=(
+                        self.spectrum_logging_config.enable_plot
+                        or self.spectrum_logging_config.enable_export
+                    ),
+                    # Single source of truth with the logger: the optimizer must
+                    # only skip the gather on ranks that actually have a logger,
+                    # otherwise their metrics are computed and silently dropped.
+                    log_metrics_locally=self.log_metrics_locally,
                 )
 
     def get_parameter_norms(self, step: int):
@@ -423,6 +439,9 @@ class OptimizersInBackwardContainer(OptimizersContainer):
         optimizer_kwargs = self._build_optimizer_kwargs(config)
         all_params = []
         self.model_parts = model_parts
+        # Set by the trainer from MetricsProcessor.Config.save_all_shard_ranks;
+        # False keeps the historical gather-to-one-rank behaviour.
+        self.log_metrics_locally: bool = False
         self.spectrum_logging_config = spectrum_logging.SpectrumLoggingConfig(
             enable_plot=config.enable_spectrum_plot,
             enable_export=config.enable_spectrum_export,

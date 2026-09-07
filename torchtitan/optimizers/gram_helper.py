@@ -64,6 +64,8 @@ from typing import Callable
 import torch
 from torch.distributed.tensor import DTensor
 
+from torchtitan.optimizers.norm_helper import _gram_spectrum, fp64_gram
+
 _DEFAULT_GRAM_EPS: float = 1e-6
 _DEFAULT_GRAM_TOPK: int = 8
 
@@ -154,10 +156,18 @@ def _dominance_ratio(diagonal: torch.Tensor, off_mean: torch.Tensor) -> torch.Te
     # specificity, which were the same formula duplicated inline.
     eps_rel = torch.finfo(diagonal.dtype).eps
     denominator = torch.maximum(off_mean, _relative_floor(diagonal, eps_rel))
-    result = torch.zeros_like(diagonal)
-    nonzero = diagonal > 0
-    result[nonzero] = diagonal[nonzero] / denominator[nonzero]
-    return result
+    # `torch.where`, not boolean-mask indexing. `result[m] = a[m] / b[m]`
+    # runs `nonzero()` for each of the three masked accesses, and every
+    # `nonzero()` is a device->host sync because the output shape is
+    # data-dependent. This helper is called ~12x per calculate_gram_metrics,
+    # so that was ~36 syncs per call on a path that is already
+    # dispatch-bound. `where` selects with no sync and no shape dependence.
+    #
+    # The unselected branch may be inf/NaN (denominator can be 0 exactly
+    # where diagonal is 0), but `where` discards it rather than propagating
+    # -- same deterministic-0 sentinel convention as radial_helper's guards.
+    safe = denominator.clamp_min(torch.finfo(diagonal.dtype).tiny)
+    return torch.where(diagonal > 0, diagonal / safe, torch.zeros_like(diagonal))
 
 
 def _row_dominance(A: torch.Tensor, m: int) -> torch.Tensor:
@@ -178,10 +188,23 @@ def _row_dominance(A: torch.Tensor, m: int) -> torch.Tensor:
 def _offdiag_stats(
     C: torch.Tensor, m: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    off_mask = ~torch.eye(m, dtype=torch.bool, device=C.device)
-    x = C[off_mask]
-    ax = x.abs()
-    return ax.mean(), x.square().mean().sqrt(), ax.max()
+    # Zero the diagonal in a copy rather than gathering with a boolean mask.
+    # `C[off_mask]` allocates an m x m bool mask AND runs a data-dependent
+    # `nonzero()` gather producing m^2 - m elements (589k at m=768) plus a
+    # device->host sync. Zeroing is one kernel and keeps everything on device.
+    #
+    # Deliberately NOT computed as (total - diagonal): that is the same
+    # catastrophic cancellation `_row_dominance` documents avoiding, and it
+    # bites exactly in the diagonally-dominant regime these metrics exist to
+    # detect. Zeroed entries contribute nothing to a sum of non-negatives, and
+    # `max` is unaffected because `ax` is non-negative -- if every off-diagonal
+    # is 0 the true max is 0 anyway.
+    count = max(m * m - m, 1)
+    ax = C.abs()
+    ax.fill_diagonal_(0)
+    sq = C.square()
+    sq.fill_diagonal_(0)
+    return ax.sum() / count, (sq.sum() / count).sqrt(), ax.max()
 
 
 def _cross_summary(C_XY: torch.Tensor, m: int) -> dict[str, torch.Tensor]:
@@ -299,21 +322,33 @@ def _gram_eigh_from_factor(X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     because the input matrix is ill-conditioned or has too many repeated
     eigenvalues" on exactly this kind of explicitly-formed product).
     Assumes rows <= cols (guaranteed by calculate_gram_metrics's
-    orientation policy -- see its docstring), so the reduced SVD's U
-    already spans the complete eigenspace, with no rank-deficient
-    dimensions to pad.
+    orientation policy -- see its docstring), so the Gram is over the
+    smaller dimension and spans the complete eigenspace, with no
+    rank-deficient dimensions to pad.
+
+    NOTE the docstring above used to argue for the SVD *because* forming
+    X @ X.T squares the condition number. That reasoning is right in
+    float32 and is exactly why this now uses `norm_helper.fp64_gram`:
+    in float64 the squared condition number is affordable, and the result
+    is both faster (4.4x with eigenvectors at [768,2048]) and MORE accurate
+    than the float32 SVD it replaces (smallest eigenvalue 34-500x closer to
+    a float64 reference). `eigh` returns ascending eigenpairs directly, so
+    no flip is needed. Eigenvector signs may differ from the SVD's, which
+    is fine: every downstream use is of the form V diag(f(w)) V^T (see
+    `_inverse_sqrt_from_eigh`), which is sign-invariant.
     """
-    U_desc, singular_desc, _ = torch.linalg.svd(X, full_matrices=False)
-    return singular_desc.square().flip(0), U_desc.flip(1)
+    w, V = torch.linalg.eigh(fp64_gram(X))
+    return w.clamp_min(0).to(X.dtype), V.to(X.dtype)
 
 
 def _svd_eigenvalues(X: torch.Tensor) -> torch.Tensor:
     """
-    Descending eigenvalues of X @ X.T via SVD of X, values only (no
-    eigenvectors) -- same motivation as `_gram_eigh_from_factor`, cheaper
-    when eigenvectors aren't needed downstream.
+    Descending eigenvalues of X @ X.T, values only (no eigenvectors) --
+    same float64-Gram reasoning as `_gram_eigh_from_factor`, and cheaper
+    still when eigenvectors aren't needed (5.9x over `svdvals` at
+    [768,2048]).
     """
-    return torch.linalg.svdvals(X).square()
+    return torch.linalg.eigvalsh(fp64_gram(X)).clamp_min(0).flip(-1).to(X.dtype)
 
 
 def _safe_sym_eigvalsh(A: torch.Tensor) -> torch.Tensor:
@@ -786,6 +821,21 @@ def _level3_metrics(
     Q_WU = GW_inv_sqrt @ (core.W_before @ core.U_actual.T) @ GU_inv_sqrt
     Q_VA = GV_inv_sqrt @ (core.V_raw @ core.A_actual.T) @ GU_inv_sqrt
 
+    # All six singular-value sets below are [m, m] and the same shape, so they
+    # go through ONE batched float64-Gram decomposition instead of six separate
+    # `svdvals` calls. That was 288 ms of level 3's 799 ms at [768,2048] --
+    # measured 207 ms -> 28 ms (7.4x) and 6800x more accurate (max relative
+    # error 5.9e-8 vs 4.05e-4 against a float64 SVD reference).
+    #
+    # Batching `svdvals` itself buys nothing (measured 1.00x) -- cuSOLVER
+    # serialises it internally, the same reason batching the expert norms was
+    # a no-op in pass 1. The win is the float64 Gram, which turns each SVD
+    # into an eigvalsh of an [m, m] matrix that DOES batch.
+    _sv = _gram_spectrum(
+        torch.stack([core.C_WV, core.C_WU, core.C_VA, Q_WV, Q_WU, Q_VA])
+    )
+    c_wv_sv, c_wu_sv, c_va_sv, q_wv_sv, q_wu_sv, q_va_sv = _sv.unbind(0)
+
     return {
         "K_V_eigenvalues": eig_KV,
         "K_V_rates": K_V_rates,
@@ -795,9 +845,9 @@ def _level3_metrics(
         # C_WV/C_WU/C_VA are plain cross-correlation singular values, NOT
         # bounded by 1 (e.g. near-duplicate rows can push these up toward
         # ~m) -- no clamp.
-        "C_WV_singular_values": torch.linalg.svdvals(core.C_WV),
-        "C_WU_singular_values": torch.linalg.svdvals(core.C_WU),
-        "C_VA_singular_values": torch.linalg.svdvals(core.C_VA),
+        "C_WV_singular_values": c_wv_sv,
+        "C_WU_singular_values": c_wu_sv,
+        "C_VA_singular_values": c_va_sv,
         # Q_WV/Q_WU/Q_VA are canonical correlations (classic whitened
         # cross-Gram CCA construction) -- mathematically guaranteed in
         # [0, 1] by Cauchy-Schwarz, unlike the plain singular values above.
@@ -805,9 +855,9 @@ def _level3_metrics(
         # whitening transforms (GW_inv_sqrt/GV_inv_sqrt/GU_inv_sqrt), not
         # real signal -- clamp to enforce the known bound, same rationale
         # as clamping PSD eigenvalues to >= 0 elsewhere in this file.
-        "Q_WV_canonical_correlations": torch.linalg.svdvals(Q_WV).clamp(0, 1),
-        "Q_WU_canonical_correlations": torch.linalg.svdvals(Q_WU).clamp(0, 1),
-        "Q_VA_canonical_correlations": torch.linalg.svdvals(Q_VA).clamp(0, 1),
+        "Q_WV_canonical_correlations": q_wv_sv.clamp(0, 1),
+        "Q_WU_canonical_correlations": q_wu_sv.clamp(0, 1),
+        "Q_VA_canonical_correlations": q_va_sv.clamp(0, 1),
         "K_U_log_rate_spread": K_U_log_rate_spread,
         "relative_spectrum_l1_distance": relative_spectrum_l1_distance,
         "J_positive_fraction": J_positive_fraction,

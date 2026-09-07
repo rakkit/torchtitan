@@ -317,19 +317,20 @@ def newton_schulz_triton(G: Tensor, steps: int = 10, eps: float = 1e-7):
     """
     Triton implementation of Newton-Schulz iteration
     """
-    # Newton-Schulz constants
-    if steps == 5:
-        ns_consts = [
-            (4.0848, -6.8946, 2.9270),
-            (3.9505, -6.3029, 2.6377),
-            (3.7418, -5.5913, 2.3037),
-            (2.8769, -3.1427, 1.2046),
-            (2.8366, -3.0525, 1.2012),
-        ]
-    else:
-        ns_consts = [
-            (3.4445, -4.7750, 2.0315),
-        ] * steps
+    # Newton-Schulz constants -- the same quintic (a, b, c) at every step, so
+    # this kernel is numerically `zeropower_via_newtonschulz5` (muon_utils.py),
+    # just faster. That equivalence is the whole point of the name: it used to
+    # special-case `steps == 5` to a tuned per-step schedule, which made
+    # switching between the two backends silently change training.
+    #
+    # The tuned schedule is not lost -- it is essentially polar-express, which
+    # is available as `polar_express_triton` and is better than either of these
+    # (err 0.0061 at 6 steps vs 0.0169 for the old special case and 0.1707 for
+    # this constant iteration). Prefer that backend if orthogonalization
+    # quality matters; do not reintroduce a hidden schedule here.
+    ns_consts = [
+        (3.4445, -4.7750, 2.0315),
+    ] * steps
 
     original_dtype = G.dtype
     X = G.to(dtype=torch.bfloat16)
@@ -378,10 +379,21 @@ def polar_express_triton(G: Tensor, steps: int = 5, eps: float = 1e-7):
         (a / 1.01, b / 1.01**3, c / 1.01**5) for (a, b, c) in coeffs_base[:-1]
     ] + [coeffs_base[-1]]
 
-    # extend the list so that coeffs[k] is defined for every k < steps
+    # extend the list so that coeffs[k] is defined for every k < steps, then
+    # truncate to `steps`.
+    #
+    # The truncation is the fix for a real bug: the loop below used to iterate
+    # the whole `coeffs` list, which is 8 entries long regardless of `steps`.
+    # So `backend_steps=5` silently ran 8 Newton-Schulz iterations here while
+    # `muon_utils.zeropower_via_polar_express` ran 5 for the same setting --
+    # the two "polar express" backends were not the same computation, and the
+    # config knob did nothing on this path. Measured before the fix: this
+    # function's error against the exact polar factor was a flat 0.0064 for
+    # every value of `steps` from 3 to 12.
     coeffs = coeffs_base + list(
         itertools.repeat(coeffs_base[-1], max(0, steps - len(coeffs_base)))
     )
+    coeffs = coeffs[:steps]
 
     original_dtype = G.dtype
     X = G.to(dtype=torch.bfloat16)

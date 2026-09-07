@@ -485,6 +485,76 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.optimizers = config.optimizer.build(
             model_parts=self.model_parts, parallel_dims=parallel_dims
         )
+        # Per-rank metric logging: DiSCO may only skip the logging all_gather
+        # when the metrics side genuinely gives EVERY shard rank a logger.
+        #
+        # `save_all_shard_ranks` alone is not enough. It is applied inside
+        # `_build_metric_logger` only after `should_log` is already true, and
+        # with `save_for_all_ranks=False` that has been narrowed to a single
+        # global rank. Enabling local mode on the raw flag would have every rank
+        # skip the gather while only one rank owns a logger -- so that rank logs
+        # its own 1/N of the parameters and the rest are silently dropped.
+        #
+        # It also has to be decided from config alone, identically on every
+        # rank: the gather is a collective, so if some ranks skipped it and
+        # others did not the job would hang rather than misreport.
+        _m = config.metrics
+        _logging_on = bool(
+            getattr(_m, "enable_wandb", False)
+            or getattr(_m, "enable_tensorboard", False)
+        )
+        if getattr(_m, "save_all_shard_ranks", False) and not getattr(
+            _m, "save_for_all_ranks", False
+        ):
+            raise ValueError(
+                "metrics.save_all_shard_ranks requires metrics.save_for_all_ranks. "
+                "Without it only one rank builds a logger, so skipping the "
+                "logging all_gather would silently drop every parameter owned by "
+                "the other shard ranks."
+            )
+        self.optimizers.log_metrics_locally = bool(
+            getattr(_m, "save_all_shard_ranks", False)
+            and getattr(_m, "save_for_all_ranks", False)
+            and _logging_on
+        )
+        if self.optimizers.log_metrics_locally:
+            # The invariant that actually matters: every rank owning a distinct
+            # slice of the metrics must hold a logger to write it to. Both
+            # sides now derive that from `rank_owns_metrics_shard`, so this is
+            # inert -- it exists to make a future divergence fail loudly at
+            # init instead of silently producing a partial dashboard, which is
+            # how the pure-DDP case went unnoticed (ownership spread over
+            # dp_replicate while only replica 0 got a logger).
+            _owns_shard = dist_utils.rank_owns_metrics_shard(parallel_dims)
+            # `_build_metric_logger` returns a bare `BaseLogger` (a no-op with
+            # no `number_of_loggers`) on ranks that do not log, and a
+            # `LoggerContainer` on ranks that do -- so this must not assume the
+            # container type. Getting that wrong crashed every non-logging rank
+            # at init on the first HSDP run.
+            _logger_obj = self.metrics_processor.logger
+            _has_logger = getattr(_logger_obj, "number_of_loggers", 0) > 0
+            # Only the direction that loses data is fatal: this rank owns a
+            # slice nobody else will log, and has nowhere to put it. The
+            # reverse (a logger with nothing to log) is harmless, and firing on
+            # it would turn a soft wandb failure -- an empty LoggerContainer
+            # because the backend could not be constructed -- into an
+            # init-time abort of the whole job.
+            if _owns_shard and not _has_logger:
+                raise RuntimeError(
+                    "per-rank metric logging would silently drop data on this "
+                    "rank: it owns a disjoint slice of the per-parameter "
+                    "metrics but has no logger to write them to. The "
+                    "optimizer's ownership split and "
+                    "metrics._build_metric_logger's rank predicate have "
+                    "diverged; both must come from "
+                    "distributed.utils.rank_owns_metrics_shard."
+                )
+            elif _has_logger and not _owns_shard:
+                logger.warning(
+                    "this rank has a metrics logger but owns no metrics shard; "
+                    "it will log global scalars only. Harmless, but it means "
+                    "the two rank predicates disagree."
+                )
         if model_spec.post_optimizer_build_fn is not None:
             model_spec.post_optimizer_build_fn(
                 self.optimizers, self.model_parts, parallel_dims

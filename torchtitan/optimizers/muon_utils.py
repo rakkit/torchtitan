@@ -52,6 +52,39 @@ def zeropower_via_svd(G, **kwargs):
 
 
 # Polar Express
+# Polar-express coefficients (https://arxiv.org/abs/2505.16932), with the
+# 1/1.01 stabiliser applied to every triple except the limit. Factored out of
+# `zeropower_via_polar_express` so `gram_newton_schulz.gram_polar_express`
+# iterates on literally the same numbers -- the two backends should differ only
+# in how the polynomial is evaluated, never in which polynomial it is.
+_POLAR_EXPRESS_BASE = [
+    (8.28721201814563, -23.595886519098837, 17.300387312530933),
+    (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+    (3.948690853482295, -2.908902115962949, 0.5518191394370137),
+    (3.318419657370602, -2.488488024314874, 0.51004894012372),
+    (2.300652019954817, -1.668903984574749, 0.4188073119525673),
+    (1.891301407787398, -1.267995827194587, 0.3768040894852483),
+    (1.875001480853448, -1.250001645399949, 0.3750001645474248),
+    (1.875000000000000, -1.250000000000000, 0.375000000000000),  # limit
+]
+_POLAR_EXPRESS_STABILISED = [
+    (a / 1.01, b / (1.01**3), c / (1.01**5))
+    for (a, b, c) in _POLAR_EXPRESS_BASE[:-1]
+] + [_POLAR_EXPRESS_BASE[-1]]
+
+
+def polar_express_coefficients(steps: int) -> list[tuple[float, float, float]]:
+    """First `steps` polar-express triples, repeating the limit triple if
+    `steps` exceeds the table."""
+    coeffs = _POLAR_EXPRESS_STABILISED + list(
+        repeat(
+            _POLAR_EXPRESS_STABILISED[-1],
+            max(0, steps - len(_POLAR_EXPRESS_STABILISED)),
+        )
+    )
+    return coeffs[:steps]
+
+
 @torch.compile
 def zeropower_via_polar_express(G, steps=5, eps=1e-7):
     # https://arxiv.org/abs/2505.16932
@@ -63,24 +96,7 @@ def zeropower_via_polar_express(G, steps=5, eps=1e-7):
         G.dim() == 3
     ), f"Please make sure gradients are 2D or 3D tensors, got shape: {G.shape}"
 
-    coeffs_base = [
-        (8.28721201814563, -23.595886519098837, 17.300387312530933),
-        (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
-        (3.948690853482295, -2.908902115962949, 0.5518191394370137),
-        (3.318419657370602, -2.488488024314874, 0.51004894012372),
-        (2.300652019954817, -1.668903984574749, 0.4188073119525673),
-        (1.891301407787398, -1.267995827194587, 0.3768040894852483),
-        (1.875001480853448, -1.250001645399949, 0.3750001645474248),
-        (1.875000000000000, -1.250000000000000, 0.375000000000000),  # limit
-    ]
-
-    # apply the 1/1.01 stabiliser only to the first seven triples
-    coeffs_base = [
-        (a / 1.01, b / (1.01**3), c / (1.01**5)) for (a, b, c) in coeffs_base[:-1]
-    ] + [coeffs_base[-1]]
-    coeffs = coeffs_base + list(
-        repeat(coeffs_base[-1], max(0, steps - len(coeffs_base)))
-    )
+    coeffs = polar_express_coefficients(steps)
 
     original_dtype = G.dtype
     X = G.bfloat16()
@@ -216,6 +232,18 @@ zeropower_backends = dict(
     hybrid_polar_express_triton_down=hybrid_polar_express_triton_down,
     identity=lambda x, **kwargs: x,
 )
+
+# Registered after the dict so `gram_newton_schulz` can import
+# `polar_express_coefficients` from this module without a cycle. Opt in with
+# `--optimizer.zeropower_backend gram_polar_express`; the default is unchanged.
+# This one is on the *update path*, so switching it changes the training
+# trajectory -- see that module's docstring for the measured speed and accuracy.
+try:
+    from .gram_newton_schulz import gram_polar_express as _gram_polar_express
+
+    zeropower_backends["gram_polar_express"] = _gram_polar_express
+except Exception:  # pragma: no cover - optional, never break import
+    pass
 
 
 def _init_adamw_group(

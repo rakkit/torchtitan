@@ -172,6 +172,23 @@ class AbstractDiSCO(torch.optim.Optimizer):
         self.gram_level: int = 0
         self.gram_scalar_names: list[str] = []
         self.gram_vector_names: list[str] = []
+        # Whether the full singular-value spectrum is wanted this step. Only
+        # optimizers/spectrum_logging.py consumes it, and it discards every
+        # `track_spectrum_*` entry unless enable_spectrum_plot or
+        # enable_spectrum_export is set -- both of which default to False. The
+        # spectra are nonetheless computed, packed into the logging buffer,
+        # all-gathered and moved to CPU on the way there, and they are ~99% of
+        # that gather's payload. Threaded from the config through
+        # calculate_norm_at_next_step (rather than read from the config here)
+        # so the optimizer keeps its single entry point for per-step logging
+        # settings. Defaults True so an unaware caller sees the old behaviour.
+        self.track_spectrum: bool = True
+        # When True every rank writes the metrics for the parameters it owns
+        # and the logging all_gather is skipped entirely. Only correct if the
+        # metrics side actually instantiates a logger on those ranks, so it is
+        # derived from the same config predicate rather than set independently
+        # -- see MetricsProcessor.Config.save_all_shard_ranks.
+        self.log_metrics_locally: bool = False
         self.norms_at_current_step: dict[str, torch.Tensor] = {}
 
     def _refresh_gram_names(self):
@@ -180,7 +197,11 @@ class AbstractDiSCO(torch.optim.Optimizer):
 
     # ----- Step norm tracking -----
     def calculate_norm_at_next_step(
-        self, norms_to_log: list[str] = None, gram_level: int | None = None
+        self,
+        norms_to_log: list[str] = None,
+        gram_level: int | None = None,
+        track_spectrum: bool | None = None,
+        log_metrics_locally: bool | None = None,
     ):
         self.need_to_calculate_norm = True
         if norms_to_log is not None:
@@ -188,6 +209,10 @@ class AbstractDiSCO(torch.optim.Optimizer):
         if gram_level is not None:
             self.gram_level = gram_level
             self._refresh_gram_names()
+        if track_spectrum is not None:
+            self.track_spectrum = track_spectrum
+        if log_metrics_locally is not None:
+            self.log_metrics_locally = log_metrics_locally
         self.norms_at_current_step = {}
 
     def _is_logging_rank(self) -> bool:

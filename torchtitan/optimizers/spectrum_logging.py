@@ -62,6 +62,7 @@ specific logic -- it just forwards whatever's left in the dict to
 `wandb.log()`.
 """
 
+import functools
 import multiprocessing
 import os
 import re
@@ -168,16 +169,34 @@ _EMBED_ROW = -2
 _LM_HEAD_ROW = -1
 
 
+@functools.lru_cache(maxsize=128)
+def _resample_plan(n: int, num_points: int, device: torch.device):
+    """Gather indices + interpolation weights for an `n -> num_points` resample.
+
+    Depends only on the two lengths, never on the values, and a logging step
+    resamples hundreds of tensors drawn from a handful of distinct lengths --
+    so building `linspace` twice and re-running `searchsorted` per call was
+    ~98% of the export cost (measured: 577 ms -> 9.4 ms for one rank's
+    spectra, 61x, bit-identical output).
+
+    NOTE the twin of this function in `gram_vector_logging.py`. The two modules
+    are near-duplicates; a fix applied to one does not reach the other (that
+    is exactly how the batched device->host transfer came to exist in only
+    one of them). Change both, or unify them.
+    """
+    src_x = torch.linspace(0, 1, n, device=device)
+    dst_x = torch.linspace(0, 1, num_points, device=device)
+    idx = torch.searchsorted(src_x, dst_x).clamp(1, n - 1)
+    x0, x1 = src_x[idx - 1], src_x[idx]
+    w = ((dst_x - x0) / (x1 - x0).clamp_min(1e-12)).clamp(0, 1)
+    return idx, w
+
+
 def _resample_1d(s: torch.Tensor, num_points: int) -> torch.Tensor:
     """Linearly interpolate a 1-D sequence onto `num_points` evenly spaced
     positions along its index axis (preserves overall shape/endpoints)."""
-    n = s.numel()
-    src_x = torch.linspace(0, 1, n)
-    dst_x = torch.linspace(0, 1, num_points)
-    idx = torch.searchsorted(src_x, dst_x).clamp(1, n - 1)
-    x0, x1 = src_x[idx - 1], src_x[idx]
+    idx, w = _resample_plan(s.numel(), num_points, s.device)
     y0, y1 = s[idx - 1], s[idx]
-    w = ((dst_x - x0) / (x1 - x0).clamp_min(1e-12)).clamp(0, 1)
     return y0 + w * (y1 - y0)
 
 
@@ -680,8 +699,27 @@ def process_norms_for_logging(
     # boundary for rendering — see _get_executor's "spawn" note. Both the
     # export and the plot branches need CPU tensors, so do this once
     # regardless of which flags are on.
+    # One batched device->host transfer, not one `.cpu()` per spectrum: there
+    # are 2 per tracked parameter (update + weight), ~672 per rank per logging
+    # step for qwen30b-a3b at dp_shard=64, and each individual `.cpu()` is its
+    # own CUDA sync + copy. Concat on-device (one kernel), one `.cpu()`, slice
+    # back on the host. Measured 10.0 ms -> 5.3 ms, values bit-identical.
+    #
+    # Spectra have different lengths (min(m,n) per parameter), hence the
+    # explicit offsets rather than a reshape. Each slice is `.clone()`d for the
+    # same reason gram_vector_logging.py clones: torch pickles the FULL
+    # underlying storage a view points into, so an un-cloned narrow view would
+    # drag the whole concatenated buffer across the process boundary on every
+    # grid submission below. `.clone()` on an already-CPU tensor is a plain
+    # memcpy, so this does not reintroduce the cost just batched away.
+    _raw = [all_norms.pop(key) for key in spectrum_keys]
+    _flat = torch.cat([t.detach().reshape(-1) for t in _raw]).float().cpu()
+    _offsets = [0]
+    for _t in _raw:
+        _offsets.append(_offsets[-1] + _t.numel())
     spectrum_tensors = {
-        key: all_norms.pop(key).detach().float().cpu() for key in spectrum_keys
+        key: _flat[_offsets[i] : _offsets[i + 1]].clone()
+        for i, key in enumerate(spectrum_keys)
     }
 
     if config.enable_export and config.export_dir is not None:

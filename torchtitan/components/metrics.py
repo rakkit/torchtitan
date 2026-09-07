@@ -17,6 +17,7 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.utils import rank_owns_metrics_shard
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import Color, device_module, device_type, NoColor
@@ -345,6 +346,37 @@ class MetricsProcessor(Configurable):
         only stage that computes loss metrics.
         """
 
+        save_all_shard_ranks: bool = False
+        """
+        Whether every FSDP/EP shard rank saves its own metrics, instead of one
+        rank saving metrics gathered from all of them.
+
+        Logs on exactly the ranks that own a distinct slice of the metrics --
+        i.e. the mesh DiSCO partitions parameter ownership over is opened up,
+        and local rank 0 is required in every other mesh (see
+        `distributed/utils.rank_owns_metrics_shard`):
+
+          * with FSDP/EP: any fsdp/ep rank, at dp_replicate rank 0 and tp
+            rank 0. Replicas hold bit-identical copies, so only one logs.
+          * pure DDP (no dp_shard/cp): ownership is spread over dp_replicate
+            itself, so *every* dp_replicate rank logs, at tp rank 0.
+
+        Contrast `save_first_dp_and_tp`, which narrows to `loss`-mesh local
+        rank 0, and the `loss` mesh is dp_replicate x dp_shard x cp, so it
+        excludes every other shard rank.
+
+        Each shard rank owns a disjoint subset of the parameters and already
+        computes exactly that subset's metrics, so the union across ranks is
+        identical to what the single-rank path logs. Setting this lets DiSCO
+        skip the logging all_gather and, more importantly, stops one rank
+        building the metrics dict for the *whole* model: for qwen30b-a3b that is
+        845,664 entries per logging step on one rank versus 13,213 per rank
+        across 64 shards.
+
+        The cost is one W&B run per shard rank (`base_log_dir` already gets a
+        `rank_{n}` suffix), so a full picture means reading N runs.
+        """
+
         save_first_dp_and_tp: bool = False
         """
         Whether to save metrics only for DP+CP+TP rank 0, meaning that the
@@ -464,7 +496,20 @@ class MetricsProcessor(Configurable):
             )
             should_log = torch.distributed.get_rank() == metrics_rank
 
-        if config.save_first_dp_and_tp and should_log:
+        if config.save_all_shard_ranks and should_log:
+            # Exactly the ranks that own a distinct slice of the per-parameter
+            # metrics -- see `rank_owns_metrics_shard`. Under FSDP/EP that is
+            # any fsdp rank at dp_replicate 0; under pure DDP the shard
+            # dimension IS dp_replicate, so every replica logs. Hard-coding
+            # "dp_replicate rank 0" here (as this did) silently dropped
+            # (R-1)/R of every metric in a pure-DDP run.
+            should_log = rank_owns_metrics_shard(parallel_dims)
+
+        if (
+            config.save_first_dp_and_tp
+            and not config.save_all_shard_ranks
+            and should_log
+        ):
             # The first data-parallel group
 
             is_dp_rank_0 = (

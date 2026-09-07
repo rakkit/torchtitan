@@ -16,12 +16,13 @@ from torch.distributed.tensor.placement_types import _StridedShard, Replicate, S
 
 from torch.profiler import record_function  # labels in PyTorch profiler
 
+from torchtitan.distributed.utils import metrics_shard_rank, rank_owns_metrics_shard
 from torchtitan.tools.logging import logger
 
-from . import gram_helper
+from . import gram_helper, norm_helper, power_iteration
 from .abstract_disco import AbstractDiSCO
 from .gram_helper import calculate_gram_metrics
-from .norm_helper import calculate_norm
+from .norm_helper import calculate_norm, calculate_norm_batched
 from .pre_norm_helper import (
     pre_norm_category,
     PRE_NORM_FULL_FUNCTIONS,
@@ -33,6 +34,7 @@ from .radial_helper import (
     calculate_radial_metrics,
     new_radial_state,
     RADIAL_METRIC_NAMES,
+    SpectralInputs,
 )
 from .utils import remove_orig_mod_and_weight_for_p_name
 
@@ -137,6 +139,48 @@ def _pseudo_post_update_weight(w, u, lr, wd):
     """
     pseudo_w = w * (1.0 - wd * lr) if wd != 0.0 else w
     return pseudo_w - lr * u
+
+
+def _materialize_gathered(t: torch.Tensor) -> torch.Tensor:
+    """Resolve an `AsyncCollectiveTensor` into a plain tensor before unpacking.
+
+    `funcol.all_gather_tensor` returns an `AsyncCollectiveTensor`, a tensor
+    subclass that routes every operation through `__torch_dispatch__` so it can
+    insert the wait. The unpack loops below index the gathered buffer once per
+    (parameter, expert, metric) -- about 194k times per logging step for a
+    600M MoE -- and paying Python-level subclass dispatch on each of those is
+    enormously more expensive than the collective itself.
+
+    Measured, 193,536 index operations on the same buffer:
+        raw AsyncCollectiveTensor   6.93 s
+        after .wait()               0.28 s     (25x)
+
+    This was ~8.7 s of a 12.2 s `step_experts` logging pass. Resolving once, up
+    front, changes nothing semantically -- the wait has to happen before the
+    first read either way, this just stops it happening through the slow path
+    on every subsequent read.
+    """
+    wait = getattr(t, "wait", None)
+    return wait() if callable(wait) else t
+
+
+def _pop_spectrum(
+    norms: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Take the spectrum entries out of a `calculate_norm` result.
+
+    Returns `(spectrum, sigma_max)`. `calculate_norm` yields the full spectrum
+    when spectrum logging is on and only `sigma_max` when it is off, so radial
+    keeps its free leading singular value either way while the vector -- the
+    part that actually costs packing, all-gathering and a device-to-host copy
+    -- is skipped. Both keys must be removed before the caller iterates
+    `.values()`: the flat logging buffers are sized to `norms_to_log` exactly.
+    """
+    spectrum = norms.pop("spectrum", None)
+    sigma_max = norms.pop("sigma_max", None)
+    if sigma_max is None and spectrum is not None and spectrum.numel():
+        sigma_max = spectrum[0]
+    return spectrum, sigma_max
 
 
 def _pack_segments(
@@ -346,6 +390,95 @@ class DiSCO(AbstractDiSCO):
         # build once now
         self._build_param_lists()
 
+    @property
+    def _stores_norms(self) -> bool:
+        """Whether this rank keeps the metrics it just computed.
+
+        Normally only the one rank that unpacks the gathered buffer keeps them.
+        Under per-rank logging there is no gather and every shard rank owns a
+        disjoint slice of the parameters, so every rank must keep its own --
+        otherwise the ranks other than `is_dp_rank_0` compute their share and
+        silently discard it, which is exactly what happened before this existed
+        (ranks 1-3 logged 40 keys instead of ~65,000).
+
+        But "every rank" means every rank that owns a *distinct* slice, not
+        literally every rank. Under HSDP the dp_replicate replicas recompute
+        bit-identical metrics and have no logger (only replica 0 does), so
+        without `rank_owns_metrics_shard` they would each unpack their slice
+        and build the full metrics dict for a no-op LoggerContainer -- at
+        dp_shard=64 on 1024 GPUs that is 15 of every 16 ranks doing it for
+        nothing. This is the same predicate metrics.py uses to hand out
+        loggers, so "stores" and "can log" cannot drift apart.
+
+        Only *local* work is skipped by this. Every collective -- the gathers,
+        the a2as, `full_tensor()`, `lmo` -- runs on every rank regardless, and
+        `calculate_radial_metrics` still runs everywhere because its
+        accumulators live in `self.state[p]` and go through DCP.
+        """
+        if self.log_metrics_locally:
+            return rank_owns_metrics_shard(self.parallel_dims)
+        return self.is_dp_rank_0
+
+    @property
+    def _stores_replicated_norms(self) -> bool:
+        """Whether this rank keeps metrics for the *replicated* families.
+
+        embed and scalar params are materialized whole on every rank (both
+        paths hold / `full_tensor()` the entire parameter), so unlike the
+        fsdp/ddp/expert families they are NOT rank-disjoint: under per-rank
+        logging every rank computes bit-identical values for them and would
+        emit a world_size-fold duplicate of the same series.
+
+        Pin them to local rank 0 of the sharding mesh -- which is also the
+        rank that carries loss/tps/lr -- so the per-rank runs partition
+        exactly: rank 0 = global scalars + replicated params + its own shard,
+        ranks 1.. = their own shard only, and the union across ranks is
+        exactly the key set the gathered path logs. This also reproduces the
+        gathered path's values bit-for-bit, since that path likewise logs
+        rank 0's locally-computed copy.
+
+        Note the metrics are still *computed* on every rank; only the storing
+        is dropped. The compute is unavoidable here (the surrounding loop runs
+        collectives -- `get_momentum_or_grad(gather_to_local=True)`, `lmo`,
+        `full_tensor()` -- that every rank must enter), and `radial_helper`'s
+        accumulators live in `self.state[p]`, so they must stay identical on
+        every rank or a resharded checkpoint would disagree with itself.
+        """
+        if not self._stores_norms:
+            return False
+        if not self.log_metrics_locally:
+            return True
+        # Shared with components/metrics.py so the "which mesh is ownership
+        # spread over" question is answered in exactly one place.
+        return metrics_shard_rank(self.parallel_dims)[0] == 0
+
+    def _owns_replicated_param(self, idx: int) -> bool:
+        """Whether this rank computes+keeps metrics for replicated param `idx`.
+
+        embed/scalar params are materialized whole on every rank, so unlike the
+        sharded families their metrics are duplicated work: every rank was
+        computing `calculate_norm` and `calculate_gram_metrics` for ALL of them
+        and then all but one rank threw the result away. That is not a load
+        imbalance -- it is the same redundant cost on every rank, and it sits
+        on the critical path because the step waits for all of them.
+
+        Round-robin the params over the shard mesh so each rank computes only
+        its own `1/world_size` share. The union is still exactly the full set,
+        and it is still one rank per param, so the logged output is unchanged.
+
+        `calculate_radial_metrics` is deliberately NOT skipped by this -- its
+        accumulators live in `self.state[p]` and go through DCP, so every rank
+        must keep stepping them or a resharded checkpoint disagrees with
+        itself. Its accumulators do not depend on the spectral inputs, so
+        non-owner ranks can pass `spectral=None` and lose nothing that is kept.
+        """
+        if not self._stores_norms:
+            return False
+        if not self.log_metrics_locally:
+            return True
+        rank, world = metrics_shard_rank(self.parallel_dims)
+        return idx % world == rank
+
     def _ensure_default_param_state(self):
         """
         Lazy-init the per-param `self.state[p]` keys every trainable param
@@ -369,8 +502,30 @@ class DiSCO(AbstractDiSCO):
                 # -persistent via the default state_dict()/load_state_dict().
                 # 3-D (expert) params get one accumulator set PER expert
                 # index, since each expert has its own W_before/W_after.
+                #
+                # Sized by the LOCAL expert count, not `p.shape[0]`. `p` is a
+                # DTensor whose dim 0 is sharded over the fsdp mesh, so
+                # `p.shape[0]` is the *global* expert count (e.g. 128) while
+                # step_experts only ever steps this rank's `ep_per_rank` (e.g.
+                # 2) and indexes the accumulators by the LOCAL expert slot.
+                # Allocating globally left 126/128 of every buffer permanently
+                # zero and made the index mean two different things depending
+                # on where you read it.
+                #
+                # These accumulators are therefore RANK-LOCAL state indexed by
+                # local expert slot: on rank r, slot e is global expert
+                # `e + r*ep_per_rank`. That mapping only holds for the
+                # topology that produced it, so a checkpoint restored at a
+                # different `dp_shard` would attach each expert's history to
+                # the wrong expert. Making this a DTensor sharded like `p`
+                # (the way `momentum_buffer` already is, via `zeros_like`)
+                # would fix that properly -- see readme.md.
                 if "radial_state" not in self.state[p]:
-                    accum_shape = (p.shape[0],) if p.ndim == 3 else ()
+                    if p.ndim == 3:
+                        p_loc = p.to_local() if isinstance(p, DTensor) else p
+                        accum_shape = (p_loc.shape[0],)
+                    else:
+                        accum_shape = ()
                     self.state[p]["radial_state"] = new_radial_state(
                         p.device, shape=accum_shape
                     )
@@ -605,6 +760,15 @@ class DiSCO(AbstractDiSCO):
         self._param_local_views: dict[int, torch.Tensor] = {}
         self._momentum_buffer_by_param_id: dict[int, torch.Tensor] = {}
         self._radial_state_by_param_id: dict[int, dict[str, torch.Tensor]] = {}
+        # Warm-start vectors for optimizers/power_iteration.py, keyed by id(p)
+        # (and by (id(p), expert_index) for 3-D expert params). Deliberately a
+        # plain attribute and NOT part of self.state: it is pure scratch that
+        # only exists on whichever rank materialises that parameter's full
+        # pre-update weight, so putting it in self.state would push a tensor
+        # with rank-varying presence through DCP for no benefit. The cost of
+        # not checkpointing it is one cold power-iteration start on the first
+        # logging step after a restart.
+        self._power_iter_v_by_param_id: dict = {}
         self._zero_scalar: torch.Tensor | None = None
         self._padding_norms: dict[str, torch.Tensor] | None = None
 
@@ -2848,6 +3012,273 @@ class DiSCO(AbstractDiSCO):
         self.need_to_calculate_norm = False
         return loss
 
+    def _batched_expert_norms(self, entries, transpose):
+        """Compute update- and weight-norms for every local expert in one go.
+
+        `entries` is a list of `(key, p_local, u, lr, wd)` with `p_local` and
+        `u` shaped `[E, m, n]`. Returns `{key: (upd_norm_dicts, w_norm_dicts)}`,
+        each a list of length `E` whose entry `i` is exactly what
+        `calculate_norm` would have returned for expert `i`.
+
+        Why this exists: `step_experts` used to call `calculate_norm` once per
+        expert, so a decomposition per matrix. For qwen30b-a3b at EP=64 a rank
+        owns 47 MoE layers x 3 matrices x 2 local experts = 282 matrices of
+        [768,2048], and one-at-a-time that is ~23 s of SVD per logging step.
+
+        The batch has to be built **across layers**. Batching a single
+        parameter's expert axis is worthless at the 1-2 local experts per rank
+        that 64-128 GPU runs actually have -- measured 1.00x at E=1 and 0.56x
+        at E=2. Every expert matrix in the model shares one of two shapes, so
+        grouping by shape across all blocks gives batches in the hundreds.
+
+        Measured per rank per logging step for that 282-matrix workload:
+            per-matrix, all norms (before)      23.5 s
+            batched, all norms                  11.4 s   (gesvd does not batch)
+            per-matrix, sigma-only tier          2.3 s
+            batched, sigma-only tier             0.33 s   (~70x)
+        The large win needs `norms_to_log` to exclude `condition_number` and
+        `effective_rank*`, which are what force the accurate driver.
+
+        Chunked at `_GESVDA_MAX_BATCH` so peak extra memory is bounded by the
+        chunk rather than by the whole model's expert weights, and so the
+        approximate driver stays inside the batch size it accepts.
+        """
+        results: dict = {}
+        if not entries:
+            return results
+        want_spectrum = self.track_spectrum
+        # Which path a group takes decides its batch size, and the two have
+        # different limits. The full-spectrum path goes through the float64
+        # Gram, whose batch is bounded by memory (`gram_batch_capacity`); the
+        # sigma-only path goes through `gesvda`, which has a hard batch limit.
+        # Using the gesvda cap for both was measurably throttling the Gram
+        # path -- 5376 [384,1024] matrices took 1236 ms at 128 versus 849 ms
+        # unchunked.
+        requested = set(self.norms_to_log)
+        full_spectrum = want_spectrum or not requested.issubset(
+            norm_helper._SVD_FREE_NORMS | norm_helper._SIGMA_ONLY_NORMS
+        )
+
+        def _cap_for(shape) -> int:
+            if not full_spectrum:
+                return max(int(norm_helper._GESVDA_MAX_BATCH), 1)
+            return norm_helper.gram_batch_capacity(shape[0], shape[1])
+
+        def flush(group):
+            if not group:
+                return
+            upd = torch.cat([-lr * u for (_k, _pl, u, lr, _wd) in group], dim=0)
+            pw = torch.cat(
+                [
+                    # `pl[: u.shape[0]]`, not `pl`: the per-expert loop this
+                    # replaces iterates `range(u.shape[0])` and indexes
+                    # `p_local` with the same index, so a parameter holding
+                    # more expert slots than the update covers must contribute
+                    # only that prefix -- otherwise the batch would be longer
+                    # than the update batch and every offset after it would be
+                    # wrong.
+                    _pseudo_post_update_weight(pl[: u.shape[0]], u, lr, wd)
+                    for (_k, pl, u, lr, wd) in group
+                ],
+                dim=0,
+            )
+            un = calculate_norm_batched(
+                upd,
+                self.norms_to_log,
+                transpose=transpose,
+                want_spectrum=want_spectrum,
+            )
+            wn = calculate_norm_batched(
+                pw,
+                self.norms_to_log,
+                transpose=transpose,
+                want_spectrum=want_spectrum,
+            )
+
+            # Pre-update weight's leading singular triple, for radial's
+            # spectral/radiality metrics. Batched for the same reason the norms
+            # are: per-expert this is a decomposition each, ~4.6 s per logging
+            # step for the 1344 expert matrices a rank owns here, versus ~0.3 s
+            # in shape-grouped batches.
+            spec_by_key: dict = {}
+            if not power_iteration.IS_STUB:
+                wb = torch.cat(
+                    [pl[: u.shape[0]] for (_k, pl, u, _lr, _wd) in group], dim=0
+                )
+                sig_b, u1_b, v1_b = norm_helper.gram_top_singular_pair(wb)
+                # aus_rms_to_rms needs sigma_max of the normalised difference,
+                # which is a second decomposition -- also batched here rather
+                # than once per expert.
+                tiny = torch.finfo(torch.float32).tiny
+                # The TRUE displacement, `pseudo_w - W_before`, not `-lr*u`.
+                # With weight decay they differ: `U = -lr*u - wd*lr*W_before`.
+                # radial's `sigma_update` and `aus_sigma` are both defined
+                # against U, so using `upd` here would normalise by the norm of
+                # a different tensor -- silently wrong rather than absent. The
+                # dense path (`_radial_spectral_inputs`) already computes
+                # sigma_update from `W_after - W_before` for exactly this
+                # reason; this makes the expert path agree with it instead of
+                # declining under `wd != 0`.
+                u_true = pw.float() - wb.float()
+                sig_u_b = norm_helper.gram_top_singular_pair(u_true)[0]
+                diff = wb.float() / sig_b.clamp_min(tiny)[:, None, None] - u_true / (
+                    sig_u_b.clamp_min(tiny)[:, None, None]
+                )
+                aus_b = norm_helper.gram_top_singular_pair(diff)[0]
+                del diff, u_true
+                del wb
+                off2 = 0
+                for (k, _pl, u, _lr, _wd) in group:
+                    e = u.shape[0]
+                    spec_by_key[k] = (
+                        sig_b[off2 : off2 + e],
+                        u1_b[off2 : off2 + e],
+                        v1_b[off2 : off2 + e],
+                        None if sig_u_b is None else sig_u_b[off2 : off2 + e],
+                        None if aus_b is None else aus_b[off2 : off2 + e],
+                    )
+                    off2 += e
+
+            del upd, pw
+            off = 0
+            for (k, _pl, u, _lr, _wd) in group:
+                e = u.shape[0]
+                results[k] = (
+                    [{n: un[n][off + i] for n in un} for i in range(e)],
+                    [{n: wn[n][off + i] for n in wn} for i in range(e)],
+                    spec_by_key.get(k),
+                )
+                off += e
+
+        # Group by (shape, dtype) first -- torch.cat needs both to agree, and
+        # only equally-shaped matrices can share a batched decomposition --
+        # then chunk each group.
+        by_shape: dict = {}
+        for ent in entries:
+            by_shape.setdefault(
+                (tuple(ent[2].shape[1:]), ent[2].dtype, ent[1].dtype), []
+            ).append(ent)
+        for key, group in by_shape.items():
+            cap = _cap_for(key[0])
+            pending, count = [], 0
+            for ent in group:
+                e = ent[2].shape[0]
+                if pending and count + e > cap:
+                    flush(pending)
+                    pending, count = [], 0
+                pending.append(ent)
+                count += e
+            flush(pending)
+        return results
+
+    def _radial_spectral_inputs(
+        self,
+        cache_key,
+        W_before: torch.Tensor,
+        W_after: torch.Tensor,
+        w_spectrum: torch.Tensor | None,
+        upd_spectrum: torch.Tensor | None,
+        wd: float,
+    ) -> SpectralInputs | None:
+        """
+        Assemble radial_helper.SpectralInputs for one parameter, reusing what
+        the norm pass has already produced and computing only what it has not.
+
+        This is why the metric families are ordered norm -> radial -> gram: the
+        two sigma_max values below are literally the first entry of spectra
+        `calculate_norm` returned moments earlier, so radial gets them for the
+        cost of an index.
+
+        What is free and what is not:
+
+        * `sigma_after` is `spectrum[0]` of `pseudo_w`. `calculate_norm`
+          returns the spectrum sorted descending (and for a 1-D parameter,
+          `sort(|v|)`, whose first entry is likewise sigma_max of the diagonal
+          matrix it represents), so this is exact at zero cost.
+        * `sigma_update` is `spectrum[0]` of `-lr*u` -- but only when
+          `wd == 0`. radial's displacement is
+          `U = pseudo_w - W_before = -lr*u - wd*lr*W_before`, which equals
+          `-lr*u` only without weight decay. Reusing the update spectrum when
+          `wd != 0` would silently divide by the norm of a different tensor, so
+          it is not reused there.
+        * `sigma_before`, the leading singular vectors, and `aus_sigma` are NOT
+          free: `calculate_norm` is never called on the pre-update weight.
+          These come from optimizers/power_iteration.py.
+
+        While power_iteration is a stub, everything that depends on it is
+        skipped rather than filled with meaningless numbers -- the affected
+        metrics stay at radial_helper's 0 sentinel, and no compute or memory is
+        spent producing them. Flipping `power_iteration.IS_STUB` to False turns
+        them on with no change here.
+
+        Takes `W_after` rather than the displacement `U`: `U = W_after -
+        W_before` is a full-size allocation, only the power-iteration branch
+        needs it, and forming it at the call site would pay for it on every
+        logged parameter every logging step even while that branch is skipped
+        (~1 GiB for a large vocab embedding). radial_helper computes its own
+        `U` regardless, so building it here too would duplicate it in any case.
+        """
+
+        def _leading(x: torch.Tensor | None) -> torch.Tensor | None:
+            # Call sites pass either a full descending spectrum or, where the
+            # norm and weight passes are split across two loops (step_ddp), the
+            # already-extracted leading value.
+            if x is None:
+                return None
+            if x.ndim == 0:
+                return x
+            return x[0] if x.numel() else None
+
+        sigma_after = _leading(w_spectrum)
+        sigma_update = _leading(upd_spectrum) if wd == 0.0 else None
+
+        sigma_before = None
+        u1 = v1 = aus_sigma = None
+        if W_before.ndim == 1:
+            # A 1-D parameter stands for diag(v), whose largest singular value
+            # is exactly max|v| -- no decomposition needed, so this one is free
+            # even though the general case is not.
+            sigma_before = W_before.detach().abs().max().float()
+        elif W_before.ndim == 2 and not power_iteration.IS_STUB:
+            sigma_before, u1, v1 = power_iteration.top_singular_pair(
+                W_before, v0=self._power_iter_v_by_param_id.get(cache_key)
+            )
+            self._power_iter_v_by_param_id[cache_key] = v1
+            U = W_after - W_before
+            if sigma_update is None:
+                sigma_update = power_iteration.spectral_norm(U)
+            if sigma_update is not None:
+                # aus_rms_to_rms needs sigma_max of the normalised difference,
+                # a matrix radial_helper never forms. Built here (and freed
+                # immediately) so radial_helper does not have to own an extra
+                # full-size temporary of its own.
+                #
+                # No `if sigma_before > 0` guard: reading a 0-d device tensor
+                # into Python would sync the CPU against the compute stream
+                # once per parameter per logging step, which is exactly the
+                # per-item stall this optimizer's workspace design exists to
+                # avoid. The clamp_min below already keeps the division finite,
+                # and radial_helper's _guarded_radiality zeroes the result on a
+                # degenerate step anyway.
+                tiny = torch.finfo(torch.float32).tiny
+                diff = W_before.float() / sigma_before.clamp_min(tiny) - U.float() / (
+                    sigma_update.clamp_min(tiny)
+                )
+                aus_sigma = power_iteration.spectral_norm(diff)
+                del diff
+            del U
+
+        if sigma_after is None and sigma_update is None and sigma_before is None:
+            return None
+        return SpectralInputs(
+            sigma_before=sigma_before,
+            u1_before=u1,
+            v1_before=v1,
+            sigma_after=sigma_after,
+            sigma_update=sigma_update,
+            aus_sigma=aus_sigma,
+        )
+
     @record_function("disco.step_scalar")
     @torch.compile()
     def step_scalar(
@@ -2895,7 +3326,7 @@ class DiSCO(AbstractDiSCO):
             # update norm is constant (learning_rate * 1.0).
             final_norms[f"scalar_param_supremum/{cleaned_p_name}"] = p_local.abs()
 
-        if self.is_dp_rank_0:
+        if self._stores_replicated_norms:
             self.norms_at_current_step.update(final_norms)
 
     @record_function("disco.step_embedding")
@@ -3040,18 +3471,34 @@ class DiSCO(AbstractDiSCO):
 
                 need_T = CONST_NAME_OF_EMBEDDING in p_name
 
+                # Every rank holds these params whole, so every rank was
+                # computing every one of their norms and gram metrics and all
+                # but one rank discarded the result. Compute only this rank's
+                # round-robin share. The collectives above/below still run on
+                # every rank -- only the local linear algebra is skipped.
+                owns = self._owns_replicated_param(i)
+
                 # Use pre-alloc float32 scratch to avoid -lr*u temp allocation (extras only)
                 scratch = norm_scratch[i]
-                if scratch is not None and scratch.shape == u.shape:
+                if not owns:
+                    upd_norms, upd_spectrum, upd_sigma = {}, None, None
+                elif scratch is not None and scratch.shape == u.shape:
                     torch.mul(u, -lr, out=scratch)
                     upd_norms = calculate_norm(
-                        scratch, self.norms_to_log, transpose=need_T
+                        scratch,
+                        self.norms_to_log,
+                        transpose=need_T,
+                        want_spectrum=self.track_spectrum,
                     )
+                    upd_spectrum, upd_sigma = _pop_spectrum(upd_norms)
                 else:
                     upd_norms = calculate_norm(
-                        -lr * u, self.norms_to_log, transpose=need_T
+                        -lr * u,
+                        self.norms_to_log,
+                        transpose=need_T,
+                        want_spectrum=self.track_spectrum,
                     )
-                upd_spectrum = upd_norms.pop("spectrum")
+                    upd_spectrum, upd_sigma = _pop_spectrum(upd_norms)
 
                 # Gather the parameter itself to a full tensor. The real
                 # update hasn't been applied yet at this point, so this is
@@ -3060,8 +3507,45 @@ class DiSCO(AbstractDiSCO):
                     p = p.full_tensor()
 
                 pseudo_w = _pseudo_post_update_weight(p, u, lr, wd)
-                wnorm = calculate_norm(pseudo_w, self.norms_to_log, transpose=need_T)
-                w_spectrum = wnorm.pop("spectrum")
+                if owns:
+                    wnorm = calculate_norm(
+                        pseudo_w,
+                        self.norms_to_log,
+                        transpose=need_T,
+                        want_spectrum=self.track_spectrum,
+                    )
+                    w_spectrum, w_sigma = _pop_spectrum(wnorm)
+                else:
+                    wnorm, w_spectrum, w_sigma = {}, None, None
+
+                # Whole-tensor radial-dynamics metrics -- always computed,
+                # independent of gram_level/norms_to_log (see
+                # radial_helper.py); reuses the exact (p, pseudo_w) pair
+                # also used as gram's (W_before, W_after).
+                #
+                # Ordered norm -> radial -> gram: radial consumes sigma_max
+                # from the two spectra the norm pass just produced (see
+                # _radial_spectral_inputs), so it has to run after norm; gram
+                # consumes nothing from radial and so runs last.
+                radial_metrics = calculate_radial_metrics(
+                    p,
+                    pseudo_w,
+                    self._radial_state_by_param_id[original_pid],
+                    # Non-owner ranks pass None: the four accumulators
+                    # (raw_A2/angular_A1/angular_A2/R1) depend only on
+                    # W_before/W_after, never on the spectral inputs, so they
+                    # step identically on every rank -- which is what DCP
+                    # requires -- while the spectral metrics take their 0
+                    # sentinel on ranks that discard the dict anyway.
+                    spectral=(
+                        self._radial_spectral_inputs(
+                            original_pid, p, pseudo_w, w_sigma, upd_sigma, wd
+                        )
+                        if owns
+                        else None
+                    ),
+                    transpose=need_T,
+                )
 
                 # embed_params includes the output/lm_head weight, shape
                 # [vocab_size, hidden_dim] -- calculate_gram_metrics now
@@ -3076,16 +3560,12 @@ class DiSCO(AbstractDiSCO):
                 # separate from gram_level, see readme.md.
                 gram_metrics = (
                     calculate_gram_metrics(p, g, pseudo_w, level=self.gram_level)
-                    if self.track_embed_gram
+                    if (self.track_embed_gram and owns)
                     else {}
                 )
-                # Whole-tensor radial-dynamics metrics -- always computed,
-                # independent of gram_level/norms_to_log (see
-                # radial_helper.py); reuses the exact (p, pseudo_w) pair
-                # already used as gram's (W_before, W_after).
-                radial_metrics = calculate_radial_metrics(
-                    p, pseudo_w, self._radial_state_by_param_id[original_pid]
-                )
+                if not owns:
+                    # Nothing below is kept for this param on this rank.
+                    continue
 
                 cleaned_p_name = remove_orig_mod_and_weight_for_p_name(p_name)
                 gram_p_name = _gram_log_param_name(cleaned_p_name, tuple(p.shape))
@@ -3103,10 +3583,17 @@ class DiSCO(AbstractDiSCO):
                 # This path already operates on fully-materialized local tensors
                 # (no FSDP/EP sharding survives to this point), so the spectrum is
                 # already complete locally — no extra collective is needed.
-                final_norms[f"track_spectrum_update/{cleaned_p_name}"] = upd_spectrum
-                final_norms[f"track_spectrum_param/{cleaned_p_name}"] = w_spectrum
+                if upd_spectrum is not None:
+                    final_norms[
+                        f"track_spectrum_update/{cleaned_p_name}"
+                    ] = upd_spectrum
+                if w_spectrum is not None:
+                    final_norms[f"track_spectrum_param/{cleaned_p_name}"] = w_spectrum
 
-            if self.is_dp_rank_0:
+            # Per-param ownership was already applied above (`_owns_replicated_param` + `continue`),
+            # so `final_norms` holds only this rank's share -- the gate here is just "does
+            # this rank keep metrics at all".
+            if self._stores_norms:
                 self.norms_at_current_step.update(final_norms)
 
         # ===== UPDATE =====
@@ -3209,7 +3696,11 @@ class DiSCO(AbstractDiSCO):
             torch.zeros(
                 self._expert_spectrum_total_size, dtype=torch.float32, device=device
             )
-            if need_to_calculate_norm and self._expert_spectrum_total_size > 0
+            if (
+                need_to_calculate_norm
+                and self.track_spectrum
+                and self._expert_spectrum_total_size > 0
+            )
             else None
         )
         weight_spectrum_flat = (
@@ -3232,6 +3723,31 @@ class DiSCO(AbstractDiSCO):
         )
 
         if need_to_calculate_norm:
+            # Update- and weight-norms for every local expert, computed up
+            # front in shape-grouped batches instead of one decomposition per
+            # expert matrix inside the loop below -- see
+            # _batched_expert_norms for the measurements and for why the batch
+            # has to be built across layers rather than across a parameter's
+            # expert axis. The consuming loop keeps its exact previous
+            # structure and packing order; only the two calculate_norm calls
+            # became lookups.
+            norm_entries = []
+            for block_idx, (start, end) in enumerate(blocks):
+                block_params = expert_params[start:end]
+                block_updates = all_updates[start:end]
+                if not block_params or not block_updates:
+                    continue
+                lr_b, _, _, wd_b, _ = self.groups_info[
+                    self._expert_block_group_idx[block_idx]
+                ]
+                for p_pos, (p, u) in enumerate(zip(block_params, block_updates)):
+                    if u is None:
+                        continue
+                    p_local_b = p.to_local() if isinstance(p, DTensor) else p
+                    norm_entries.append(((block_idx, p_pos), p_local_b, u, lr_b, wd_b))
+            batched_norms = self._batched_expert_norms(norm_entries, transpose)
+            del norm_entries
+
             for block_idx, (start, end) in enumerate(blocks):
                 block_params = expert_params[start:end]
                 block_updates = all_updates[start:end]
@@ -3252,16 +3768,54 @@ class DiSCO(AbstractDiSCO):
                     self._expert_block_group_idx[block_idx]
                 ]
                 local_pos = 0
-                for p, u, g_raw in zip(block_params, block_updates, block_raw_grads):
+                for p_pos, (p, u, g_raw) in enumerate(
+                    zip(block_params, block_updates, block_raw_grads)
+                ):
                     if u is None:
                         continue
                     assert u.ndim == 3
                     p_local = p.to_local() if isinstance(p, DTensor) else p
-                    for ep_idx in range(u.shape[0]):
-                        update_norms = calculate_norm(
-                            u[ep_idx], self.norms_to_log, transpose=transpose
-                        )
-                        upd_spec = update_norms.pop("spectrum")
+                    batched_upd, batched_w, batched_spec = batched_norms[
+                        (block_idx, p_pos)
+                    ]
+                    # The per-expert work is split into three passes so the
+                    # radial family can run ONCE for all of this param's
+                    # experts instead of once each: it was ~65% of
+                    # step_experts, and its cost is CPU dispatch over the many
+                    # small 0-d ops that 26 metrics need, which is exactly what
+                    # batching over the expert axis removes. Order across the
+                    # passes is still norm -> radial -> gram.
+                    #
+                    # `local_pos` is derived from `p_start_pos + ep_idx` rather
+                    # than incremented, so both passes address the same slot
+                    # for the same expert.
+                    n_ep = u.shape[0]
+                    p_start_pos = local_pos
+                    # Elementwise, so one batched call equals the per-expert
+                    # ones exactly (see _pseudo_post_update_weight).
+                    # p_local may carry more expert slots than were stepped
+                    # (`u.shape[0]`); the per-expert path only ever touched the
+                    # first n_ep, so slice to match rather than rely on them
+                    # being equal.
+                    p_local = p_local[:n_ep]
+                    pseudo_w_all = _pseudo_post_update_weight(p_local, u, lr, wd)
+                    w_sigmas: list = []
+                    upd_sigmas: list = []
+                    # ---- pass 1: norm family ----
+                    for ep_idx in range(n_ep):
+                        local_pos = p_start_pos + ep_idx
+                        # Computed above by _batched_expert_norms, one
+                        # decomposition per shape-chunk across all layers
+                        # instead of one per expert matrix. `dict(...)` because
+                        # _pop_spectrum below mutates what it is handed.
+                        #
+                        # The measured quantity is `-lr * u`, matching
+                        # step_embedding / step_ddp / step_fsdp. This path
+                        # previously measured the bare LMO output, leaving
+                        # track_update_* for expert params off by a factor of
+                        # lr relative to every other family.
+                        update_norms = dict(batched_upd[ep_idx])
+                        upd_spec, upd_sigma = _pop_spectrum(update_norms)
                         norms_of_update.extend(update_norms.values())
                         if update_spectrum_flat is not None:
                             off = block_base + local_pos * K_block
@@ -3272,19 +3826,112 @@ class DiSCO(AbstractDiSCO):
                         # step_embedding/step_ddp/step_fsdp -- used for both
                         # track_param_* (historical post-update meaning) and
                         # as gram's W_after argument below.
-                        pseudo_w = _pseudo_post_update_weight(
-                            p_local[ep_idx], u[ep_idx], lr, wd
-                        )
-                        weight_norms = calculate_norm(
-                            pseudo_w,
-                            self.norms_to_log,
-                            transpose=transpose,
-                        )
-                        w_spec = weight_norms.pop("spectrum")
+                        pseudo_w = pseudo_w_all[ep_idx]
+                        weight_norms = dict(batched_w[ep_idx])
+                        w_spec, w_sigma = _pop_spectrum(weight_norms)
                         norms_of_weight.extend(weight_norms.values())
                         if weight_spectrum_flat is not None:
                             off = block_base + local_pos * K_block
                             weight_spectrum_flat[off : off + K_block].copy_(w_spec)
+
+                        w_sigmas.append(w_sigma)
+                        upd_sigmas.append(upd_sigma)
+
+                    # ---- pass 2: radial family, batched over the expert axis
+                    # Ordered norm -> radial -> gram: radial consumes sigma_max
+                    # from the two spectra the norm pass just produced (see
+                    # _radial_spectral_inputs); gram consumes nothing from
+                    # radial and runs last.
+                    #
+                    # `p` is never reassigned in this loop (only the derived
+                    # `p_local` is), so id(p) is safe to use directly.
+                    # radial_state is allocated with this rank's LOCAL expert
+                    # count, which is exactly the `[E]` accumulator layout
+                    # batch_ndim=1 expects, so this slice is normally a no-op.
+                    # It is kept as a guard for the case where fewer experts
+                    # are stepped than allocated (`u.shape[0]` < local count),
+                    # matching what the per-expert loop did by indexing
+                    # [ep_idx] for ep_idx < n_ep. It is a view, so the in-place
+                    # add_ inside calculate_radial_metrics still writes through
+                    # to self.state[p].
+                    radial_state_for_p = {
+                        k: v[:n_ep]
+                        for k, v in self._radial_state_by_param_id[id(p)].items()
+                    }
+                    if batched_spec is not None:
+                        # Already stacked over the expert axis by
+                        # _batched_expert_norms.
+                        radial_spectral = SpectralInputs(
+                            sigma_before=batched_spec[0],
+                            u1_before=batched_spec[1],
+                            v1_before=batched_spec[2],
+                            # `w_sigmas` entries are None when `norms_to_log`
+                            # needs no decomposition (e.g. ["supremum"]):
+                            # `calculate_norm_batched` then returns no
+                            # `sigma_max` and `_pop_spectrum` yields None.
+                            # `torch.stack` on a list of None raises, so guard.
+                            sigma_after=(
+                                torch.stack(w_sigmas)
+                                if w_sigmas and all(x is not None for x in w_sigmas)
+                                else None
+                            ),
+                            # No `wd != 0` guard any more: batched_spec[3] is
+                            # sigma_max of the TRUE displacement
+                            # (`pseudo_w - W_before`), computed in
+                            # `_batched_expert_norms`, so it is valid for any
+                            # weight decay -- matching the dense path.
+                            sigma_update=batched_spec[3],
+                            aus_sigma=(
+                                None if batched_spec[4] is None else batched_spec[4]
+                            ),
+                        )
+                    else:
+                        # Fallback (power_iteration disabled): the per-expert
+                        # helper has no batched form, so stack what it returns.
+                        per_ep = [
+                            self._radial_spectral_inputs(
+                                (id(p), e),
+                                p_local[e],
+                                pseudo_w_all[e],
+                                w_sigmas[e],
+                                upd_sigmas[e],
+                                wd,
+                            )
+                            for e in range(n_ep)
+                        ]
+                        # `_radial_spectral_inputs` returns SpectralInputs
+                        # or None, and any individual field may be None; a
+                        # field is only usable batched if every expert
+                        # supplied it.
+                        if any(si is None for si in per_ep):
+                            radial_spectral = None
+                        else:
+                            radial_spectral = SpectralInputs(
+                                *[
+                                    None
+                                    if any(si[f] is None for si in per_ep)
+                                    else torch.stack([si[f] for si in per_ep])
+                                    for f in range(len(SpectralInputs._fields))
+                                ]
+                            )
+                    radial_metrics = calculate_radial_metrics(
+                        p_local,
+                        pseudo_w_all,
+                        radial_state_for_p,
+                        spectral=radial_spectral,
+                        transpose=transpose,
+                        batch_ndim=1,
+                    )
+                    # Append order must stay [expert][metric] -- the unpack
+                    # does divmod(rem, E*K) then divmod(rem2, K).
+                    for ep_idx in range(n_ep):
+                        for name in RADIAL_METRIC_NAMES:
+                            norms_of_radial.append(radial_metrics[name][ep_idx])
+
+                    # ---- pass 3: gram family ----
+                    for ep_idx in range(n_ep):
+                        local_pos = p_start_pos + ep_idx
+                        pseudo_w = pseudo_w_all[ep_idx]
 
                         # p_local[ep_idx] (pre-update), g_raw[ep_idx] (raw
                         # pre-LMO moment), and pseudo_w (post-update) are all
@@ -3308,25 +3955,7 @@ class DiSCO(AbstractDiSCO):
                                 gram_vec_flat[voff : voff + K_block_vec].copy_(
                                     gram_metrics[vname]
                                 )
-
-                        # `p` is never reassigned in this loop (only the
-                        # derived `p_local` is), so id(p) is safe to use
-                        # directly -- unlike step_embedding/step_ddp/
-                        # step_fsdp, which reassign their weight variable in
-                        # place and need to capture the id beforehand.
-                        # Per-expert accumulator state: radial_state's
-                        # tensors are shaped (num_local_experts,) for 3-D
-                        # expert params (see the lazy-init above), so index
-                        # by ep_idx to get this expert's own 0-d views.
-                        radial_state_for_p = self._radial_state_by_param_id[id(p)]
-                        radial_metrics = calculate_radial_metrics(
-                            p_local[ep_idx],
-                            pseudo_w,
-                            {k: v[ep_idx] for k, v in radial_state_for_p.items()},
-                        )
-                        for name in RADIAL_METRIC_NAMES:
-                            norms_of_radial.append(radial_metrics[name])
-                        local_pos += 1
+                    local_pos = p_start_pos + n_ep
 
         if not skip_update:
             if any(u is not None for u in all_updates):
@@ -3380,12 +4009,25 @@ class DiSCO(AbstractDiSCO):
                     local_parts.append(weight_spectrum_flat)
 
             local_buf = torch.cat(local_parts)
-            gathered = funcol.all_gather_tensor(
-                local_buf, gather_dim=0, group=fsdp_mesh
-            )
+            # With per-rank logging every shard writes the parameters it owns,
+            # so there is nothing to bring together: skip the collective and
+            # unpack this rank's slice only. That also stops one rank building
+            # the metrics dict for the whole model -- 845,664 entries per
+            # logging step for qwen30b-a3b, versus 13,213 per rank over 64
+            # shards. Ownership is already disjoint and complete, so the union
+            # across ranks is exactly what the gathered path logs.
+            log_local = self.log_metrics_locally
+            if log_local:
+                gathered = local_buf
+                unpack_ranks = [local_rank]
+            else:
+                gathered = _materialize_gathered(
+                    funcol.all_gather_tensor(local_buf, gather_dim=0, group=fsdp_mesh)
+                )
+                unpack_ranks = list(range(world_size))
             per_rank_total = local_buf.numel()
 
-            if local_rank == 0:
+            if self._stores_norms:
                 norm_names = list(self.norms_to_log)
 
                 P = len(expert_params)  # parameters per rank
@@ -3401,87 +4043,81 @@ class DiSCO(AbstractDiSCO):
                     self._expert_gram_vec_total_size if gram_vec_flat is not None else 0
                 )
 
-                for idx in range(world_size * block):
-                    r, rem = divmod(idx, block)  # producing rank
-                    p, rem2 = divmod(rem, E * K)  # parameter index
-                    e, k = divmod(rem2, K)  # expert, norm indices
+                for r in unpack_ranks:
+                    rank_base = 0 if log_local else r * per_rank_total
+                    for rem in range(block):
+                        p, rem2 = divmod(rem, E * K)  # parameter index
+                        e, k = divmod(rem2, K)  # expert, norm indices
 
-                    actual_ep_idx = e + r * E
-                    if actual_ep_idx >= expert_params[0].shape[0]:
-                        continue  # skip pure padding slots
+                        actual_ep_idx = e + r * E
+                        if actual_ep_idx >= expert_params[0].shape[0]:
+                            continue  # skip pure padding slots
 
-                    cleaned_name = remove_orig_mod_and_weight_for_p_name(
-                        expert_param_names[p]
-                    )
-                    norm_name = norm_names[k]
-                    rank_base = r * per_rank_total
+                        cleaned_name = remove_orig_mod_and_weight_for_p_name(
+                            expert_param_names[p]
+                        )
+                        norm_name = norm_names[k]
 
-                    key_update = (
-                        f"track_update_{norm_name}/ep_{actual_ep_idx}/{cleaned_name}"
-                    )
-                    final_norms[key_update] = gathered[rank_base + rem]
+                        key_update = f"track_update_{norm_name}/ep_{actual_ep_idx}/{cleaned_name}"
+                        final_norms[key_update] = gathered[rank_base + rem]
 
-                    key_param = (
-                        f"track_param_{norm_name}/ep_{actual_ep_idx}/{cleaned_name}"
-                    )
-                    final_norms[key_param] = gathered[
-                        rank_base + weight_scalar_offset + rem
-                    ]
+                        key_param = (
+                            f"track_param_{norm_name}/ep_{actual_ep_idx}/{cleaned_name}"
+                        )
+                        final_norms[key_param] = gathered[
+                            rank_base + weight_scalar_offset + rem
+                        ]
 
                 # block_g == 0 when G == 0, so this loop naturally no-ops --
                 # no explicit "is gram active" guard needed.
                 gram_names = list(self.gram_scalar_names)
                 block_g = P * E * G
-                for idx in range(world_size * block_g):
-                    r, rem = divmod(idx, block_g)  # producing rank
-                    p, rem2 = divmod(rem, E * G)  # parameter index
-                    e, g = divmod(rem2, G)  # expert, gram-metric indices
+                for r in unpack_ranks:
+                    rank_base = 0 if log_local else r * per_rank_total
+                    for rem in range(block_g):
+                        p, rem2 = divmod(rem, E * G)  # parameter index
+                        e, g = divmod(rem2, G)  # expert, gram-metric indices
 
-                    actual_ep_idx = e + r * E
-                    if actual_ep_idx >= expert_params[0].shape[0]:
-                        continue  # skip pure padding slots
+                        actual_ep_idx = e + r * E
+                        if actual_ep_idx >= expert_params[0].shape[0]:
+                            continue  # skip pure padding slots
 
-                    cleaned_name = remove_orig_mod_and_weight_for_p_name(
-                        expert_param_names[p]
-                    )
-                    gram_param_name = _gram_log_param_name(
-                        cleaned_name, tuple(expert_params[p].shape)
-                    )
-                    gram_name = gram_names[g]
-                    rank_base = r * per_rank_total
+                        cleaned_name = remove_orig_mod_and_weight_for_p_name(
+                            expert_param_names[p]
+                        )
+                        gram_param_name = _gram_log_param_name(
+                            cleaned_name, tuple(expert_params[p].shape)
+                        )
+                        gram_name = gram_names[g]
 
-                    key_gram = (
-                        f"track_gram_{gram_name}/ep_{actual_ep_idx}/{gram_param_name}"
-                    )
-                    final_norms[key_gram] = gathered[
-                        rank_base + gram_scalar_offset + rem
-                    ]
+                        key_gram = f"track_gram_{gram_name}/ep_{actual_ep_idx}/{gram_param_name}"
+                        final_norms[key_gram] = gathered[
+                            rank_base + gram_scalar_offset + rem
+                        ]
 
                 # Same layout as the gram-scalar loop above, but unconditional
                 # (block_radial is never 0, no gram_level gate).
                 radial_names = RADIAL_METRIC_NAMES
                 block_radial = P * E * R
-                for idx in range(world_size * block_radial):
-                    r, rem = divmod(idx, block_radial)  # producing rank
-                    p, rem2 = divmod(rem, E * R)  # parameter index
-                    e, rk = divmod(rem2, R)  # expert, radial-metric indices
+                for r in unpack_ranks:
+                    rank_base = 0 if log_local else r * per_rank_total
+                    for rem in range(block_radial):
+                        p, rem2 = divmod(rem, E * R)  # parameter index
+                        e, rk = divmod(rem2, R)  # expert, radial-metric indices
 
-                    actual_ep_idx = e + r * E
-                    if actual_ep_idx >= expert_params[0].shape[0]:
-                        continue  # skip pure padding slots
+                        actual_ep_idx = e + r * E
+                        if actual_ep_idx >= expert_params[0].shape[0]:
+                            continue  # skip pure padding slots
 
-                    cleaned_name = remove_orig_mod_and_weight_for_p_name(
-                        expert_param_names[p]
-                    )
-                    radial_name = radial_names[rk]
-                    rank_base = r * per_rank_total
+                        cleaned_name = remove_orig_mod_and_weight_for_p_name(
+                            expert_param_names[p]
+                        )
+                        radial_name = radial_names[rk]
 
-                    key_radial = (
-                        f"track_radial_{radial_name}/ep_{actual_ep_idx}/{cleaned_name}"
-                    )
-                    final_norms[key_radial] = gathered[
-                        rank_base + radial_scalar_offset + rem
-                    ]
+                        key_radial = f"track_radial_{radial_name}/ep_{actual_ep_idx}/{cleaned_name}"
+                        final_norms[key_radial] = gathered[
+                            rank_base + radial_scalar_offset + rem
+                        ]
 
                 if gram_vec_flat is not None:
                     for block_idx, (start, end) in enumerate(blocks):
@@ -3493,36 +4129,36 @@ class DiSCO(AbstractDiSCO):
                         P_block = end - start
                         expected_block = P_block * ep_per_rank
 
-                        for bidx in range(world_size * expected_block):
-                            r, rem = divmod(bidx, expected_block)
-                            p_idx, e = divmod(rem, ep_per_rank)
-                            actual_ep_idx = e + r * ep_per_rank
-                            if actual_ep_idx >= expert_params[0].shape[0]:
-                                continue  # skip pure padding slots
+                        for r in unpack_ranks:
+                            rank_base = 0 if log_local else r * per_rank_total
+                            for rem in range(expected_block):
+                                p_idx, e = divmod(rem, ep_per_rank)
+                                actual_ep_idx = e + r * ep_per_rank
+                                if actual_ep_idx >= expert_params[0].shape[0]:
+                                    continue  # skip pure padding slots
 
-                            cleaned_name = remove_orig_mod_and_weight_for_p_name(
-                                block_names[p_idx]
-                            )
-                            gram_param_name = _gram_log_param_name(
-                                cleaned_name,
-                                tuple(expert_params[start + p_idx].shape),
-                            )
-                            rank_base = r * per_rank_total
-                            local_off = block_base_vec + rem * K_block_vec * n_vec
-                            for vi, vname in enumerate(self.gram_vector_names):
-                                v_start = (
-                                    rank_base
-                                    + gram_vec_offset
-                                    + local_off
-                                    + vi * K_block_vec
+                                cleaned_name = remove_orig_mod_and_weight_for_p_name(
+                                    block_names[p_idx]
                                 )
-                                gram_key = (
-                                    f"track_gram_{vname}/ep_{actual_ep_idx}/"
-                                    f"{gram_param_name}"
+                                gram_param_name = _gram_log_param_name(
+                                    cleaned_name,
+                                    tuple(expert_params[start + p_idx].shape),
                                 )
-                                final_norms[gram_key] = gathered[
-                                    v_start : v_start + K_block_vec
-                                ]
+                                local_off = block_base_vec + rem * K_block_vec * n_vec
+                                for vi, vname in enumerate(self.gram_vector_names):
+                                    v_start = (
+                                        rank_base
+                                        + gram_vec_offset
+                                        + local_off
+                                        + vi * K_block_vec
+                                    )
+                                    gram_key = (
+                                        f"track_gram_{vname}/ep_{actual_ep_idx}/"
+                                        f"{gram_param_name}"
+                                    )
+                                    final_norms[gram_key] = gathered[
+                                        v_start : v_start + K_block_vec
+                                    ]
 
                 if update_spectrum_flat is not None:
                     for block_idx, (start, end) in enumerate(blocks):
@@ -3534,29 +4170,31 @@ class DiSCO(AbstractDiSCO):
                         P_block = end - start
                         expected_block = P_block * ep_per_rank
 
-                        for bidx in range(world_size * expected_block):
-                            r, rem = divmod(bidx, expected_block)
-                            p_idx, e = divmod(rem, ep_per_rank)
-                            actual_ep_idx = e + r * ep_per_rank
-                            if actual_ep_idx >= expert_params[0].shape[0]:
-                                continue  # skip pure padding slots
+                        for r in unpack_ranks:
+                            rank_base = 0 if log_local else r * per_rank_total
+                            for rem in range(expected_block):
+                                p_idx, e = divmod(rem, ep_per_rank)
+                                actual_ep_idx = e + r * ep_per_rank
+                                if actual_ep_idx >= expert_params[0].shape[0]:
+                                    continue  # skip pure padding slots
 
-                            cleaned_name = remove_orig_mod_and_weight_for_p_name(
-                                block_names[p_idx]
-                            )
-                            rank_base = r * per_rank_total
-                            local_off = block_base + rem * K_block
-                            spec_start = rank_base + spectrum_offset + local_off
-                            final_norms[
-                                f"track_spectrum_update/ep_{actual_ep_idx}/{cleaned_name}"
-                            ] = gathered[spec_start : spec_start + K_block]
-                            if weight_spectrum_flat is not None:
-                                w_start = spec_start + self._expert_spectrum_total_size
+                                cleaned_name = remove_orig_mod_and_weight_for_p_name(
+                                    block_names[p_idx]
+                                )
+                                local_off = block_base + rem * K_block
+                                spec_start = rank_base + spectrum_offset + local_off
                                 final_norms[
-                                    f"track_spectrum_param/ep_{actual_ep_idx}/{cleaned_name}"
-                                ] = gathered[w_start : w_start + K_block]
+                                    f"track_spectrum_update/ep_{actual_ep_idx}/{cleaned_name}"
+                                ] = gathered[spec_start : spec_start + K_block]
+                                if weight_spectrum_flat is not None:
+                                    w_start = (
+                                        spec_start + self._expert_spectrum_total_size
+                                    )
+                                    final_norms[
+                                        f"track_spectrum_param/ep_{actual_ep_idx}/{cleaned_name}"
+                                    ] = gathered[w_start : w_start + K_block]
 
-        if self.is_dp_rank_0:
+        if self._stores_norms:
             self.norms_at_current_step.update(final_norms)
 
     @record_function("disco.step_ddp")
@@ -3752,7 +4390,16 @@ class DiSCO(AbstractDiSCO):
             if rank < len(self._ddp_spectrum_offsets_by_rank)
             else []
         )
-        if need_to_calculate_norm and self._ddp_spectrum_max_total > 0:
+        # `and self.track_spectrum`: with spectrum logging off (the default) these
+        # buffers stay None, _pack_segments drops the segment entirely, and the
+        # all-gather payload loses ~99% of its size. The unpack side is already
+        # keyed on segment presence (`if "upd_spec" in offsets`), so nothing else
+        # has to change.
+        if (
+            need_to_calculate_norm
+            and self.track_spectrum
+            and self._ddp_spectrum_max_total > 0
+        ):
             required_spectrum_elems = self._ddp_spectrum_max_total
             upd_spectrum_local_flat = workspace.get("upd_spectrum_local_flat")
             if (
@@ -3800,6 +4447,14 @@ class DiSCO(AbstractDiSCO):
             gram_vec_local_flat.zero_()
 
         # ---- local update norms (owner slots only) ----
+        # sigma_max of each owned param's `-lr*u`, carried across to the
+        # weight/radial loop below. DDP splits update-norms and weight-norms
+        # into two passes, so unlike the other three families radial cannot see
+        # `upd_spectrum` in its own scope; keeping the leading singular value
+        # (a 0-d tensor per owned param) is cheaper than either recomputing it
+        # or reading it back out of the packed spectrum buffer, and it still
+        # works when spectrum packing is switched off.
+        upd_sigma_by_idx: dict[int, torch.Tensor] = {}
         if need_to_calculate_norm and upd_norm_local_flat is not None:
             for my_idx in self._ddp_owned_indices:
                 u = local_updates[my_idx]
@@ -3811,8 +4466,12 @@ class DiSCO(AbstractDiSCO):
                 if scratch is None:
                     raise ValueError("Missing DDP norm scratch buffer for owned index.")
                 torch.mul(u, -lr, out=scratch)
-                upd_norms = calculate_norm(scratch, self.norms_to_log)
-                upd_spectrum = upd_norms.pop("spectrum")
+                upd_norms = calculate_norm(
+                    scratch, self.norms_to_log, want_spectrum=self.track_spectrum
+                )
+                upd_spectrum, upd_sigma = _pop_spectrum(upd_norms)
+                if upd_sigma is not None:
+                    upd_sigma_by_idx[my_idx] = upd_sigma
                 owner_bucket = self._ddp_owner_bucket_by_param[my_idx]
                 base = owner_bucket * num_norm_types
                 upd_norm_local_flat[base : base + num_norm_types].copy_(
@@ -3866,8 +4525,10 @@ class DiSCO(AbstractDiSCO):
                     u = torch.zeros_like(w)
 
                 pseudo_w = _pseudo_post_update_weight(w, u, lr, wd)
-                w_norms = calculate_norm(pseudo_w, self.norms_to_log)
-                w_spectrum = w_norms.pop("spectrum")
+                w_norms = calculate_norm(
+                    pseudo_w, self.norms_to_log, want_spectrum=self.track_spectrum
+                )
+                w_spectrum, w_sigma = _pop_spectrum(w_norms)
                 owner_bucket = self._ddp_owner_bucket_by_param[my_idx]
                 base = owner_bucket * num_norm_types
                 w_norm_local_flat[base : base + num_norm_types].copy_(
@@ -3879,6 +4540,33 @@ class DiSCO(AbstractDiSCO):
                     off = rank_spectrum_offsets[owner_bucket]
                     w_spectrum_local_flat[off : off + w_spectrum.numel()].copy_(
                         w_spectrum
+                    )
+
+                # Ordered norm -> radial -> gram: radial consumes sigma_max
+                # from the spectra the norm passes produced (see
+                # _radial_spectral_inputs); gram consumes nothing from radial
+                # and runs last.
+                if radial_local_flat is not None:
+                    radial_metrics = calculate_radial_metrics(
+                        w,
+                        pseudo_w,
+                        self._radial_state_by_param_id[id(ddp_params[my_idx])],
+                        spectral=self._radial_spectral_inputs(
+                            id(ddp_params[my_idx]),
+                            w,
+                            pseudo_w,
+                            w_sigma,
+                            upd_sigma_by_idx.get(my_idx),
+                            wd,
+                        ),
+                    )
+                    radial_base = owner_bucket * num_radial_types
+                    radial_local_flat[
+                        radial_base : radial_base + num_radial_types
+                    ].copy_(
+                        torch.stack(
+                            [radial_metrics[name] for name in RADIAL_METRIC_NAMES]
+                        )
                     )
 
                 if gram_norm_local_flat is not None or gram_vec_local_flat is not None:
@@ -3905,22 +4593,6 @@ class DiSCO(AbstractDiSCO):
                             vec = gram_metrics[vname]
                             gram_vec_local_flat[off : off + vec.numel()].copy_(vec)
                             off += vec.numel()
-
-                if radial_local_flat is not None:
-                    radial_metrics = calculate_radial_metrics(
-                        w,
-                        pseudo_w,
-                        self._radial_state_by_param_id[id(ddp_params[my_idx])],
-                    )
-                    radial_base = owner_bucket * num_radial_types
-                    radial_local_flat[
-                        radial_base : radial_base + num_radial_types
-                    ].copy_(
-                        torch.stack(
-                            [radial_metrics[name] for name in RADIAL_METRIC_NAMES]
-                        )
-                    )
-
         # -------- Phase C: apply once (pre-cast + grouped foreach apply) --------
         if not skip_update:
             apply_updates = self._prepare_ddp_apply_updates(
@@ -3953,15 +4625,22 @@ class DiSCO(AbstractDiSCO):
                 ("w_spec", w_spectrum_local_flat),
             ]
         )
-        if dp_replicate_mesh is not None and world_size > 1:
-            gathered = funcol.all_gather_tensor(
-                local_buf, gather_dim=0, group=dp_replicate_mesh
+        # Per-rank logging skips the collective: each rank owns a disjoint set
+        # of parameters and keeps its own metrics, so there is nothing to bring
+        # together. Decided from config, so it is uniform across ranks -- a
+        # per-rank decision here would deadlock, since this is a collective.
+        log_local = self.log_metrics_locally
+        if dp_replicate_mesh is not None and world_size > 1 and not log_local:
+            gathered = _materialize_gathered(
+                funcol.all_gather_tensor(
+                    local_buf, gather_dim=0, group=dp_replicate_mesh
+                )
             )
         else:
             gathered = local_buf
         per_rank_total = local_buf.numel()
 
-        if self.is_dp_rank_0:
+        if self._stores_norms:
             cleaned_names = (
                 self._ddp_clean_param_names
                 if len(self._ddp_clean_param_names) == len(ddp_param_names)
@@ -3982,8 +4661,12 @@ class DiSCO(AbstractDiSCO):
             )
             for param_idx, cleaned in enumerate(cleaned_names):
                 owner_rank = owner_ranks[param_idx]
+                if log_local and owner_rank != rank:
+                    continue
                 owner_bucket = owner_buckets[param_idx]
-                rank_base = owner_rank * per_rank_total
+                # Per-rank logging: only this rank's owned parameters are
+                # present in the buffer, and they start at 0.
+                rank_base = 0 if log_local else owner_rank * per_rank_total
                 base = offsets["upd"] + owner_bucket * num_norm_types
                 w_base = offsets["w"] + owner_bucket * num_norm_types
                 for k, norm_name in enumerate(self.norms_to_log):
@@ -4019,6 +4702,8 @@ class DiSCO(AbstractDiSCO):
                 if gram_vec_lens is not None:
                     for param_idx, cleaned in enumerate(cleaned_names):
                         owner_rank = owner_ranks[param_idx]
+                        if log_local and owner_rank != rank:
+                            continue
                         owner_bucket = owner_buckets[param_idx]
                         if owner_rank >= len(gram_vec_offsets_by_rank):
                             continue
@@ -4026,7 +4711,7 @@ class DiSCO(AbstractDiSCO):
                         if owner_bucket >= len(rank_offsets):
                             continue
                         length = gram_vec_lens[param_idx]
-                        rank_base = owner_rank * per_rank_total
+                        rank_base = 0 if log_local else owner_rank * per_rank_total
                         v_start = (
                             rank_base + offsets["gram_vec"] + rank_offsets[owner_bucket]
                         )
@@ -4049,6 +4734,8 @@ class DiSCO(AbstractDiSCO):
                 if spectrum_lens is not None:
                     for param_idx, cleaned in enumerate(cleaned_names):
                         owner_rank = owner_ranks[param_idx]
+                        if log_local and owner_rank != rank:
+                            continue
                         owner_bucket = owner_buckets[param_idx]
                         if owner_rank >= len(spectrum_offsets_by_rank):
                             continue
@@ -4056,7 +4743,7 @@ class DiSCO(AbstractDiSCO):
                         if owner_bucket >= len(rank_offsets):
                             continue
                         length = spectrum_lens[param_idx]
-                        rank_base = owner_rank * per_rank_total
+                        rank_base = 0 if log_local else owner_rank * per_rank_total
                         upd_spec_start = (
                             rank_base + offsets["upd_spec"] + rank_offsets[owner_bucket]
                         )
@@ -4073,7 +4760,7 @@ class DiSCO(AbstractDiSCO):
                                 w_spec_start : w_spec_start + length
                             ]
 
-        if self.is_dp_rank_0:
+        if self._stores_norms:
             self.norms_at_current_step.update(final_norms)
 
     def _gather_and_log_fsdp(
@@ -4124,11 +4811,22 @@ class DiSCO(AbstractDiSCO):
                 ("w_spec", w_spectrum_local_flat),
             ]
         )
-        gathered = funcol.all_gather_tensor(local_buf, gather_dim=0, group=fsdp_mesh)
+        # Per-rank logging skips the collective -- each shard rank owns a
+        # disjoint set of parameters (`param_idx % world_size`) and keeps its
+        # own metrics. Decided from config so it is uniform across ranks; a
+        # per-rank decision would deadlock here, this is a collective.
+        log_local = self.log_metrics_locally
+        rank = fsdp_mesh.get_local_rank() if fsdp_mesh is not None else 0
+        if log_local:
+            gathered = local_buf
+        else:
+            gathered = _materialize_gathered(
+                funcol.all_gather_tensor(local_buf, gather_dim=0, group=fsdp_mesh)
+            )
         per_rank_total = local_buf.numel()
 
         final_norms = {}
-        if self.is_dp_rank_0:
+        if self._stores_norms:
             num_norm_types = len(self.norms_to_log)
             num_gram_types = len(self.gram_scalar_names)
             num_radial_types = len(RADIAL_METRIC_NAMES)
@@ -4138,8 +4836,11 @@ class DiSCO(AbstractDiSCO):
 
             for param_idx, cleaned_p_name in enumerate(cleaned_names):
                 owner_rank = param_idx % world_size
+                if log_local and owner_rank != rank:
+                    continue
                 bucket_idx_on_owner = param_idx // world_size
-                rank_base = owner_rank * per_rank_total
+                # Only this rank's own slice is present, starting at 0.
+                rank_base = 0 if log_local else owner_rank * per_rank_total
                 base = offsets["upd"] + bucket_idx_on_owner * num_norm_types
 
                 for norm_idx, norm_name in enumerate(self.norms_to_log):
@@ -4173,12 +4874,14 @@ class DiSCO(AbstractDiSCO):
             if "gram_vec" in offsets:
                 for param_idx, cleaned_p_name in enumerate(cleaned_names):
                     owner_rank = param_idx % world_size
+                    if log_local and owner_rank != rank:
+                        continue
                     owner_bucket = param_idx // world_size
                     rank_offsets = self._fsdp_gram_vec_offsets_by_rank[owner_rank]
                     if owner_bucket >= len(rank_offsets):
                         continue
                     length = self._fsdp_gram_vec_len_by_param[param_idx]
-                    rank_base = owner_rank * per_rank_total
+                    rank_base = 0 if log_local else owner_rank * per_rank_total
                     v_start = (
                         rank_base + offsets["gram_vec"] + rank_offsets[owner_bucket]
                     )
@@ -4194,12 +4897,14 @@ class DiSCO(AbstractDiSCO):
             if "upd_spec" in offsets:
                 for param_idx, cleaned_p_name in enumerate(cleaned_names):
                     owner_rank = param_idx % world_size
+                    if log_local and owner_rank != rank:
+                        continue
                     owner_bucket = param_idx // world_size
                     rank_offsets = self._fsdp_spectrum_offsets_by_rank[owner_rank]
                     if owner_bucket >= len(rank_offsets):
                         continue
                     length = self._fsdp_spectrum_len_by_param[param_idx]
-                    rank_base = owner_rank * per_rank_total
+                    rank_base = 0 if log_local else owner_rank * per_rank_total
                     upd_spec_start = (
                         rank_base + offsets["upd_spec"] + rank_offsets[owner_bucket]
                     )
@@ -4214,7 +4919,7 @@ class DiSCO(AbstractDiSCO):
                             f"track_spectrum_param/{cleaned_p_name}"
                         ] = gathered[w_spec_start : w_spec_start + length]
 
-        if self.is_dp_rank_0:
+        if self._stores_norms:
             self.norms_at_current_step.update(final_norms)
 
     @record_function("disco.step_fsdp")
@@ -4283,7 +4988,11 @@ class DiSCO(AbstractDiSCO):
         # total spectrum lengths — unlike the fixed-stride scalar norm buffers.
         upd_spectrum_local_flat = None
         w_spectrum_local_flat = None
-        if need_to_calculate_norm and self._fsdp_spectrum_max_total > 0:
+        if (
+            need_to_calculate_norm
+            and self.track_spectrum
+            and self._fsdp_spectrum_max_total > 0
+        ):
             upd_spectrum_local_flat = torch.zeros(
                 self._fsdp_spectrum_max_total, dtype=torch.float32, device=device
             )
@@ -4298,6 +5007,13 @@ class DiSCO(AbstractDiSCO):
         # norms_of_gram (a plain list needing explicit padding entries),
         # non-owned slots simply stay zero, same as the spectrum buffers.
         gram_vec_local_flat = None
+        # sigma_max of each bucket's `-lr*u`, carried from whichever update-norm
+        # loop ran (once-mode or bucket-mode) to the weight/radial loop below.
+        # step_fsdp computes update norms and weight norms in separate passes,
+        # so as in step_ddp radial cannot see the update spectrum in its own
+        # scope; keeping one 0-d tensor per bucket is cheaper than recomputing
+        # it, and keeps working when spectrum packing is switched off.
+        upd_sigma_by_bucket: dict[int, torch.Tensor] = {}
         if need_to_calculate_norm and self._fsdp_gram_vec_max_total > 0:
             gram_vec_local_flat = torch.zeros(
                 self._fsdp_gram_vec_max_total, dtype=torch.float32, device=device
@@ -4375,11 +5091,19 @@ class DiSCO(AbstractDiSCO):
 
                     if need_to_calculate_norm and my_param_in_bucket:
                         lr, *_ = self.groups_info[bucket_group_indices[rank]]
-                        d = calculate_norm(-lr * u, self.norms_to_log)
-                        spec = d.pop("spectrum")
+                        d = calculate_norm(
+                            -lr * u,
+                            self.norms_to_log,
+                            want_spectrum=self.track_spectrum,
+                        )
+                        spec, upd_sigma = _pop_spectrum(d)
+                        if upd_sigma is not None:
+                            upd_sigma_by_bucket[bucket_idx] = upd_sigma
                         bucket_norm_dicts[bucket_idx] = d
-                        if upd_spectrum_local_flat is not None and bucket_idx < len(
-                            self._fsdp_spectrum_offsets
+                        if (
+                            spec is not None
+                            and upd_spectrum_local_flat is not None
+                            and bucket_idx < len(self._fsdp_spectrum_offsets)
                         ):
                             off = self._fsdp_spectrum_offsets[bucket_idx]
                             upd_spectrum_local_flat[off : off + spec.numel()].copy_(
@@ -4538,10 +5262,18 @@ class DiSCO(AbstractDiSCO):
                 if need_to_calculate_norm:
                     if my_param_in_bucket:
                         lr, *_ = self.groups_info[bucket_group_indices[rank]]
-                        upd_norms = calculate_norm(-lr * u, self.norms_to_log)
-                        spec = upd_norms.pop("spectrum")
-                        if upd_spectrum_local_flat is not None and bucket_idx < len(
-                            self._fsdp_spectrum_offsets
+                        upd_norms = calculate_norm(
+                            -lr * u,
+                            self.norms_to_log,
+                            want_spectrum=self.track_spectrum,
+                        )
+                        spec, upd_sigma = _pop_spectrum(upd_norms)
+                        if upd_sigma is not None:
+                            upd_sigma_by_bucket[bucket_idx] = upd_sigma
+                        if (
+                            spec is not None
+                            and upd_spectrum_local_flat is not None
+                            and bucket_idx < len(self._fsdp_spectrum_offsets)
                         ):
                             off = self._fsdp_spectrum_offsets[bucket_idx]
                             upd_spectrum_local_flat[off : off + spec.numel()].copy_(
@@ -4626,13 +5358,39 @@ class DiSCO(AbstractDiSCO):
                     bucket_group_indices = self._fsdp_bucket_group_indices[bucket_idx]
                     lr, _, _, wd, _ = self.groups_info[bucket_group_indices[rank]]
                     pseudo_w = _pseudo_post_update_weight(full_weight, u, lr, wd)
-                    w_norms = calculate_norm(pseudo_w, self.norms_to_log)
-                    w_spec = w_norms.pop("spectrum")
-                    if w_spectrum_local_flat is not None and bucket_idx < len(
-                        self._fsdp_spectrum_offsets
+                    w_norms = calculate_norm(
+                        pseudo_w, self.norms_to_log, want_spectrum=self.track_spectrum
+                    )
+                    w_spec, w_sigma = _pop_spectrum(w_norms)
+                    if (
+                        w_spec is not None
+                        and w_spectrum_local_flat is not None
+                        and bucket_idx < len(self._fsdp_spectrum_offsets)
                     ):
                         off = self._fsdp_spectrum_offsets[bucket_idx]
                         w_spectrum_local_flat[off : off + w_spec.numel()].copy_(w_spec)
+
+                    # Ordered norm -> radial -> gram: radial consumes sigma_max
+                    # from the spectra the norm passes produced (see
+                    # _radial_spectral_inputs); gram consumes nothing from
+                    # radial and runs last.
+                    owned_param = fsdp_params[start_idx + rank]
+                    radial_metrics = calculate_radial_metrics(
+                        full_weight,
+                        pseudo_w,
+                        self._radial_state_by_param_id[id(owned_param)],
+                        spectral=self._radial_spectral_inputs(
+                            id(owned_param),
+                            full_weight,
+                            pseudo_w,
+                            w_sigma,
+                            upd_sigma_by_bucket.get(bucket_idx),
+                            wd,
+                        ),
+                    )
+                    radial_values = [
+                        radial_metrics[name] for name in RADIAL_METRIC_NAMES
+                    ]
 
                     # Always called -- cheap no-op when gram_level==0 (see
                     # gram_helper.py), so no extra "is gram active"
@@ -4653,16 +5411,6 @@ class DiSCO(AbstractDiSCO):
                             vec = gram_metrics[vname]
                             gram_vec_local_flat[off : off + vec.numel()].copy_(vec)
                             off += vec.numel()
-
-                    owned_param = fsdp_params[start_idx + rank]
-                    radial_metrics = calculate_radial_metrics(
-                        full_weight,
-                        pseudo_w,
-                        self._radial_state_by_param_id[id(owned_param)],
-                    )
-                    radial_values = [
-                        radial_metrics[name] for name in RADIAL_METRIC_NAMES
-                    ]
                 else:
                     w_norms = padding_norms
                     gram_scalar_values = list(gram_padding.values())

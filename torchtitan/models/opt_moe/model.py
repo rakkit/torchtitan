@@ -13,12 +13,14 @@ import torch
 from torch import nn
 
 from torchtitan.models.common.attention import (
+    BaseAttention,
     AttentionMasksType,
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
     ScaledDotProductInnerAttention,
 )
+from torchtitan.config.transform import convert_config_type
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
@@ -502,6 +504,42 @@ class OPTMoEModel(Decoder):
             # self.layers for TP/EP validation and token-dispatcher setup, so the
             # per-layer list has to exist by then.
             self._expand_layers()
+
+            # Context Parallel: swap in a CP-aware inner attention. Upstream
+            # #4322 moved the k/v all-gather OUT of a local_map in
+            # Module.forward() and INTO the attention implementation, and
+            # config/validation.py now REQUIRES a CPInnerAttention whenever
+            # cp > 1 (and rejects one when cp == 1). This mirrors
+            # ContextParallelTransform; it runs here rather than in a recipe
+            # because our context_parallel_degree comes from the CLI, and
+            # update_from_config is the hook that sees it.
+            #
+            # Runs AFTER _expand_layers(). The flavor registry has usually
+            # expanded the layer list already, which makes _expand_layers() a
+            # no-op, so swapping the `self.layer` TEMPLATE alone reaches 1 of 25
+            # configs and leaves the 24 real layers on the non-CP kernel.
+            # Upstream's validate_context_parallel catches exactly that, which
+            # is how this was found.
+            if parallelism.context_parallel_degree > 1:
+                from torchtitan.models.common.cp_attention import (
+                    KVAllGatherCPFlexInnerAttention,
+                )
+
+                if base_attn.attn_backend not in ("flex", "flex_flash"):
+                    raise ValueError(
+                        "Context Parallel requires the flex attention backend "
+                        f"(got attn_backend={base_attn.attn_backend!r}). The CP "
+                        "kernels are flex-only: sdpa cannot express the "
+                        "per-document mask, and there is no CP varlen flex "
+                        "variant for this model."
+                    )
+                # Traverse, exactly as ContextParallelTransform does, so the
+                # template AND every expanded layer are converted.
+                for _, attn_cfg, _, _ in self.traverse(BaseAttention.Config):
+                    attn_cfg.inner_attention = convert_config_type(
+                        attn_cfg.inner_attention, KVAllGatherCPFlexInnerAttention
+                    )
+
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
             from torchtitan.models.opt_moe.sharding import set_opt_moe_sharding_config

@@ -50,20 +50,21 @@ def parallelize_opt_moe(
     )
 
     if parallel_dims.cp_enabled:
-        # CP is wired but NOT validated on real hardware. In place:
-        # `sharding.py` installs the inner-attention local_map (k/v Replicate on
-        # the CP axis so they are all-gathered to match the BlockMask's kv dim)
-        # and stamps a ShardingConfig on every Linear and on the MoE expert
-        # state, so `fully_shard(dp_mesh_dims=...)` accepts the params under
-        # spmd_types. Verified with a FAKE process group only -- dense and MoE
-        # both reach 100% DTensor params at dp_shard=2/cp=2 -- so no collective
-        # has actually run.
+        # CP now runs on upstream's mechanism: #4322 moved the k/v all-gather
+        # out of a local_map in Module.forward() and into the attention
+        # implementation itself, and `OPTMoEModel.Config.update_from_config`
+        # swaps in KVAllGatherCPFlexInnerAttention when the degree is > 1.
+        # `config/validation.py` then REQUIRES a CPInnerAttention at cp > 1, so
+        # a misconfigured run fails at config time rather than training wrong.
         #
-        # KNOWN GAP: `rope.cache` stays a plain tensor (see sharding.py).
-        logger.warning(
-            "Context Parallel is enabled for OPT MoE. This path is newly wired "
-            "and has NOT been validated on multiple GPUs -- verify loss against "
-            "a cp=1 run before trusting it."
+        # What stays ours is document identity across the load-balancer seam:
+        # `doc_id` is computed from GLOBAL positions before cp_shard runs (see
+        # model.py preprocess_inputs), because "headtail" hands each rank two
+        # NON-adjacent chunks whose join carries no `positions == 0` reset.
+        logger.info(
+            "Context Parallel enabled for OPT MoE (degree %d) using "
+            "KVAllGatherCPFlexInnerAttention.",
+            parallel_dims.cp,
         )
 
     model.parallelize(parallel_dims)

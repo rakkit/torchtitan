@@ -20,7 +20,30 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
-from torchtitan.observability.data_consumption import build_data_mix_metrics
+from torchtitan.observability.data_consumption import (
+    build_data_mix_metrics,
+    DataMixMetricsLike,
+    NoDataMixMetrics,
+)
+from torchtitan.optimizers.container import DiSCOOptimizersContainer
+
+
+def _disco_container(optimizers: Any) -> DiSCOOptimizersContainer | None:
+    """The optimizer container if it is DiSCO's, else None.
+
+    A free function rather than a Trainer attribute so that `train_step` needs
+    nothing on `self` that upstream's trainer does not already set: several
+    upstream tests drive `Trainer.train_step` with a duck-typed stand-in for
+    `self`, and every instance attribute we add is one more thing each of those
+    has to grow on the next rebase.
+
+    isinstance, not hasattr: those tests pass a MagicMock optimizer, where every
+    `hasattr` answers True and every `getattr` returns a mock rather than the
+    default.
+    """
+    return optimizers if isinstance(optimizers, DiSCOOptimizersContainer) else None
+
+
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validate import BaseValidator, Validator
 from torchtitan.config import Configurable
@@ -121,6 +144,69 @@ class Trainer(Configurable):
                     max_num_documents=self.dataloader.max_num_documents,
                 )
 
+            self._resolve_norm_logging()
+
+        def _resolve_norm_logging(self) -> None:
+            """Reconcile DiSCO's norm logging with the metrics config.
+
+            Both settings live on the optimizer, but their validity depends on
+            `metrics`, so this is the one place that sees both. Doing it at
+            config time means a bad combination fails before the job allocates
+            anything, and means the container is built already correct rather
+            than patched afterwards.
+
+            No-op for upstream's container, which has neither field.
+            """
+            log_norm_freq = getattr(self.optimizer, "log_norm_freq", None)
+            if log_norm_freq is None:
+                return
+            # Norm logging is gated on `should_log`, so norms would otherwise
+            # land on lcm(log_freq, log_norm_freq) rather than the requested
+            # cadence: log_freq=100 with log_norm_freq=250 silently gives norms
+            # every 500 steps. Require the multiple so the configured cadence
+            # is the real one.
+            if (
+                log_norm_freq > 0
+                and self.metrics.log_freq > 0
+                and log_norm_freq % self.metrics.log_freq != 0
+            ):
+                raise ValueError(
+                    f"optimizer.log_norm_freq ({log_norm_freq}) must be a "
+                    f"multiple of metrics.log_freq ({self.metrics.log_freq}); "
+                    "norm logging only happens on steps that are also "
+                    "metric-logging steps, so otherwise norms land on "
+                    "lcm(log_freq, log_norm_freq) instead of the cadence you "
+                    "asked for."
+                )
+            if (
+                self.metrics.save_all_shard_ranks
+                and not self.metrics.save_for_all_ranks
+            ):
+                raise ValueError(
+                    "metrics.save_all_shard_ranks requires "
+                    "metrics.save_for_all_ranks. Without it only one rank "
+                    "builds a logger, so skipping the logging all_gather would "
+                    "silently drop every parameter owned by the other shard "
+                    "ranks."
+                )
+            # DiSCO may only skip its logging all_gather when the metrics side
+            # really gives EVERY shard rank a logger. `save_all_shard_ranks`
+            # alone is not enough: it is applied inside `_build_metric_logger`
+            # only after `should_log` is already true, and with
+            # `save_for_all_ranks=False` that has been narrowed to a single
+            # global rank -- every rank would skip the gather while only one
+            # owns a logger, so that rank logs its 1/N of the parameters and
+            # the rest are silently dropped.
+            #
+            # Derived from config alone so it is identical on every rank: the
+            # gather is a collective, and ranks that disagree hang rather than
+            # misreport.
+            self.optimizer.log_metrics_locally = bool(
+                self.metrics.save_all_shard_ranks
+                and self.metrics.save_for_all_ranks
+                and (self.metrics.enable_wandb or self.metrics.enable_tensorboard)
+            )
+
         def to_dict(self) -> dict[str, Any]:
             d = {}
             for f in dataclasses.fields(self):
@@ -172,6 +258,15 @@ class Trainer(Configurable):
     metrics_processor: MetricsProcessor
     gradient_accumulation_steps: int
     num_pp_microbatches: int
+
+    data_mix_metrics: DataMixMetricsLike = NoDataMixMetrics()
+    """Per-dataset consumption reporter, replaced per-instance in __init__.
+
+    A class-level null object rather than an attribute that only exists after
+    __init__: upstream drives `train_step` with duck-typed stand-ins for `self`,
+    and a plain attribute would make every one of them carry this. The null
+    object is stateless, so sharing a single instance is safe.
+    """
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
@@ -276,7 +371,7 @@ class Trainer(Configurable):
         self.metrics_processor.optimizers = engine.optimizers
         self.metrics_processor.model_parts = engine.model_parts
 
-        self._setup_norm_logging(config, parallel_dims)
+        self._check_per_rank_metric_logging()
 
         self.data_mix_metrics = build_data_mix_metrics(self.dataloader)
         logger.info(
@@ -331,114 +426,57 @@ class Trainer(Configurable):
             f"(warmup {config.lr_scheduler.warmup_steps})"
         )
 
-    def _setup_norm_logging(self, config: "Trainer.Config", parallel_dims) -> None:
-        """Cross-check DiSCO's logging against the metrics side, and site its exports.
+    def _check_per_rank_metric_logging(self) -> None:
+        """Assert the optimizer's and the metrics side's rank predicates agree.
 
-        The cadence, norm selection and gram level now live on the optimizer
-        config, where they belong -- they are optimizer behaviour. What still
-        has to happen here is the part that genuinely spans both configs:
+        `Trainer.Config._resolve_norm_logging` already decided
+        `log_metrics_locally` from config. This is the post-build half it could
+        not do: confirming that a rank which owns a disjoint slice of the
+        per-parameter metrics actually has a logger to write it to.
 
-        DiSCO may only skip the logging all_gather when the metrics side
-        genuinely gives EVERY shard rank a logger. `save_all_shard_ranks` alone
-        is not enough: it is applied inside `_build_metric_logger` only after
-        `should_log` is already true, and with `save_for_all_ranks=False` that
-        has been narrowed to a single global rank. Enabling local mode on the
-        raw flag would have every rank skip the gather while only one rank owns
-        a logger -- so that rank logs its own 1/N of the parameters and the rest
-        are silently dropped.
-
-        It also has to be decided from config alone, identically on every rank:
-        the gather is a collective, so if some ranks skipped it and others did
-        not the job would hang rather than misreport.
+        Inert today -- both sides derive ownership from
+        `rank_owns_metrics_shard`. It exists so a future divergence fails
+        loudly at init instead of silently producing a partial dashboard, which
+        is how the pure-DDP case went unnoticed.
         """
-        optimizers = self.engine.optimizers
-        if not hasattr(optimizers, "calculate_norm_at_next_step"):
-            # Upstream container: no DiSCO norm machinery to wire.
+        disco = _disco_container(self.engine.optimizers)
+        if disco is None or not disco.log_metrics_locally:
             return
+        owns_shard = dist_utils.rank_owns_metrics_shard(self.engine.parallel_dims)
+        # `_build_metric_logger` returns a bare `BaseLogger` (a no-op with no
+        # `number_of_loggers`) on ranks that do not log and a `LoggerContainer`
+        # on ranks that do, so this must not assume the container type.
+        has_logger = getattr(self.metrics_processor.logger, "number_of_loggers", 0) > 0
+        # Only the direction that loses data is fatal: this rank owns a slice
+        # nobody else will log and has nowhere to put it. The reverse (a logger
+        # with nothing to log) is harmless, and firing on it would turn a soft
+        # W&B failure into an init-time abort of the whole job.
+        if owns_shard and not has_logger:
+            raise RuntimeError(
+                "per-rank metric logging would silently drop data on this rank: "
+                "it owns a disjoint slice of the per-parameter metrics but has "
+                "no logger to write them to. The optimizer's ownership split "
+                "and metrics._build_metric_logger's rank predicate have "
+                "diverged; both must come from "
+                "distributed.utils.rank_owns_metrics_shard."
+            )
+        if has_logger and not owns_shard:
+            logger.warning(
+                "this rank has a metrics logger but owns no metrics shard; it "
+                "will log global scalars only. Harmless, but it means the two "
+                "rank predicates disagree."
+            )
 
-        metrics_config = config.metrics
-        logging_on = bool(
-            metrics_config.enable_wandb or metrics_config.enable_tensorboard
-        )
-        log_norm_freq = getattr(optimizers, "log_norm_freq", 0)
-        # Norm logging is gated on `should_log`, so norms would otherwise land
-        # on lcm(log_freq, log_norm_freq) rather than the requested cadence:
-        # log_freq=100 with log_norm_freq=250 silently gives norms every 500
-        # steps. Require the multiple so the configured cadence is the real one.
-        if (
-            log_norm_freq > 0
-            and metrics_config.log_freq > 0
-            and log_norm_freq % metrics_config.log_freq != 0
-        ):
-            raise ValueError(
-                f"optimizer.log_norm_freq ({log_norm_freq}) must be a multiple "
-                f"of metrics.log_freq ({metrics_config.log_freq}); norm logging "
-                "only happens on steps that are also metric-logging steps, so "
-                "otherwise norms land on lcm(log_freq, log_norm_freq) instead "
-                "of the cadence you asked for."
-            )
-        if (
-            metrics_config.save_all_shard_ranks
-            and not metrics_config.save_for_all_ranks
-        ):
-            raise ValueError(
-                "metrics.save_all_shard_ranks requires metrics.save_for_all_ranks. "
-                "Without it only one rank builds a logger, so skipping the "
-                "logging all_gather would silently drop every parameter owned by "
-                "the other shard ranks."
-            )
-        optimizers.log_metrics_locally = bool(
-            metrics_config.save_all_shard_ranks
-            and metrics_config.save_for_all_ranks
-            and logging_on
-        )
-        if optimizers.log_metrics_locally:
-            # The invariant that actually matters: every rank owning a distinct
-            # slice of the metrics must hold a logger to write it to. Both sides
-            # derive that from `rank_owns_metrics_shard`, so this is inert -- it
-            # exists to make a future divergence fail loudly at init instead of
-            # silently producing a partial dashboard, which is how the pure-DDP
-            # case went unnoticed.
-            owns_shard = dist_utils.rank_owns_metrics_shard(parallel_dims)
-            # `_build_metric_logger` returns a bare `BaseLogger` (a no-op with no
-            # `number_of_loggers`) on ranks that do not log, and a
-            # `LoggerContainer` on ranks that do -- so this must not assume the
-            # container type.
-            has_logger = (
-                getattr(self.metrics_processor.logger, "number_of_loggers", 0) > 0
-            )
-            # Only the direction that loses data is fatal: this rank owns a slice
-            # nobody else will log, and has nowhere to put it. The reverse (a
-            # logger with nothing to log) is harmless, and firing on it would turn
-            # a soft wandb failure into an init-time abort of the whole job.
-            if owns_shard and not has_logger:
-                raise RuntimeError(
-                    "per-rank metric logging would silently drop data on this "
-                    "rank: it owns a disjoint slice of the per-parameter metrics "
-                    "but has no logger to write them to. The optimizer's "
-                    "ownership split and metrics._build_metric_logger's rank "
-                    "predicate have diverged; both must come from "
-                    "distributed.utils.rank_owns_metrics_shard."
-                )
-            elif has_logger and not owns_shard:
-                logger.warning(
-                    "this rank has a metrics logger but owns no metrics shard; "
-                    "it will log global scalars only. Harmless, but it means the "
-                    "two rank predicates disagree."
-                )
+    def _is_final_step(self, current_step: int) -> bool:
+        """Whether `current_step` is the run's last.
 
-        # enable_plot/enable_export live on the optimizer config itself and are
-        # already set by its __init__; only export_dir depends on dump_folder.
-        optimizers.spectrum_logging_config = (
-            optimizers.spectrum_logging_config._replace(
-                export_dir=os.path.join(config.dump_folder, "spectrum_export")
-            )
-        )
-        optimizers.gram_vector_logging_config = (
-            optimizers.gram_vector_logging_config._replace(
-                export_dir=os.path.join(config.dump_folder, "gram_export")
-            )
-        )
+        The final step gets a metrics point (and, with norm logging on, a final
+        spectrum snapshot) even when it does not land on a log_freq boundary.
+        getattr, not attribute access: upstream's trainer tests build a fake
+        config carrying no `training.steps`, and hard access made them fail on
+        our addition rather than on anything they were testing.
+        """
+        return current_step == getattr(self.config.training, "steps", None)
 
     def microbatch_generator(
         self, data_iterable: Iterable[TrainingMicrobatch]
@@ -474,16 +512,11 @@ class Trainer(Configurable):
         engine = self.engine
         current_step = engine.num_completed_steps + 1
         # Always log the final step even when it does not land on a log_freq
-        # boundary, so a run ends with a metrics point (and, when norm logging
-        # is on, a final spectrum snapshot). This has to be decided here, not at
-        # the log site: the loss is only accumulated when should_log is true.
-        # getattr, not attribute access: this is a fork-only convenience, and
-        # upstream's trainer tests build a fake config that carries no
-        # `training.steps`. Hard-accessing it made those tests fail on our
-        # addition rather than on anything they were testing.
-        should_log = self.metrics_processor.should_log(current_step) or (
-            current_step == getattr(self.config.training, "steps", None)
-        )
+        # boundary, so a run ends with a metrics point. This has to be decided
+        # here, not at the log site: the loss is only accumulated when
+        # should_log is true.
+        is_final_step = self._is_final_step(current_step)
+        should_log = self.metrics_processor.should_log(current_step) or is_final_step
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
@@ -491,21 +524,12 @@ class Trainer(Configurable):
         # All groups form one optimizer step. Each microbatch group forms one
         # complete PP step, or one local forward/backward when PP is disabled.
         # Decided BEFORE the optimizer step, because DiSCO produces the norms
-        # inside step(). Also armed on the very last step even when it does not
-        # land on a log_norm_freq boundary, so a run ends with a final spectrum
-        # snapshot. getattr for the same reason as `should_log` above: this
-        # DiSCO-only block must not make upstream's trainer tests fail on a fake
-        # config carrying no `metrics` / `training.steps`.
-        log_norm_freq = getattr(engine.optimizers, "log_norm_freq", 0)
-        if not isinstance(log_norm_freq, int):
-            # Upstream's trainer tests pass a MagicMock optimizer, where getattr
-            # returns a mock rather than falling back to the default.
-            log_norm_freq = 0
-        need_to_calculate_norm = log_norm_freq > 0 and (
-            current_step == getattr(self.config.training, "steps", None)
-            or (should_log and (current_step == 1 or current_step % log_norm_freq == 0))
+        # inside step(). The cadence itself lives on the container, with the
+        # config that defines it.
+        disco = _disco_container(engine.optimizers)
+        compute_param_norms = disco is not None and disco.wants_norms_at(
+            current_step, should_log=should_log, is_final_step=is_final_step
         )
-        engine.calculate_norm_at_next_step = need_to_calculate_norm
         microbatch_groups: list[list[TrainingMicrobatch]] = []
         local_valid_tokens = 0
         for _ in range(self.gradient_accumulation_steps):
@@ -559,6 +583,16 @@ class Trainer(Configurable):
         # Capture the learning rates used by this optimizer update before the
         # scheduler advances in engine.optimizer_step().
         lr_metrics = engine.lr_schedulers.get_metrics() if should_log else {}
+        if compute_param_norms:
+            # Arm immediately before the step: DiSCO produces the norms as a
+            # by-product of the update itself, so this cannot wait until the
+            # metrics are collected. Done here rather than inside
+            # `engine.optimizer_step` so the engine keeps upstream's shape and
+            # needs no knowledge of which optimizer container it is driving;
+            # `optimizer_step` is called once per train step with or without
+            # pipeline parallelism, so this site is correct for both.
+            assert disco is not None  # implied by compute_param_norms
+            disco.arm_norm_computation()
         grad_norm = engine.optimizer_step()
 
         # log metrics
@@ -606,38 +640,22 @@ class Trainer(Configurable):
             **lr_metrics,
             **collect_aux_loss_metrics(parallel_dims),
         }
-        # getattr for the same reason as `should_log` above: per-dataset
-        # consumption reporting is a fork-only addition, and upstream's trainer
-        # tests build a fake trainer that carries no `data_mix_metrics`. Hard
-        # attribute access made those tests fail on our addition rather than on
-        # anything they were testing.
-        data_mix_metrics = getattr(self, "data_mix_metrics", None)
-        if data_mix_metrics is not None:
-            data_mix, data_docs, data_tokens = data_mix_metrics.get_log_dict_at_step(
-                engine.num_completed_steps
-            )
-            extra_metrics.update(data_mix)
-            extra_metrics.update({k: int(v) for k, v in data_docs.items()})
-            extra_metrics.update({k: int(v) for k, v in data_tokens.items()})
-        optimizers = engine.optimizers
-        if need_to_calculate_norm and hasattr(optimizers, "get_parameter_norms"):
+        # No None guard: build_data_mix_metrics always returns an object --
+        # NoDataMixMetrics when the loader has no per-dataset cursors -- and
+        # __init__ always assigns it. "Nothing to report" is that null object
+        # returning empty dicts, not the attribute being absent.
+        data_mix, data_docs, data_tokens = self.data_mix_metrics.get_log_dict_at_step(
+            engine.num_completed_steps
+        )
+        extra_metrics.update(data_mix)
+        extra_metrics.update({k: int(v) for k, v in data_docs.items()})
+        extra_metrics.update({k: int(v) for k, v in data_tokens.items()})
+        if disco is not None:
             extra_metrics.update(
-                optimizers.get_parameter_norms(step=engine.num_completed_steps)
+                disco.collect_metrics(
+                    engine.num_completed_steps, include_norms=compute_param_norms
+                )
             )
-        if hasattr(optimizers, "join_log_queue"):
-            # The MoE load-balancing hook reports router entropy / max-violation
-            # from a worker thread; drain it before reading the per-layer dicts.
-            optimizers.join_log_queue()
-        for model_part in engine.model_parts:
-            layers = getattr(model_part, "layers", None)
-            if layers is None:
-                continue
-            for layer in layers.values():
-                moe = getattr(layer, "moe", None)
-                # `_log_expert_metrics` is a dict the MoE fills in, not a method.
-                expert_metrics = getattr(moe, "_log_expert_metrics", None)
-                if expert_metrics:
-                    extra_metrics.update(expert_metrics)
         self.metrics_processor.log(
             engine.num_completed_steps,
             global_avg_loss,

@@ -11,11 +11,11 @@ gather the raw values into `track_spectrum_update/...` and
 `track_spectrum_param/...` metric entries) via Weights & Biases.
 
 Two things can happen to each spectrum, independently controlled by
-`SpectrumLoggingConfig` (built from `OptimizersContainer.Config`'s
+`SpectrumLoggingConfig` (built from `DiSCOOptimizersContainer.Config`'s
 `enable_spectrum_plot`/`enable_spectrum_export` fields -- i.e.
 `config.optimizer.enable_spectrum_plot`/`enable_spectrum_export` in the job
 config -- see `components/optimizer.py`'s
-`OptimizersContainer.spectrum_logging_config`):
+`DiSCOOptimizersContainer.spectrum_logging_config`):
 
 - `enable_plot`: instead of one image per parameter (illegible/unusable at
   ~31k tracked parameters), render a small number of "atlas" grid images —
@@ -55,7 +55,7 @@ config -- see `components/optimizer.py`'s
   meant to be the lossless record.
 
 `process_norms_for_logging` is the entry point: given the raw norms dict
-produced by `OptimizersContainer.get_parameter_norms()`
+produced by `DiSCOOptimizersContainer.get_parameter_norms()`
 (components/optimizer.py), it replaces every raw spectrum tensor with
 whatever's enabled, so components/metrics.py never needs any spectrum-
 specific logic -- it just forwards whatever's left in the dict to
@@ -82,10 +82,9 @@ class SpectrumLoggingConfig(NamedTuple):
     """
     Bundles the settings `process_norms_for_logging` needs, so callers pass
     one object instead of a growing list of loose bool/str arguments.
-    `enable_plot`/`enable_export` are set from `OptimizersContainer.Config`
-    directly in its `__init__`; `export_dir` depends on the top-level
-    `config.dump_folder`, so trainer.py patches that in afterward. Stored as
-    `OptimizersContainer.spectrum_logging_config`.
+    All three come from `DiSCOOptimizersContainer.Config` / its `output_dir`
+    build kwarg and are set in its `__init__`. Stored as
+    `DiSCOOptimizersContainer.spectrum_logging_config`.
     """
 
     enable_plot: bool = True

@@ -69,11 +69,10 @@ class GramVectorLoggingConfig(NamedTuple):
     """
     Bundles the settings `process_gram_vectors_for_logging` needs -- mirrors
     `spectrum_logging.SpectrumLoggingConfig` exactly (same two independent
-    toggles, same deferred `export_dir`). `enable_plot`/`enable_export` are
-    set from `OptimizersContainer.Config` directly in its `__init__`;
-    `export_dir` depends on the top-level `config.dump_folder`, so
-    trainer.py patches that in afterward. Stored as
-    `OptimizersContainer.gram_vector_logging_config`.
+    toggles, same `export_dir`). All three come from
+    `DiSCOOptimizersContainer.Config` / its `output_dir` build kwarg and are
+    set in its `__init__`. Stored as
+    `DiSCOOptimizersContainer.gram_vector_logging_config`.
     """
 
     enable_plot: bool = True

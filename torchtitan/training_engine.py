@@ -57,6 +57,7 @@ from torchtitan.observability.metrics import (
 )
 from torchtitan.observability.profiler import Profiler
 from torchtitan.observability.sdc_replayer import ScalarStateAccessor, SDCReplayer
+from torchtitan.optimizers.container import DiSCOOptimizersContainer
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.quantization.utils import has_quantization
@@ -188,10 +189,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     num_accumulation_steps: int
     num_completed_steps: int
     ntokens_seen: int
-    calculate_norm_at_next_step: bool
-    """Set by the owner before ``optimizer_step`` when the upcoming step
-    should also compute DiSCO's parameter norms. The decision has to be
-    made before the step because the norms are produced inside it."""
     sdc_replayer: SDCReplayer | None
     model_param_count: int
     num_flops_per_token: int
@@ -218,7 +215,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.has_quantization = has_quantization(model_config)
         self.num_accumulation_steps = 1
         self.num_completed_steps = 0
-        self.calculate_norm_at_next_step = False
         self.ntokens_seen = 0
         self._num_optimizer_steps_since_cuda_graph_init = 0
         self.sdc_replayer = None
@@ -353,13 +349,19 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 cast(BaseModel, model_part).init_weights(buffer_device=buffer_device)
             model_part.train()
 
-        # A loss may wrap the chunked one, so look one level in rather than only
-        # at the top.
-        chunked_loss_fn = (
-            self.loss_fn
-            if isinstance(self.loss_fn, ChunkedLossWrapper)
-            else getattr(self.loss_fn, "inner", None)
-        )
+        # A loss may wrap the chunked one, so walk `.inner` down to a fixed
+        # point rather than probing exactly one level: two nested wrappers would
+        # otherwise leave lm_head unset, and the failure is silent until the
+        # first chunked forward.
+        chunked_loss_fn = self.loss_fn
+        seen: set[int] = set()
+        while (
+            not isinstance(chunked_loss_fn, ChunkedLossWrapper)
+            and id(chunked_loss_fn) not in seen
+            and getattr(chunked_loss_fn, "inner", None) is not None
+        ):
+            seen.add(id(chunked_loss_fn))
+            chunked_loss_fn = chunked_loss_fn.inner
         if isinstance(chunked_loss_fn, ChunkedLossWrapper) and (
             not self.parallel_dims.pp_enabled or self.pp_has_last_stage
         ):
@@ -388,7 +390,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         # groups and metric-ownership split from the mesh topology, not from
         # FQN regexes. Upstream's container accepts and ignores it.
         self.optimizers = self.config.optimizer.build(
-            model_parts=self.model_parts, parallel_dims=self.parallel_dims
+            model_parts=self.model_parts,
+            parallel_dims=self.parallel_dims,
+            output_dir=self.output_dir,
         )
         if model_spec.post_optimizer_build_fn is not None:
             model_spec.post_optimizer_build_fn(
@@ -721,12 +725,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         )
         if hasattr(self, "checkpointer"):
             self.checkpointer.maybe_wait_for_staging()
-        # DiSCO computes parameter norms inside step() when armed, so this has
-        # to be decided BEFORE the step, not when the metrics are collected.
-        if self.calculate_norm_at_next_step and hasattr(
-            self.optimizers, "calculate_norm_at_next_step"
-        ):
-            self.optimizers.calculate_norm_at_next_step()
         self.optimizers.step()
         self.lr_schedulers.step()
         # getattr, not attribute access: `ema` is only assigned in
@@ -786,8 +784,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             cuda_graph_teardown()
         if hasattr(self, "checkpointer"):
             self.checkpointer.close()
-        # DiSCO's optimizer container runs an async metrics worker thread; without
-        # this the process hangs at exit.
-        optimizers = getattr(self, "optimizers", None)
-        if optimizers is not None and hasattr(optimizers, "close"):
-            optimizers.close()
+        # DiSCO's optimizer container runs an async metrics worker thread;
+        # without this the process hangs at exit. getattr because close() is
+        # reachable on a partly built engine.
+        if isinstance(getattr(self, "optimizers", None), DiSCOOptimizersContainer):
+            self.optimizers.close()

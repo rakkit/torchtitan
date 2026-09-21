@@ -24,6 +24,7 @@ async logging queue.
 """
 
 import logging
+import os
 import queue
 import threading
 from collections.abc import Callable, Iterator
@@ -48,19 +49,18 @@ from torchtitan.optimizers import (
     create_disco_optimizer_kwargs_from_optimizer_config,
     create_disco_param_groups,
     DiSCO,
+    norm_helper,
     spectrum_logging,
 )
 from torchtitan.optimizers.gram_vector_logging import (
     GramVectorLoggingConfig,
     process_gram_vectors_for_logging,
 )
-from torchtitan.optimizers import norm_helper
 from torchtitan.optimizers.spectrum_logging import process_norms_for_logging
 
 __all__ = [
-    "OptimizersContainer",
+    "DiSCOOptimizersContainer",
     "register_moe_load_balancing_hook",
-
 ]
 logger = logging.getLogger(__name__)
 
@@ -72,8 +72,27 @@ MAXVIO_EPS = 1e-12
 T = TypeVar("T", bound=Optimizer)
 
 
-class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
-    """A container for multiple optimizers.
+class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
+    """Upstream's optimizer container, extended for DiSCO.
+
+    Named for the optimizer it exists to serve, not for the only one it can
+    build -- ``name`` also accepts Adam/AdamW, so the same instrumentation can
+    run the AdamW arm of an A/B. It used to be called ``OptimizersContainer``,
+    exactly like its base, which made it read as a FORK of upstream's container
+    rather than a subclass: 25 of the base's methods are inherited untouched.
+
+    What it adds over the base:
+
+    * DiSCO parameter groups derived from MESH TOPOLOGY rather than from FQN
+      regexes, which is why it needs ``parallel_dims`` at construction.
+    * Per-parameter norm / spectrum / gram metrics. These are produced INSIDE
+      ``step()``, so a step that should report them has to be armed before it
+      runs: ``wants_norms_at()`` decides, ``arm_norm_computation()`` arms, and
+      ``collect_metrics()`` reads the result back afterwards.
+    * The async MoE load-balancing metrics worker, also drained by
+      ``collect_metrics()``.
+
+    Upstream's own docstring follows.
 
     This class is used to wrap multiple optimizers into a single object that can be
     used to reduce the complexity of the training loop. This mimics the behavior of
@@ -163,6 +182,16 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
         - more info: https://pytorch.org/docs/stable/optim.html
         """
 
+        log_metrics_locally: bool = False
+        """Whether every shard rank logs its own slice instead of gathering.
+
+        Derived, not user-set: ``Trainer.Config.__post_init__`` computes it
+        from ``metrics.save_all_shard_ranks``/``save_for_all_ranks`` and
+        whether any logger backend is on, because the decision spans two
+        configs. It has to be identical on every rank -- the gather it skips is
+        a collective, so ranks that disagree hang rather than misreport.
+        """
+
         log_norm_freq: int = 0
         """How often, in steps, to log DiSCO's per-parameter norms. 0 disables.
 
@@ -219,15 +248,22 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
     model_parts: list[nn.Module]
 
     @staticmethod
-    def _resolve_optimizer_cls(name: str) -> type:
-        optimizer_classes = {
+    def _resolve_optimizer_factory(name: str) -> Callable[..., Optimizer]:
+        """Upstream's registry with DiSCO in place of DistMuon.
+
+        Overrides the base hook rather than sitting beside it as a separate
+        `_resolve_optimizer_cls`, so there is one name for this lookup and a
+        future change to upstream's signature shows up as a conflict here
+        instead of silently leaving a second, stale registry in the subclass.
+        """
+        optimizer_factories: dict[str, Callable[..., Optimizer]] = {
             "Adam": torch.optim.Adam,
             "AdamW": torch.optim.AdamW,
             "DiSCO": DiSCO,
         }
-        if name not in optimizer_classes:
+        if name not in optimizer_factories:
             raise NotImplementedError(f"Optimizer {name} not added.")
-        return optimizer_classes[name]
+        return optimizer_factories[name]
 
     @staticmethod
     def _build_optimizer_kwargs(
@@ -264,8 +300,9 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
         *,
         model_parts: list[nn.Module],
         parallel_dims: ParallelDims,
+        output_dir: str | None = None,
     ) -> None:
-        optimizer_cls = self._resolve_optimizer_cls(config.name)
+        optimizer_cls = self._resolve_optimizer_factory(config.name)
         optimizer_kwargs = self._build_optimizer_kwargs(config, parallel_dims)
         all_params = []
         self.optimizers = []
@@ -282,16 +319,23 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
         self.log_norm_freq: int = config.log_norm_freq
         self.log_queue: queue.Queue | None = None
         self.log_thread: threading.Thread | None = None
-        # Set by the trainer from MetricsProcessor.Config.save_all_shard_ranks;
-        # False keeps the historical gather-to-one-rank behaviour.
-        self.log_metrics_locally: bool = False
+        self.log_metrics_locally: bool = config.log_metrics_locally
+        # The export directories are the only part of the logging setup that
+        # depends on a runtime value, so `output_dir` is taken as a build kwarg
+        # rather than left for the trainer to patch in afterwards. It used to
+        # assign both configs back onto this object post-construction, which
+        # left the container briefly in a state its own methods did not expect.
         self.spectrum_logging_config = spectrum_logging.SpectrumLoggingConfig(
             enable_plot=config.enable_spectrum_plot,
             enable_export=config.enable_spectrum_export,
+            export_dir=(
+                os.path.join(output_dir, "spectrum_export") if output_dir else None
+            ),
         )
         self.gram_vector_logging_config = GramVectorLoggingConfig(
             enable_plot=config.enable_gram_plot,
             enable_export=config.enable_gram_export,
+            export_dir=os.path.join(output_dir, "gram_export") if output_dir else None,
         )
 
         # `param_groups` and `optimizer_factory_kwargs_by_name` are inherited
@@ -342,7 +386,10 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
             self.optimizers.append(optimizer_cls(params, **optimizer_kwargs))
             all_params.extend(params)
 
-        self._validate_length(len(self.model_parts))
+        assert len(self.optimizers) == len(self.model_parts), (
+            f"{len(self.optimizers)} optimizers for {len(self.model_parts)} "
+            "model parts; this container builds exactly one per part."
+        )
         self._post_init(all_params, optimizer_kwargs)
 
     def __iter__(self) -> Iterator[T]:
@@ -385,9 +432,33 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
                     )
                     param_group["lr"] = prev_lr
 
-    def calculate_norm_at_next_step(self):
-        # for Disco, we tell the optimizer to calculate the norm at next step
-        # in the step() function
+    def wants_norms_at(
+        self, step: int, *, should_log: bool, is_final_step: bool
+    ) -> bool:
+        """Whether `step` should compute per-parameter norms.
+
+        The cadence lives here because `log_norm_freq` does. The two facts it
+        cannot know -- whether this is a metrics-logging step at all, and
+        whether it is the run's last -- are passed in by the trainer.
+
+        Norm logging is gated on `should_log` downstream, so anything computed
+        on a non-logging step would be thrown away; `log_norm_freq` is required
+        to be a multiple of `metrics.log_freq` so that the two cadences line up
+        (validated in `Trainer.Config.__post_init__`). The final step is armed
+        unconditionally so a run always ends with a spectrum snapshot.
+        """
+        if self.log_norm_freq <= 0:
+            return False
+        if is_final_step:
+            return True
+        return should_log and (step == 1 or step % self.log_norm_freq == 0)
+
+    def arm_norm_computation(self):
+        """Tell DiSCO to produce norms during the NEXT `step()`.
+
+        Has to happen before the step, not at the log site: the norms are a
+        by-product of the update itself.
+        """
         for i, _ in enumerate(self.model_parts):
             optimizer = self.optimizers[i]
             if isinstance(optimizer, DiSCO):
@@ -408,29 +479,59 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
                     log_metrics_locally=self.log_metrics_locally,
                 )
 
+    def collect_metrics(self, step: int, *, include_norms: bool) -> dict[str, Any]:
+        """Everything this container has to report for `step`.
+
+        One call instead of three, so the trainer does not have to know that
+        norms and MoE routing stats come from different machinery on different
+        schedules. `include_norms` must match what `wants_norms_at` returned
+        before the step -- asking for norms that were never armed yields an
+        empty dict, not an error.
+        """
+        metrics: dict[str, Any] = {}
+        if include_norms:
+            metrics.update(self.get_parameter_norms(step=step))
+        metrics.update(self.collect_moe_metrics())
+        return metrics
+
+    def collect_moe_metrics(self) -> dict[str, Any]:
+        """Drain the async MoE metrics worker and gather what it produced.
+
+        The worker writes each layer's dict onto the MoE MODULE
+        (`_log_expert_metrics`) because that is the handle the load-balancing
+        hook already holds. Reading them back belongs here, with the producer,
+        rather than in the trainer -- which used to walk
+        `model_parts -> layers -> moe` and read that private attribute itself.
+        """
+        # The worker reports router entropy / max-violation from a background
+        # thread; drain it before reading the per-layer dicts.
+        self.join_log_queue()
+        metrics: dict[str, Any] = {}
+        for model_part in self.model_parts:
+            layers = getattr(model_part, "layers", None)
+            if layers is None:
+                continue
+            for layer in layers.values():
+                moe = getattr(layer, "moe", None)
+                if moe is not None:
+                    metrics.update(getattr(moe, "_log_expert_metrics", None) or {})
+        return metrics
+
     def get_parameter_norms(self, step: int):
+        """Post-process the norms DiSCO computed during the armed `step()`."""
         all_norms = {}
-        for i, model_part in enumerate(self.model_parts):
-            # NB: assumes correspondences between model parts and optimizers
-            optimizer = self.optimizers[i]
-            for group in optimizer.param_groups:
-                if isinstance(optimizer, DiSCO):
-                    all_norms.update(optimizer.get_norms_at_current_step())
-                else:
-                    logger.warning(
-                        f"Optimizer {optimizer.__class__.__name__} does not support norm calculation."
-                    )
-                    # all_norms.update(
-                    #     naive_param_norm.get_parameter_norms(
-                    #         [model_part],
-                    #         [optimizer],
-                    #         self.norms_to_log,
-                    #     )
-                    # )
-                # # To Debug, we can force using naive_param_norm
-                # all_norms.update(
-                #     naive_param_norm.get_parameter_norms([model_part], [optimizer])
-                # )
+        for optimizer in self.optimizers:
+            if isinstance(optimizer, DiSCO):
+                # Returns the dict stashed by the armed step, so it is read
+                # once per optimizer -- this used to sit inside a
+                # `for group in optimizer.param_groups` loop, re-reading and
+                # re-merging the same dict once per parameter group.
+                all_norms.update(optimizer.get_norms_at_current_step())
+            else:
+                logger.warning(
+                    f"Optimizer {optimizer.__class__.__name__} does not support "
+                    "norm calculation."
+                )
         all_norms = process_gram_vectors_for_logging(
             all_norms, step=step, config=self.gram_vector_logging_config
         )
@@ -446,12 +547,6 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
             for k, group in enumerate(optimizer.param_groups):
                 lrs[f"lr/opt_{i}/group_{k}"] = group["lr"]
         return lrs
-
-    def _validate_length(self, expected_length: int) -> None:
-        assert expected_length == len(self.optimizers), (
-            "Must pass one optimizer per model part or per param if "
-            "using OptimizersInBackwardContainer."
-        )
 
     def set_up_async_logging(self, log_fn: Callable):
         self.log_queue = queue.Queue()
@@ -505,10 +600,6 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
         self.defaults.pop("parallel_dims", None)
         for group in self.param_groups:
             group.pop("parallel_dims", None)
-
-    def init_cache_state_dict(self) -> None:
-        """Initialize cached state dict for TorchFT. No-op for base class."""
-        pass
 
 
 def moe_metrics_worker(log_queue: queue.Queue):
@@ -679,10 +770,10 @@ def fused_hier_reduce_loss_stats(
 
 
 def register_moe_load_balancing_hook(
-    optimizers: OptimizersContainer,
+    optimizers: DiSCOOptimizersContainer,
     model_parts: list[nn.Module],
     parallel_dims: ParallelDims,
-) -> OptimizersContainer:
+) -> DiSCOOptimizersContainer:
 
     # NOTE: the worker thread is started lazily, at the bottom of this
     # function, only once `_should_register_moe_balancing_hook` says the hook
@@ -789,7 +880,9 @@ def register_moe_load_balancing_hook(
                 load_balance_loss_buffers.append(
                     aux.instance_acc.reshape(1)
                     if aux is not None
-                    else torch.zeros(1, dtype=torch.float32, device=moe.acc_fwd_times.device)
+                    else torch.zeros(
+                        1, dtype=torch.float32, device=moe.acc_fwd_times.device
+                    )
                 )
         # Early exit if no MoE layers were found
         if not moe_layers_info:

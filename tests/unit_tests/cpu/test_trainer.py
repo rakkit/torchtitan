@@ -94,13 +94,22 @@ def _training_loop(trainer: TrainingEngine) -> SimpleNamespace:
     if not hasattr(trainer, "optimizer_step"):
         trainer.optimizer_step = lambda: TrainingEngine.optimizer_step(trainer)
 
-    return SimpleNamespace(
+    fake_trainer = SimpleNamespace(
         engine=trainer,
         config=trainer.config,
         gradient_accumulation_steps=trainer.gradient_accumulation_steps,
         num_pp_microbatches=trainer.num_pp_microbatches,
         metrics_processor=trainer.metrics_processor,
     )
+    # Same idiom as the attributes patched onto `trainer` above: a duck-typed
+    # `self` still has to carry what `train_step` reads off it. A
+    # SimpleNamespace does not inherit Trainer's class-level
+    # `data_mix_metrics` null object, so it needs one of its own.
+    fake_trainer.data_mix_metrics = Trainer.data_mix_metrics
+    fake_trainer._is_final_step = lambda step: Trainer._is_final_step(
+        fake_trainer, step
+    )
+    return fake_trainer
 
 
 def test_microbatch_generator_preserves_labels() -> None:

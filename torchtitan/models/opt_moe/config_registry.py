@@ -6,11 +6,11 @@
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper
-from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.config import DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.optimizers.container import OptimizersContainer
+from torchtitan.observability.metrics import MetricsProcessor
+from torchtitan.optimizers.container import DiSCOOptimizersContainer
 from torchtitan.trainer import Trainer
 from . import model_registry
 
@@ -23,7 +23,7 @@ def moe_template_config() -> Trainer.Config:
         # No `dataloader=` default. Every recipe assigns `config.dataloader` from
         # `components/data/mix.make_pretrain_dataloader_config`, and a template default
         # that no run uses is a trap: it decides the shape of anything that forgets to.
-        optimizer=OptimizersContainer.Config(lr=8e-4),
+        optimizer=DiSCOOptimizersContainer.Config(lr=8e-4),
         # Plain chunked cross-entropy. The load-balance term is no longer added
         # here: NormMoE injects its gradient at the layer via LoadBalanceLoss,
         # so the model returns logits alone.

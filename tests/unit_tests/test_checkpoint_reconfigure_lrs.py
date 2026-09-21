@@ -38,12 +38,12 @@ class TestReconfigureLrs(unittest.TestCase):
         self.assertIn("does not support preserving learning", body)
 
     def test_the_fork_container_does_support_it(self):
-        from torchtitan.optimizers.container import OptimizersContainer
+        from torchtitan.optimizers.container import DiSCOOptimizersContainer
 
         self.assertIn(
             "preserve_lrs_when_loading",
-            OptimizersContainer.__init__.__code__.co_names
-            + tuple(OptimizersContainer.load_state_dict.__code__.co_names),
+            DiSCOOptimizersContainer.__init__.__code__.co_names
+            + tuple(DiSCOOptimizersContainer.load_state_dict.__code__.co_names),
         )
 
 

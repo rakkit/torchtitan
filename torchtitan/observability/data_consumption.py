@@ -37,7 +37,12 @@ import torch
 # BaseDataLoader is UPSTREAM's (components/data/loader.py).
 from torchtitan.components.data.loader import BaseDataLoader
 
-__all__ = ["DataMixMetrics", "build_data_mix_metrics"]
+__all__ = [
+    "DataMixMetrics",
+    "DataMixMetricsLike",
+    "NoDataMixMetrics",
+    "build_data_mix_metrics",
+]
 
 
 class DataMixMetrics:
@@ -95,6 +100,11 @@ class NoDataMixMetrics:
 
     def dump_mixing_configs(self, dump_folder: str) -> None:
         pass
+
+
+# What `build_data_mix_metrics` returns: the real reporter, or the null object
+# used when the loader has no per-dataset cursors.
+DataMixMetricsLike = DataMixMetrics | NoDataMixMetrics
 
 
 def build_data_mix_metrics(

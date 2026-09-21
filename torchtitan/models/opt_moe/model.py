@@ -223,6 +223,8 @@ class OPTMoETransformerBlock(TransformerBlock):
         positions: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
         doc_id: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
     ) -> "tuple[torch.Tensor, torch.Tensor | None]":
         """Forward pass through the block.
 
@@ -232,6 +234,15 @@ class OPTMoETransformerBlock(TransformerBlock):
                 when layers mix backends, or a single mask.
             positions: Optional position indices ``[T]``.
             loss_mask: Optional token loss mask for the MoE load-balance loss.
+            padding_mask: Upstream's per-token padding flag (#4594), accepted
+                because ``Decoder.forward`` now passes it to every layer. NOT
+                used here: opt_moe derives its own ``loss_mask`` from
+                ``labels != IGNORE_INDEX`` in ``preprocess_inputs``, which is
+                not the same signal. Under SFT a prompt token has
+                ``IGNORE_INDEX`` labels but is not padding, so ours excludes
+                prompt tokens from the load-balance statistics while upstream's
+                would include them. Switching to upstream's mask is a numerics
+                change, not a rename.
 
         Returns:
             ``output``. The load-balance gradient is injected inside the MoE
@@ -558,6 +569,8 @@ class OPTMoEModel(Decoder):
         attention_masks: AttentionMasksType | None = None,
         loss_mask: torch.Tensor | None = None,
         doc_id: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
     ):
         """Forward pass.
 
@@ -567,6 +580,9 @@ class OPTMoEModel(Decoder):
             positions: Position indices ``[T]``.
             attention_masks: Per-layer masks (dict) or a single mask.
             loss_mask: Token mask for the MoE load-balance loss.
+            padding_mask: Accepted and ignored; see
+                ``OPTMoETransformerBlock.forward`` for why it is not
+                interchangeable with ``loss_mask``.
                 prior pipeline stage.
 
         Returns:

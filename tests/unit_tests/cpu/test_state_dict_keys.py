@@ -52,13 +52,13 @@ _ADAMW_STATE_NAMES = ("step", "exp_avg", "exp_avg_sq")
 # failure, but a rename in the model would.
 _TOP_LEVEL_ANCHORS = ("tok_embeddings.weight", "norm.weight", "lm_head.weight")
 _LAYER0_ANCHORS = (
-    # debugmodel uses fused QKV by default, so named_parameters() exposes the
-    # single fused ``wqkv`` (state_dict() splits it back to wq/wk/wv via a hook).
+    # debugmodel uses fused QKV by default, and native state dicts retain its
+    # single packed ``wqkv`` parameter.
     "layers.0.attention.qkv_linear.wqkv.weight",
     "layers.0.attention.wo.weight",
-    "layers.0.feed_forward.w1.weight",
+    # FeedForward stores gate/up in one physical w13 parameter.
+    "layers.0.feed_forward.w13.weight",
     "layers.0.feed_forward.w2.weight",
-    "layers.0.feed_forward.w3.weight",
     "layers.0.attention_norm.weight",
     "layers.0.ffn_norm.weight",
 )

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict_saver import _stateful_to_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
@@ -47,7 +48,6 @@ from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.tools import filesystem
-from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
 
 from .base import (
@@ -59,6 +59,9 @@ from .base import (
     OPTIMIZER,
     purge_thread,
 )
+
+logger = logging.getLogger(__name__)
+
 
 DEFAULT_TORCH_CHECKPOINTING_BARRIER_TCPSTORE_PORT = 43001
 _DEFAULT_BARRIER_INIT_TIMEOUT_SEC = 60
@@ -85,7 +88,7 @@ class _BackendCheckpointStorage:
 
     ``Path`` would mangle a remote URI -- it collapses the double slash in
     ``gs://bucket/x`` -- but every path arriving here is joined off
-    ``checkpoint.folder`` or ``checkpoint.initial_load_path``, and the manager
+    ``checkpointer.folder`` or ``checkpointer.initial_load_path``, and the manager
     rejects a remote value for either at construction. So there is nothing left
     to guard against by the time a path reaches this class.
     """
@@ -233,9 +236,6 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         base_folder: str = "",
         storage_config: StorageConfig | None = None,
     ) -> None:
-        self.enable = config.enable
-        if not self.enable:
-            return
         self.save_future: Future[Any] | None = None
         self.purge_thread: threading.Thread | None = None
 
@@ -244,8 +244,8 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         # probe when retention is off, so it would otherwise reach the backend
         # and be mangled by Path() rather than failing.
         for label, candidate in (
-            ("checkpoint.folder", self.folder),
-            ("checkpoint.initial_load_path", config.initial_load_path),
+            ("checkpointer.folder", self.folder),
+            ("checkpointer.initial_load_path", config.initial_load_path),
         ):
             if candidate and filesystem.is_remote(candidate):
                 raise ValueError(
@@ -312,7 +312,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         self.sd_adapter = sd_adapter
         if self.last_save_in_hf and self.sd_adapter is None:
             raise ValueError(
-                "checkpoint.last_save_in_hf is True, but sd_adapter is not provided."
+                "checkpointer.last_save_in_hf is True, but sd_adapter is not provided."
             )
 
         self._manager = self._manager_config.build()
@@ -353,7 +353,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         if not self._is_valid_checkpoint(checkpoint_id):
             raise ValueError(
                 f"Checkpoint {checkpoint_id!r} is not a native "
-                "torch_checkpointing checkpoint."
+                "torch_checkpointing checkpointer."
             )
         # strict: the backend defaults to skipping anything the checkpoint does
         # not carry, which would silently leave parameters at their initialized
@@ -375,8 +375,6 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                     f"{type(target).__name__}"
                 )
 
-    @sl.log_trace_span("checkpoint_save")
-    @torch.no_grad()
     def _save(self, curr_step: int, last_step: bool = False) -> bool:
         should_save = self._should_save(curr_step, last_step)
         # Prewarm on a step we are not saving, so the first real save does not
@@ -520,12 +518,16 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             hf_storage_config = storage_config or LocalFileSystemStorageConfig(
                 use_direct_io=False
             )
-            # The backend invokes the callback after all ranks finish writing
-            # (past the write barrier) and before the atomic rename of the
+
+            # The backend invokes the callback after each rank finishes writing
+            # but before the write barrier and the atomic rename of the
             # temp dir to its final path, passing the directory the shards
             # were actually written to. Consolidation repacks the per-rank
             # shards into HF-layout files in the checkpoint directory.
-            pre_finalize_callback = lambda staged, _event_logger: (
+            def pre_finalize_callback(staged: str, _event_logger) -> None:  # noqa: F811
+                # Need all ranks to finish writing before any rank starts consolidating
+                if dist.is_initialized():
+                    dist.barrier()
                 consolidate_hf_safetensors_checkpoint(
                     staged,
                     output_dir=checkpoint_id,
@@ -533,7 +535,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                     fqn_to_index_mapping=fqn_to_index_mapping,
                     storage_config=hf_storage_config,
                 )
-            )
+
         manager_config = _default_backend_config(
             _sync_save_config(),
             storage_config=storage_config,
@@ -551,4 +553,4 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         GarbageCollection.collect("GC collection invoked by checkpointer.")
 
     def _should_prewarm(self) -> bool:
-        return self.enable and not self._prewarmed and not self.load_only
+        return not self._prewarmed and not self.load_only

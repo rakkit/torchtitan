@@ -20,7 +20,7 @@ from torchtitan.models.common.attention import (
     create_varlen_metadata_for_document,
     GQAttention,
     QKVLinear,
-    VarlenAttention,
+    VarlenInnerAttention,
 )
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rope import ComplexRoPE
@@ -78,7 +78,7 @@ class TestPackedVarlenMetadata(unittest.TestCase):
         self.assertEqual(metadata.max_q, 4)
 
 
-class TestPackedVarlenAttention(unittest.TestCase):
+class TestPackedVarlenInnerAttention(unittest.TestCase):
     def test_gqa_preserves_td_shape(self):
         torch.manual_seed(42)
         num_tokens, dim, num_heads, head_dim = 6, 8, 2, 4
@@ -89,11 +89,12 @@ class TestPackedVarlenAttention(unittest.TestCase):
             dim=dim,
             qkv_linear=QKVLinear.Config(
                 head_dim=head_dim,
-                wq=Linear.Config(in_features=dim, out_features=dim),
-                wkv=Linear.Config(in_features=dim, out_features=dim),
+                n_heads=num_heads,
+                n_kv_heads=num_heads,
+                wqkv=Linear.Config(in_features=dim, out_features=3 * dim),
             ),
             wo=Linear.Config(in_features=dim, out_features=dim),
-            inner_attention=VarlenAttention.Config(),
+            inner_attention=VarlenInnerAttention.Config(),
             rope=ComplexRoPE.Config(dim=head_dim, max_context_length=num_tokens),
         ).build()
         x_TD = torch.randn(num_tokens, dim)
@@ -134,14 +135,18 @@ class TestPackedVarlenAttention(unittest.TestCase):
         self.assertEqual(axis_types[MeshAxisName.DP], spmd.S(0))
         self.assertEqual(axis_types[MeshAxisName.CP], spmd.S(0))
         self.assertEqual(axis_types[MeshAxisName.TP], spmd.S(1))
-        self.assertEqual(_per_axis_types(k_dst_layout)[MeshAxisName.CP], spmd.R)
+        self.assertEqual(_per_axis_types(k_dst_layout)[MeshAxisName.CP], spmd.S(0))
+        self.assertEqual(
+            _per_axis_types(k_dst_layout),
+            _per_axis_types((sharding.in_src_shardings or {})["k_THK"]),
+        )
 
     def test_out_transform_receives_th_lse(self):
         num_tokens, num_heads, head_dim = 5, 2, 4
         q_THK = torch.randn(num_tokens, num_heads, head_dim)
         positions_T = torch.tensor([0, 1, 0, 1, 2])
         metadata = create_varlen_metadata_for_document(positions_T)
-        inner_attention = VarlenAttention.Config().build()
+        inner_attention = VarlenInnerAttention.Config().build()
 
         def _varlen_with_lse(q, k, v, *args, **kwargs):
             lse_HT = torch.randn(num_heads, num_tokens)

@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import dataclasses as _dc
 from dataclasses import dataclass, field
 from typing import Any
@@ -16,7 +17,7 @@ from torchtitan.models.common.attention import (
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
-    ScaledDotProductAttention,
+    ScaledDotProductInnerAttention,
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
@@ -24,7 +25,6 @@ from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import quadratic_attention_flops_per_token
-from torchtitan.tools.logging import logger
 from .gated_norm_swattention import GatedNormSWAttention
 from .norm_moe import get_nparams_and_active_nparams
 from .utils.inits import (
@@ -42,6 +42,8 @@ def _parse_layer_pattern(
     true_char: str,
     false_char: str,
     default_true: bool = False,
+
+logger = logging.getLogger(__name__)
 ) -> "list[bool]":
     """Parse a per-layer pattern into a flat list of booleans.
 
@@ -136,24 +138,24 @@ class OPTMoETransformerBlock(TransformerBlock):
 
         # Pre-compute the mask dict key used in forward() so we avoid string
         # comparisons and conditional logic on every training step.
-        #   "swa" → FlexAttention with sliding-window mask
-        #   "full"→ FlexAttention with full-causal mask
+        #   "swa" → FlexInnerAttention with sliding-window mask
+        #   "full"→ FlexInnerAttention with full-causal mask
         # SDPA is not reachable through `build_inner_attention` any more (it
         # delegates to upstream's `get_attention_config`, which raises for
         # language models), but a hand-built `inner_attention=
-        # ScaledDotProductAttention.Config()` could still land here. Refuse it
+        # ScaledDotProductInnerAttention.Config()` could still land here. Refuse it
         # rather than silently returning a None mask key, which is what made
         # attention span document boundaries in the first place.
         self._mask_key: str | None
         # "flex_flash" is also a flex backend: get_attention_config maps it to a
-        # FlexAttention.Config with FLASH kernel options, so it takes a mask.
+        # FlexInnerAttention.Config with FLASH kernel options, so it takes a mask.
         # Check the RESOLVED inner attention, not just the backend string: a
-        # hand-built `inner_attention=ScaledDotProductAttention.Config()` keeps
+        # hand-built `inner_attention=ScaledDotProductInnerAttention.Config()` keeps
         # whatever `attn_backend` says while actually running SDPA, and SDPA
         # cannot take a mask at all (it only has a boolean is_causal), which is
         # exactly what made attention span document boundaries.
         _inner = getattr(config.attention, "inner_attention", None)
-        _is_sdpa = isinstance(_inner, ScaledDotProductAttention.Config)
+        _is_sdpa = isinstance(_inner, ScaledDotProductInnerAttention.Config)
         if self.attn_backend not in ("flex", "flex_flash", "varlen") or _is_sdpa:
             raise ValueError(
                 f"attn_backend={self.attn_backend!r} / "
@@ -371,7 +373,7 @@ class OPTMoEModel(Decoder):
                     dim=self.dim,
                     use_rope=use_rope[layer_id],
                     sliding_window_size=swa_window if use_swa[layer_id] else -1,
-                    # SWA requires FlexAttention; non-SWA keeps the configured backend.
+                    # SWA requires FlexInnerAttention; non-SWA keeps the configured backend.
                     attn_backend=attn_backend,
                     # Always stamped: GQAttention requires a rope config to
                     # build. NoPE layers drop the module in the attention's

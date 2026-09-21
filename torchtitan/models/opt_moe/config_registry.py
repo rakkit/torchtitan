@@ -6,7 +6,7 @@
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper
-from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.config import DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
@@ -48,7 +48,7 @@ def moe_template_config() -> Trainer.Config:
             # for EP backends that synchronize during dispatch.
             disable_cuda_graphs=True,
         ),
-        checkpoint=CheckpointManager.Config(
+        checkpointer=CheckpointManager.Config(
             interval=50,
             last_save_model_only=False,
             export_dtype="float16",

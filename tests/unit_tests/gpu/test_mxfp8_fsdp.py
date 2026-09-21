@@ -19,22 +19,20 @@ from torch.distributed.tensor import DTensor
 pytest.importorskip("torchao")
 pytest.importorskip("torchao.prototype.moe_training.kernels.mxfp8")
 
-import torchtitan.components.quantization.mxfp8.tensor as mxfp8_tensor  # noqa: E402
-from torchtitan.components.quantization._fsdp_tensor import (  # noqa: E402
-    _UnshardedFSDPTensor,
-)
-from torchtitan.components.quantization.mxfp8.linear import MXFP8Linear  # noqa: E402
-from torchtitan.components.quantization.mxfp8.tensor import (  # noqa: E402
-    _LinearShardedTensorWithMXFP8Compute,
-)
-from torchtitan.distributed.cudagraph import (  # noqa: E402
-    cudagraph_teardown,
+import torchtitan.quantization.mxfp8.tensor as mxfp8_tensor  # noqa: E402
+from torchtitan.distributed.cuda_graph import (  # noqa: E402
+    cuda_graph_teardown,
     CUDAGraphWrapper,
 )
 from torchtitan.experiments.graph_trainer.simple_fsdp import (  # noqa: E402
     data_parallel,
     disable_active_parametrization,
     MixedPrecisionPolicy as SimpleFSDPMixedPrecisionPolicy,
+)
+from torchtitan.quantization._fsdp_tensor import _UnshardedFSDPTensor  # noqa: E402
+from torchtitan.quantization.mxfp8.linear import MXFP8Linear  # noqa: E402
+from torchtitan.quantization.mxfp8.tensor import (  # noqa: E402
+    _LinearShardedTensorWithMXFP8Compute,
 )
 
 
@@ -203,7 +201,7 @@ def _run_pp_cache_lifecycle(
             for _ in range(2)
         ]
         outputs = [linear(input_MK) for input_MK in inputs]
-        assert num_quantize_calls == 1
+        assert num_quantize_calls == 1, num_quantize_calls
         weight_param = _get_weight_param(linear)
         assert isinstance(linear.weight, _UnshardedFSDPTensor)
         assert linear.weight.operands is not None
@@ -225,7 +223,7 @@ def _run_pp_cache_lifecycle(
         )
 
         outputs[0].sum().backward()
-        assert num_quantize_calls == 1
+        assert num_quantize_calls == 1, num_quantize_calls
         assert isinstance(linear.weight, _UnshardedFSDPTensor)
         assert linear.weight.operands is not None
         assert all(
@@ -360,6 +358,7 @@ def _run_cuda_graph_cache_lifecycle(
             (input_MK,),
             static_input_indices=(0,),
             should_check_address=True,
+            num_warmup_iterations=1,
         )
 
         # RAF=false keeps the prepared weights alive, so CUDA-graph warmup,
@@ -393,7 +392,7 @@ def _run_cuda_graph_cache_lifecycle(
         )
     finally:
         mxfp8_tensor._quantize_mxfp8_weight = original_quantize_weight
-        cudagraph_teardown()
+        cuda_graph_teardown()
         dist.destroy_process_group()
 
 
@@ -454,7 +453,7 @@ def _run_simple_fsdp(
         output_MN.sum().backward()
 
         assert output_MN.shape == (64, 128)
-        assert num_quantize_calls == 1
+        assert num_quantize_calls == 1, num_quantize_calls
         assert input_MK.grad is not None
         assert sharded_weight.grad is not None
     finally:

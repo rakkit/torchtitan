@@ -41,7 +41,7 @@ class _FakeParallelDims:
         self.tp_enabled = not sparse
 
     def get_optional_mesh(self, name):
-        enabled = {"fsdp", "tp"} if not self.sparse else {"efsdp", "ep"}
+        enabled = {"dp_shard", "tp"} if not self.sparse else {"efsdp", "ep"}
         return _FakeMesh((name,)) if name in enabled else None
 
     def get_mesh(self, names):
@@ -139,7 +139,7 @@ def test_autoparallel_graph_pass_selection_uses_regular_memory_policy():
         compile=GraphTrainerCompileConfig(
             enable_autoparallel=True,
             enable_async_tensor_parallel=False,
-            disable_passes=["cudagraph_pass"],
+            disable_passes=["cuda_graph_pass"],
         ),
         model_spec=SimpleNamespace(model=SimpleNamespace(layers=[object()])),
         parallelism=SimpleNamespace(

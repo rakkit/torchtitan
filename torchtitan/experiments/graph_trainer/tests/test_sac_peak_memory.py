@@ -11,12 +11,14 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from torchtitan.components.data.types import TokenizedTrainingMicrobatch
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.graph_trainer.llama3 import (
     model_registry as llama3_registry,
 )
 from torchtitan.experiments.graph_trainer.tests._trainer_test_utils import (
     build_minimal_trainer,
+    single_device_parallel_dims,
 )
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.trainer import Trainer
@@ -56,18 +58,26 @@ class StepResult:
 def _measure_step(
     trainer: Trainer, tokens: torch.Tensor, labels: torch.Tensor
 ) -> StepResult:
-    model = trainer.model_parts[0]
+    model = trainer.engine.model_parts[0]
     model.zero_grad(set_to_none=True)
     global_valid_tokens = torch.tensor(labels.numel(), dtype=torch.float, device="cuda")
     # The dataloader always supplies per-document positions, which the trainer
-    # requires to build the FlexAttention mask. Reset positions between the
+    # requires to build the FlexInnerAttention mask. Reset positions between the
     # packed documents.
     positions = torch.arange(NUM_TOKENS, device="cuda", dtype=torch.int32) % 2048
 
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
-    loss = trainer.forward_backward_step(
-        input_dict={"input": tokens, "positions": positions, "labels": labels},
+    loss = trainer.engine.forward_backward_microbatch(
+        microbatch_group=[
+            TokenizedTrainingMicrobatch(
+                input=tokens,
+                positions=positions,
+                labels=labels,
+                padding_mask=torch.zeros_like(labels, dtype=torch.bool),
+                num_valid_tokens=labels.numel(),
+            )
+        ],
         global_valid_tokens=global_valid_tokens,
     )
     torch.cuda.synchronize()
@@ -85,6 +95,8 @@ def _measure_step(
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestGraphSACPeakMemory(unittest.TestCase):
     def setUp(self):
+        self.parallel_dims = self.enterContext(single_device_parallel_dims())
+
         _set_deterministic()
         model = _build_model(DEBUGMODEL)
         self.state_dict = {
@@ -107,6 +119,7 @@ class TestGraphSACPeakMemory(unittest.TestCase):
             eager_model,
             llama3_registry(DEBUGMODEL).model,
             Trainer,
+            parallel_dims=self.parallel_dims,
         )
 
         traced_model = _build_model(DEBUGMODEL)
@@ -116,6 +129,7 @@ class TestGraphSACPeakMemory(unittest.TestCase):
             llama3_registry(DEBUGMODEL).model,
             GraphTrainer,
             activation_checkpoint_mode="selective",
+            parallel_dims=self.parallel_dims,
         )
         # Use eager-compatible SAC policy (alternating mm save/recompute)
         # to match the eager AC path's memory behavior.
@@ -169,6 +183,7 @@ class TestGraphSACPeakMemory(unittest.TestCase):
             eager_model,
             llama3_registry(DEBUGMODEL).model,
             Trainer,
+            parallel_dims=self.parallel_dims,
         )
 
         traced_model = _build_model(DEBUGMODEL)
@@ -178,6 +193,7 @@ class TestGraphSACPeakMemory(unittest.TestCase):
             llama3_registry(DEBUGMODEL).model,
             GraphTrainer,
             activation_checkpoint_mode="selective",
+            parallel_dims=self.parallel_dims,
         )
         traced_trainer.config.compile.memory_policy = "full"
 

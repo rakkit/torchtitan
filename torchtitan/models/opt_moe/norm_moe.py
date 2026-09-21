@@ -40,6 +40,7 @@ EP is now live end to end: `model.py` sets `enable_ep=expert_parallel_degree > 1
 TENSOR parallelism.
 """
 
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from fractions import Fraction
@@ -52,14 +53,12 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
 from torchtitan.distributed.spmd_types import spmd_mesh_size
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.config_utils import make_token_dispatcher_config
 from torchtitan.models.common.linear import RouterGateLinear
 from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.nn_modules import Identity
 from torchtitan.protocols.module import Module
-from torchtitan.tools.logging import logger
 
 from .norm_ffn import FeedForward
 from .utils.activations import build_activation
@@ -68,6 +67,8 @@ from .utils.moe_utils import calc_gate_scaling_factor
 from .utils.norms import build_norm_config
 
 MAXVIO_EMA_BETA = 0.995
+
+logger = logging.getLogger(__name__)
 MAXVIO_EPS = 1e-12
 
 
@@ -437,18 +438,12 @@ class NormGroupedExperts(Module):
             w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
 
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
-        if (
-            get_spmd_backend() == "spmd_types"
-            and spmd.is_type_checking()
-            and spmd_mesh_size("ep") == 1
-        ):
+        if spmd.is_type_checking() and spmd_mesh_size("ep") == 1:
             for axis in ("dp", "cp"):
                 # if no EP, convert to V for grouped_mm, which would otherwise see
                 # x:R, w1:V, offsets:P in local SPMD typechecking.
                 # spmd.P is not currently allowed to mix with spmd.V.
-                # Verbatim from upstream `models/common/moe.py:85-96`. Inert while
-                # `spmd_backend="partial_dtensor"` is pinned, but omitting it made the
-                # grouped GEMM fail type checking the moment that pin is flipped.
+                # Verbatim from upstream `models/common/moe.py:85-96`.
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
         h_RF = self.act_fn(

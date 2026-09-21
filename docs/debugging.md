@@ -5,10 +5,10 @@ Launch training job with the following command (or alternatively set configs in 
 MODULE=llama3 CONFIG=llama3_debugmodel ./run_train.sh --profiler.enable_memory_snapshot --profiler.save_memory_snapshot_folder memory_snapshot
 ```
 * `--profiler.enable_memory_snapshot`: to enable memory profiling
-* `--profiler.save_memory_snapshot_folder`: configures the folder which memory snapshots are dumped into (`./outputs/memory_snapshot/` by default)
+* `--profiler.save_memory_snapshot_folder`: configures the folder which memory snapshots are dumped into (`profiling/memory_snapshot` under the dump folder by default)
 * `--profiler.memory_snapshot_freq`: controls how often regular memory snapshots are taken. When unset, it defaults to `--profiler.profile_freq` for backward compatibility.
-	+ In case of OOMs, the snapshots will be in `./outputs/memory_snapshot/iteration_x_exit`.
-	+ Regular snapshots will be in `memory_snapshot/iteration_x`.
+	+ In case of OOMs, the snapshots will be in `step_{step:012d}_exit` under that folder.
+	+ Regular snapshots will be in `step_{step:012d}`.
 	+ For example, set `--profiler.memory_snapshot_freq 3` to take a snapshot every three iterations independently of trace profiling.
 
 You can find the saved pickle files in your output folder.
@@ -157,19 +157,17 @@ For multiple experimental runs with different parallelism configs, we need to us
 
 #### Creating a Seed Checkpoint
 
-```bash
-NGPU=1 MODULE=llama3 CONFIG=llama3_debugmodel ./run_train.sh --checkpoint.enable --checkpoint.create_seed_checkpoint --parallelism.data_parallel_replicate_degree 1 --parallelism.data_parallel_shard_degree 1 --parallelism.tensor_parallel_degree 1 --parallelism.pipeline_parallel_degree 1 --parallelism.context_parallel_degree 1 --parallelism.expert_parallel_degree 1
-```
+Create a registry configuration with `create_seed_checkpoint=True`, a
+non-`None` `checkpointer`, and every parallelism degree set to 1, then run it
+on one device.
 
 #### Loading Seed Checkpoints for Debugging
 
 When using seed checkpoints for debugging or validation purposes, you can enable the `load_only` configuration to load checkpoints without saving any new ones during training. This is particularly useful when you only want to verify model correctness or compare different configurations without cluttering your disk:
 
-```bash
-MODULE=llama3 CONFIG=llama3_debugmodel ./run_train.sh --checkpoint.enable --checkpoint.load_only
-```
-
-The `--checkpoint.load_only` flag prevents the training process from saving any checkpoints, allowing you to:
+Set `checkpointer=CheckpointManager.Config(load_only=True)` in the config
+registry. The `load_only` setting prevents the training process from saving
+any checkpoints, allowing you to:
 - Run debugging sessions without generating unwanted checkpoint files
 - Compare model behaviors using the same initial weights without checkpoint overhead
 

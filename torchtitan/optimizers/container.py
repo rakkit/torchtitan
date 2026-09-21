@@ -23,6 +23,7 @@ sign update, and reports router entropy / max-violation metrics through an
 async logging queue.
 """
 
+import logging
 import queue
 import threading
 from collections.abc import Callable, Iterator
@@ -54,12 +55,14 @@ from torchtitan.optimizers.gram_vector_logging import (
     process_gram_vectors_for_logging,
 )
 from torchtitan.optimizers.spectrum_logging import process_norms_for_logging
-from torchtitan.tools.logging import logger
 
 __all__ = [
     "OptimizersContainer",
     "register_moe_load_balancing_hook",
+
 ]
+logger = logging.getLogger(__name__)
+
 
 MAXVIO_EMA_BETA = 0.995
 MAXVIO_EPS = 1e-12

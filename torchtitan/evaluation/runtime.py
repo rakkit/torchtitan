@@ -6,6 +6,7 @@
 
 """Model loading, dense loss evaluation, and durable CSV output."""
 
+import logging
 from __future__ import annotations
 
 import csv
@@ -37,7 +38,6 @@ from torchtitan.evaluation.config import (
 from torchtitan.evaluation.data import build_evaluation_dataloader
 from torchtitan.protocols import BaseModel
 from torchtitan.tools import utils
-from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 
 
@@ -54,6 +54,8 @@ CSV_FIELDS = (
     "ppl",
     "elapsed_seconds",
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,10 +134,6 @@ class EvaluationRuntime:
             pp=1,
             ep=1,
             world_size=world_size,
-            # opt_moe requires this backend (models/opt_moe/config_registry.py);
-            # under "spmd_types" there is no "fsdp" mesh axis, which DiSCO and
-            # the metrics predicate resolve by name.
-            spmd_backend="partial_dtensor",
         )
         parallel_dims.build_mesh()
 
@@ -157,7 +155,7 @@ class EvaluationRuntime:
         model_converters = config.model_converters.build(
             parallel_dims=parallel_dims,
             model_compile_enabled=(
-                config.compile.enable and "model" in config.compile.components
+                config.compile is not None and "model" in config.compile.components
             ),
         )
         model_converters.convert(model)

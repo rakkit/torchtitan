@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import math
 import os
 from enum import Enum
@@ -21,7 +22,6 @@ from torchtitan.distributed.utils import (
     metrics_shard_rank,
     rank_owns_metrics_shard,
 )
-from torchtitan.tools.logging import logger
 from torchtitan.observability import structured_logger as sl
 
 from . import gram_helper, norm_helper, power_iteration
@@ -46,7 +46,10 @@ from .utils import remove_orig_mod_and_weight_for_p_name
 
 __all__ = [
     "DiSCO",
+
 ]
+logger = logging.getLogger(__name__)
+
 
 
 # these variables are hardcoded for now, taken from torchtitan

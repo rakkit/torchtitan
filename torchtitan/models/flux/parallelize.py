@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from typing import Any
 
 import torch
@@ -22,6 +23,7 @@ from torch.distributed.fsdp import (
 
 from torchtitan.config import (
     CompileConfig,
+    FSDPSymmMemScope,
     ParallelismConfig,
     TORCH_DTYPE_MAP,
     TrainingConfig,
@@ -36,7 +38,9 @@ from torchtitan.distributed.fsdp import (
 from torchtitan.distributed.spmd_types import annotate_replicated_parameters
 from torchtitan.models.flux.model.hf_embedder import FluxEmbedder
 from torchtitan.models.flux.model.model import FluxModel
-from torchtitan.tools.logging import logger
+
+
+logger = logging.getLogger(__name__)
 
 
 def parallelize_flux(
@@ -45,33 +49,27 @@ def parallelize_flux(
     parallel_dims: ParallelDims,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    compile_config: CompileConfig,
+    compile_config: CompileConfig | None,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ):
     if ac_config is not None:
         apply_ac(model)
 
-    if parallelism.spmd_backend == "spmd_types":
-        model.parallelize(parallel_dims)
-        annotate_replicated_parameters(model, parallel_dims)
+    model.parallelize(parallel_dims)
+    annotate_replicated_parameters(model, parallel_dims)
 
-    if compile_config.enable and "model" in compile_config.components:
+    if compile_config is not None and "model" in compile_config.components:
         apply_compile(model, compile_config)
 
-    if parallelism.spmd_backend == "spmd_types":
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-    else:
-        dp_mesh = parallel_dims.get_activated_mesh(["dp_replicate", "fsdp"])
-        dp_mesh_dims = None
-        assert dp_mesh is not None
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
     apply_fsdp(
         model,
         dp_mesh,
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
         cpu_offload=training.enable_cpu_offload,
-        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        symm_mem_scope=parallelism.fsdp_symm_mem_scope,
         dp_mesh_dims=dp_mesh_dims,
     )
 
@@ -86,7 +84,7 @@ def apply_fsdp(
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
     cpu_offload: bool = False,
-    enable_symm_mem: bool = False,
+    symm_mem_scope: FSDPSymmMemScope = None,
     dp_mesh_dims: DataParallelMeshDims | None = None,
 ):
     """
@@ -98,7 +96,7 @@ def apply_fsdp(
         param_dtype (torch.dtype): The data type to use for model parameters.
         reduce_dtype (torch.dtype): The data type to use for reduction operations.
         cpu_offload (bool): Whether to offload model parameters to CPU. Defaults to False.
-        enable_symm_mem (bool): Whether to enable symmetric-memory FSDP communication.
+        symm_mem_scope: Which FSDP modules use symmetric-memory communication.
     """
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
@@ -140,8 +138,7 @@ def apply_fsdp(
     # Wrap all the rest of model
     fully_shard(model, **fsdp_config)
 
-    if enable_symm_mem:
-        enable_fsdp_symm_mem(model)
+    enable_fsdp_symm_mem(model, symm_mem_scope)
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)
@@ -191,19 +188,14 @@ def parallelize_encoders(
     parallel_dims: ParallelDims,
     *,
     training: TrainingConfig,
-    enable_symm_mem: bool = False,
+    symm_mem_scope: FSDPSymmMemScope = None,
 ):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
     )
 
-    if parallel_dims.spmd_backend == "spmd_types":
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-    else:
-        dp_mesh = parallel_dims.get_activated_mesh(["dp_replicate", "fsdp"])
-        dp_mesh_dims = None
-        assert dp_mesh is not None
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
     fsdp_config: dict[str, Any] = {
         "mesh": dp_mesh,
         "mp_policy": mp_policy,
@@ -217,15 +209,13 @@ def parallelize_encoders(
     # CLIP Text encoder has low computation / communication ratio, so it's not necessary to apply FSDP to it.
     hf_module = t5_model.hf_module
     assert isinstance(hf_module, nn.Module)
-    if parallel_dims.spmd_backend == "spmd_types":
-        annotate_replicated_parameters(hf_module, parallel_dims)
+    annotate_replicated_parameters(hf_module, parallel_dims)
     # pyrefly: ignore [missing-attribute, not-iterable]
     for block in hf_module.encoder.block:
         fully_shard(block, **fsdp_config)
     fully_shard(hf_module, **fsdp_config)
 
-    if enable_symm_mem:
-        enable_fsdp_symm_mem(hf_module)
+    enable_fsdp_symm_mem(hf_module, symm_mem_scope)
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(hf_module)

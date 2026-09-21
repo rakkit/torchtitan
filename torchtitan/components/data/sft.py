@@ -49,6 +49,7 @@ released) this does not scale across threads. It is the one genuinely GIL-bound 
 the data path.
 """
 
+import logging
 from __future__ import annotations
 
 import json
@@ -67,7 +68,6 @@ from torchtitan.components.data.mix import build_mix, DatasetSpec, replace_colum
 from torchtitan.components.data.packing import FirstFitPackingConfig
 from torchtitan.components.data.types import DatasetBuildContext
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.tools.logging import logger
 
 
 def _as_list(value: Any) -> list:
@@ -101,6 +101,8 @@ def _render(tokenizer: Any, messages: list[dict], **kwargs: Any) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
 # Row adapters: one per corpus LAYOUT, not per corpus.
 #
 # This is the one thing the old 937-line SFT loader was right about. Corpora

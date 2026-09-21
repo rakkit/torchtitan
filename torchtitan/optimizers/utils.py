@@ -4,12 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import re
 from typing import Any
 
 import torch
 
-from torchtitan.tools.logging import logger
 
 
 def remove_orig_mod_and_weight_for_p_name(
@@ -17,6 +17,8 @@ def remove_orig_mod_and_weight_for_p_name(
     remove_orig_mod: bool = True,
     remove_weight: bool = True,
     remove_checkpoint_wrapped_module: bool = True,
+
+logger = logging.getLogger(__name__)
 ) -> str:
     """
     Remove "._orig_mod", ".weight", and "._checkpoint_wrapped_module" to

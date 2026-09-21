@@ -14,6 +14,8 @@ Adds TorchFT fault tolerance support on top of the base CheckpointManager:
 
 from __future__ import annotations
 
+import logging
+
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -35,10 +37,13 @@ from torchtitan.components.checkpointer import (
 from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer
 from torchtitan.experiments.torchft.manager import TorchFTManager
+from torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainer
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.tools import filesystem
-from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
+
+
+logger = logging.getLogger(__name__)
 
 
 class TorchFTCheckpointManager(CheckpointManager):
@@ -108,13 +113,12 @@ class TorchFTCheckpointManager(CheckpointManager):
                 "multiple times, which can result in overfitting."
             )
 
-        if not self.enable:
-            return
-
         if self.ft_manager:
             optimizers.init_cache_state_dict()
 
             def state_dict():
+                assert isinstance(optimizers, TorchFTOptimizersContainer)
+                optimizers._refresh_cached_state_dict()
                 ret = {}
                 for k, v in self.states.items():
                     if k in {MODEL, OPTIMIZER, LR_SCHEDULER, TRAIN_STATE}:
@@ -140,7 +144,6 @@ class TorchFTCheckpointManager(CheckpointManager):
             if self.pg is None:
                 self.pg = cast(dist.ProcessGroup, dist.new_group(backend="gloo"))
 
-    @torch.no_grad()
     def _save(self, curr_step: int, last_step: bool = False) -> bool:
         # FT dataloader checkpoint is saved every step (not gated by interval)
         # to minimize data replay on replica failure.
@@ -165,8 +168,9 @@ class TorchFTCheckpointManager(CheckpointManager):
         # full save reports False.
         return False
 
+    @torch.no_grad()
     def load(self, step: int = -1) -> bool:
-        if self.enable and self.enable_ft_dataloader_checkpoints:
+        if self.enable_ft_dataloader_checkpoints:
             self._ft_load()
         return super().load(step)
 
@@ -213,7 +217,6 @@ class TorchFTCheckpointManager(CheckpointManager):
         self.save_future = result
         logger.info(f"Staging torchft checkpoint took {time.monotonic() - begin} secs.")
 
-    @torch.no_grad()
     def _ft_load(self) -> None:
         step = self._find_load_step(folder=self._ft_folder())
         if step == -1:

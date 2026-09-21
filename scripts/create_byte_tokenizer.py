@@ -4,9 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config import JobConfig
-from torchtitan.tools.logging import logger
 
 
 class ByteTokenizer(BaseTokenizer):
@@ -278,3 +278,5 @@ if __name__ == "__main__":
 
     alphabet_hf = hf_tok.encode(byte_alphabet).ids
     assert alphabet_hf == alphabet_tt
+
+logger = logging.getLogger(__name__)

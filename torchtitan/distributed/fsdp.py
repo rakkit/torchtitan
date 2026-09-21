@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, TYPE_CHECKING
+import logging
+from typing import Any, cast, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -18,8 +19,11 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.tensor import Shard
 
+from torchtitan.config import FSDPSymmMemScope
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from torchtitan.models.common.decoder import Decoder
@@ -27,6 +31,26 @@ if TYPE_CHECKING:
 
 _DENSE_STORAGE_AXES = ["dp_replicate", "dp_shard", "cp", "tp"]
 _SPARSE_STORAGE_AXES = ["dp_replicate", "efsdp", "ep"]
+
+
+def _linear_param_shard_placements(module: nn.Module) -> dict[nn.Parameter, Shard]:
+    """Shard stacked Linear parameters along their matrix-row dimension.
+
+    A stacked Linear stores weight as ``[N, F, D]`` and bias as ``[N, F]``.
+    FSDP's default ``Shard(0)`` would split the small logical-projection
+    dimension, so shard ``F`` instead. Ordinary Linear parameters remain 2D
+    and use FSDP's default placement.
+    """
+    placements: dict[nn.Parameter, Shard] = {}
+    for child in module.modules():
+        if not isinstance(child, nn.Linear) or getattr(child, "num_linears", 1) == 1:
+            continue
+        weight = cast(nn.Parameter, child.weight)
+        placements[weight] = Shard(1)
+        if child.bias is not None:
+            bias = child.bias
+            placements[bias] = Shard(1)
+    return placements
 
 
 def resolve_fsdp_mesh(
@@ -38,9 +62,6 @@ def resolve_fsdp_mesh(
     even at size 1) so FSDP can pick the DP submesh out of the multi-axis
     storage mesh inside ``DeviceMesh._concatenate([dp_mesh, tp_mesh])``.
     """
-    assert (
-        parallel_dims.spmd_backend == "spmd_types"
-    ), "resolve_fsdp_mesh is only meaningful under spmd_types"
     storage_mesh = parallel_dims.get_activated_mesh(_DENSE_STORAGE_AXES)
     assert storage_mesh is not None
 
@@ -71,9 +92,6 @@ def resolve_sparse_fsdp_mesh(
     storage mesh + sparse DP axes. The FSDP axis is ``efsdp`` and
     ``dp_replicate`` is shared with the dense path.
     """
-    assert (
-        parallel_dims.spmd_backend == "spmd_types"
-    ), "resolve_sparse_fsdp_mesh is only meaningful under spmd_types"
     if not parallel_dims.ep_enabled:
         return None, None
     sparse_mesh = parallel_dims.get_activated_mesh(_SPARSE_STORAGE_AXES)
@@ -99,14 +117,17 @@ def disable_fsdp_gradient_division(model: nn.Module) -> None:
             module.set_gradient_divide_factor(1.0)
 
 
-def enable_fsdp_symm_mem(model: nn.Module) -> None:
-    """
-    Enable symmetric-memory communication optimizations for all FSDP modules.
-    """
+def enable_fsdp_symm_mem(model: nn.Module, scope: FSDPSymmMemScope) -> None:
+    """Enable symmetric-memory communication for the FSDP modules ``scope`` selects."""
+    if scope is None:
+        return
     for module in model.modules():
-        if isinstance(module, FSDPModule):
-            module.set_force_sum_reduction_for_comms(True)
-            module.set_symm_mem_for_comm()
+        if not isinstance(module, FSDPModule):
+            continue
+        if scope == "dense" and getattr(module, "moe_enabled", False):
+            continue
+        module.set_force_sum_reduction_for_comms(True)
+        module.set_symm_mem_for_comm()
 
 
 def get_fsdp_reshard_after_forward_policy(
@@ -175,34 +196,6 @@ def apply_fsdp_to_vision_encoder(
     fully_shard(vision_encoder, **fsdp_config)
 
 
-def _fsdp_shard_degree(mesh: DeviceMesh, mesh_dims: Any | None) -> int:
-    """Number of ranks a parameter is actually SHARDED over.
-
-    NOT ``mesh.size()``. Under HSDP the FSDP mesh also carries ``dp_replicate``,
-    which replicates rather than shards, so ``mesh.size()`` overstates the degree
-    by the replicate factor. That mattered: the expert placement rule below
-    compares this against ``num_experts``, so an HSDP run with dp_replicate=2 and
-    dp_shard == num_experts flipped to Shard(1) even though Shard(0) divides
-    evenly, and DiSCO's expert path (which assumes whole expert matrices per rank)
-    died in ``_foreach_copy_``. 0.4.0 never hit this because its equivalent branch
-    read ``edp_mesh["efsdp"].size()`` -- the shard axis -- and only ran under EP.
-    """
-    if mesh_dims is not None:
-        # spmd_types: DataParallelMeshDims names the shard axes explicitly.
-        shard = mesh_dims.shard
-        axes: tuple[str, ...] = (shard,) if isinstance(shard, str) else tuple(shard)
-    else:
-        # partial_dtensor: the mesh is ["dp_replicate", "fsdp"] or ["fsdp"].
-        names = mesh.mesh_dim_names or ()
-        axes = tuple(n for n in names if n != "dp_replicate")
-        if not axes:
-            return mesh.size()
-    degree = 1
-    for axis in axes:
-        degree *= mesh[axis].size()
-    return degree
-
-
 def apply_fsdp_to_decoder(
     model: "Decoder",
     dp_mesh: DeviceMesh,
@@ -215,7 +208,7 @@ def apply_fsdp_to_decoder(
     edp_mesh: DeviceMesh | None = None,
     dp_mesh_dims: "DataParallelMeshDims | None" = None,
     edp_mesh_dims: "DataParallelMeshDims | None" = None,
-    enable_symm_mem: bool = False,
+    symm_mem_scope: FSDPSymmMemScope = None,
     expert_shard_dim: int | None = None,
 ):
     """
@@ -255,9 +248,8 @@ def apply_fsdp_to_decoder(
             strong enough to infer safely, and an explicit declaration
             avoids silent miscategorization when new mesh axes appear.
         edp_mesh_dims: Sibling of ``dp_mesh_dims`` for the sparse SPMD mesh
-            used by routed experts. ``None`` under partial_dtensor.
-        enable_symm_mem (bool): Whether to enable symmetric-memory FSDP
-            communication.
+            used by routed experts.
+        symm_mem_scope: Which FSDP modules use symmetric-memory communication.
         expert_shard_dim (int | None): Pin routed-expert params to this shard
             dim instead of choosing one by heuristic. ``None`` (default) keeps
             the heuristic: ``Shard(1)`` when the shard degree exceeds
@@ -266,9 +258,7 @@ def apply_fsdp_to_decoder(
             no gather, which is only the true LMO when a rank owns WHOLE expert
             matrices -- i.e. under ``Shard(0)``. Under ``Shard(1)`` each rank
             holds a row-block of every expert, so orthogonalizing it is not
-            orthogonalizing the matrix. This mirrors 0.4.0, where the
-            ``Shard(1)`` branch existed only under ``ep_degree > 1`` and
-            opt_moe therefore always got ``Shard(0)``.
+            orthogonalizing the matrix.
     """
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
@@ -284,7 +274,6 @@ def apply_fsdp_to_decoder(
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
         reshard_after_forward_policy, pp_enabled
     )
-
     if model.enable_weight_tying:
         # When weights are tied, tok_embeddings and output share the same parameter.
         # Group them together in one FSDP unit to avoid duplicate all-gathers.
@@ -314,109 +303,58 @@ def apply_fsdp_to_decoder(
                 reshard_after_forward=reshard_after_forward_policy == "always",
             )
 
-    warned_expert_pad = False
     for layer_id, transformer_block in model.layers.items():
+        # A stacked Linear keeps W1/W3 separate from the matrix-row dimension.
+        # Shard matrix rows so every rank retains both projections.
+        stacked_param_placements = _linear_param_shard_placements(transformer_block)
         # NOTE: In an MoE layer, we use shard_placement_fn to apply different
         # FSDP mesh and shard placement to different parameters:
         # - When EP > 1: routed experts use edp_mesh, other params use dp_mesh
         # - When EP = 1: all params use the same FSDP mesh, but experts may
-        #   use Shard(1) when the SHARD DEGREE exceeds num_experts, to avoid
-        #   padding -- unless the caller pinned a dim via expert_shard_dim.
-        # Dense blocks (no ``moe_enabled``) fall through to a plain fully_shard.
+        #   use Shard(1) when FSDP degree > num_experts to avoid padding
+        # Dense blocks use the default mesh with only stacked-parameter
+        # placement overrides.
         if getattr(transformer_block, "moe_enabled", False):
             assert hasattr(transformer_block, "moe")
-            # Expert weights live on the grouped-GEMM child (inner_experts) for
-            # common.moe.MoE. A model may supply its own MoE that holds the
-            # grouped expert weights directly (OPT MoE's GroupedExperts does),
-            # so fall back to that rather than assuming the upstream layout.
-            moe = transformer_block.moe
-            routed_experts = getattr(moe, "routed_experts", None)
-            if routed_experts is not None:
-                # pyrefly: ignore [missing-attribute]
-                experts = routed_experts.inner_experts
-            else:
-                experts = moe.experts
+            # Expert weights live on the grouped-GEMM child (inner_experts).
+            # pyrefly: ignore [missing-attribute]
+            experts = transformer_block.moe.routed_experts.inner_experts
             expert_params = set(experts.parameters())
             num_experts = experts.num_experts
 
-            # How many pieces dim 0 (num_experts) gets cut into -- the ONLY thing the
-            # placement rule below needs. EP cuts it `ep_degree` ways and FSDP cuts
-            # each of those `efsdp` ways; without EP it is just the FSDP shard degree.
-            # Upstream calls both branches "efsdp_ep_size" and computes the ep==1 one
-            # as fsdp_config["mesh"].size(), which under HSDP multiplies in
-            # dp_replicate -- an axis that REPLICATES and never cuts dim 0.
             if ep_degree > 1:
                 assert edp_mesh is not None
-                expert_dim0_cuts = edp_mesh["efsdp"].size() * ep_degree
+                efsdp_ep_size = edp_mesh["efsdp"].size() * ep_degree
             else:
-                expert_dim0_cuts = _fsdp_shard_degree(
-                    fsdp_config["mesh"], dp_mesh_dims
-                )
+                # FSDP cuts dim 0 only over its shard axes: ``dp_shard``,
+                # plus ``cp`` when CP is on (see ``resolve_fsdp_mesh``).
+                # ``dp_replicate`` replicates, and ``tp`` shards other dims
+                # via the TP plan, so neither divides dim 0.
+                dp_storage_mesh = fsdp_config["mesh"]
+                efsdp_ep_size = dp_storage_mesh["dp_shard"].size()
+                if "cp" in dp_storage_mesh.mesh_dim_names:
+                    efsdp_ep_size *= dp_storage_mesh["cp"].size()
 
-            if expert_shard_dim == 0 and expert_dim0_cuts > num_experts:
-                # Shard(0) still WORKS here -- torch.chunk gives the surplus
-                # ranks an empty [0, F, D] local view, and DiSCO skips those --
-                # but it is expensive: only num_experts of the shard ranks own
-                # anything, and each owns a WHOLE expert, so per-rank expert
-                # memory is (shard_degree / num_experts) x what Shard(1) would
-                # use. Warn rather than refuse (the caller pinned dim 0 on
-                # purpose), once per model rather than once per layer.
-                if not warned_expert_pad:
-                    warned_expert_pad = True
-                    logger.warning(
-                        f"Routed experts are pinned to Shard(0) but the FSDP "
-                        f"shard degree ({expert_dim0_cuts}) exceeds num_experts "
-                        f"({num_experts}): "
-                        f"{expert_dim0_cuts - num_experts} of "
-                        f"{expert_dim0_cuts} shard ranks own no expert, and "
-                        f"each owner holds a whole one -- about "
-                        f"{expert_dim0_cuts // num_experts}x the per-rank "
-                        f"expert memory of a dim-1 shard.\n"
-                        f"Checkpoints from this config DO resume: DiSCO's "
-                        f"per-expert `radial_state` is a DTensor sharded like "
-                        f"the param, so DCP round-trips the uneven split. That "
-                        f"was not always true -- it used to be a plain tensor "
-                        f"sized by each rank's LOCAL expert count, which saved "
-                        f"as [1,..,0,..] and failed on load. Only the memory "
-                        f"cost above remains."
-                    )
             if expert_shard_dim is not None:
-                # Caller pinned the dim (see the arg docstring). Shard(0) with
-                # shard_degree > num_experts is still correct -- FSDP2 pads, and
-                # DiSCO already skips zero-expert local shards -- it just costs
-                # some padding, which is the deliberate trade for a valid LMO.
+                # Caller pinned the dim (opt_moe pins 0 for DiSCO); the
+                # padding heuristic below must not override it.
                 expert_shard_placement = Shard(expert_shard_dim)
-            elif expert_dim0_cuts > num_experts:
+            elif efsdp_ep_size > num_experts:
                 expert_shard_placement = Shard(1)
             else:
                 expert_shard_placement = Shard(0)
 
-            # When ep_degree == 1 and the placement is plain Shard(0), skip
-            # shard_placement_fn entirely for simplicity -- Shard(0) is exactly
-            # what fully_shard does by default.
-            if ep_degree == 1 and expert_shard_placement == Shard(0):
+            if ep_degree == 1:
+                param_placements = stacked_param_placements.copy()
+                for param in expert_params:
+                    param_placements[param] = expert_shard_placement
                 fully_shard(
                     transformer_block,
                     **fsdp_config,
                     reshard_after_forward=reshard_after_forward,
-                )
-            elif ep_degree == 1:
-                # ep_degree == 1 and experts need a non-default placement
-                # (heuristic Shard(1), or whatever the caller pinned).
-                def _experts_shard_placement_fn(
-                    param: nn.Parameter,
-                    _expert_params: set = expert_params,
-                    _placement: Shard = expert_shard_placement,
-                ) -> Shard | None:
-                    if param in _expert_params:
-                        return _placement
-                    return None
-
-                fully_shard(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                    shard_placement_fn=_experts_shard_placement_fn,
+                    # dict.get returns None for parameters that use the default
+                    # Shard(0), matching shard_placement_fn's contract.
+                    shard_placement_fn=param_placements.get,
                 )
             else:
                 # ep_degree > 1: per-param mesh
@@ -444,6 +382,7 @@ def apply_fsdp_to_decoder(
                     param: nn.Parameter,
                     _expert_params: set = expert_params,
                     _expert_placement: Shard = expert_shard_placement,
+                    _stacked: dict[nn.Parameter, Shard] = stacked_param_placements,
                     _edp_mesh_info: FSDPMeshInfo = edp_mesh_info,
                     _dp_mesh_info: FSDPMeshInfo = dp_mesh_info,
                 ) -> ShardPlacementResult:
@@ -453,7 +392,8 @@ def apply_fsdp_to_decoder(
                         )
                     else:
                         return ShardPlacementResult(
-                            placement=Shard(0), mesh_info=_dp_mesh_info
+                            placement=_stacked.get(param, Shard(0)),
+                            mesh_info=_dp_mesh_info,
                         )
 
                 fully_shard(
@@ -467,12 +407,12 @@ def apply_fsdp_to_decoder(
                 transformer_block,
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward,
+                shard_placement_fn=stacked_param_placements.get,
             )
 
     fully_shard(model, **fsdp_config)
 
-    if enable_symm_mem:
-        enable_fsdp_symm_mem(model)
+    enable_fsdp_symm_mem(model, symm_mem_scope)
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)

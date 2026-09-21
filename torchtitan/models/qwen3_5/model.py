@@ -21,14 +21,13 @@ from torchtitan.distributed.spmd_types import (
     set_current_spmd_mesh,
     spmd_local_context,
 )
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common import Linear
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
     create_varlen_metadata_for_document,
-    FlexAttention,
-    VarlenAttention,
+    FlexInnerAttention,
+    VarlenInnerAttention,
     VarlenMetadata,
 )
 from torchtitan.models.common.decoder import Decoder
@@ -226,6 +225,8 @@ class Qwen35TransformerBlock(Module):
         x_TD: torch.Tensor,
         attention_masks: Qwen35AttentionMaskDict | None,
         positions: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layer_mask = (
             attention_masks[self.attn_mask_key] if attention_masks is not None else None
@@ -239,7 +240,7 @@ class Qwen35TransformerBlock(Module):
 
         h_TD = self.ffn_norm(x_TD)
         if self.moe_enabled:
-            x_TD = x_TD + self.moe(h_TD)
+            x_TD = x_TD + self.moe(h_TD, padding_mask_T=padding_mask)
         else:
             x_TD = x_TD + self.feed_forward(h_TD)
         return x_TD
@@ -381,21 +382,25 @@ class Qwen35Model(Decoder):
         parallelism: ParallelismConfig,
         max_num_documents: int | None = None,
         max_context_length: int | None = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build masks, CP-shard, SPMD-wrap (+ deltanet annotation), and return."""
+        del kwargs
         # Function-local import avoids a circular import.
         from torchtitan.distributed.context_parallel.api import (
             prepare_context_parallel_input,
         )
 
         batch: dict[str, Any] = dict(input_dict)
-        padding_mask = batch.pop("padding_mask", None)
+        padding_mask = batch.get("padding_mask", None)
 
         # Attention masks are built from the 1D ``positions``.
         positions = batch.get("positions")
         if positions is not None:
             inner = self.config.first_full_attention_backend
-            if isinstance(inner, (FlexAttention.Config, VarlenAttention.Config)):
+            if isinstance(
+                inner, (FlexInnerAttention.Config, VarlenInnerAttention.Config)
+            ):
                 batch["attention_masks"] = self.get_attention_masks(
                     positions=positions,
                     padding_mask=padding_mask,
@@ -437,14 +442,13 @@ class Qwen35Model(Decoder):
                 parallelism.context_parallel_load_balancer,
                 parallelism.context_parallel_ptrr_mask_key,
             )
-        if parallelism.spmd_backend == "spmd_types":
-            batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
-            # Plain-tensor inputs are typed above; the GatedDeltaNet cu_seq_q,
-            # nested inside attention_masks, must be annotated at its container.
-            attention_masks = batch.get("attention_masks")
-            if attention_masks is not None:
-                with set_current_spmd_mesh(parallel_dims.spmd_dense_mesh()):
-                    annotate_deltanet_cu_seqlens(attention_masks)
+        batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
+        # Plain-tensor inputs are typed above; the GatedDeltaNet cu_seq_q,
+        # nested inside attention_masks, must be annotated at its container.
+        attention_masks = batch.get("attention_masks")
+        if attention_masks is not None:
+            with set_current_spmd_mesh(parallel_dims.spmd_dense_mesh()):
+                annotate_deltanet_cu_seqlens(attention_masks)
 
         inputs = batch.pop("input")
         labels = batch.pop("labels")
@@ -484,14 +488,14 @@ class Qwen35Model(Decoder):
             and deltanet_metadata.cu_seq_q.numel() == 2
             and not (
                 attn_config is not None
-                and isinstance(attn_config.inner_attention, VarlenAttention.Config)
+                and isinstance(attn_config.inner_attention, VarlenInnerAttention.Config)
             )
         ):
             deltanet_metadata = None
 
         if attn_config is None:
             quadratic_attention = None
-        elif isinstance(attn_config.inner_attention, VarlenAttention.Config):
+        elif isinstance(attn_config.inner_attention, VarlenInnerAttention.Config):
             # Under varlen both consumers read the same document offsets.
             quadratic_attention = deltanet_metadata
         else:
@@ -604,6 +608,7 @@ class Qwen35Model(Decoder):
         grid_thw_videos: torch.Tensor | None = None,
         attention_masks: Qwen35AttentionMaskDict | None = None,
         positions: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
         special_tokens: dict[str, int] | None = None,
     ):
         with spmd_local_context("dp"):
@@ -619,7 +624,7 @@ class Qwen35Model(Decoder):
             else:
                 x = tokens
 
-        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+        if spmd.is_type_checking():
             spmd.assert_type(
                 x,
                 {"dp": spmd.V, "cp": spmd.V, "tp": spmd.R},
@@ -630,7 +635,7 @@ class Qwen35Model(Decoder):
         # 2D (batch, seq) for text; ``preprocess_inputs`` resolved which one to
         # forward. The per-layer MRoPE dispatches on rank.
         for layer in self.layers.values():
-            x = layer(x, attention_masks, positions)
+            x = layer(x, attention_masks, positions, padding_mask=padding_mask)
 
         x = self.norm(x) if self.norm is not None else x
         if self._skip_lm_head:

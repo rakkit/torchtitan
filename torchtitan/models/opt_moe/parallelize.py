@@ -46,7 +46,7 @@ def parallelize_opt_moe(
     skip_dp: bool = False,
 ):
     model_compile_enabled = (
-        compile_config.enable and "model" in compile_config.components
+        compile_config is not None and "model" in compile_config.components
     )
 
     if parallel_dims.cp_enabled:
@@ -59,12 +59,6 @@ def parallelize_opt_moe(
         # both reach 100% DTensor params at dp_shard=2/cp=2 -- so no collective
         # has actually run.
         #
-        # The spmd_types requirement is enforced upstream by
-        # `context_parallel/api.py::validate_cp_backend`, which
-        # `models/common/decoder.py` calls while BUILDING the model -- i.e.
-        # before this function runs, but at model-build time, not config-parse
-        # time. Re-raising it here would be dead code.
-        #
         # KNOWN GAP: `rope.cache` stays a plain tensor (see sharding.py).
         logger.warning(
             "Context Parallel is enabled for OPT MoE. This path is newly wired "
@@ -72,12 +66,7 @@ def parallelize_opt_moe(
             "a cp=1 run before trusting it."
         )
 
-    if (
-        parallelism.spmd_backend == "spmd_types"
-        or parallel_dims.tp_enabled
-        or parallel_dims.ep_enabled
-    ):
-        model.parallelize(parallel_dims)
+    model.parallelize(parallel_dims)
 
     if ac_config is not None:
         ac_config.build(dump_folder=dump_folder).apply(model)
@@ -95,25 +84,8 @@ def parallelize_opt_moe(
     if skip_dp:
         return model
 
-    if parallelism.spmd_backend == "spmd_types":
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
-    else:
-        dp_mesh_names = (
-            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-        )
-        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-        dp_mesh_dims = None
-        edp_mesh = None
-        edp_mesh_dims = None
-        if parallel_dims.ep_enabled:
-            edp_mesh_names = (
-                ["dp_replicate", "efsdp"]
-                if parallel_dims.dp_replicate_enabled
-                else ["efsdp"]
-            )
-            edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
-
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+    edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
     apply_fsdp_to_decoder(
         model,
         dp_mesh,
@@ -126,7 +98,7 @@ def parallelize_opt_moe(
         edp_mesh=edp_mesh,
         dp_mesh_dims=dp_mesh_dims,
         edp_mesh_dims=edp_mesh_dims,
-        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        symm_mem_scope=parallelism.fsdp_symm_mem_scope,
         # Pin routed experts to Shard(0). DiSCO's step_experts runs the LMO on
         # each rank's LOCAL expert buffer with no gather, which is only the true
         # LMO when a rank owns whole expert matrices. Under Shard(1) a rank holds

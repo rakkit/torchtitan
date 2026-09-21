@@ -30,7 +30,7 @@ from torchtitan.models.common.decoder_sharding import (
     dense_param_placement,
     norm_config,
     set_decoder_sharding_config,
-    set_gqa_inner_attention_local_map,
+    set_gqa_inner_attention_local_spmd,
 )
 
 from torchtitan.models.common.moe_sharding import (
@@ -167,23 +167,22 @@ def set_opt_moe_sharding_config(
     for layer_cfg in config.layers:
         layer_cfg.attention_norm.sharding_config = norm
         layer_cfg.ffn_norm.sharding_config = norm
-        # Context Parallel needs the inner attention to declare that q stays
-        # token-sharded on the CP axis while k/v are Replicate there, so the
-        # local_map boundary all-gathers k/v and the kernel sees full-length
-        # keys -- matching the BlockMask's kv dimension, which `cp_shard` has
-        # already sharded. Without it the kernel gets k/v of length T/cp against
-        # a mask whose kv dim is still T. llama3 and qwen3 install this the same
-        # way (`<model>/sharding.py`: set_gqa_attention_sharding then
-        # set_gqa_inner_attention_local_map).
+        # Localize q/k/v at the kernel boundary without changing placements.
+        # Upstream #4322 moved the CP k/v all-gather OUT of this local_map and
+        # into the CP attention implementations themselves
+        # (KVAllGatherCPFlexInnerAttention / the Ulysses variants), so this now
+        # only declares the local SPMD boundary. llama3 and qwen3 do the same
+        # (`<model>/sharding.py`: set_gqa_attention_sharding then
+        # set_gqa_inner_attention_local_spmd).
         #
         # It goes on the INNER attention, not on GatedNormSWAttention: the inner
         # module is where q/k/v cross the kernel boundary, and `Module.parallelize`
         # recurses into children BEFORE its `_sharding_config is None` early
         # return, so the parent needing no config of its own is fine.
         #
-        # Safe unconditionally: under `partial_dtensor` the (tp,)-only mesh
-        # consumes just the TP placement and ignores the rest.
-        set_gqa_inner_attention_local_map(layer_cfg.attention.inner_attention)
+        # NOTE: opt_moe does not yet select a CP-aware inner attention, so CP
+        # is not wired for this model until that is done.
+        set_gqa_inner_attention_local_spmd(layer_cfg.attention.inner_attention)
 
         # Every parameter must be a DTensor before fully_shard() runs under
         # spmd_types -- "all parameters must be DTensors on the full SPMD mesh

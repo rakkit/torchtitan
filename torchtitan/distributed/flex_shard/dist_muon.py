@@ -70,8 +70,9 @@ def build_dist_muon(
     must be nonzero and divisible by ``R``. Each consecutive ``R`` rows forms
     one independent ``[R, C]`` matrix for local Muon compute. A native
     batch-first 3D ``[M, R, C]`` parameter uses ``Shard(0)`` to distribute
-    complete matrices. A single 2D matrix without ``BlockShard`` uses
-    whole-matrix compute such as ``Owned``.
+    complete matrices, or ``Owned`` to assign the complete batch to one rank.
+    A single 2D matrix without ``BlockShard`` uses whole-matrix compute such as
+    ``Owned``.
     """
     return DistMuon(
         _normalize_param_groups(params),
@@ -958,7 +959,8 @@ def _resolve_muon_redistribution_plans(
 ) -> tuple[tuple[_RedistributionPlan | None, ...], ...]:
     """Resolve Muon compute shardings directly into transport plans."""
     cumulative_loads_by_participants: dict[tuple[int, ...], tuple[int, ...]] = {}
-    plans_by_bucket = []
+    specs_by_bucket = []
+    unique_specs = {}
     for context in contexts:
         participants = context.group.participants
         initial_loads = cumulative_loads_by_participants.setdefault(
@@ -972,21 +974,34 @@ def _resolve_muon_redistribution_plans(
             ns_steps_by_group=ns_steps_by_group,
         )
         cumulative_loads_by_participants[participants] = cumulative_loads
-        plans_by_bucket.append(
-            tuple(
-                _build_parameter_redistribution_plan(
-                    layout,
-                    context.group,
-                    owner_rank,
-                )
-                for layout, owner_rank in zip(
-                    context.items,
-                    owner_ranks,
-                    strict=True,
-                )
+        bucket_specs = []
+        for layout, owner_rank in zip(context.items, owner_ranks, strict=True):
+            if layout.storage_is_compute_ready:
+                bucket_specs.append(None)
+                continue
+            spec = (
+                layout.storage_layout_signature,
+                tuple(layout.param.device_mesh.shape),
+                layout.storage_mesh_ranks,
+                layout.redistribution_storage_mesh_axis,
+                context.group.participants,
+                context.group.mesh_axis_participants,
+                tuple(layout.global_compute_shape),
+                layout.compute_sharding,
+                owner_rank,
             )
-        )
-    return tuple(plans_by_bucket)
+            bucket_specs.append(spec)
+            unique_specs.setdefault(spec, (layout, context.group, owner_rank))
+        specs_by_bucket.append(bucket_specs)
+
+    plans_by_spec = {
+        spec: _build_parameter_redistribution_plan(*args)
+        for spec, args in unique_specs.items()
+    }
+    return tuple(
+        tuple(None if spec is None else plans_by_spec[spec] for spec in bucket)
+        for bucket in specs_by_bucket
+    )
 
 
 def _assign_balanced_owner_ranks(
@@ -1030,10 +1045,11 @@ def _estimate_muon_compute_cost(
     matrix_shape: torch.Size,
     ns_steps: int,
 ) -> int:
-    rows, columns = matrix_shape
+    *batch_shape, rows, columns = matrix_shape
+    num_matrices = math.prod(batch_shape)
     short_dim, long_dim = sorted((rows, columns))
     # Each NS step has two s^2 * l matmuls and one s^3 matmul.
-    return ns_steps * short_dim * short_dim * (2 * long_dim + short_dim)
+    return num_matrices * ns_steps * short_dim * short_dim * (2 * long_dim + short_dim)
 
 
 def _balance_loads_across_partitions(
@@ -1678,10 +1694,11 @@ def _resolve_storage_to_compute_transition(
     resolved_compute_layout_signature = tuple(resolved_target_signature)
     compute_shard_dims = [*resolved_shard_dims, *declared_shard_dims]
     if applicable_owned_storage_mesh_axes and (
-        len(global_compute_shape) != 2 or param.ndim != 2
+        compute_view is not None or param.ndim not in (2, 3)
     ):
         raise ValueError(
-            f"Muon owned compute for parameter {fqn!r} requires a 2D matrix"
+            f"Muon owned compute for parameter {fqn!r} requires a native "
+            "2D matrix or batch-first 3D matrix tensor"
         )
     if active_owned_storage_mesh_axes:
         compute_sharding: _ResolvedComputeSharding = Owned()

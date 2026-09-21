@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from torchtitan.models.common.attention import AttentionMasksType, VarlenAttention
+from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.utils import (
     get_nparams_and_active_nparams,
@@ -55,11 +55,13 @@ class Qwen3TransformerBlock(TransformerBlock):
         x: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
     ):
         x = x + self.attention(self.attention_norm(x), attention_masks, positions)
 
         if self.moe_enabled:
-            x = x + self.moe(self.ffn_norm(x))
+            x = x + self.moe(self.ffn_norm(x), padding_mask_T=padding_mask)
         else:
             x = x + self.feed_forward(self.ffn_norm(x))
         return x
@@ -86,14 +88,6 @@ class Qwen3Model(Decoder):
         ) -> None:
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
-
-            if parallelism.context_parallel_degree > 1 and isinstance(
-                self.layers[0].attention.inner_attention, VarlenAttention.Config
-            ):
-                raise NotImplementedError(
-                    "Context Parallel only supports SDPA and FlexAttention. "
-                    "Varlen attention is not supported with CP."
-                )
 
             from torchtitan.models.qwen3.sharding import set_qwen3_sharding_config
 

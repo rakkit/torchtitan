@@ -12,6 +12,7 @@ only an inference model, loads model weights only, and never instantiates a
 Trainer, optimizer, scheduler, or training dataloader.
 """
 
+import logging
 from __future__ import annotations
 
 import argparse
@@ -27,7 +28,7 @@ from torchtitan.evaluation.config import (
     resolve_checkpoint,
 )
 from torchtitan.evaluation.runtime import EvaluationRuntime, result_row, upsert_result
-from torchtitan.tools.logging import init_logger, logger
+from torchtitan.observability.logging import init_logger
 
 
 def parse_args() -> argparse.Namespace:
@@ -183,3 +184,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+logger = logging.getLogger(__name__)

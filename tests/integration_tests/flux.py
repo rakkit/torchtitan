@@ -5,15 +5,19 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+
+import logging
 import os
 import shlex
 
 import torchtitan_recipes.tests.flux as recipes
-
-from torchtitan.tools.logging import logger
+from torchtitan.observability.logging import init_logger
 
 from tests.integration_tests import OverrideDefinitions, validate_fake_pg_compatibility
 from tests.integration_tests.run_tests import _run_cmd
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_flux_test_list() -> list[OverrideDefinitions]:
@@ -26,7 +30,7 @@ def build_flux_test_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             configs=[
                 recipes.flux_debugmodel_hsdp2x2_cp2_validation,
-                recipes.flux_debugmodel_test,
+                recipes.flux_debugmodel_inference_test,
             ],
             test_descr="HSDP+CP+Validation+Inference",
             test_name="hsdp+cp+validation+inference",
@@ -124,6 +128,7 @@ def run_tests(args, test_list: list[OverrideDefinitions]):
 
 
 def main():
+    init_logger()
     parser = argparse.ArgumentParser()
     parser.add_argument("output_dir")
     parser.add_argument(

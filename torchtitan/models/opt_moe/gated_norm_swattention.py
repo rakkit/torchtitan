@@ -13,12 +13,13 @@ import torch
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
-    FlexAttention,
+    FlexInnerAttention,
+    InnerAttention,
     GQAttention,
-    QKVLinear,
 )
 from torchtitan.models.common.config_utils import get_attention_config
 from torchtitan.models.common.linear import Linear
+from .split_qkv import SplitQKVLinear
 from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
@@ -86,7 +87,9 @@ class GatedNormSWAttention(GQAttention):
         # Filled in by OPTMoEModel.Config expansion from ``attn_backend`` and the
         # model-level rope/rope_of_swa configs. Declared with defaults so the
         # compact flavor registry in __init__.py does not have to spell them out.
-        inner_attention: Module.Config = field(default_factory=FlexAttention.Config)
+        inner_attention: InnerAttention.Config = field(
+            default_factory=FlexInnerAttention.Config
+        )
         rope: RoPE.Config | None = None
 
         wq_init_fn_type: str = "scaled_orthogonal"
@@ -143,17 +146,17 @@ class GatedNormSWAttention(GQAttention):
                 self.wv_init_fn_type,
                 self.wv_init_std,
             ):
-                # QKVLinear builds wk and wv from one shared config, so it cannot
+                # SplitQKVLinear builds wk and wv from one shared config, so it cannot
                 # express different initializers for them. Fail loudly rather
                 # than silently applying wk's to both.
                 raise ValueError(
                     "wk and wv initializers must match "
                     f"(got wk={self.wk_init_fn_type}/{self.wk_init_std}, "
                     f"wv={self.wv_init_fn_type}/{self.wv_init_std}): upstream's "
-                    "QKVLinear shares one config between them."
+                    "SplitQKVLinear shares one config between them."
                 )
 
-            qkv = QKVLinear.Config(
+            qkv = SplitQKVLinear.Config(
                 head_dim=head_dim,
                 wq=Linear.Config(
                     in_features=self.dim,

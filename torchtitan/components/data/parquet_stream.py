@@ -67,6 +67,7 @@ stretch is still one contiguous piece of disk.
 Neither needs random access, and neither reads a row group twice.
 """
 
+import logging
 from __future__ import annotations
 
 import random
@@ -88,7 +89,6 @@ from torchtitan.components.data.parquet_manifest import (
 )
 from torchtitan.components.data.types import DatasetIterationPolicy
 from torchtitan.config import Configurable
-from torchtitan.tools.logging import logger
 
 
 class ParquetStreamSource(Configurable, grain.IterDataset):
@@ -473,3 +473,5 @@ class _ParquetSpanIterator(grain.DatasetIterator):
         self._next_span = int(state["next_span"])
         self._draw_index = int(state["draw_index"])
         self._emitted = int(state.get("next_index", 0))
+
+logger = logging.getLogger(__name__)

@@ -8,10 +8,10 @@
 Shared configuration dataclasses for torchtitan.
 
 Some configs live near their owner instead of here:
-  - Profiler.Config                 (in tools/profiler.py)
+  - Profiler.Config                 (in observability/profiler.py)
   - OptimizersContainer.Config      (in components/optimizer/optimizer.py)
   - LRSchedulersContainer.Config    (in components/optimizer/lr_scheduler.py)
-  - MetricsProcessor.Config         (in components/metrics.py)
+  - MetricsProcessor.Config         (in observability/metrics.py)
   - CheckpointManager.Config        (in components/checkpointer/dcp.py)
 
 Configs without a clear single owner (or with circular-import constraints)
@@ -27,9 +27,14 @@ The command-line surface is frozen either way, so annotate a new field with
 """
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Annotated, get_args, Literal, TypeAlias
 
 import torch
+import tyro
+
+
+FSDPSymmMemScope: TypeAlias = Literal["all", "dense", None]
+_FSDP_SYMM_MEM_SCOPES = get_args(FSDPSymmMemScope)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -83,8 +88,8 @@ class TrainingConfig:
     Disable CUDA graph capture and replay for the forward+backward step. CUDA
     graphs require fixed-shape inputs and no CPU<->GPU synchronization during
     the captured region. Expert parallelism is supported only with HybridEP
-    when ``non_blocking_capacity_factor`` is set, or with MinimalAsyncEP. Other
-    EP backends synchronize with the host during dispatch. Pipeline parallelism
+    when ``non_blocking_capacity_factor`` is set. Other EP backends synchronize
+    with the host during dispatch. Pipeline parallelism
     is supported with single-stage schedules such as GPipe and 1F1B. CUDA graphs
     are independent of ``torch.compile(mode="reduce-overhead")``, which performs
     its own CUDA graph capture.
@@ -105,7 +110,7 @@ class TrainingConfig:
     and no other parallelism is enabled, i.e. under DDP or single-device training.
     """
 
-    mixed_precision_reduce: Literal["float32"] = "float32"
+    mixed_precision_reduce: Literal["bfloat16", "float32"] = "float32"
     """
     torch dtype to use for reductions when applying mixed precision via FSDP.
     This feature only takes effect when data_parallel_shard_degree > 1
@@ -163,10 +168,12 @@ class ParallelismConfig:
     - "never" will disable `reshard_after_forward` for all forward passes.
     """
 
-    enable_fsdp_symm_mem: bool = False
+    fsdp_symm_mem_scope: Annotated[FSDPSymmMemScope, tyro.conf.Suppress] = None
     """
-    Whether to enable FSDP2 symmetric-memory communication optimizations for
-    all FSDP modules after `fully_shard` has been applied.
+    Which FSDP modules use symmetric-memory communication. None disables it.
+    "dense" skips any module with routed experts. An MoE transformer block is
+    one FSDP module, so its attention parameters are skipped along with its
+    experts.
     """
 
     tensor_parallel_degree: int = 1
@@ -174,14 +181,6 @@ class ParallelismConfig:
 
     enable_sequence_parallel: bool = True
     """Whether to use SequenceParallel as part of tensor parallelism. Enabled by default."""
-
-    spmd_backend: Literal["partial_dtensor", "spmd_types"] = "spmd_types"
-    """
-    SPMD backend selector.
-
-    - "partial_dtensor": use DTensor for model-parallel axes only.
-    - "spmd_types": use the spmd_types path.
-    """
 
     pipeline_parallel_degree: int = 1
     """
@@ -249,7 +248,7 @@ class ParallelismConfig:
     """
     Load balancer type for context parallelism. Options:
     - "headtail": Use HeadTailLoadBalancer for SDPA
-    - "ptrr": Use PTRRLoadBalancer for FlexAttention
+    - "ptrr": Use PTRRLoadBalancer for FlexInnerAttention
     - None: Disable load balancing
     """
 
@@ -263,11 +262,6 @@ class ParallelismConfig:
     """
 
     def __post_init__(self):
-        if self.spmd_backend not in {"partial_dtensor", "spmd_types"}:
-            raise ValueError(
-                "parallelism.spmd_backend must be either 'partial_dtensor' "
-                "or 'spmd_types'."
-            )
         if self.context_parallel_load_balancer == "":
             raise ValueError(
                 "context_parallel_load_balancer cannot be an empty string. "
@@ -284,7 +278,13 @@ class ParallelismConfig:
                 f"None, 'headtail', 'ptrr' "
                 f"(got {self.context_parallel_load_balancer!r})"
             )
-        if self.enable_fsdp_symm_mem and (
+        if self.fsdp_symm_mem_scope not in _FSDP_SYMM_MEM_SCOPES:
+            raise ValueError(
+                "parallelism.fsdp_symm_mem_scope must be one of: "
+                f"{list(_FSDP_SYMM_MEM_SCOPES)} "
+                f"(got {self.fsdp_symm_mem_scope!r})"
+            )
+        if self.fsdp_symm_mem_scope is not None and (
             not torch.cuda.is_available()
             or (
                 torch.version.hip is None
@@ -292,7 +292,7 @@ class ParallelismConfig:
             )
         ):
             raise ValueError(
-                "For NVIDIA GPUs, parallelism.enable_fsdp_symm_mem is only supported "
+                "For NVIDIA GPUs, parallelism.fsdp_symm_mem_scope is only supported "
                 "for compute capability 9.0 or newer."
             )
         # Import lazily so loading configs.py does not pull in pipelining.
@@ -309,6 +309,7 @@ class ParallelismConfig:
     expert_parallel_degree: int = 1
     """
     Expert parallelism degree. 1 means disabled. No effect for non-MoE models.
+    For MoE models, this must be at least tensor_parallel_degree.
 
     Mesh constraint: the dense region (dp_shard * cp * tp) and sparse region
     (efsdp * ep) cover the same ranks, so dp_shard * cp * tp == efsdp * ep.
@@ -319,9 +320,6 @@ class ParallelismConfig:
 
 @dataclass(kw_only=True, slots=True)
 class CompileConfig:
-    enable: bool = False
-    """Whether to apply torch.compile"""
-
     enable_async_tensor_parallel: bool = False
     """Whether to pipeline tensor-parallel collectives with matrix multiplications."""
 
@@ -338,13 +336,8 @@ class CompileConfig:
                 f"Unknown compile.components entries {unknown}; "
                 f"allowed values are {sorted(allowed)}"
             )
-        if self.enable_async_tensor_parallel and not (
-            self.enable and "model" in self.components
-        ):
-            raise ValueError(
-                "Async TP requires 'model' in --compile.components and "
-                "--compile.enable"
-            )
+        if self.enable_async_tensor_parallel and "model" not in self.components:
+            raise ValueError("Async TP requires 'model' in --compile.components.")
 
 
 @dataclass(kw_only=True, slots=True)
@@ -383,7 +376,7 @@ class DebugConfig:
     """Choose the base RNG seed used for training"""
 
     spmd_typechecking: bool = False
-    """Enable global SPMD type checking; only effective under spmd_backend="spmd_types"."""
+    """Enable global SPMD type checking."""
 
     deterministic: bool = False
     """Use deterministic algorithms wherever possible, may be slower"""

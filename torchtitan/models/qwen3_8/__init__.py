@@ -4,8 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from functools import partial
+
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
-from torchtitan.distributed.pipeline_parallel import pipeline_vlm
+from torchtitan.config.transform import (
+    ModelConfigConverter,
+    validate_converter_compatibility,
+)
+from torchtitan.distributed.pipeline_parallel import pipeline_with_first_stage_modules
 from torchtitan.models.common import Embedding, Linear
 from torchtitan.models.qwen3_5 import (
     _27b,
@@ -21,8 +27,6 @@ from torchtitan.models.qwen3_5 import (
 )
 from torchtitan.models.qwen3_5.rope import MRoPE
 from torchtitan.models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
-from torchtitan.models.utils import validate_converter_order
-from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
 __all__ = [
@@ -123,7 +127,7 @@ def model_registry(
         ),
     )
     if converters is not None:
-        validate_converter_order(converters)
+        validate_converter_compatibility(converters)
         for converter_config in converters:
             config = converter_config.build().convert(config)
 
@@ -133,7 +137,10 @@ def model_registry(
         model=config,
         max_context_length=context_len,
         parallelize_fn=parallelize_qwen3_5,
-        pipelining_fn=pipeline_vlm,
+        pipelining_fn=partial(
+            pipeline_with_first_stage_modules,
+            first_stage_module_fqns=("vision_encoder",),
+        ),
         post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=Qwen35StateDictAdapter,
     )

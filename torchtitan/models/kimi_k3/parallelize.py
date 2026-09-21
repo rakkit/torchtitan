@@ -30,7 +30,7 @@ def parallelize_kimi_k3(
     parallel_dims: ParallelDims,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    compile_config: CompileConfig,
+    compile_config: CompileConfig | None,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
     skip_dp: bool = False,
@@ -40,7 +40,6 @@ def parallelize_kimi_k3(
     unsupported_parallelisms = [
         name
         for name, enabled in (
-            ("tensor parallel", parallel_dims.tp_enabled),
             ("pipeline parallel", parallel_dims.pp_enabled),
             ("context parallel", parallel_dims.cp_enabled),
         )
@@ -51,20 +50,18 @@ def parallelize_kimi_k3(
             "Kimi K3 currently supports FSDP2 data parallelism "
             f"only; disable {', '.join(unsupported_parallelisms)}."
         )
-    if compile_config.enable and "model" in compile_config.components:
+    if compile_config is not None and "model" in compile_config.components:
         raise NotImplementedError("Kimi K3 does not support model compilation yet.")
 
     assert isinstance(model, KimiK3Model)
-    if parallelism.spmd_backend == "spmd_types":
-        # Seed replicated layouts for parameters outside the explicit expert
-        # declarations. Vision buffers declare their DP layouts separately.
-        annotate_replicated_parameters(model, parallel_dims)
+    # Seed replicated layouts for parameters outside the explicit expert
+    # declarations. Vision buffers declare their DP layouts separately.
+    annotate_replicated_parameters(model, parallel_dims)
 
-    if parallelism.spmd_backend == "spmd_types" or parallel_dims.ep_enabled:
-        # model_registry's moe_comm_backend picks the dispatcher: standard
-        # (default), deepep and minimal_async_ep run on this model; hybridep
-        # needs GB200-class hardware.
-        model.parallelize(parallel_dims)
+    # model_registry's moe_comm_backend picks the dispatcher: standard
+    # (default) and deepep run on this model; hybridep
+    # needs GB200-class hardware.
+    model.parallelize(parallel_dims)
 
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
@@ -74,28 +71,12 @@ def parallelize_kimi_k3(
 
     # Skip FSDP wrapper for inference. FSDP's forward hooks
     # are incompatible with torch.inference_mode() used by vLLM.
-    # AC and compile are disabled via config (mode="none", enable=False).
+    # AC and compile are disabled via config (AC mode="none", compile is None).
     if skip_dp:
         return model
 
-    if parallelism.spmd_backend == "spmd_types":
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
-    else:
-        dp_mesh_names = (
-            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-        )
-        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-        dp_mesh_dims = None
-        edp_mesh = None
-        edp_mesh_dims = None
-        if parallel_dims.ep_enabled:
-            edp_mesh_names = (
-                ["dp_replicate", "efsdp"]
-                if parallel_dims.dp_replicate_enabled
-                else ["efsdp"]
-            )
-            edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+    edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
 
     vision_encoder = model.vision_encoder
     if vision_encoder is not None:
@@ -125,7 +106,7 @@ def parallelize_kimi_k3(
         edp_mesh=edp_mesh,
         dp_mesh_dims=dp_mesh_dims,
         edp_mesh_dims=edp_mesh_dims,
-        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        symm_mem_scope=parallelism.fsdp_symm_mem_scope,
     )
 
     return model

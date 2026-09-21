@@ -73,7 +73,7 @@ def run_case(*, norm_everywhere, num_shared_experts, top_k, label):
 
     x = torch.randn(48, 64, device="cuda")
     with torch.no_grad():
-        fast, aux = moe(x)
+        fast = moe(x)
         ref = reference_moe(moe, x)
 
     d = (fast.float() - ref).abs().max().item()
@@ -81,7 +81,7 @@ def run_case(*, norm_everywhere, num_shared_experts, top_k, label):
     ok = d < 5e-2 * scale
     print(
         f"  {'OK  ' if ok else 'FAIL'} {label}: max|d|={d:.3e} "
-        f"scale={scale:.3f} rel={d/scale:.2e} aux={aux}"
+        f"scale={scale:.3f} rel={d/scale:.2e}"
     )
     return not ok
 

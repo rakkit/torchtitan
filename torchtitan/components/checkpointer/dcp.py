@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import enum
+import logging
 import os
 import queue
 import threading
@@ -30,7 +31,6 @@ from torch.distributed.checkpoint.state_dict_saver import (
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools import filesystem
-from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
 
 from .base import (
@@ -42,6 +42,9 @@ from .base import (
     OPTIMIZER,
     purge_thread,
 )
+
+logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     import torch.nn as nn
@@ -126,7 +129,7 @@ class CheckpointManager(BaseCheckpointManager):
             previous 4 components.
         sd_adapter (Optional[type[BaseStateDictAdapter]]): The adapter used to convert
             model state dicts between native format and other formats.
-        base_folder (str): The base folder to save the checkpoint. Will be concatenated
+        base_folder (str): The base folder to save the checkpointer. Will be concatenated
             with config.folder
 
     """
@@ -159,10 +162,6 @@ class CheckpointManager(BaseCheckpointManager):
         sd_adapter: BaseStateDictAdapter | None,
         base_folder: str = "",
     ) -> None:
-
-        self.enable = config.enable
-        if not self.enable:
-            return
 
         self.folder = filesystem.join(base_folder, config.folder)
         self.interval = config.interval
@@ -208,7 +207,7 @@ class CheckpointManager(BaseCheckpointManager):
         self.sd_adapter = sd_adapter
         if self.last_save_in_hf and self.sd_adapter is None:
             raise ValueError(
-                "checkpoint.last_save_in_hf is True, but sd_adapter is not provided."
+                "checkpointer.last_save_in_hf is True, but sd_adapter is not provided."
             )
 
         # Async & Distributed Infrastructure
@@ -248,7 +247,8 @@ class CheckpointManager(BaseCheckpointManager):
         )
 
     def __del__(self):
-        self.close()
+        if hasattr(self, "staging_future"):
+            self.close()
 
     def _close(self):
         if (
@@ -262,7 +262,6 @@ class CheckpointManager(BaseCheckpointManager):
         if self.stager is not None:
             self.stager.close()
 
-    @torch.no_grad()
     def dcp_save(
         self,
         state_dict: dict[str, Any],
@@ -279,7 +278,7 @@ class CheckpointManager(BaseCheckpointManager):
 
         Args:
             state_dict (dict): The state dict to save.
-            checkpoint_id (str): Unique identifier (usually a path) for the checkpoint.
+            checkpoint_id (str): Unique identifier (usually a path) for the checkpointer.
             async_mode (AsyncMode): The saving/staging strategy.
             enable_garbage_collection (bool): To trigger a manual GC collect after save.
             to_hf (bool): If True, uses a HuggingFaceStorageWriter and adapts the
@@ -381,7 +380,7 @@ class CheckpointManager(BaseCheckpointManager):
 
         Args:
             states: Live state objects selected for restoration.
-            checkpoint_id: Path or identifier for the source checkpoint.
+            checkpoint_id: Path or identifier for the source checkpointer.
             from_hf: If True, adapts the load process for HuggingFace model
                 definitions and safetensors format.
             from_quantized: Indicates if the source is in a quantized format
@@ -432,8 +431,6 @@ class CheckpointManager(BaseCheckpointManager):
         for key in reseed_optional:
             self.states[key].load_state_dict({})
 
-    @sl.log_trace_span("checkpoint_save")
-    @torch.no_grad()
     def _save(self, curr_step: int, last_step: bool = False) -> bool:
         """Save the checkpoint for the current step.
 
@@ -465,7 +462,7 @@ class CheckpointManager(BaseCheckpointManager):
         checkpoint_phase = (
             "saving" if self.async_mode == AsyncMode.DISABLED else "staging"
         )
-        logger.info(f"{checkpoint_phase.capitalize()} the checkpoint.")
+        logger.info(f"{checkpoint_phase.capitalize()} the checkpointer.")
 
         if last_step:
             self._save_last_step(curr_step)
@@ -476,6 +473,7 @@ class CheckpointManager(BaseCheckpointManager):
 
         checkpoint_id = self._create_checkpoint_id(curr_step)
         states = self._flattened_model_states_sd()
+        async_save_started_at: float | None = None
 
         if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
             GarbageCollection.collect("GC collection invoked by checkpointer.")
@@ -489,6 +487,7 @@ class CheckpointManager(BaseCheckpointManager):
                     )
                 )
 
+            async_save_started_at = time.monotonic()
             result = self.dcp_save(
                 states,
                 checkpoint_id=checkpoint_id,
@@ -502,6 +501,7 @@ class CheckpointManager(BaseCheckpointManager):
 
         elif self.async_mode == AsyncMode.ASYNC:
             GarbageCollection.collect("GC collection invoked by checkpointer.")
+            async_save_started_at = time.monotonic()
             result = self.dcp_save(
                 states,
                 checkpoint_id=checkpoint_id,
@@ -520,6 +520,18 @@ class CheckpointManager(BaseCheckpointManager):
                 enable_garbage_collection=True,
             )
 
+        if async_save_started_at is not None:
+            assert self.save_future is not None
+            self.save_future.add_done_callback(
+                lambda _: sl.log_trace_scalar(
+                    {
+                        "train.checkpoint_write.native_dcp.execute.async_total.latency_ms": (
+                            time.monotonic() - async_save_started_at
+                        )
+                        * 1000
+                    }
+                )
+            )
         logger.info(
             f"Finished {checkpoint_phase} the checkpoint in "
             f"{time.monotonic() - begin:.2f} seconds."
@@ -572,11 +584,12 @@ class CheckpointManager(BaseCheckpointManager):
                 "self.save_future is not None, but self.async_mode is DISABLED."
             )
 
-        # Narrowing for the type checker: maybe_wait_for_saving only dispatches
-        # here when save_future is set.
-        assert self.save_future is not None
-        self.save_future.result()
+        # Clear before awaiting so a failed save is not retried by a later
+        # close() or __del__ call.
+        save_future = self.save_future
+        assert save_future is not None
         self.save_future = None
+        save_future.result()
 
     def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
         return self._storage.isfile(filesystem.join(checkpoint_dir, ".metadata"))

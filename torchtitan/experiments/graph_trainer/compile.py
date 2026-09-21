@@ -17,6 +17,7 @@ Additionally supports pre-compile via --compile.precompile_artifact_dir:
 - Generate artifacts with precompile_main.py
 """
 
+import logging
 import warnings
 
 import torch
@@ -32,7 +33,9 @@ from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConf
 from torchtitan.experiments.graph_trainer.jit_backend import (
     get_compile_backend_with_passes,
 )
-from torchtitan.tools.logging import logger
+
+
+logger = logging.getLogger(__name__)
 
 
 def _apply_jit_compile(
@@ -71,7 +74,7 @@ def apply_compile(
         parallel_dims: Parallel dimensions
         dump_folder: Folder for dumping debug graphs
     """
-    if not compile_config.enable:
+    if compile_config is None:
         return model
 
     _maybe_enable_async_tp(
@@ -103,10 +106,10 @@ def apply_compile(
             compile_config,
         )
     elif mode == "aot_fx_trace":
-        # aot_fx_trace traces fwd+loss+bwd together inside forward_backward_step,
+        # aot_fx_trace traces fwd+loss+bwd together inside a forward/backward microbatch,
         # so no model-level wrapping is needed here. If precompile_artifact_dir
         # is set, the precompiled artifact will be loaded lazily in
-        # GraphTrainer._make_fx_forward_backward_step.
+        # GraphTrainingEngine._make_fx_forward_backward_microbatch.
         if compile_config.precompile_artifact_dir:
             logger.info(
                 "aot_fx_trace compile mode: precompiled artifact will be loaded "

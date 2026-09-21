@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import os
 from dataclasses import dataclass, field, replace
 
@@ -13,7 +14,6 @@ from torch.distributed.pipelining.schedules import _PipelineSchedule
 
 from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.loss import LossFunction
-from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.components.validate import (
     iterate_and_close_dataloader,
@@ -22,7 +22,7 @@ from torchtitan.components.validate import (
 )
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
-from torchtitan.tools.logging import logger
+from torchtitan.observability.metrics import MetricsProcessor
 
 from .configs import SamplingConfig
 from .flux_datasets import FluxValidationDatasetConfig
@@ -31,6 +31,9 @@ from .model.autoencoder import AutoEncoder
 from .model.hf_embedder import FluxEmbedder
 from .tokenizer import FluxTokenizerContainer
 from .utils import create_position_encoding_for_latents, pack_latents, preprocess_data
+
+
+logger = logging.getLogger(__name__)
 
 
 class FluxValidator(Validator):
@@ -78,7 +81,7 @@ class FluxValidator(Validator):
         loss_fn: LossFunction,
         validation_context: ValidationContext,
         seq_len: int,
-        num_tokens_per_batch: int,
+        num_tokens_per_microbatch: int,
         metrics_processor: MetricsProcessor | None = None,
         pp_schedule: _PipelineSchedule | None = None,
         pp_has_first_stage: bool | None = None,
@@ -110,7 +113,7 @@ class FluxValidator(Validator):
         self.dp_world_size = dp_world_size
         self.dp_rank = dp_rank
         self.seq_len = seq_len
-        self.num_tokens_per_batch = num_tokens_per_batch
+        self.num_tokens_per_microbatch = num_tokens_per_microbatch
         self.validation_context = validation_context
         # pyrefly: ignore [bad-assignment]
         self.metrics_processor = metrics_processor
@@ -165,13 +168,14 @@ class FluxValidator(Validator):
             dp_rank=self.dp_rank,
             tokenizer=self.tokenizer,
             max_context_length=self.seq_len,
-            num_tokens_per_batch=self.num_tokens_per_batch,
+            num_tokens_per_microbatch=self.num_tokens_per_microbatch,
         )
 
-        for input_dict in iterate_and_close_dataloader(validation_dataloader):
+        for microbatch in iterate_and_close_dataloader(validation_dataloader):
             if self.config.steps != -1 and num_steps >= self.config.steps:
                 break
 
+            input_dict = microbatch.to_input_dict(self.device)
             labels = input_dict.pop("labels")
             prompt = input_dict.pop("prompt")
             if not isinstance(prompt, list):
@@ -181,23 +185,24 @@ class FluxValidator(Validator):
                 assert isinstance(p, str), f"prompt must be a string, got {type(p)}"
                 if max_saved_images != -1 and image_idx >= max_saved_images:
                     break
-                image = generate_image(
-                    device=self.device,
-                    dtype=self._dtype,
-                    img_height=img_height,
-                    img_width=img_width,
-                    enable_classifier_free_guidance=self.config.sampling.enable_classifier_free_guidance,
-                    denoising_steps=self.config.sampling.denoising_steps,
-                    classifier_free_guidance_scale=self.config.sampling.classifier_free_guidance_scale,
-                    # pyrefly: ignore [bad-argument-type]
-                    model=model,
-                    prompt=p,
-                    autoencoder=self.autoencoder,
-                    # pyrefly: ignore [bad-argument-type]
-                    tokenizer=self.tokenizer,
-                    t5_encoder=self.t5_encoder,
-                    clip_encoder=self.clip_encoder,
-                )
+                with self.validation_context():
+                    image = generate_image(
+                        device=self.device,
+                        dtype=self._dtype,
+                        img_height=img_height,
+                        img_width=img_width,
+                        enable_classifier_free_guidance=self.config.sampling.enable_classifier_free_guidance,
+                        denoising_steps=self.config.sampling.denoising_steps,
+                        classifier_free_guidance_scale=self.config.sampling.classifier_free_guidance_scale,
+                        # pyrefly: ignore [bad-argument-type]
+                        model=model,
+                        prompt=p,
+                        autoencoder=self.autoencoder,
+                        # pyrefly: ignore [bad-argument-type]
+                        tokenizer=self.tokenizer,
+                        t5_encoder=self.t5_encoder,
+                        clip_encoder=self.clip_encoder,
+                    )
 
                 save_image(
                     name=(
@@ -316,7 +321,7 @@ class FluxValidator(Validator):
         # additional elements to the denominator.
         if parallel_dims.dp_enabled:
             total_global_elements = dist_utils.dist_sum_tensor(
-                total_local_elements, parallel_dims.get_mesh("batch")
+                total_local_elements, parallel_dims.get_mesh("dp")
             )
         else:
             total_global_elements = total_local_elements

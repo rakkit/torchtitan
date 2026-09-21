@@ -10,27 +10,10 @@ from typing import Any
 
 import torch
 
-from torchtitan.config import Configurable, ParallelismConfig
+from torchtitan.config import ParallelismConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 
 from .module import Module
-
-
-class ModelConfigConverter(Configurable):
-    """Base class for converters that transform the model config tree.
-
-    Subclasses implement ``convert()`` to modify configs before model build
-    (e.g. quantization, LoRA).  Converters may return a replacement root
-    config when the transform needs to wrap the model config itself.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Configurable.Config):
-        pass
-
-    @abstractmethod
-    def convert(self, model_config: Module.Config) -> Module.Config:
-        raise NotImplementedError
 
 
 class BaseModel(Module):
@@ -62,6 +45,7 @@ class BaseModel(Module):
         parallelism: ParallelismConfig,
         max_num_documents: int | None = None,
         max_context_length: int | None = None,
+        **kwargs: Any,
     ) -> tuple[
         torch.Tensor | tuple[torch.Tensor, ...],
         torch.Tensor | tuple[torch.Tensor, ...],
@@ -76,10 +60,11 @@ class BaseModel(Module):
         ``(inputs, labels, extra_kwargs)``. Models with aligned multi-output
         objectives may return tuples of input and label tensors.
 
-        The trainer calls this via ``cast(BaseModel, model).preprocess_inputs``,
-        so the declaration lives here for typing. There is no meaningful default:
-        models with a bespoke pipeline (e.g. Flux) never call it, and every model
-        that does must override it -- hence the ``NotImplementedError`` below.
+        Additional keyword arguments may provide model-specific preprocessing
+        dependencies that are owned outside the trainable model. The trainer
+        calls this via ``cast(BaseModel, model).preprocess_inputs``,
+        so the declaration lives here for typing. There is no meaningful default;
+        every model used by the training engine must implement it.
         """
         raise NotImplementedError(
             f"{type(self).__name__} must implement preprocess_inputs()."

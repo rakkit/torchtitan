@@ -21,13 +21,14 @@ from torchtitan.distributed.fsdp import (
     resolve_fsdp_mesh,
     resolve_sparse_fsdp_mesh,
 )
+from torchtitan.models.common.cp_attention import UlyssesCPInnerAttention
 from torchtitan.models.gpt_oss.model import GptOssModel
 
 
 def _raise_dynamo_recompile_limit(
     model: GptOssModel,
 ) -> None:
-    # TP/EP sharding can compile a block before every DTensor local tensor has
+    # TP/EP sharding can compile a block before every local tensor has
     # resolved from AsyncCollectiveTensor to a plain Tensor. Dynamo specializes
     # on both states, and fullgraph=True turns the recompile cap into a hard
     # failure instead of falling back. GPT-OSS needs a slightly higher cap
@@ -60,21 +61,26 @@ def parallelize_gptoss(
     parallel_dims: ParallelDims,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    compile_config: CompileConfig,
+    compile_config: CompileConfig | None,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
     skip_dp: bool = False,
 ):
+    # TODO(fegin): Shard per-head sinks over CP to support Ulysses.
+    if parallel_dims.cp_enabled and isinstance(
+        model.config.first_full_attention_backend,
+        UlyssesCPInnerAttention.Config,
+    ):
+        raise NotImplementedError(
+            "GPT-OSS does not support Ulysses CP because its per-head sinks "
+            "are not sharded over CP."
+        )
+
     model_compile_enabled = (
-        compile_config.enable and "model" in compile_config.components
+        compile_config is not None and "model" in compile_config.components
     )
 
-    if (
-        parallelism.spmd_backend == "spmd_types"
-        or parallel_dims.tp_enabled
-        or parallel_dims.ep_enabled
-    ):
-        model.parallelize(parallel_dims)
+    model.parallelize(parallel_dims)
 
     if ac_config is not None:
         ac_config.build(dump_folder=dump_folder).apply(model)
@@ -91,28 +97,12 @@ def parallelize_gptoss(
 
     # Skip FSDP wrapper for inference. FSDP's forward hooks
     # are incompatible with torch.inference_mode() used by vLLM.
-    # AC and compile are disabled via config (mode="none", enable=False).
+    # AC and compile are disabled via config (AC mode="none", compile is None).
     if skip_dp:
         return model
 
-    if parallelism.spmd_backend == "spmd_types":
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
-    else:
-        dp_mesh_names = (
-            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-        )
-        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-        dp_mesh_dims = None
-        edp_mesh = None
-        edp_mesh_dims = None
-        if parallel_dims.ep_enabled:
-            edp_mesh_names = (
-                ["dp_replicate", "efsdp"]
-                if parallel_dims.dp_replicate_enabled
-                else ["efsdp"]
-            )
-            edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+    edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
 
     apply_fsdp_to_decoder(
         model,
@@ -126,7 +116,7 @@ def parallelize_gptoss(
         edp_mesh=edp_mesh,
         dp_mesh_dims=dp_mesh_dims,
         edp_mesh_dims=edp_mesh_dims,
-        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        symm_mem_scope=parallelism.fsdp_symm_mem_scope,
     )
 
     return model

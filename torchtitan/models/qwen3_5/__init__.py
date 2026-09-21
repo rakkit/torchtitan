@@ -10,14 +10,19 @@ from functools import partial
 import torch.nn as nn
 
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
-from torchtitan.distributed.pipeline_parallel import pipeline_vlm
+from torchtitan.config.transform import (
+    ModelConfigConverter,
+    validate_converter_compatibility,
+)
+from torchtitan.distributed.pipeline_parallel import pipeline_with_first_stage_modules
 
 from torchtitan.models.common import (  # noqa: F401
     Conv1d,
     Embedding,
     Linear,
-    ScaledBiasRowwiseLinear,
+    PartialBiasRowwiseLinear,
     SigmoidGatedFeedForward,
+    Softmax,
 )
 from torchtitan.models.common.config_utils import (
     get_attention_config,
@@ -33,8 +38,6 @@ from torchtitan.models.common.vision_encoder import (
     VisionMLP,
     VisionTransformerBlock,
 )
-from torchtitan.models.utils import validate_converter_order
-from torchtitan.protocols.model import ModelConfigConverter
 
 from torchtitan.protocols.model_spec import ModelSpec
 
@@ -112,10 +115,10 @@ def _linear(in_features: int, out_features: int) -> Linear.Config:
     )
 
 
-def _scaled_bias_rowwise_linear(
+def _partial_bias_rowwise_linear(
     in_features: int, out_features: int
-) -> ScaledBiasRowwiseLinear.Config:
-    return ScaledBiasRowwiseLinear.Config(
+) -> PartialBiasRowwiseLinear.Config:
+    return PartialBiasRowwiseLinear.Config(
         in_features=in_features,
         out_features=out_features,
         bias=True,
@@ -138,9 +141,8 @@ def _shared_experts_config(
         w2w3_param_init=_depth_init(layer_id),
     )
     return SigmoidGatedFeedForward.Config(
-        w1=ffn.w1,
+        w13=ffn.w13,
         w2=ffn.w2,
-        w3=ffn.w3,
         gate=Linear.Config(in_features=dim, out_features=1, param_init=_LINEAR_INIT),
     )
 
@@ -184,11 +186,11 @@ def _qwen35_vision_encoder_config(
                 wq=_linear(dim, dim),
                 wk=_linear(dim, dim),
                 wv=_linear(dim, dim),
-                proj=_scaled_bias_rowwise_linear(dim, dim),
+                proj=_partial_bias_rowwise_linear(dim, dim),
             ),
             mlp=VisionMLP.Config(
                 fc1=_linear(dim, ffn_dim),
-                fc2=_scaled_bias_rowwise_linear(ffn_dim, dim),
+                fc2=_partial_bias_rowwise_linear(ffn_dim, dim),
             ),
         ),
         rotary_pos_emb=VisionRotaryEmbedding.Config(
@@ -199,7 +201,7 @@ def _qwen35_vision_encoder_config(
             merged_hidden_size=merged_hidden_size,
             norm=LayerNorm.Config(normalized_shape=dim, eps=layer_norm_eps),
             fc1=_linear(merged_hidden_size, merged_hidden_size),
-            fc2=_scaled_bias_rowwise_linear(merged_hidden_size, out_hidden_size),
+            fc2=_partial_bias_rowwise_linear(merged_hidden_size, out_hidden_size),
         ),
         param_init=_POS_EMBED_INIT,
     )
@@ -441,7 +443,7 @@ def _build_qwen35_moe_layers(
                         num_experts=num_experts,
                         gate_param_init=_depth_init(layer_id),
                         top_k=top_k,
-                        score_func="softmax",
+                        score_func=Softmax.Config(),
                         route_norm=True,
                     ),
                     routed_experts=make_routed_experts_config(
@@ -1118,7 +1120,7 @@ def model_registry(
         ),
     )
     if converters is not None:
-        validate_converter_order(converters)
+        validate_converter_compatibility(converters)
         for c in converters:
             config = c.build().convert(config)
 
@@ -1128,7 +1130,10 @@ def model_registry(
         model=config,
         max_context_length=context_len,
         parallelize_fn=parallelize_qwen3_5,
-        pipelining_fn=pipeline_vlm,
+        pipelining_fn=partial(
+            pipeline_with_first_stage_modules,
+            first_stage_module_fqns=("vision_encoder",),
+        ),
         post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=Qwen35StateDictAdapter,
     )

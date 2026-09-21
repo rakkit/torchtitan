@@ -20,10 +20,12 @@ from torchtitan.models.common.decoder_sharding import (
     set_decoder_sharding_config,
     set_dense_ffn_sharding,
     token_id_placement,
-    token_id_sequence_parallel_placement,
 )
-from torchtitan.models.common.moe_sharding import set_moe_sharding_config
-from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
+from torchtitan.models.common.moe_sharding import (
+    set_moe_block_padding_mask_sharding,
+    set_moe_sharding_config,
+)
+from torchtitan.protocols.sharding import ShardingConfig
 
 _dense_param_rep = dense_param_placement(tp=spmd.R)
 _act_shard0_tp_rep = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
@@ -39,12 +41,6 @@ if TYPE_CHECKING:
         DeepSeekV4Model,
         DeepSeekV4TransformerBlock,
     )
-
-_GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
-    "w1_EFD": spmd.S(1),
-    "w2_EDF": spmd.S(2),
-    "w3_EFD": spmd.S(1),
-}
 
 _replicate_weight = ShardingConfig(
     state_shardings={"weight": _dense_param_rep},
@@ -76,17 +72,10 @@ def hc_mix_sequence_parallel_placement():
 def set_dsa_flex_attention_sharding(inner_attention_cfg) -> None:
     query_states = dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0))
     replicated_activation = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
-    partial_activation = dense_activation_placement(tp=spmd.P, cp=spmd.S(0))
-
     input_shardings = {
         "q": query_states,
         "swa_k": replicated_activation,
     }
-    grad_placements = [
-        query_states,
-        partial_activation,
-    ]
-
     compress_ratio = getattr(inner_attention_cfg, "compress_ratio", 1)
     if compress_ratio == 4:
         input_shardings.update(
@@ -98,15 +87,6 @@ def set_dsa_flex_attention_sharding(inner_attention_cfg) -> None:
                 "attn_sink": _attn_sink_placement,
             }
         )
-        grad_placements.extend(
-            [
-                partial_activation,
-                replicated_activation,
-                replicated_activation,
-                replicated_activation,
-                _attn_sink_placement,
-            ]
-        )
     elif compress_ratio > 1:
         input_shardings.update(
             {
@@ -114,17 +94,15 @@ def set_dsa_flex_attention_sharding(inner_attention_cfg) -> None:
                 "attn_sink": _attn_sink_placement,
             }
         )
-        grad_placements.extend([partial_activation, _attn_sink_placement])
     else:
         input_shardings["attn_sink"] = _attn_sink_placement
-        grad_placements.append(_attn_sink_placement)
 
     inner_attention_cfg.sharding_config = ShardingConfig(
         in_src_shardings=input_shardings,
         in_dst_shardings=dict(input_shardings),
         out_src_shardings=query_states,
         out_dst_shardings=query_states,
-        local_map=LocalMapConfig(in_grad_placements=tuple(grad_placements)),
+        local_spmd=True,
     )
 
 
@@ -274,24 +252,16 @@ def set_deepseek_v4_layer_sharding(
 
     # MoE FFN (MoE-enabled layers only).
     if layer_cfg.moe is not None:
+        set_moe_block_padding_mask_sharding(layer_cfg, enable_sp=enable_sp)
         set_moe_sharding_config(
             layer_cfg.moe,
             enable_ep=enable_ep,
             enable_sp=enable_sp,
-            expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
         )
         router_cfg = layer_cfg.moe.router
         if getattr(router_cfg, "layer_id", 0) < getattr(router_cfg, "n_hash_layers", 0):
-            # tokens / input_ids_T enter the model TP-replicated. MoE keeps
-            # activations sequence-parallel only on the SP+EP path, so hash
-            # ids must shard T the same way. Otherwise x is all-gathered or
-            # unreplicated on TP and the full token-id tensor matches.
             input_ids_src_placement = token_id_placement()
-            input_ids_dst_placement = (
-                token_id_sequence_parallel_placement()
-                if enable_sp and enable_ep
-                else token_id_placement()
-            )
+            input_ids_dst_placement = token_id_placement(enable_sp=enable_ep)
             moe_sharding_config = layer_cfg.moe.sharding_config or ShardingConfig()
             in_src_shardings = moe_sharding_config.in_src_shardings or {}
             in_src_shardings["input_ids_T"] = input_ids_src_placement
@@ -341,9 +311,6 @@ def set_deepseek_v4_sharding_config(
     if config.mtp_layers is not None:
         replicated_activation = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
         for mtp_cfg in config.mtp_layers:
-            set_deepseek_v4_layer_sharding(
-                mtp_cfg, enable_sp=enable_sp, enable_ep=enable_ep
-            )
             mtp_cfg.e_proj.sharding_config = _replicate_weight
             mtp_cfg.h_proj.sharding_config = _replicate_weight
             mtp_cfg.enorm.sharding_config = _replicate_weight
@@ -362,12 +329,17 @@ def set_deepseek_v4_sharding_config(
                 in_src_shardings={
                     "mtp_input_embed": replicated_activation,
                     "prev_hc_hidden": replicated_activation,
-                    "mtp_input_ids_T": dense_activation_placement(
-                        tp=spmd.R, cp=spmd.S(0)
-                    ),
-                    "mtp_input_valid_mask": dense_activation_placement(
-                        tp=spmd.R, cp=spmd.S(0)
-                    ),
+                    "mtp_input_ids_T": token_id_placement(),
+                    "mtp_input_valid_mask": token_id_placement(),
+                },
+                in_dst_shardings={
+                    "mtp_input_ids_T": token_id_placement(enable_sp=enable_sp),
+                    "mtp_input_valid_mask": token_id_placement(enable_sp=enable_sp),
                 },
                 out_src_shardings=replicated_activation,
+            )
+            set_deepseek_v4_layer_sharding(
+                mtp_cfg,
+                enable_sp=enable_sp,
+                enable_ep=enable_ep,
             )

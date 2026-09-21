@@ -14,6 +14,7 @@ lookup instead of a reconstruction. See keyed_mix_state for the contract.
 Everything else -- rank keying, the DP-degree guard, iteration -- is inherited unchanged.
 """
 
+import logging
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -27,7 +28,6 @@ from torchtitan.components.data.keyed_mix_state import (
     to_keyed,
 )
 from torchtitan.components.data.loader import GrainDataLoader
-from torchtitan.tools.logging import logger
 
 KEYED_STATE_VERSION = 2
 
@@ -140,3 +140,5 @@ class KeyedMixDataLoader(GrainDataLoader):
         except Exception:
             self.close()
             raise
+
+logger = logging.getLogger(__name__)

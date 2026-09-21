@@ -7,6 +7,7 @@
 # This file provides the util functions to apply activation checkpointing to the model.
 # Technically, this is not a part of distributed, but distributed module is the best place to put it.
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Annotated, cast
@@ -27,7 +28,9 @@ from torch.utils.checkpoint import (
 
 from torchtitan.config import Configurable
 from torchtitan.protocols.module import Module
-from torchtitan.tools.logging import logger
+
+
+logger = logging.getLogger(__name__)
 
 
 def _get_default_save_ops() -> set:
@@ -47,7 +50,7 @@ def _get_default_save_ops() -> set:
         # For low precision training, always save the absolute maximum used
         # to compute the scaling factor for quantization.
         torch.ops.aten.max.default,
-        # FlexAttention (torch.ops.higher_order.flex_attention is the same object)
+        # FlexInnerAttention (torch.ops.higher_order.flex_attention is the same object)
         torch._higher_order_ops.flex_attention,
         torch.ops.aten.linear.default,
         torch.ops.aten.mm.dtype,
@@ -202,7 +205,7 @@ class SelectiveAC(ActivationCheckpointing):
         """
         This list of fully qualified names is used to determine which mm shapes to
         force recompute, rather than being considered by rest of the sac policy,
-        e.g save every other mm. Only nn.Linear modules are supported today.
+        e.g save every other mm. Linear modules are supported today.
 
         Note: this config applies to mms not limited to those matching the specified
         fqns, e.g. if "moe.router.gate", corresponding to Linear(in, out), is specified,
@@ -258,9 +261,10 @@ class SelectiveAC(ActivationCheckpointing):
                 if not isinstance(submod, nn.Linear):
                     raise ValueError(
                         "force_recompute_mm_shapes_by_fqns expected to "
-                        f"match a nn.Linear, but got: {submod}"
+                        f"match a linear projection, but got: {submod}"
                     )
-                out_f, in_f = submod.weight.shape
+                in_f = submod.weight.shape[-1]
+                out_f = submod.weight.numel() // in_f
                 mm_recompute_shapes.add((in_f, out_f))
 
         # Some backends (e.g. PrivateUse1) register aten.linear as a leaf op

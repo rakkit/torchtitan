@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from typing import Any
 
 import torch
@@ -19,6 +20,7 @@ from torch.distributed.tensor import Shard
 
 from torchtitan.config import (
     CompileConfig,
+    FSDPSymmMemScope,
     ParallelismConfig,
     TORCH_DTYPE_MAP,
     TrainingConfig,
@@ -33,7 +35,9 @@ from torchtitan.distributed.fsdp import (
     resolve_fsdp_mesh,
     resolve_sparse_fsdp_mesh,
 )
-from torchtitan.tools.logging import logger
+
+
+logger = logging.getLogger(__name__)
 
 
 def _wrap_flex_kernel_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
@@ -47,10 +51,10 @@ def _wrap_flex_kernel_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
     keys -- the BlockMask is Q-sharded / KV-full to match.
 
     This is the explicit-collective analogue of Titan's ``flex_cp_allgather``
-    path: the kernel runs nested inside the attention module's local_map region
+    path: the kernel runs nested inside the attention module's local SPMD region
     where the CP mesh dim is no longer visible to a declarative redistribute, so
     the gather is done here on local tensors. Called before ``model.parallelize``
-    so the wrap is captured inside the local_map wrapping.
+    so the wrap is captured inside the local SPMD wrapper.
     """
     import torch.distributed as dist
     from torch.distributed.tensor.experimental._context_parallel._attention import (
@@ -90,7 +94,7 @@ def parallelize_hf_transformers(
     parallel_dims: ParallelDims,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    compile_config: CompileConfig,
+    compile_config: CompileConfig | None,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ):
@@ -103,15 +107,8 @@ def parallelize_hf_transformers(
     4. Single model.parallelize(parallel_dims) call — shards states, wraps forward
     5. Apply AC, compile, FSDP as usual
     """
-    if parallel_dims.spmd_backend != "spmd_types":
-        raise ValueError(
-            "The Transformers modeling backend only supports "
-            "parallelism.spmd_backend='spmd_types'; "
-            f"got '{parallel_dims.spmd_backend}'."
-        )
-
     # Flex attention supports FSDP, TP, CP, and PP (in any combination). Under CP
-    # the flex kernel's local_map redistributes
+    # the flex kernel's local SPMD boundary redistributes
     # k/v from seq-sharded to CP-Replicate (all-gather); see _attach_flex_kernel
     # in hf_sharding.py. The CP-sharded BlockMask is built and sharded on its Q
     # axis upstream (trainer, ptrr balancer). Note: the ptrr balancer requires
@@ -170,7 +167,7 @@ def parallelize_hf_transformers(
 
     # 3b. Under CP, wrap each flex kernel forward to all-gather k/v across
     # the CP axis (on the seq dim). Must run before model.parallelize so the
-    # wrap is captured inside the local_map region and operates on the local
+    # wrap is captured inside the local SPMD region and operates on the local
     # (already TP-head-sharded, CP-seq-sharded) tensors.
     if parallel_dims.cp_enabled:
         _wrap_flex_kernel_cp(model, parallel_dims.get_mesh("cp"))
@@ -179,7 +176,7 @@ def parallelize_hf_transformers(
     model.parallelize(parallel_dims)
 
     model_compile_enabled = (
-        compile_config.enable and "model" in compile_config.components
+        compile_config is not None and "model" in compile_config.components
     )
 
     if ac_config is not None:
@@ -207,7 +204,7 @@ def parallelize_hf_transformers(
         pp_enabled=parallel_dims.pp_enabled,
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        symm_mem_scope=parallelism.fsdp_symm_mem_scope,
         ep_degree=parallel_dims.ep,
         dp_mod_ep_mesh=edp_mesh,
         dp_mesh_dims=dp_mesh_dims,
@@ -242,7 +239,7 @@ def apply_fsdp(
     dp_mesh_dims: DataParallelMeshDims | None = None,
     edp_mesh_dims: DataParallelMeshDims | None = None,
     gradient_divide_factor: int | None = None,
-    enable_symm_mem: bool = False,
+    symm_mem_scope: FSDPSymmMemScope = None,
 ):
     """Apply data parallelism (via FSDP2) to the model.
 
@@ -366,8 +363,7 @@ def apply_fsdp(
 
     fully_shard(model, **fsdp_config)
 
-    if enable_symm_mem:
-        enable_fsdp_symm_mem(model)
+    enable_fsdp_symm_mem(model, symm_mem_scope)
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)

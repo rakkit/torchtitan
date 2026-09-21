@@ -13,12 +13,10 @@ from torch.utils.checkpoint import checkpoint
 pytest.importorskip("torchao")
 pytest.importorskip("torchao.prototype.moe_training.kernels.mxfp8")
 
-import torchtitan.components.quantization.mxfp8.linear as mxfp8_linear  # noqa: E402
-from torchtitan.components.quantization._fsdp_tensor import (  # noqa: E402
-    _UnshardedFSDPTensor,
-)
-from torchtitan.components.quantization.mxfp8.linear import MXFP8Linear  # noqa: E402
-from torchtitan.components.quantization.mxfp8.tensor import (  # noqa: E402
+import torchtitan.quantization.mxfp8.linear as mxfp8_linear  # noqa: E402
+from torchtitan.quantization._fsdp_tensor import _UnshardedFSDPTensor  # noqa: E402
+from torchtitan.quantization.mxfp8.linear import MXFP8Linear  # noqa: E402
+from torchtitan.quantization.mxfp8.tensor import (  # noqa: E402
     _LinearShardedTensorWithMXFP8Compute,
 )
 
@@ -252,7 +250,7 @@ def test_operands_fields_must_be_distinct_allocations():
     """
     from dataclasses import dataclass
 
-    from torchtitan.components.quantization._fsdp_tensor import _unsharded_inner_tensors
+    from torchtitan.quantization._fsdp_tensor import _unsharded_inner_tensors
 
     qdata = torch.empty(64, 64, device="cuda", dtype=torch.float8_e4m3fn)
 
@@ -493,16 +491,23 @@ def test_fsdp_post_all_gather_drops_the_padding():
     assert len(unsharded_inner_tensors) == 3
 
 
-def test_fsdp_pre_all_gather_rejects_a_non_zero_shard_dim():
-    """Only dim 0 is supported; the all-gather concatenates along it."""
+def test_fsdp_hooks_support_a_non_zero_shard_dim():
+    """Structured weights move their sharded matrix axis to the gather axis."""
     sharded_weight = _LinearShardedTensorWithMXFP8Compute(
-        torch.randn(96, 64, device="cuda", dtype=torch.bfloat16)
+        torch.randn(2, 48, 128, device="cuda", dtype=torch.bfloat16)
     )
-    with pytest.raises(NotImplementedError, match="sharding dimension 0 only"):
-        sharded_weight.fsdp_pre_all_gather(
-            _StubMesh(2),
-            torch.Size([96, 128]),
-            None,
-            None,
-            _StubMixedPrecisionPolicy(),
-        )
+    (comm_N2K,), metadata = sharded_weight.fsdp_pre_all_gather(
+        _StubMesh(2),
+        torch.Size([2, 96, 128]),
+        None,
+        None,
+        _StubMixedPrecisionPolicy(),
+    )
+
+    assert comm_N2K.shape == (48, 2, 128)
+    gathered_N2K = torch.randn(96, 2, 128, device="cuda", dtype=torch.bfloat16)
+    unsharded, inner_tensors = sharded_weight.fsdp_post_all_gather(
+        (gathered_N2K,), metadata, torch.bfloat16
+    )
+    assert unsharded.shape == (2, 96, 128)
+    assert len(inner_tensors) == 3

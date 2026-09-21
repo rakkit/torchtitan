@@ -192,6 +192,18 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         a collective, so ranks that disagree hang rather than misreport.
         """
 
+        enable_step_tracing: bool = False
+        """Emit DiSCO's per-step structured-logger spans. Off by default.
+
+        These are 8 records per step per rank (one scalar plus seven spans
+        around prepare_grads / workspaces / embedding / experts / fsdp / ddp /
+        scalar). At 32 nodes x 4 GPUs that is 1024 records per step, which is a
+        lot of storage for something only wanted while profiling the optimizer.
+
+        Separate from `debug.enable_structured_logging`, which is global: this
+        silences DiSCO's spans without also silencing the trainer's.
+        """
+
         log_norm_freq: int = 0
         """How often, in steps, to log DiSCO's per-parameter norms. 0 disables.
 
@@ -210,13 +222,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         """Gram-matrix metric depth, on the same cadence as log_norm_freq.
         0 disables. Levels 2-3 need batched eigh and are expensive."""
 
-        enable_spectrum_plot: bool = False
-        """
-        Whether to render each tracked parameter's singular-value spectrum as
-        a plot image for W&B (see optimizers/spectrum_logging.py). Only
-        takes effect when log_norm_freq > 0.
-        """
-
         enable_spectrum_export: bool = False
         """
         Whether to export the full raw singular-value spectra (every tracked
@@ -225,13 +230,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         the plot shows. Off by default: can be large for big MoE models (see
         optimizers/spectrum_logging.py). Only takes effect when
         log_norm_freq > 0.
-        """
-
-        enable_gram_plot: bool = False
-        """
-        Whether to render each tracked vector-valued gram metric as an
-        atlas-grid plot image for W&B (see optimizers/gram_vector_logging.py).
-        Only takes effect when gram_level > 0.
         """
 
         enable_gram_export: bool = False
@@ -326,14 +324,12 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         # assign both configs back onto this object post-construction, which
         # left the container briefly in a state its own methods did not expect.
         self.spectrum_logging_config = spectrum_logging.SpectrumLoggingConfig(
-            enable_plot=config.enable_spectrum_plot,
             enable_export=config.enable_spectrum_export,
             export_dir=(
                 os.path.join(output_dir, "spectrum_export") if output_dir else None
             ),
         )
         self.gram_vector_logging_config = GramVectorLoggingConfig(
-            enable_plot=config.enable_gram_plot,
             enable_export=config.enable_gram_export,
             export_dir=os.path.join(output_dir, "gram_export") if output_dir else None,
         )
@@ -466,13 +462,10 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                     self.norms_to_log,
                     self.gram_level,
                     # The spectra are only ever consumed by
-                    # process_norms_for_logging, which drops them unless one of
-                    # these is on. Telling the optimizer up front lets it skip
-                    # computing, packing and all-gathering them entirely.
-                    track_spectrum=(
-                        self.spectrum_logging_config.enable_plot
-                        or self.spectrum_logging_config.enable_export
-                    ),
+                    # process_norms_for_logging, which drops them unless the
+                    # parquet export is on. Telling the optimizer up front lets
+                    # it skip computing, packing and all-gathering them.
+                    track_spectrum=self.spectrum_logging_config.enable_export,
                     # Single source of truth with the logger: the optimizer must
                     # only skip the gather on ranks that actually have a logger,
                     # otherwise their metrics are computed and silently dropped.
@@ -617,6 +610,7 @@ def moe_metrics_worker(log_queue: queue.Queue):
             log_queue.task_done()
             break
 
+        moe_layers_info: list[dict] = []
         # Any exception here used to kill the worker silently -- and then
         # `join_log_queue()`, which the trainer calls every logging step,
         # would block the MAIN thread forever on a queue nobody drains.
@@ -683,6 +677,14 @@ def moe_metrics_worker(log_queue: queue.Queue):
 
         except Exception:
             logger.exception("async MoE metrics worker failed on one payload")
+            # Clear what this payload was meant to fill. `collect_moe_metrics`
+            # reads whatever is still on the module, so leaving the previous
+            # payload's dict in place republishes the PREVIOUS logging step's
+            # entropy / maxvio / bias as if they were current -- the chart shows
+            # a flat segment rather than a gap, and a flat maxvio is exactly
+            # what a healthy run looks like. Missing is honest; stale is not.
+            for info in moe_layers_info:
+                info["module"]._log_expert_metrics = {}
         finally:
             log_queue.task_done()
 

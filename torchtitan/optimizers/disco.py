@@ -7,6 +7,7 @@
 import logging
 import math
 import os
+from contextlib import nullcontext
 from enum import Enum
 
 import torch
@@ -22,7 +23,14 @@ from torchtitan.distributed.utils import (
     metrics_shard_rank,
     rank_owns_metrics_shard,
 )
+
 from torchtitan.observability import structured_logger as sl
+
+
+def _ignore_scalars(scalars, **kwargs) -> None:
+    """No-op stand-in for `sl.log_trace_scalar` when tracing is off."""
+    del scalars, kwargs
+
 
 from . import gram_helper, norm_helper, power_iteration
 from .abstract_disco import AbstractDiSCO
@@ -46,10 +54,8 @@ from .utils import remove_orig_mod_and_weight_for_p_name
 
 __all__ = [
     "DiSCO",
-
 ]
 logger = logging.getLogger(__name__)
-
 
 
 # these variables are hardcoded for now, taken from torchtitan
@@ -347,7 +353,14 @@ class DiSCO(AbstractDiSCO):
         communication_dtype=torch.bfloat16,
         extra_reduce_for_HSDP=False,
         experts_weights_layout="G-D_out-D_in",
+        enable_step_tracing=False,
     ):
+        # Resolved once, not branched per call: `step()` emits 8 of these per
+        # rank per step, and they are off by default.
+        self._span = sl.log_trace_span if enable_step_tracing else nullcontext
+        self._trace_scalar = (
+            sl.log_trace_scalar if enable_step_tracing else _ignore_scalars
+        )
         env_vars = parse_env_var()
         logger.info(f"[DiSCO] Environment variables: {env_vars}")
         debug_mode = env_vars["debug_mode"]
@@ -3084,8 +3097,8 @@ class DiSCO(AbstractDiSCO):
         # GPU time. That is the useful view here -- the two biggest wins in
         # the metrics work were CPU-side (AsyncCollectiveTensor dispatch and
         # a sync-bound gram helper), and neither shows up in GPU time.
-        sl.log_trace_scalar({"disco_logging_step": int(self.need_to_calculate_norm)})
-        with sl.log_trace_span("disco_prepare_grads"):
+        self._trace_scalar({"disco_logging_step": int(self.need_to_calculate_norm)})
+        with self._span("disco_prepare_grads"):
             self.prepare_gradients_and_momentum()
             self._apply_reduce_pre_norm_pass()
 
@@ -3099,7 +3112,7 @@ class DiSCO(AbstractDiSCO):
             self._precompute_ddp_gram_vector_metadata()
             self._gram_level_at_last_vector_precompute = self.gram_level
 
-        with sl.log_trace_span("disco_workspaces"):
+        with self._span("disco_workspaces"):
             fsdp_workspace = None
             if self.fsdp_params and self.fsdp_a2a_mode == "once":
                 fsdp_workspace = self._create_fsdp_step_workspace(
@@ -3129,14 +3142,14 @@ class DiSCO(AbstractDiSCO):
             )
 
         if self.embed_params:
-            with sl.log_trace_span("disco_embedding"):
+            with self._span("disco_embedding"):
                 self.step_embedding(
                     self.embed_params, self.embed_param_names, embed_workspace
                 )
 
         # Expert LMO launches are coordinated inside step_experts.
         if self.expert_params:
-            with sl.log_trace_span("disco_experts"):
+            with self._span("disco_experts"):
                 self.step_experts(
                     self.expert_params,
                     self.expert_param_names,
@@ -3144,7 +3157,7 @@ class DiSCO(AbstractDiSCO):
                 )
 
         if self.fsdp_params:
-            with sl.log_trace_span("disco_fsdp"):
+            with self._span("disco_fsdp"):
                 self.step_fsdp(
                     self.fsdp_params,
                     self.fsdp_param_names,
@@ -3152,7 +3165,7 @@ class DiSCO(AbstractDiSCO):
                 )
 
         if self.ddp_params:
-            with sl.log_trace_span("disco_ddp"):
+            with self._span("disco_ddp"):
                 self.step_ddp(
                     self.ddp_params,
                     self.ddp_param_names,
@@ -3160,7 +3173,7 @@ class DiSCO(AbstractDiSCO):
                 )
 
         if self.scale_params:
-            with sl.log_trace_span("disco_scalar"):
+            with self._span("disco_scalar"):
                 self.step_scalar(self.scale_params, self.scale_param_names)
 
         self.need_to_calculate_norm = False

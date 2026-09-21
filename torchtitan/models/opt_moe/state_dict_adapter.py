@@ -14,7 +14,7 @@ from torchtitan.models.utils import MoEStateDictAdapter
 
 from torchtitan.protocols.model import BaseModel
 
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
 
 class OPTMoEStateDictAdapter(MoEStateDictAdapter):
@@ -75,6 +75,13 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
         # "consecutive halves" RoPE convention, so wq/wk weights are copied verbatim.
         to_hf_map = {v: k for k, v in self.from_hf_map.items()}
         hf_state_dict = {}
+        # Collected, then fatal. A tensor with no mapping used to be dropped
+        # behind a warning while the export reported success -- that is how the
+        # 0.5.0 rename shipped a checkpoint with 10 of 21 tensors. Deliberate
+        # skips are explicit elsewhere (`tokens_per_expert` by name below,
+        # learned norms via `_is_unsupported_norm_key`), so reaching here means
+        # the map and the model have genuinely diverged.
+        unmapped: list[str] = []
 
         for key, value in state_dict.items():
             if "load_balance_loss" in key:
@@ -98,7 +105,7 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
                 layer_num = re.search(r"\d+", key).group(0)
 
                 if abstract_key not in to_hf_map:
-                    logger.warning("Skipping unknown state dict key: %s", key)
+                    unmapped.append(key)
                     continue
 
                 new_key = to_hf_map[abstract_key]
@@ -140,11 +147,20 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
                     hf_state_dict[new_key] = value
             else:
                 if key not in to_hf_map:
-                    logger.warning("Skipping unknown state dict key: %s", key)
+                    unmapped.append(key)
                     continue
                 new_key = to_hf_map[key]
                 hf_state_dict[new_key] = value
 
+        if unmapped:
+            raise ValueError(
+                f"{len(unmapped)} tensor(s) have no HF mapping, so exporting "
+                "would silently produce a short checkpoint: "
+                f"{sorted(unmapped)[:10]}"
+                f"{' ...' if len(unmapped) > 10 else ''}. Add them to "
+                "`from_hf_map`, or to `_is_unsupported_norm_key` if they are "
+                "deliberately not exportable."
+            )
         return hf_state_dict
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:

@@ -222,27 +222,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
         return groups, patterns
 
-    def __init__(
-        self,
-        config: Config,
-        *,
-        model_parts: list[nn.Module],
-        parallel_dims: ParallelDims | None = None,
-        output_dir: str | None = None,
-    ) -> None:
-        # Declared, not swallowed through **kwargs. A container whose parameter
-        # grouping or metric ownership depends on the MESH rather than on FQN
-        # regexes needs the job-level topology at construction time -- DiSCO
-        # derives both from it. Upstream's own DistMuon reads layout off each
-        # DTensor parameter instead, which is enough for a per-parameter
-        # decision but not for one that spans named job meshes ("loss", "tp",
-        # "dp_replicate"). This container does not use it.
-        #
-        # `output_dir` is here for the same reason: a container that writes
-        # diagnostics to disk needs the run's directory at construction, and
-        # the engine cannot know which subclass it is building. This container
-        # does not use it either.
-        del parallel_dims, output_dir
+    def __init__(self, config: Config, *, model_parts: list[nn.Module]) -> None:
         impl_kwargs = self._build_impl_kwargs(config)
         param_group_configs = config.param_groups
         all_params = []

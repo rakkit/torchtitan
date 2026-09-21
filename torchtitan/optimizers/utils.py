@@ -49,6 +49,7 @@ def create_disco_optimizer_kwargs_from_optimizer_config(
     eps = optimizer_config.eps
     norm_factor = optimizer_config.norm_factor
     pre_norm = getattr(optimizer_config, "pre_norm", "identity")
+    enable_step_tracing = getattr(optimizer_config, "enable_step_tracing", False)
 
     optimizer_kwargs = {
         "parallel_dims": parallel_dims,
@@ -62,6 +63,7 @@ def create_disco_optimizer_kwargs_from_optimizer_config(
         "pre_norm": pre_norm,
         "backend": zeropower_backend_algorithm,
         "backend_steps": backend_steps,
+        "enable_step_tracing": enable_step_tracing,
     }
 
     # Add extra_param_group_split_rules if present

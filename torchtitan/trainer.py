@@ -101,6 +101,16 @@ class Trainer(Configurable):
                 )
 
             if self.model_spec is not None:
+                # Let the model rewrite its own config for the selected
+                # parallelism BEFORE validation, which is where upstream
+                # enforces things like "cp > 1 requires a CPInnerAttention".
+                # update_from_config is too late: it runs after this.
+                apply = getattr(
+                    self.model_spec.model, "apply_parallelism_transforms", None
+                )
+                if callable(apply):
+                    apply(parallelism=self.parallelism)
+
                 validate_model_training_config(
                     self.model_spec.model,
                     parallelism=self.parallelism,

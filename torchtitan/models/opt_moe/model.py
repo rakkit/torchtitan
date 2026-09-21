@@ -232,7 +232,7 @@ class OPTMoETransformerBlock(TransformerBlock):
         doc_id: torch.Tensor | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
-    ) -> "tuple[torch.Tensor, torch.Tensor | None]":
+    ) -> torch.Tensor:
         """Forward pass through the block.
 
         Args:
@@ -254,7 +254,6 @@ class OPTMoETransformerBlock(TransformerBlock):
         Returns:
             ``output``. The load-balance gradient is injected inside the MoE
             (see norm_moe.LoadBalanceLoss), not returned.
-            loss on MoE layers and ``None`` on dense layers.
         """
         # _mask_key is pre-computed at init; no string comparisons or tensor ops
         # here. It is never None -- __init__ raises for the only backend that
@@ -528,9 +527,10 @@ class OPTMoEModel(Decoder):
                     self.rope_of_swa, max_context_length=max_context_length
                 )
 
-            self.enable_token_mask_for_moe = getattr(
-                config.training, "enable_token_mask_for_moe", False
-            )
+            # Direct: TrainingConfig is a slots dataclass that always has the
+            # field, so a rename must raise rather than silently disable the
+            # SFT MoE token mask.
+            self.enable_token_mask_for_moe = config.training.enable_token_mask_for_moe
 
             base_attn = self.layer.attention
             assert isinstance(base_attn, GatedNormSWAttention.Config)
@@ -636,7 +636,6 @@ class OPTMoEModel(Decoder):
             padding_mask: Accepted and ignored; see
                 ``OPTMoETransformerBlock.forward`` for why it is not
                 interchangeable with ``loss_mask``.
-                prior pipeline stage.
 
         Returns:
             ``output``.

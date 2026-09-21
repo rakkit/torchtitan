@@ -180,10 +180,10 @@ class GatedNormSWAttention(GQAttention):
                 )
 
             if self.linear_sharding_config is not None:
-                for _sub in ("wqkv", "wq", "wkv", "wk", "wv"):
-                    _lin = getattr(qkv, _sub, None)
-                    if _lin is not None:
-                        _lin.sharding_config = self.linear_sharding_config
+                # SplitQKVLinear.Config has exactly wq and wkv; the old loop
+                # also tried wqkv/wk/wv, which never existed.
+                qkv.wq.sharding_config = self.linear_sharding_config
+                qkv.wkv.sharding_config = self.linear_sharding_config
 
             return GQAttention.Config(
                 n_heads=self.n_heads,

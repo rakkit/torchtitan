@@ -25,7 +25,7 @@ from .utils.norms import build_norm_config
 #     over unchanged, and `_make_fused_linear_init` composes w1/w3 for the
 #     fused w13 -- so the scion/orthogonal init survives fusion intact).
 #  2. Stock `FusedSwiGLU.forward` is `w2(silu_and_mul(w13(x)))` with NO slot for
-#     `mid_norm`. 74 of 119 flavors set `norm_everywhere=True`, so fusing them
+#     `mid_norm`. Most flavors set `norm_everywhere=True`, so fusing them
 #     with the stock class would silently DELETE a norm. Those need a subclass
 #     computing `w2(mid_norm(silu_and_mul(w13(x))))`; it still gets both wins
 #     (w1+w3 in one GEMM, fused silu_and_mul kernel). The other 45 flavors can
@@ -79,7 +79,7 @@ class FeedForward(Module):
         """ShardingConfig for `mid_norm`, which this config builds internally.
         Without it a PARAMETRIC `norm_type` leaves `feed_forward.mid_norm` and
         `moe.shared_experts.mid_norm` as plain tensors and `fully_shard`
-        rejects them under spmd_types -- 74 of 118 flavors. Inert for the
+        rejects them under spmd_types. Inert for the
         parameter-free `np_*` norms."""
         dim: int = 0
         residual_div: float = 1.0

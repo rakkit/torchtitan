@@ -19,9 +19,10 @@ here is only what upstream has no equivalent for:
   * ``norm_everywhere`` -- a norm between the gated activation and the down
     projection, inside the grouped expert GEMM.
   * a configurable activation (upstream hardcodes SiLU).
-  * the sequence-wise / batch-wise auxiliary load-balance loss, returned from
-    ``forward``. Upstream's MoE is aux-loss-free and steers balance purely
-    through the expert bias.
+  * the sequence-wise / batch-wise auxiliary load-balance loss, whose gradient
+    is injected at the layer via ``LoadBalanceLoss`` rather than returned.
+    Upstream's MoE is aux-loss-free and steers balance purely through the
+    expert bias.
   * per-expert initialization, so every expert draws different weights.
   * router entropy and max-violation metrics.
   * ``loss_mask``, so padding tokens do not count toward load balance.
@@ -796,7 +797,7 @@ class NormMoE(Module):
         positions: torch.Tensor | None = None,
         doc_id: torch.Tensor | None = None,
         **router_kwargs,
-    ) -> "tuple[torch.Tensor, torch.Tensor | None]":
+    ) -> torch.Tensor:
         """
         Args:
             x_TD: Input ``(T, D)``.

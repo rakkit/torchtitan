@@ -55,7 +55,7 @@ def _cover_all_norm_params(cfg: ShardingConfig) -> ShardingConfig:
     ``norm_type`` also allows ``layernorm`` (weight + bias) and ``ss_rmsnorm``
     (ssnorm_scale), and `Module._distribute_states` raises on any parameter
     with no declared placement -- so `attention_norm`, `ffn_norm` and the root
-    `norm` failed on all 118 flavors under either of those types.
+    `norm` failed on every flavor under either of those types.
 
     Extra names are inert: the lookup is driven by the module's ACTUAL
     parameters, so a plan naming states a given norm does not own costs
@@ -179,9 +179,6 @@ def set_opt_moe_sharding_config(
         # module is where q/k/v cross the kernel boundary, and `Module.parallelize`
         # recurses into children BEFORE its `_sharding_config is None` early
         # return, so the parent needing no config of its own is fine.
-        #
-        # NOTE: opt_moe does not yet select a CP-aware inner attention, so CP
-        # is not wired for this model until that is done.
         set_gqa_inner_attention_local_spmd(layer_cfg.attention.inner_attention)
 
         # Every parameter must be a DTensor before fully_shard() runs under
@@ -201,11 +198,9 @@ def set_opt_moe_sharding_config(
         # nn.Parameters on NormGroupedExperts rather than Linear submodules, so
         # nothing else stamps them. The router gate and shared experts need the
         # same treatment. NOTE: the config goes on `inner_experts`, NOT on
-        # NormMoE itself -- NormMoE.forward returns a tuple, and
-        # `_redistribute_outputs` silently skips non-Tensor outputs, so a plan
-        # declared there would be quietly ignored; it also owns extra buffers
-        # (load_balance_loss, router_entropy, ...) that `_distribute_states`
-        # would then demand placements for.
+        # NormMoE itself, which owns extra buffers (load_balance_loss,
+        # router_entropy, ...) that `_distribute_states` would then demand
+        # placements for.
         # KNOWN GAP (CP): `rope.cache` stays a PLAIN tensor while everything
         # around it becomes a DTensor. llama3/qwen3 get its placement from
         # `set_gqa_attention_sharding`, which cannot be used here (it asserts
@@ -249,8 +244,7 @@ def set_opt_moe_sharding_config(
                 #     tokens_per_expert_E, expert_bias_E, acc_fwd_times,
                 #     tokens_per_expert_cumul). Declaring a plan on the wrapper
                 #     makes `_distribute_states` demand a placement for each of
-                #     them, and NormMoE.forward returns a tuple so
-                #     `_redistribute_outputs` would skip the outputs anyway.
+                #     them.
                 routed_cfg, inner_cfg = _routed_experts_sharding_configs(
                     enable_ep=True,
                     enable_sp=enable_sp,

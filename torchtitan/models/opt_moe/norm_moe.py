@@ -1127,9 +1127,8 @@ class MoE:
         track_router_metrics: bool = True
         moe_comm_backend: str = "standard"
         """EP communication backend: "standard" (all-to-all, falls back to local
-        dispatch at EP=1), "deepep", "hybridep" or "minimal_async_ep". Upstream
-        selects this per flavor rather than per run. Only "standard" and
-        "minimal_async_ep" have their dependencies satisfied in this env."""
+        dispatch at EP=1), "deepep" or "hybridep". Upstream selects this per
+        flavor rather than per run."""
         norm_everywhere: bool = False
         norm_type: str = "np_rmsnorm"
         norm_eps: float = 1e-30

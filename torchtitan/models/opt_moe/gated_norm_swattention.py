@@ -14,7 +14,6 @@ from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
     FlexAttention,
-    FusedQKVLinear,
     GQAttention,
     QKVLinear,
 )
@@ -35,10 +34,9 @@ class GatedNormSWAttention(GQAttention):
     ``BlockMask``.
 
     Q/K/V projection, output projection, RoPE, QK-norm and the inner attention
-    backend all come from ``GQAttention`` -- including its pluggable
-    ``qkv_linear``, so fused QKV is available by setting ``fuse_qkv``. Only what
-    upstream has no equivalent for is added here: V-norm, mid-norm, sigmoid
-    gating and partial RoPE.
+    backend all come from ``GQAttention``, including its pluggable
+    ``qkv_linear``. Only what upstream has no equivalent for is added here:
+    V-norm, mid-norm, sigmoid gating and partial RoPE.
 
     The config keeps the flat, string-valued authoring surface the flavor
     registry uses (``attn_backend="flex"``, ``qk_norm=True``, ...) and
@@ -125,19 +123,6 @@ class GatedNormSWAttention(GQAttention):
         reach them the way it reaches `attention_norm`/`ffn_norm`; it threads
         the plan in here instead. Inert for parameter-free norm types."""
 
-        # TODO(fused-qkv): this is implemented (uses upstream FusedQKVLinear
-        # below) but NO flavor sets it -- 0 of 119. Enabling it merges wq/wk/wv
-        # into one GEMM. Gated on wq/wk/wv sharing an initializer, which the
-        # scion/orthogonal init family does not always satisfy; check per flavor
-        # before flipping. Benchmark alongside TODO(fused-swiglu).
-        fuse_qkv: bool = False
-        """Project Q/K/V with one fused GEMM instead of three.
-
-        Off by default, which is the historical behaviour and keeps wq/wk/wv as
-        separate checkpoint entries. Upstream's FusedQKVLinear still saves and
-        loads in the split layout, so this is a pure throughput switch.
-        """
-
         def to_gqa_config(self) -> "GQAttention.Config":
             """Synthesize upstream's GQAttention.Config from these flat fields."""
             assert self.dim > 0, (
@@ -168,53 +153,19 @@ class GatedNormSWAttention(GQAttention):
                     "QKVLinear shares one config between them."
                 )
 
-            if self.fuse_qkv:
-                if (self.wq_init_fn_type, self.wq_init_std) != (
-                    self.wk_init_fn_type,
-                    self.wk_init_std,
-                ):
-                    # The fused init applies one initializer to q, k and v, so
-                    # fusing would silently change wq's or wk's initialization.
-                    raise ValueError(
-                        "fuse_qkv requires wq, wk and wv to share an initializer "
-                        f"(got wq={self.wq_init_fn_type}/{self.wq_init_std}, "
-                        f"wk={self.wk_init_fn_type}/{self.wk_init_std}). Leave "
-                        "fuse_qkv off to keep them independent."
-                    )
-                # Upstream's _fused_qkv_param_init reproduces the exact draws the
-                # split wq/wk/wv would make, so fusing is a pure throughput
-                # change and does not perturb initialization.
-                from torchtitan.models.common.config_utils import _fused_qkv_param_init
-
-                qkv = FusedQKVLinear.Config(
-                    head_dim=head_dim,
-                    n_heads=self.n_heads,
-                    n_kv_heads=n_kv,
-                    wqkv=Linear.Config(
-                        in_features=self.dim,
-                        out_features=(self.n_heads + 2 * n_kv) * head_dim,
-                        param_init=_fused_qkv_param_init(
-                            wq_init,
-                            n_heads=self.n_heads,
-                            n_kv_heads=n_kv,
-                            head_dim=head_dim,
-                        ),
-                    ),
-                )
-            else:
-                qkv = QKVLinear.Config(
-                    head_dim=head_dim,
-                    wq=Linear.Config(
-                        in_features=self.dim,
-                        out_features=self.n_heads * head_dim,
-                        param_init=wq_init,
-                    ),
-                    wkv=Linear.Config(
-                        in_features=self.dim,
-                        out_features=n_kv * head_dim,
-                        param_init=wkv_init,
-                    ),
-                )
+            qkv = QKVLinear.Config(
+                head_dim=head_dim,
+                wq=Linear.Config(
+                    in_features=self.dim,
+                    out_features=self.n_heads * head_dim,
+                    param_init=wq_init,
+                ),
+                wkv=Linear.Config(
+                    in_features=self.dim,
+                    out_features=n_kv * head_dim,
+                    param_init=wkv_init,
+                ),
+            )
 
             qk_norm = None
             if self.qk_norm or self.norm_everywhere:

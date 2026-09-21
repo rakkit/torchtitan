@@ -13,7 +13,7 @@ fake (meta) impl they raise
     tensors, but there was no fake impl or Meta kernel registered.
 
 the moment any enclosing module is compiled, so `moe_comm_backend="deepep"` could only
-run with model compile disabled. Unlike hybridep and minimal_async_ep -- whose dispatch
+run with model compile disabled. Unlike hybridep -- whose dispatch
 outputs are statically sized -- DeepEP's training layout is COMPACT/deduplicated: the
 received-token count only exists after a host sync, so the fake must produce an unbacked
 symint and every downstream consumer must stay symbolic.

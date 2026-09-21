@@ -30,8 +30,20 @@ from .utils.norms import build_norm_config
 #     computing `w2(mid_norm(silu_and_mul(w13(x))))`; it still gets both wins
 #     (w1+w3 in one GEMM, fused silu_and_mul kernel). The other 45 flavors can
 #     use the stock class directly.
-# Checkpoints are safe either way: FusedSwiGLU has _split_w13_on_save /
-# _merge_w13_on_load, so state dicts stay in unfused w1/w3 form.
+#  3. DiSCO's parameter classifier. Upstream's stacked w13 is `[2, F, D]`, and
+#     `optimizers/disco.py::get_param_type` uses `ndim == 3` as its proxy for
+#     "routed expert" -- so a stacked w13 is MISFILED as an expert and handed to
+#     `step_experts`, which orthogonalizes the local buffer with NO gather. The
+#     `Shard(!=0)` guard does not catch it: it inspects only `expert_params[0]`,
+#     and the sort puts a real expert first. Tighten that classifier (check the
+#     parameter name, or `num_linears`) BEFORE fusing. Latent today only because
+#     this class keeps `num_linears=1`.
+# Checkpoints are NOT safe any more: #4808 DELETED FusedSwiGLU's
+# _split_w13_on_save / _merge_w13_on_load and moved the split to the HF adapter
+# boundary, so `named_parameters()` now equals `state_dict()` (measured on
+# llama3) and fusing CHANGES the native DCP layout. HF export still works, but
+# it needs the `.clone()` in convert_to_hf._export_hf_weights: gate_proj/up_proj
+# come out of `to_hf` as VIEWS of one storage and safetensors refuses those.
 class FeedForward(Module):
     """SwiGLU feed-forward module for OPT MoE.
 

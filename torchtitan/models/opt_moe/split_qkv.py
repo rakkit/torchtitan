@@ -21,6 +21,23 @@ equivalent any more. opt_moe keeps it for two reasons:
 Ported verbatim from upstream ``models/common/attention.py`` as of
 ``3dadef77c``, with the dead ``get_spmd_backend() == "spmd_types"`` guard
 dropped (``spmd_types`` is the only backend since #4217/#4419).
+
+TODO(fused-qkv): evaluate adopting upstream's fused ``QKVLinear`` and deleting
+this file. DiSCO handles it MECHANICALLY already -- ``wqkv`` is 2-D
+``[(n_heads + 2 * n_kv) * head_dim, dim]``, so ``get_param_type`` files it
+FSDP/DDP and orthogonalizes it like any other matrix; nothing needs changing in
+the optimizer. Two open questions, both numerics rather than plumbing:
+
+  1. Orthogonalizing the CONCATENATION is not orthogonalizing wq/wk/wv
+     separately. Whether that is better, worse or neutral for DiSCO is an
+     experiment, not a refactor -- run it at fixed seed against a split-QKV arm
+     before switching.
+  2. The native DCP layout changes (one ``wqkv`` where there were three
+     tensors), so existing checkpoints do not load. HF export is unaffected:
+     the adapters split Q/K/V at the external boundary.
+
+The throughput argument for fusing is one GEMM instead of three. Pair this with
+TODO(fused-swiglu) in ``norm_ffn.py``; they are the same decision twice.
 """
 
 from dataclasses import dataclass

@@ -11,14 +11,14 @@ from typing import Any
 import torch
 
 
+logger = logging.getLogger(__name__)
+
 
 def remove_orig_mod_and_weight_for_p_name(
     name: str,
     remove_orig_mod: bool = True,
     remove_weight: bool = True,
     remove_checkpoint_wrapped_module: bool = True,
-
-logger = logging.getLogger(__name__)
 ) -> str:
     """
     Remove "._orig_mod", ".weight", and "._checkpoint_wrapped_module" to

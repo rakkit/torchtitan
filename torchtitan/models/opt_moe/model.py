@@ -4,23 +4,24 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import logging
 import dataclasses as _dc
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 from torch import nn
 
+from torchtitan.config.transform import convert_config_type
+
 from torchtitan.models.common.attention import (
-    BaseAttention,
     AttentionMasksType,
+    BaseAttention,
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
     ScaledDotProductInnerAttention,
 )
-from torchtitan.config.transform import convert_config_type
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
@@ -38,14 +39,15 @@ from .utils.inits import (
 from .utils.norms import build_norm_config
 
 
+logger = logging.getLogger(__name__)
+
+
 def _parse_layer_pattern(
     pattern: "str | list[bool] | list[str] | None",
     n_layers: int,
     true_char: str,
     false_char: str,
     default_true: bool = False,
-
-logger = logging.getLogger(__name__)
 ) -> "list[bool]":
     """Parse a per-layer pattern into a flat list of booleans.
 
@@ -806,7 +808,7 @@ class OPTMoEModel(Decoder):
             parallel_dims=parallel_dims,
             parallelism=parallelism,
             max_num_documents=max_num_documents,
-            max_context_length=max_context_length
+            max_context_length=max_context_length,
         )
         if self.config.enable_token_mask_for_moe:
             from torchtitan.components.loss import IGNORE_INDEX

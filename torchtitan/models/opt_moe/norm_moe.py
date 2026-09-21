@@ -53,9 +53,9 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
 from torchtitan.distributed.spmd_types import spmd_mesh_size
+from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.config_utils import make_token_dispatcher_config
 from torchtitan.models.common.linear import RouterGateLinear
-from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.nn_modules import Identity
 from torchtitan.protocols.module import Module
@@ -66,10 +66,8 @@ from .utils.inits import build_init_fn, make_param_init
 from .utils.moe_utils import calc_gate_scaling_factor
 from .utils.norms import build_norm_config
 
-MAXVIO_EMA_BETA = 0.995
 
 logger = logging.getLogger(__name__)
-MAXVIO_EPS = 1e-12
 
 
 def make_seed_from_global(
@@ -103,10 +101,9 @@ def init_all_experts_different(init_fn, w, init_std, slot, layer_id):
 
         init_fn(local_tensor[e], mean=0.0, std=init_std, generator=rng)
 
-    if isinstance(w, torch.distributed.tensor.DTensor):
-        w.to_local().copy_(local_tensor)
-    else:
-        w.copy_(local_tensor)
+    # No copy back: `local_tensor` aliases `w`'s storage in both branches
+    # above (`w.to_local()` shares it; the dense branch binds `w` itself), and
+    # `init_fn` wrote through that alias in place. The copy was `w.copy_(w)`.
 
 
 def saint_check_scaling_factor(
@@ -500,11 +497,11 @@ class RouterOutput(NamedTuple):
     when not requested.
     """
 
-    topk_scores_TK: torch.Tensor
-    topk_expert_ids_TK: torch.Tensor
-    scores_TE: torch.Tensor
+    topk_scores_TK: torch.Tensor  # noqa: N815
+    topk_expert_ids_TK: torch.Tensor  # noqa: N815
+    scores_TE: torch.Tensor  # noqa: N815
     experts_entropy: torch.Tensor | None
-    unbiased_expert_ids_TK: torch.Tensor | None
+    unbiased_expert_ids_TK: torch.Tensor | None  # noqa: N815
 
 
 class NormRouter(Module):
@@ -881,9 +878,7 @@ class NormMoE(Module):
                     loss_mask=loss_mask,
                 )
             else:
-                raise ValueError(
-                    f"Invalid loss_type: {self.aux_loss.loss_type}"
-                )
+                raise ValueError(f"Invalid loss_type: {self.aux_loss.loss_type}")
         out_TD = self.routed_experts(
             x_TD,
             topk_scores_TK,
@@ -1128,7 +1123,6 @@ class MoE:
         norm_type: str = "np_rmsnorm"
         norm_eps: float = 1e-30
         activation_type: str = "silu"
-        use_grouped_mm: bool = True
         # NOTE there is deliberately no `force_router_on_fp32`. 0.4.0 needed it to wrap
         # the router gate in autocast(float32); upstream's RouterGateLinear
         # (models/common/linear.py) now yields FP32 logits unconditionally -- CUDA bf16
@@ -1137,7 +1131,6 @@ class MoE:
         # are fp32. The knob has nothing left to switch off. It previously existed here
         # as a field that was declared, defaulted True and then silently dropped by
         # to_norm_moe_config, so setting it False was a no-op that read as supported.
-        score_before_experts: bool = False
         w1_init_fn_type: str = "scaled_orthogonal"
         w2_init_fn_type: str = "scaled_orthogonal"
         w3_init_fn_type: str = "scaled_orthogonal"
@@ -1153,17 +1146,14 @@ class MoE:
         residual_div: float = 1.0
         init_gate_as_residual: bool = False
 
+        # NOTE there are deliberately no `use_grouped_mm` or
+        # `score_before_experts` fields either, for the same reason as
+        # `force_router_on_fp32` above: both were declared, defaulted to the
+        # only value that works, and then raised if you changed them. Upstream's
+        # GroupedExperts is grouped-GEMM only and its token dispatcher applies
+        # routing scores in combine(), so neither knob has anything to switch.
+        # Nothing in the tree set either one.
         def to_norm_moe_config(self) -> "NormMoE.Config":
-            if self.score_before_experts:
-                raise ValueError(
-                    "score_before_experts is not supported: upstream's token "
-                    "dispatcher applies routing scores in combine()."
-                )
-            if not self.use_grouped_mm:
-                raise ValueError(
-                    "use_grouped_mm=False is not supported; upstream's "
-                    "GroupedExperts is grouped-GEMM only."
-                )
             return make_norm_moe_config(
                 dim=self.dim,
                 hidden_dim=self.hidden_dim,

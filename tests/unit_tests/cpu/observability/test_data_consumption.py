@@ -106,14 +106,15 @@ def test_documents_consumed_is_reported_per_dataset(tmp_path: Path):
         for _ in range(4):
             next(iterator)
         metrics = build_data_mix_metrics(loader)
-        _, data_docs, data_tokens = metrics.get_log_dict_at_step(4)
+        _, data_docs = metrics.get_log_dict_at_step(4)
     finally:
         loader.close()
 
     assert set(data_docs) == {"data_docs/High-Quality", "data_docs/v1-Code"}
     assert sum(int(v) for v in data_docs.values()) > 0
-    # Token counts are deliberately not tracked anywhere in this design.
-    assert data_tokens == {}
+    # Token counts are deliberately not tracked anywhere in this design, so
+    # there is no third return value to assert on -- the tuple is (mix, docs).
+    assert len(metrics.get_log_dict_at_step(4)) == 2
 
 
 def test_a_mixing_schedule_is_rejected_rather_than_silently_ignored(tmp_path: Path):

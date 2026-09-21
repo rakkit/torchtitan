@@ -644,12 +644,11 @@ class Trainer(Configurable):
         # NoDataMixMetrics when the loader has no per-dataset cursors -- and
         # __init__ always assigns it. "Nothing to report" is that null object
         # returning empty dicts, not the attribute being absent.
-        data_mix, data_docs, data_tokens = self.data_mix_metrics.get_log_dict_at_step(
+        data_mix, data_docs = self.data_mix_metrics.get_log_dict_at_step(
             engine.num_completed_steps
         )
         extra_metrics.update(data_mix)
         extra_metrics.update({k: int(v) for k, v in data_docs.items()})
-        extra_metrics.update({k: int(v) for k, v in data_tokens.items()})
         if disco is not None:
             extra_metrics.update(
                 disco.collect_metrics(

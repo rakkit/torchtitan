@@ -52,7 +52,7 @@ def _svdvals(W: torch.Tensor, sigma_only: bool = False) -> torch.Tensor:
     `driver=` is only accepted for CUDA inputs -- passing it on a CPU tensor
     raises outright, which is why every 2-D norm in this module used to be
     CPU-unusable. Selecting it by device here makes the module work on CPU
-    (needed for unit tests and naive_param_norm's debug path) with no change to
+    (needed for unit tests) with no change to
     CUDA behaviour.
     """
     if not W.is_cuda:

@@ -114,11 +114,13 @@ class FaultTolerantTrainingEngine(TrainingEngine):
     def _initialize_optimizer(self, model_spec: ModelSpec) -> None:
         if isinstance(self.config.optimizer, TorchFTOptimizersContainer.Config):
             self.optimizers = self.config.optimizer.build(
-                model_parts=self.model_parts,
+                **self._optimizer_build_kwargs(),
                 ft_manager=self.ft_manager,
             )
         else:
-            self.optimizers = self.config.optimizer.build(model_parts=self.model_parts)
+            self.optimizers = self.config.optimizer.build(
+                **self._optimizer_build_kwargs()
+            )
         if model_spec.post_optimizer_build_fn is not None:
             model_spec.post_optimizer_build_fn(
                 self.optimizers,

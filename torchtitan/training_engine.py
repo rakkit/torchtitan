@@ -384,16 +384,29 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             f"{self.model_param_count:,} total parameters"
         )
 
+    def _optimizer_build_kwargs(self) -> dict[str, Any]:
+        """Build kwargs shared by every optimizer container this engine builds.
+
+        DiSCO's container needs two things upstream's does not: the job mesh,
+        because its parameter groups and metric-ownership split come from
+        topology rather than from FQN regexes, and the run directory, because
+        it writes spectrum/gram exports there.
+
+        They are passed only for the container that declares them. Widening
+        upstream's base ``__init__`` to accept-and-discard them instead looked
+        equivalent and was not: ``TorchFTOptimizersContainer`` does not inherit
+        that signature, so the FT path still raised ``TypeError`` on any
+        container with required extras.
+        """
+        kwargs: dict[str, Any] = {"model_parts": self.model_parts}
+        if isinstance(self.config.optimizer, DiSCOOptimizersContainer.Config):
+            kwargs["parallel_dims"] = self.parallel_dims
+            kwargs["output_dir"] = self.output_dir
+        return kwargs
+
     def _initialize_optimizer(self, model_spec: ModelSpec) -> None:
         """Construct optimizers, learning-rate schedulers and the weight EMA."""
-        # parallel_dims is passed through because DiSCO derives its parameter
-        # groups and metric-ownership split from the mesh topology, not from
-        # FQN regexes. Upstream's container accepts and ignores it.
-        self.optimizers = self.config.optimizer.build(
-            model_parts=self.model_parts,
-            parallel_dims=self.parallel_dims,
-            output_dir=self.output_dir,
-        )
+        self.optimizers = self.config.optimizer.build(**self._optimizer_build_kwargs())
         if model_spec.post_optimizer_build_fn is not None:
             model_spec.post_optimizer_build_fn(
                 self.optimizers, self.model_parts, self.parallel_dims

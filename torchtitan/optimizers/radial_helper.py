@@ -126,8 +126,8 @@ class SpectralInputs(NamedTuple):
       * `sigma_update` -- `calculate_norm(-lr*u)["spectrum"][0]`.
       * `sigma_before`, `u1_before`, `v1_before` -- NOT free. `calculate_norm`
         is never called on the pre-update weight in any of the four `step_*`
-        paths, so these come from optimizers/power_iteration.py, warm-started
-        across logging events by the caller.
+        paths, so these come from optimizers/power_iteration.py. (No warm start
+        despite the `v0=` argument: `top_singular_pair` accepts and ignores it.)
 
     Any field may be None; every metric that depends on a missing field falls
     back to the degenerate 0 sentinel, so the output arity never changes.

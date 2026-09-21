@@ -882,14 +882,13 @@ into three groups:
 
 **`sigma_max(W_before)` is not free, unlike the other two.** `calculate_norm` is called on `-lr*u`
 and on `pseudo_w`, never on the pre-update weight, so the pre-update spectral quantities come from
-`optimizers/power_iteration.py` -- warm-started across logging events from a cache
-(`_power_iter_v_by_param_id`) that is deliberately *not* checkpointed, since it only exists on
-whichever rank materialises that parameter's full weight. **That module is currently a stub
-returning random values** (`power_iteration.IS_STUB`), and while it is, `disco.py` skips it
-entirely rather than feeding meaningless numbers in: `spectral_radius`, `spectral_growth`,
-`spectral_relative_step`, `radiality_rms_to_rms` and `aus_rms_to_rms` stay at the 0 sentinel. The
-other six new metrics are exact and live now. One exception: a 1-D parameter stands for `diag(v)`,
-whose largest singular value is exactly `max|v|`, so `spectral_radius` *is* real there.
+`optimizers/power_iteration.py`, which delegates to `norm_helper.gram_top_singular_pair`.
+**These metrics are live and exact** -- `spectral_radius`, `spectral_growth`,
+`spectral_relative_step`, `radiality_rms_to_rms` and `aus_rms_to_rms` are all real values, not
+sentinels. (This paragraph previously claimed the module was "a stub returning random values",
+contradicting the section above it; that has not been true since the module started delegating.)
+One special case: a 1-D parameter stands for `diag(v)`, whose largest singular value is exactly
+`max|v|`, so `spectral_radius` is computed directly there.
 
 **Fixed arity is load-bearing.** `disco.py` sizes four flat logging buffers from
 `len(RADIAL_METRIC_NAMES)`. Every metric must therefore be present in every returned dict for

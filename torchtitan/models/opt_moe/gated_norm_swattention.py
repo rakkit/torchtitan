@@ -14,15 +14,15 @@ from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
     FlexInnerAttention,
-    InnerAttention,
     GQAttention,
+    InnerAttention,
 )
 from torchtitan.models.common.config_utils import get_attention_config
 from torchtitan.models.common.linear import Linear
-from .split_qkv import SplitQKVLinear
 from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
+from .split_qkv import SplitQKVLinear
 from .utils.inits import make_param_init
 from .utils.norms import build_norm_config
 
@@ -280,7 +280,12 @@ class GatedNormSWAttention(GQAttention):
                 config.norm_eps,
                 sharding_config=config.norm_sharding_config,
             ).build()
-        if config.mid_norm or config.norm_everywhere:
+        # `not gate_only` mirrors the two forward call sites: with gate_only
+        # the mid-norm is never applied, so building it left a module in the
+        # graph that could not run. Inert while `norm_type` is the default
+        # parameter-free rmsnorm (no params, no state-dict keys), but it
+        # would ship dead trained weights under a parametric norm.
+        if (config.mid_norm or config.norm_everywhere) and not config.gate_only:
             mid_dim = (
                 self.n_heads * self.head_dim
                 if self.mid_norm_position == "after" and not self.head_wise_mid_norm

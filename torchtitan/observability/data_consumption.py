@@ -51,10 +51,6 @@ class DataMixMetrics:
     def __init__(self, dataloader) -> None:
         self.dataloader = dataloader
 
-    def get_weights_at_step(self, current_step: int):
-        del current_step
-        return list(getattr(self.dataloader, "_dataset_weights", []))
-
     def get_log_dict_at_step(self, current_step: int):
         del current_step
         mixing = {
@@ -65,16 +61,7 @@ class DataMixMetrics:
             key: torch.tensor(value)
             for key, value in self.dataloader.consumption_metrics().items()
         }
-        return mixing, docs, {}
-
-    def convert_mixing_configs_to_json(self):
-        return {"0": self.get_weights_at_step(0)}
-
-    def step(self, current_step: int) -> None:
-        pass
-
-    def dump_mixing_configs(self, dump_folder: str) -> None:
-        pass
+        return mixing, docs
 
 
 class NoDataMixMetrics:
@@ -84,22 +71,9 @@ class NoDataMixMetrics:
     the old fallback did and what made `data_docs/not_mixed_datasets` show up in runs.
     """
 
-    def get_weights_at_step(self, current_step: int):
-        del current_step
-        return [1]
-
     def get_log_dict_at_step(self, current_step: int):
         del current_step
-        return {}, {}, {}
-
-    def convert_mixing_configs_to_json(self):
-        return {"0": [1]}
-
-    def step(self, current_step: int) -> None:
-        pass
-
-    def dump_mixing_configs(self, dump_folder: str) -> None:
-        pass
+        return {}, {}
 
 
 # What `build_data_mix_metrics` returns: the real reporter, or the null object

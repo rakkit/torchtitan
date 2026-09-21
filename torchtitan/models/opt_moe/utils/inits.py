@@ -225,7 +225,6 @@ INIT_FN_MAP = {
         norm_axis=1,
     ),
 }
-INIT_FN_TYPES = list(INIT_FN_MAP.keys())
 
 
 def build_init_fn(init_fn_type: str):

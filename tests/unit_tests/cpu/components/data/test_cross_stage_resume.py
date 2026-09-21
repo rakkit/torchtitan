@@ -69,7 +69,7 @@ def _loader(tmp_path: Path, ids: list[str], rows: int = 256):
         shuffle=False,
         repeat=True,
         seed=0,
-        num_prefetch_batches=1,
+        num_prefetch_microbatches=1,
         read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=1),
     )
     return KeyedMixDataLoader(
@@ -78,7 +78,7 @@ def _loader(tmp_path: Path, ids: list[str], rows: int = 256):
         dp_rank=0,
         tokenizer=FakeTokenizer(),
         max_context_length=8,
-        num_tokens_per_batch=16,
+        num_tokens_per_microbatch=16,
     )
 
 
@@ -198,7 +198,7 @@ def test_dataset_ids_are_required(tmp_path):
             dp_rank=0,
             tokenizer=FakeTokenizer(),
             max_context_length=8,
-            num_tokens_per_batch=16,
+            num_tokens_per_microbatch=16,
         )
 
 

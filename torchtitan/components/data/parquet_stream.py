@@ -67,8 +67,8 @@ stretch is still one contiguous piece of disk.
 Neither needs random access, and neither reads a row group twice.
 """
 
-import logging
 from __future__ import annotations
+import logging
 
 import random
 from dataclasses import dataclass

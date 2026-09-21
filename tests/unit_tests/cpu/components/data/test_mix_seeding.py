@@ -50,7 +50,7 @@ class _Tokenizer:
 CONTEXT = DatasetBuildContext(
     tokenizer=_Tokenizer(),
     max_context_length=32,
-    num_tokens_per_batch=32,
+    num_tokens_per_microbatch=32,
     read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=1),
 )
 POLICY = DatasetIterationPolicy(

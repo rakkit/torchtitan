@@ -16,7 +16,7 @@ Note the drop threshold is `max_context_length`, NOT the row width
 configs, which is exactly why the difference is easy to miss; the last two tests here
 pin it for the case where they differ.
 
-Measured on a real PDF corpus (median ~7.4k tokens) at num_tokens_per_batch=8192:
+Measured on a real PDF corpus (median ~7.4k tokens) at num_tokens_per_microbatch=8192:
 FirstFit dropped 41% of documents, which was 60.7% of all tokens; padding was 7.7% at
 the default 8 bins and 2.4% at 32. These tests pin the behaviour that produces those
 numbers so the trade-off stays visible.
@@ -50,7 +50,7 @@ class _Tokenizer:
 CONTEXT = DatasetBuildContext(
     tokenizer=_Tokenizer(),
     max_context_length=NUM_TOKENS_PER_BATCH,
-    num_tokens_per_batch=NUM_TOKENS_PER_BATCH,
+    num_tokens_per_microbatch=NUM_TOKENS_PER_BATCH,
     read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=1),
 )
 POLICY = DatasetIterationPolicy(

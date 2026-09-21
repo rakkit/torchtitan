@@ -109,7 +109,7 @@ def test_validator_config_builds_and_iterates(tmp_path):
         make_pretrain_dataloader_config(
             _specs(tmp_path),
             read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=1),
-            num_prefetch_batches=1,
+            num_prefetch_microbatches=1,
         ),
         repeat=False,
     )
@@ -119,13 +119,14 @@ def test_validator_config_builds_and_iterates(tmp_path):
         dp_rank=0,
         tokenizer=FakeTokenizer(),
         max_context_length=16,
-        num_tokens_per_batch=32,
+        num_tokens_per_microbatch=32,
     )
     try:
-        batch = next(iter(loader))  # #4572: one dict, labels included
-        assert batch["input"].numel() == 32
-        assert "labels" in batch
-        assert batch["num_valid_tokens"] > 0
+        # #4773 replaced the batch dict with TokenizedTrainingMicrobatch.
+        batch = next(iter(loader))
+        assert batch.input.numel() == 32
+        assert batch.labels is not None
+        assert batch.num_valid_tokens > 0
     finally:
         loader.close()
 
@@ -158,7 +159,7 @@ def test_trainer_must_not_forward_seed_into_a_grain_dataloader(tmp_path):
             dp_rank=0,
             tokenizer=None,
             max_context_length=16,
-            num_tokens_per_batch=32,
+            num_tokens_per_microbatch=32,
             seed=42,
         )
     # The kwargs trainer.py actually passes must all be absent from the config.

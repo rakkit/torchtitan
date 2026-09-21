@@ -14,8 +14,8 @@ lookup instead of a reconstruction. See keyed_mix_state for the contract.
 Everything else -- rank keying, the DP-degree guard, iteration -- is inherited unchanged.
 """
 
-import logging
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass
 from typing import Annotated, Any

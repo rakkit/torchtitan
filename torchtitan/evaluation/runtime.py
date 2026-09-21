@@ -6,8 +6,8 @@
 
 """Model loading, dense loss evaluation, and durable CSV output."""
 
-import logging
 from __future__ import annotations
+import logging
 
 import csv
 import fcntl

@@ -12,8 +12,8 @@ only an inference model, loads model weights only, and never instantiates a
 Trainer, optimizer, scheduler, or training dataloader.
 """
 
-import logging
 from __future__ import annotations
+import logging
 
 import argparse
 from pathlib import Path

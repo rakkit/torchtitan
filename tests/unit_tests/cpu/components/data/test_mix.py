@@ -46,7 +46,7 @@ class FakeTokenizer:
 CONTEXT = DatasetBuildContext(
     tokenizer=FakeTokenizer(),
     max_context_length=9,
-    num_tokens_per_batch=18,
+    num_tokens_per_microbatch=18,
     read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=1),
 )
 

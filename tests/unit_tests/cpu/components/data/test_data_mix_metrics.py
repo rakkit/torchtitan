@@ -61,7 +61,7 @@ def _loader(tmp_path: Path) -> KeyedMixDataLoader:
     config = make_pretrain_dataloader_config(
         specs,
         read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=1),
-        num_prefetch_batches=1,
+        num_prefetch_microbatches=1,
     )
     return KeyedMixDataLoader(
         config,
@@ -69,7 +69,7 @@ def _loader(tmp_path: Path) -> KeyedMixDataLoader:
         dp_rank=0,
         tokenizer=_Tokenizer(),
         max_context_length=16,
-        num_tokens_per_batch=32,
+        num_tokens_per_microbatch=32,
     )
 
 

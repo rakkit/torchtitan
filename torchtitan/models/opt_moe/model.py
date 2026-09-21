@@ -571,9 +571,8 @@ class OPTMoEModel(Decoder):
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
-            # `moe_types=(NormMoE,)`: opt_moe's MoE is not upstream's `MoE`,
-            # and without this its routed experts would count at full weight,
-            # inflating active params and every FLOP/MFU number from them.
+            # NormMoE is not upstream's MoE; without moe_types its routed
+            # experts count at full weight and inflate active params.
             nparams, active_nparams = get_nparams_and_active_nparams(
                 model, moe_types=(NormMoE,)
             )

@@ -280,11 +280,8 @@ class GatedNormSWAttention(GQAttention):
                 config.norm_eps,
                 sharding_config=config.norm_sharding_config,
             ).build()
-        # `not gate_only` mirrors the two forward call sites: with gate_only
-        # the mid-norm is never applied, so building it left a module in the
-        # graph that could not run. Inert while `norm_type` is the default
-        # parameter-free rmsnorm (no params, no state-dict keys), but it
-        # would ship dead trained weights under a parametric norm.
+        # `not gate_only` mirrors the forward call sites, which skip
+        # mid_norm entirely when gate_only is set.
         if (config.mid_norm or config.norm_everywhere) and not config.gate_only:
             mid_dim = (
                 self.n_heads * self.head_dim

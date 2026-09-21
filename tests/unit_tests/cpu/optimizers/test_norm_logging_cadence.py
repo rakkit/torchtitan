@@ -6,18 +6,9 @@
 
 """The arm -> step -> collect handshake for DiSCO's per-parameter norms.
 
-The norms are a by-product of the optimizer update: `arm_norm_computation()`
-sets a flag, `step()` fills `norms_at_current_step` and clears the flag again,
-and only then can the trainer read them back. Nothing type-checks that
-sequence, and every way of breaking it is silent -- norms that are never
-computed simply do not appear on the dashboard.
-
-Two things are pinned here:
-
-1. `wants_norms_at` reproduces the cadence expression it replaced, which used
-   to live inline in `Trainer.train_step`.
-2. Arming reaches every DiSCO optimizer with the container's logging settings,
-   and a step consumes it exactly once.
+Nothing type-checks the sequence and every way of breaking it is silent: norms
+that are never computed just do not appear. Pins the cadence against the
+expression it replaced, and that one arm covers exactly one step.
 """
 
 from __future__ import annotations

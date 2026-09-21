@@ -31,15 +31,9 @@ from torchtitan.optimizers.container import DiSCOOptimizersContainer
 def _disco_container(optimizers: Any) -> DiSCOOptimizersContainer | None:
     """The optimizer container if it is DiSCO's, else None.
 
-    A free function rather than a Trainer attribute so that `train_step` needs
-    nothing on `self` that upstream's trainer does not already set: several
-    upstream tests drive `Trainer.train_step` with a duck-typed stand-in for
-    `self`, and every instance attribute we add is one more thing each of those
-    has to grow on the next rebase.
-
-    isinstance, not hasattr: those tests pass a MagicMock optimizer, where every
-    `hasattr` answers True and every `getattr` returns a mock rather than the
-    default.
+    A free function so `train_step` needs nothing extra on `self`: upstream
+    tests drive it with a duck-typed stand-in. isinstance, not hasattr --
+    those tests pass a MagicMock, where every hasattr answers True.
     """
     return optimizers if isinstance(optimizers, DiSCOOptimizersContainer) else None
 
@@ -260,13 +254,8 @@ class Trainer(Configurable):
     num_pp_microbatches: int
 
     data_mix_metrics: DataMixMetricsLike = NoDataMixMetrics()
-    """Per-dataset consumption reporter, replaced per-instance in __init__.
-
-    A class-level null object rather than an attribute that only exists after
-    __init__: upstream drives `train_step` with duck-typed stand-ins for `self`,
-    and a plain attribute would make every one of them carry this. The null
-    object is stateless, so sharing a single instance is safe.
-    """
+    """Replaced per-instance in __init__; a class-level null object so the
+    duck-typed `self` in upstream's tests does not have to carry one."""
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
@@ -584,13 +573,8 @@ class Trainer(Configurable):
         # scheduler advances in engine.optimizer_step().
         lr_metrics = engine.lr_schedulers.get_metrics() if should_log else {}
         if compute_param_norms:
-            # Arm immediately before the step: DiSCO produces the norms as a
-            # by-product of the update itself, so this cannot wait until the
-            # metrics are collected. Done here rather than inside
-            # `engine.optimizer_step` so the engine keeps upstream's shape and
-            # needs no knowledge of which optimizer container it is driving;
-            # `optimizer_step` is called once per train step with or without
-            # pipeline parallelism, so this site is correct for both.
+            # Armed here, not in the engine, so the engine needs no knowledge
+            # of which container it drives. Correct with and without PP.
             assert disco is not None  # implied by compute_param_norms
             disco.arm_norm_computation()
         grad_norm = engine.optimizer_step()
@@ -640,10 +624,8 @@ class Trainer(Configurable):
             **lr_metrics,
             **collect_aux_loss_metrics(parallel_dims),
         }
-        # No None guard: build_data_mix_metrics always returns an object --
-        # NoDataMixMetrics when the loader has no per-dataset cursors -- and
-        # __init__ always assigns it. "Nothing to report" is that null object
-        # returning empty dicts, not the attribute being absent.
+        # No None guard: "nothing to report" is the null object's empty
+        # dicts, not a missing attribute.
         data_mix, data_docs = self.data_mix_metrics.get_log_dict_at_step(
             engine.num_completed_steps
         )

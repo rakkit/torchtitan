@@ -6,31 +6,12 @@
 
 """Every module that calls `logger.*` must actually have a `logger`.
 
-This exists because of a real, shipped defect. A sweep that added
-`logger = logging.getLogger(__name__)` to several modules landed the statement
-INSIDE a function's parameter list in two of them:
-
-    def remove_orig_mod_and_weight_for_p_name(
-        name: str,
-        ...
-        remove_checkpoint_wrapped_module: bool = True,
-
-    logger = logging.getLogger(__name__)      # <- absorbed as a 5th parameter
-    ) -> str:
-
-Python accepts that. It parses, it imports, it passes lint and it passes every
-test that does not take the branch -- the statement simply becomes a keyword
-parameter `logger=<Logger>`, and the module is left with NO module-level
-`logger`. Every `logger.warning(...)` in the file then raises `NameError` on the
-first execution of its branch.
-
-Both instances sat on cold error paths: `create_disco_param_groups`'s
-"no parameters matched this rule" warning, and `update_from_config`'s
-`max_context_length > rope.max_context_length` warning. So the crash would have
-surfaced on a long-context run, from a line whose only job was to print advice.
-
-A grep for `logging.getLogger` would NOT have caught this -- the string is
-present in both files. The check has to be semantic.
+Guards a real defect: a `logger = logging.getLogger(__name__)` statement landed
+inside a function's parameter list in two modules, becoming a keyword parameter
+and leaving the module with no module-level `logger`. It parses, imports and
+lints clean; every `logger.*` call then raises NameError when its branch runs.
+A grep for `logging.getLogger` does not catch it -- the string is there -- so
+the check has to be semantic.
 """
 
 from __future__ import annotations

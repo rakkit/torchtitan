@@ -6,17 +6,10 @@
 
 """Every opt_moe tensor must have a HuggingFace mapping.
 
-`to_hf()` translates each native parameter name to its HF name through
-`from_hf_map`. A name that is not in the table used to be dropped behind a
-warning while the export still reported success -- which is exactly how the
-0.5.0 rename (q/k/v under `qkv_linear`, `output` -> `lm_head`, experts under
-`routed_experts.inner_experts`) shipped a checkpoint holding 10 of 21 tensors.
-The adapter's own comment records it.
-
-`to_hf` now raises instead, but a raise at export time is late: the rename
-lands in one PR and the broken export is discovered in another. This test moves
-the failure to the PR that renames the parameter, by asserting the invariant
-directly on a built model for every architecture shape we train.
+A tensor missing from `from_hf_map` used to be dropped while the export still
+reported success -- that is how the 0.5.0 rename shipped 10 of 21 tensors.
+`to_hf` now raises, but that is export time; this moves the failure to the PR
+that renames the parameter.
 """
 
 from __future__ import annotations

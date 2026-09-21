@@ -75,22 +75,11 @@ T = TypeVar("T", bound=Optimizer)
 class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
     """Upstream's optimizer container, extended for DiSCO.
 
-    Named for the optimizer it exists to serve, not for the only one it can
-    build -- ``name`` also accepts Adam/AdamW, so the same instrumentation can
-    run the AdamW arm of an A/B. It used to be called ``OptimizersContainer``,
-    exactly like its base, which made it read as a FORK of upstream's container
-    rather than a subclass: 25 of the base's methods are inherited untouched.
-
-    What it adds over the base:
-
-    * DiSCO parameter groups derived from MESH TOPOLOGY rather than from FQN
-      regexes, which is why it needs ``parallel_dims`` at construction.
-    * Per-parameter norm / spectrum / gram metrics. These are produced INSIDE
-      ``step()``, so a step that should report them has to be armed before it
-      runs: ``wants_norms_at()`` decides, ``arm_norm_computation()`` arms, and
-      ``collect_metrics()`` reads the result back afterwards.
-    * The async MoE load-balancing metrics worker, also drained by
-      ``collect_metrics()``.
+    Adds mesh-derived parameter groups (hence ``parallel_dims``), per-parameter
+    norm/spectrum/gram metrics, and the async MoE metrics worker. The norms are
+    produced inside ``step()``, so a reporting step must be armed first:
+    ``wants_norms_at`` decides, ``arm_norm_computation`` arms,
+    ``collect_metrics`` reads back. Also accepts Adam/AdamW.
 
     Upstream's own docstring follows.
 
@@ -279,11 +268,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                 "eps": config.eps / width_multiplier,
                 "weight_decay": config.weight_decay
                 * width_multiplier,  # WD is coupled with LR in torch AdamW
-                # Delegated, not re-implemented: this used to spell out
-                # fused/foreach itself and assert a THREE-value literal, which
-                # silently dropped upstream's `fused_opt_states_bf16` and with
-                # it the bf16 optimizer-state hooks. Deriving it from upstream
-                # keeps the two from drifting again on the next rebase.
+                # Delegated so it cannot drift from upstream again.
                 **BaseOptimizersContainer._build_impl_kwargs(config),
             }
         elif name in ["DiSCO"]:
@@ -321,11 +306,8 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         self.log_queue: queue.Queue | None = None
         self.log_thread: threading.Thread | None = None
         self.log_metrics_locally: bool = config.log_metrics_locally
-        # The export directories are the only part of the logging setup that
-        # depends on a runtime value, so `output_dir` is taken as a build kwarg
-        # rather than left for the trainer to patch in afterwards. It used to
-        # assign both configs back onto this object post-construction, which
-        # left the container briefly in a state its own methods did not expect.
+        # `output_dir` is a build kwarg so these are set at construction
+        # rather than patched on by the trainer afterwards.
         self.spectrum_logging_config = spectrum_logging.SpectrumLoggingConfig(
             enable_export=config.enable_spectrum_export,
             export_dir=(
@@ -389,10 +371,8 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
             f"{len(self.optimizers)} optimizers for {len(self.model_parts)} "
             "model parts; this container builds exactly one per part."
         )
-        # Mirrors upstream's __init__, which this container overrides
-        # wholesale: without this the option is accepted and the bf16
-        # optimizer-state hooks never run, which is a silent no-op rather
-        # than an error.
+        # Mirrors upstream's __init__, which this class overrides wholesale;
+        # without it the option is accepted and does nothing.
         if config.implementation == "fused_opt_states_bf16":
             self._register_bf16_optimizer_state_hook()
         self._post_init(all_params, optimizer_kwargs)
@@ -442,15 +422,8 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
     ) -> bool:
         """Whether `step` should compute per-parameter norms.
 
-        The cadence lives here because `log_norm_freq` does. The two facts it
-        cannot know -- whether this is a metrics-logging step at all, and
-        whether it is the run's last -- are passed in by the trainer.
-
-        Norm logging is gated on `should_log` downstream, so anything computed
-        on a non-logging step would be thrown away; `log_norm_freq` is required
-        to be a multiple of `metrics.log_freq` so that the two cadences line up
-        (validated in `Trainer.Config.__post_init__`). The final step is armed
-        unconditionally so a run always ends with a spectrum snapshot.
+        The cadence lives with `log_norm_freq`; the trainer supplies the two
+        facts it cannot know. The final step is always armed.
         """
         if self.log_norm_freq <= 0:
             return False
@@ -459,11 +432,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         return should_log and (step == 1 or step % self.log_norm_freq == 0)
 
     def arm_norm_computation(self):
-        """Tell DiSCO to produce norms during the NEXT `step()`.
-
-        Has to happen before the step, not at the log site: the norms are a
-        by-product of the update itself.
-        """
+        """Tell DiSCO to produce norms during the next `step()`."""
         for i, _ in enumerate(self.model_parts):
             optimizer = self.optimizers[i]
             if isinstance(optimizer, DiSCO):
@@ -482,13 +451,10 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                 )
 
     def collect_metrics(self, step: int, *, include_norms: bool) -> dict[str, Any]:
-        """Everything this container has to report for `step`.
+        """Everything this container reports for `step`.
 
-        One call instead of three, so the trainer does not have to know that
-        norms and MoE routing stats come from different machinery on different
-        schedules. `include_norms` must match what `wants_norms_at` returned
-        before the step -- asking for norms that were never armed yields an
-        empty dict, not an error.
+        `include_norms` must match what `wants_norms_at` said before the step;
+        unarmed norms yield an empty dict rather than an error.
         """
         metrics: dict[str, Any] = {}
         if include_norms:
@@ -497,16 +463,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         return metrics
 
     def collect_moe_metrics(self) -> dict[str, Any]:
-        """Drain the async MoE metrics worker and gather what it produced.
-
-        The worker writes each layer's dict onto the MoE MODULE
-        (`_log_expert_metrics`) because that is the handle the load-balancing
-        hook already holds. Reading them back belongs here, with the producer,
-        rather than in the trainer -- which used to walk
-        `model_parts -> layers -> moe` and read that private attribute itself.
-        """
-        # The worker reports router entropy / max-violation from a background
-        # thread; drain it before reading the per-layer dicts.
+        """Drain the async MoE worker and gather what it wrote per layer."""
         self.join_log_queue()
         metrics: dict[str, Any] = {}
         for model_part in self.model_parts:
@@ -524,10 +481,8 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         all_norms = {}
         for optimizer in self.optimizers:
             if isinstance(optimizer, DiSCO):
-                # Returns the dict stashed by the armed step, so it is read
-                # once per optimizer -- this used to sit inside a
-                # `for group in optimizer.param_groups` loop, re-reading and
-                # re-merging the same dict once per parameter group.
+                # One read per optimizer: this returns the dict the armed
+                # step stashed, so re-reading per param group was wasted.
                 all_norms.update(optimizer.get_norms_at_current_step())
             else:
                 logger.warning(
@@ -686,12 +641,8 @@ def moe_metrics_worker(log_queue: queue.Queue):
 
         except Exception:
             logger.exception("async MoE metrics worker failed on one payload")
-            # Clear what this payload was meant to fill. `collect_moe_metrics`
-            # reads whatever is still on the module, so leaving the previous
-            # payload's dict in place republishes the PREVIOUS logging step's
-            # entropy / maxvio / bias as if they were current -- the chart shows
-            # a flat segment rather than a gap, and a flat maxvio is exactly
-            # what a healthy run looks like. Missing is honest; stale is not.
+            # Clear, or collect_moe_metrics republishes the previous step's
+            # values as current -- a flat chart segment rather than a gap.
             for info in moe_layers_info:
                 info["module"]._log_expert_metrics = {}
         finally:

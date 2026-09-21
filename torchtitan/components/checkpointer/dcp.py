@@ -36,6 +36,7 @@ from torchtitan.tools.utils import GarbageCollection
 from .base import (
     BaseCheckpointManager,
     DATALOADER,
+    EMA,
     LR_SCHEDULER,
     MODEL,
     ModelWrapper,
@@ -50,7 +51,11 @@ if TYPE_CHECKING:
     import torch.nn as nn
 
     from torchtitan.components.data.loader import BaseDataLoader
-    from torchtitan.components.optimizer import (
+
+    # The EMA class shares its name with the ``EMA = "ema"`` state-dict key
+    # constant imported above, so alias it here.
+    from torchtitan.components.optimizer import (  # noqa: N811
+        EMA as EMAContainer,
         LRSchedulersContainer,
         OptimizersContainer,
     )
@@ -125,8 +130,10 @@ class CheckpointManager(BaseCheckpointManager):
         optimizers (OptimizersContainer): The optimizers used to optimize the model.
         lr_schedulers (LRSchedulersContainer): The lr schedulers used to optimize
             the model.
+        ema (Optional[EMA]): Online EMA of model weights, or None when the
+            user hasn't configured one (see torchtitan.components.optimizer.ema.EMA).
         states (Dict[str, Any]): The states that need to be saved, other than the
-            previous 4 components.
+            previous components.
         sd_adapter (Optional[type[BaseStateDictAdapter]]): The adapter used to convert
             model state dicts between native format and other formats.
         base_folder (str): The base folder to save the checkpointer. Will be concatenated
@@ -158,6 +165,7 @@ class CheckpointManager(BaseCheckpointManager):
         model_parts: list[nn.Module],
         optimizers: OptimizersContainer,
         lr_schedulers: LRSchedulersContainer,
+        ema: EMAContainer | None,
         states: dict[str, Any],
         sd_adapter: BaseStateDictAdapter | None,
         base_folder: str = "",
@@ -176,6 +184,8 @@ class CheckpointManager(BaseCheckpointManager):
                 LR_SCHEDULER: lr_schedulers,
             }
         )
+        if ema is not None:
+            self.states[EMA] = ema
 
         # Loading & Saving Policy
         self.load_only = config.load_only
@@ -390,18 +400,6 @@ class CheckpointManager(BaseCheckpointManager):
         Raises:
             AssertionError: If `from_hf` is True but no `sd_adapter` is available.
         """
-        # FORK: an optional component enabled now but absent from the checkpoint
-        # (EMA turned on for a resume, or a checkpoint predating it) makes DCP's
-        # load planner raise "Missing key in checkpoint state_dict" before any
-        # component's own load_state_dict runs. Drop it here and cold-start it
-        # from the resumed weights afterwards. This lived in our own _load()
-        # until upstream #4191 replaced that with base.load().
-        # model_only=False is safe: a model-only `states` carries no optional
-        # state, so nothing is found to drop either way.
-        reseed_optional = self._exclude_missing_optional_states(
-            states, checkpoint_id, model_only=False
-        )
-
         state_dict = self._flattened_model_states_sd(states)
 
         if from_hf:
@@ -427,9 +425,12 @@ class CheckpointManager(BaseCheckpointManager):
             if MODEL in states:
                 states[MODEL].load_state_dict(state_dict)
 
-        # FORK: cold-start whatever was dropped above, now that the model is loaded.
-        for key in reseed_optional:
-            self.states[key].load_state_dict({})
+        # Reseed EMA from the just-loaded weights if it wasn't itself restored
+        # (excluded, or a model_only load). MODEL is never excludable, so its
+        # presence rules out torchft's per-replica dataloader-only load, which
+        # also calls _load_checkpoint but never includes MODEL.
+        if MODEL in states and EMA in self.states and EMA not in states:
+            self.states[EMA].load_state_dict({})
 
     def _save(self, curr_step: int, last_step: bool = False) -> bool:
         """Save the checkpoint for the current step.
@@ -624,9 +625,6 @@ class CheckpointManager(BaseCheckpointManager):
             sd.update(states[MODEL].state_dict())
         return sd
 
-    _OPTIONAL_RESUME_STATES: tuple[str, ...] = ("ema_optimizer",)
-    """States that may legitimately be absent from an existing checkpoint."""
-
     def _checkpoint_has_prefix(self, checkpoint_id: str, prefix: str) -> bool:
         """Whether the on-disk checkpoint has any key starting with ``prefix``.
 
@@ -656,60 +654,6 @@ class CheckpointManager(BaseCheckpointManager):
             )
             raise
         return any(k.startswith(prefix) for k in metadata.state_dict_metadata)
-
-    def _exclude_missing_optional_states(
-        self, states_to_load: dict[str, Any], checkpoint_id: str, model_only: bool
-    ) -> list[str]:
-        """Drop optional states absent from this checkpoint, in place.
-
-        Returns the keys the caller must reseed (via ``load_state_dict({})``)
-        once the model is loaded, so they cold-start from the resumed weights.
-        A model-only load never carries them in the first place.
-        """
-        if model_only:
-            return []
-        reseed = []
-        for key in self._OPTIONAL_RESUME_STATES:
-            if key in states_to_load and not self._checkpoint_has_prefix(
-                checkpoint_id, f"{key}."
-            ):
-                del states_to_load[key]
-                reseed.append(key)
-                logger.info(
-                    f"Checkpoint has no '{key}' state; it will be initialized "
-                    "from the loaded model weights."
-                )
-        return reseed
-
-    def _states_to_load(self, model_only: bool) -> dict[str, Any]:
-        """Determine which state objects should be restored during loading.
-
-        This method filters the checkpointer's state dictionary based on the
-        loading context. It supports partial restoration for specific steps
-        (e.g., loading only model weights for step 0) and respects explicit
-        exclusion rules for auxiliary states.
-
-        Args:
-            model_only (bool): If True, returns only the model's parameters,
-                bypassing optimizers and other training metadata.
-
-        Returns:
-            dict[str, Any]: A prepared dictionary of states to be passed to
-                the loader.
-        """
-        # For the first step, we will only load the model.
-        if model_only:
-            return self.states[MODEL].state_dict()
-
-        for exclude_key in self.exclude_from_loading:
-            if exclude_key not in self.states:
-                raise ValueError(f"{exclude_key} not found in state_dict.")
-
-        states_to_load = {
-            k: v for k, v in self.states.items() if k not in self.exclude_from_loading
-        }
-
-        return self._flattened_model_states_sd(states_to_load)
 
     def _save_last_step(self, curr_step: int) -> None:
         """Execute the final checkpoint save at the completion of training.

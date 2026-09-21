@@ -332,38 +332,6 @@ def set_init_fn_type(config):
             set_init_fn_type(value)
 
 
-def _load_ema_state_dict(
-    actual_model, input_dir: Path, read_threads: int = 16
-) -> "dict[str, torch.Tensor] | None":
-    """Load the EMA weights for ``actual_model`` from a DCP checkpoint.
-
-    Returns a native (non-HF) FQN -> tensor state dict, or None if the
-    checkpoint has no EMA data (EMA was disabled during training, or the
-    checkpoint predates EMA support). Doesn't mutate actual_model's own
-    parameters -- the EMA weights are a separate set of tensors.
-    """
-    from torchtitan.components.ema import EMAOptimizersContainer
-
-    if not _checkpoint_has_prefix(input_dir, "ema_optimizer."):
-        return None
-
-    ema_container = EMAOptimizersContainer.Config(enable=True).build(
-        model_parts=[actual_model]
-    )
-    dcp.load(
-        {"ema_optimizer": ema_container},
-        storage_reader=ParallelFileSystemReader(input_dir, thread_count=read_threads),
-    )
-
-    ema_opt = ema_container.optimizers[0]
-    ema_state_dict = {}
-    for name, p in actual_model.named_parameters():
-        state = ema_opt.state.get(p)
-        if state is not None and "ema_params" in state:
-            ema_state_dict[name] = state["ema_params"]
-    return ema_state_dict
-
-
 def _export_hf_weights(
     state_dict: dict, sd_adapter, target_dtype, output_dir: Path
 ) -> None:
@@ -372,6 +340,18 @@ def _export_hf_weights(
     hf_state_dict = sd_adapter.to_hf(state_dict)
     if target_dtype != torch.float32:
         hf_state_dict = {k: v.to(target_dtype) for k, v in hf_state_dict.items()}
+    # Give each exported tensor its OWN storage before writing. Upstream's
+    # stacked projections (#4808: w13 is one [2, F, D] parameter) reach `to_hf`
+    # split into gate_proj / up_proj, which are VIEWS into the stacked storage.
+    # safetensors refuses those -- "found no suitable name to keep for saving
+    # ... None is covering the entire storage" -- because it cannot tell an
+    # alias from a duplicate. `.contiguous()` is NOT enough: a view that is
+    # already contiguous is returned as-is, still sharing the storage. Clone.
+    # One extra buffer per tensor, at conversion time on a CPU host.
+    hf_state_dict = {
+        k: (v.detach().clone() if torch.is_tensor(v) else v)
+        for k, v in hf_state_dict.items()
+    }
     output_dir.mkdir(parents=True, exist_ok=True)
     save_torch_state_dict(
         hf_state_dict,
@@ -428,7 +408,6 @@ def convert_to_hf(
     hf_assets_path: "Path | None",
     export_dtype: str,
     job_config: "Path | None" = None,
-    ema_output: "Path | None" = None,
     read_threads: int = 16,
 ):
     """Convert a DCP checkpoint to HuggingFace safetensors format.
@@ -442,9 +421,6 @@ def convert_to_hf(
       6. Optionally cast dtype.
       7. Write HF safetensors.
       8. Copy HF config/modeling files and generate config.json.
-      9. If ema_output is given and the checkpoint has EMA weights (see
-         torchtitan.components.ema), also export those to ema_output, reusing
-         the config/tokenizer files just written to output_dir.
     """
     # 1. Get ModelSpec from the model registry
     model_spec = _resolve_model_spec_for_conversion(
@@ -509,29 +485,6 @@ def convert_to_hf(
 
     print(f"model is saved to {output_dir}")
 
-    # 9. Optionally also export EMA weights
-    if ema_output is not None:
-        ema_state_dict = _load_ema_state_dict(actual_model, input_dir, read_threads)
-        if ema_state_dict is None:
-            print(
-                f"[WARNING] --ema_output was given but the checkpoint at {input_dir} "
-                "has no EMA weights (EMA was disabled during that training run, or "
-                "this checkpoint predates EMA support). Skipping EMA export."
-            )
-        else:
-            # EMA only tracks gradient-trained nn.Parameters (see
-            # _load_ema_state_dict), so it never includes buffers such as the
-            # MoE routing `expert_bias` (a torchtitan register_buffer, updated
-            # by a non-gradient heuristic rather than the optimizer/EMA).
-            # Backfill those from the already-loaded main state_dict -- as
-            # their live (non-averaged) value, since EMA doesn't apply to
-            # them -- so the EMA export is a complete, loadable checkpoint
-            # rather than silently missing keys like expert_bias.
-            for key, tensor in state_dict.items():
-                ema_state_dict.setdefault(key, tensor)
-            _export_hf_weights(ema_state_dict, sd_adapter, target_dtype, ema_output)
-            _copy_hf_assets(output_dir, ema_output)
-            print(f"EMA weights saved to {ema_output}")
 
 
 if __name__ == "__main__":
@@ -581,18 +534,6 @@ if __name__ == "__main__":
         help="Export dtype for HF checkpoint (default: float32).",
     )
     parser.add_argument(
-        "--ema_output",
-        type=Path,
-        default=None,
-        help="If provided, also export the checkpoint's EMA weights "
-        "(see torchtitan.components.ema) to this directory in HF format. "
-        "Reuses output_dir's config/tokenizer files instead of regenerating "
-        "them, since EMA weights share the same architecture/config as the "
-        "main export. If the checkpoint has no EMA weights (EMA was disabled "
-        "during training, or it predates EMA support), prints a warning and "
-        "skips the EMA export rather than failing.",
-    )
-    parser.add_argument(
         "--read_threads",
         type=int,
         default=min(32, os.cpu_count() or 16),
@@ -611,6 +552,5 @@ if __name__ == "__main__":
         args.hf_assets_path,
         args.export_dtype,
         args.job_config,
-        args.ema_output,
         args.read_threads,
     )

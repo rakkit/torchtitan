@@ -23,7 +23,11 @@ from torchtitan.components.checkpointer import BaseCheckpointManager, Checkpoint
 from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
-from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer
+from torchtitan.components.optimizer import (
+    EMA,
+    LRSchedulersContainer,
+    OptimizersContainer,
+)
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
 from torchtitan.config.configs import (
     CommConfig,
@@ -82,6 +86,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         lr_scheduler: LRSchedulersContainer.Config = field(
             default_factory=LRSchedulersContainer.Config
         )
+        ema: EMA.Config | None = None
+        """Online EMA of model weights, e.g. for cheap mid-WSD-training eval
+        without a full LR decay. Unset (None) means EMA is disabled."""
         training: TrainingConfig = field(default_factory=TrainingConfig)
         parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
         checkpointer: Annotated[
@@ -174,6 +181,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     loss_fn: BaseLoss
     optimizers: OptimizersContainer
     lr_schedulers: LRSchedulersContainer
+    ema: EMA | None
     checkpointer: BaseCheckpointManager
     pp_has_last_stage: bool
     max_num_documents: int | None
@@ -375,7 +383,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         )
 
     def _initialize_optimizer(self, model_spec: ModelSpec) -> None:
-        """Construct optimizers and learning-rate schedulers."""
+        """Construct optimizers, learning-rate schedulers and the weight EMA."""
         # parallel_dims is passed through because DiSCO derives its parameter
         # groups and metric-ownership split from the mesh topology, not from
         # FQN regexes. Upstream's container accepts and ignores it.
@@ -389,6 +397,11 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.lr_schedulers = self.config.lr_scheduler.build(
             optimizers=self.optimizers,
             training_steps=self.config.training.steps,
+        )
+        self.ema = (
+            self.config.ema.build(model_parts=self.model_parts)
+            if self.config.ema is not None
+            else None
         )
 
     def _initialize_checkpointer(
@@ -406,6 +419,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
+            ema=self.ema,
             states={"train_state": self},
             sd_adapter=sd_adapter,
             base_folder=self.output_dir,
@@ -715,6 +729,10 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.optimizers.calculate_norm_at_next_step()
         self.optimizers.step()
         self.lr_schedulers.step()
+        if self.ema is not None:
+            # current_step is the step just optimized, which is what the EMA
+            # schedule's start_step/update_every_n_steps are defined against.
+            self.ema.step(current_step)
         self.num_completed_steps = current_step
         self._num_optimizer_steps_since_cuda_graph_init += 1
         return grad_norm

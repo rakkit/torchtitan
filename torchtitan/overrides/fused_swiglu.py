@@ -13,6 +13,7 @@ framework. ``fused_grouped_experts`` retains the grouped gate/up projection
 override until that projection becomes the core ``GroupedExperts`` default.
 """
 
+import logging
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -25,6 +26,8 @@ from torchtitan.config import derive, override
 from torchtitan.models.common.activation import BinaryActivationFn, SwiGLU
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.sharding import ShardingConfig
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "FusedGroupedExperts",
@@ -461,7 +464,16 @@ def _fuse_grouped_experts_sharding(base: ShardingConfig) -> ShardingConfig:
     description="Fuse routed-experts gate/up projection and SwiGLU activation.",
 )
 def fused_grouped_experts(cfg: GroupedExperts.Config) -> GroupedExperts.Config:
+    # Exact type, not isinstance: the fused config replaces w1/w3 with a single
+    # interleaved w13, which a subclass overriding forward or adding parameters
+    # would not survive. Warn rather than return silently -- a no-op override
+    # is indistinguishable from one that worked.
     if type(cfg) is not GroupedExperts.Config:
+        logger.warning(
+            "fused_grouped_experts does not apply to %s (only the exact "
+            "GroupedExperts.Config); the override is a no-op here.",
+            type(cfg).__qualname__,
+        )
         return cfg
 
     fused = derive(

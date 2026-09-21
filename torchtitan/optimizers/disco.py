@@ -79,15 +79,14 @@ def get_param_type(p, fsdp_enabled, expert_enabled):
     if p.numel() == 1:
         # treat scalars separately in _build_param_lists(); return DDP here by default
         return ParamType.DDP
-    # TODO(fused-swiglu): `ndim == 3` is a PROXY for "routed expert", and it
-    # stops being a safe one the moment a stacked Linear enters the model.
-    # Upstream's fused w13 is `[2, F, D]` -- also rank 3 -- so it would be
-    # misfiled here and handed to `step_experts`, which runs the LMO on each
-    # rank's local buffer with no gather. That is silently wrong, not a crash:
-    # the `Shard(!=0)` guard inspects only `expert_params[0]`, and the sort puts
-    # a real expert first. Check the parameter name or `num_linears` before
-    # opt_moe adopts any fused projection. Safe today only because
-    # `opt_moe/norm_ffn.py` keeps `num_linears=1`.
+    # TODO(fused-swiglu): `ndim == 3` is a PROXY for "routed expert". Two
+    # stacked shapes exist and break it in OPPOSITE directions:
+    #   dense FeedForward.w13 [2, F, D]        rank 3 -> misfiled AS an expert
+    #   FusedGroupedExperts.w13 [E, F, 2, D]   rank 4 -> real experts missed
+    # The first is silently wrong rather than a crash (the Shard(!=0) guard
+    # only inspects expert_params[0], which the sort makes a real expert).
+    # Classify on the parameter name or num_linears before adopting either.
+    # Safe today only because opt_moe/norm_ffn.py keeps num_linears=1.
     if p.ndim == 3 and (expert_enabled or fsdp_enabled):
         return ParamType.Expert
     if fsdp_enabled:

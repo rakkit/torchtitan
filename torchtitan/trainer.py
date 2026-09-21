@@ -479,12 +479,17 @@ class Trainer(Configurable):
     def train_step(self, data_iterator: Iterator[TrainingMicrobatch]):
         engine = self.engine
         current_step = engine.num_completed_steps + 1
-        should_log = self.metrics_processor.should_log(current_step)
-        # Always log the final step: otherwise a run whose step count is not a
-        # multiple of log_freq ends with its last metrics missing, which makes
-        # two runs of different length impossible to compare at the end.
-        if current_step == self.config.training.steps:
-            should_log = True
+        # Always log the final step even when it does not land on a log_freq
+        # boundary, so a run ends with a metrics point (and, when norm logging
+        # is on, a final spectrum snapshot). This has to be decided here, not at
+        # the log site: the loss is only accumulated when should_log is true.
+        # getattr, not attribute access: this is a fork-only convenience, and
+        # upstream's trainer tests build a fake config that carries no
+        # `training.steps`. Hard-accessing it made those tests fail on our
+        # addition rather than on anything they were testing.
+        should_log = self.metrics_processor.should_log(current_step) or (
+            current_step == getattr(self.config.training, "steps", None)
+        )
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
@@ -492,11 +497,21 @@ class Trainer(Configurable):
         # All groups form one optimizer step. Each microbatch group forms one
         # complete PP step, or one local forward/backward when PP is disabled.
         # Decided BEFORE the optimizer step, because DiSCO produces the norms
-        # inside step(). Gated on should_log so the cadence is
-        # lcm-free (validated in _setup_norm_logging).
-        log_norm_freq = self.config.metrics.log_norm_freq
-        need_to_calculate_norm = bool(
-            should_log and log_norm_freq > 0 and current_step % log_norm_freq == 0
+        # inside step(). Also armed on the very last step even when it does not
+        # land on a log_norm_freq boundary, so a run ends with a final spectrum
+        # snapshot. getattr for the same reason as `should_log` above: this
+        # DiSCO-only block must not make upstream's trainer tests fail on a fake
+        # config carrying no `metrics` / `training.steps`.
+        log_norm_freq = getattr(
+            getattr(self.config, "metrics", None), "log_norm_freq", 0
+        )
+        if not isinstance(log_norm_freq, int):
+            # Those same tests pass a MagicMock config, where getattr returns a
+            # mock rather than falling back to the default.
+            log_norm_freq = 0
+        need_to_calculate_norm = log_norm_freq > 0 and (
+            current_step == getattr(self.config.training, "steps", None)
+            or (should_log and (current_step == 1 or current_step % log_norm_freq == 0))
         )
         engine.calculate_norm_at_next_step = need_to_calculate_norm
         microbatch_groups: list[list[TrainingMicrobatch]] = []
@@ -594,32 +609,36 @@ class Trainer(Configurable):
                 global_avg_loss = global_max_loss = float(accumulated_loss.item())
                 global_ntokens_seen = engine.ntokens_seen
 
-        data_mix, data_docs, data_tokens = self.data_mix_metrics.get_log_dict_at_step(
-            engine.num_completed_steps
-        )
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
             **collect_aux_loss_metrics(parallel_dims),
-            **data_mix,
-            **data_docs,
-            **data_tokens,
         }
+        data_mix, data_docs, data_tokens = self.data_mix_metrics.get_log_dict_at_step(
+            engine.num_completed_steps
+        )
+        extra_metrics.update(data_mix)
+        extra_metrics.update({k: int(v) for k, v in data_docs.items()})
+        extra_metrics.update({k: int(v) for k, v in data_tokens.items()})
         optimizers = engine.optimizers
         if need_to_calculate_norm and hasattr(optimizers, "get_parameter_norms"):
             extra_metrics.update(
                 optimizers.get_parameter_norms(step=engine.num_completed_steps)
             )
         if hasattr(optimizers, "join_log_queue"):
-            # DiSCO's async metrics worker; join before logging so this step's
-            # values are present rather than arriving one step late.
+            # The MoE load-balancing hook reports router entropy / max-violation
+            # from a worker thread; drain it before reading the per-layer dicts.
             optimizers.join_log_queue()
         for model_part in engine.model_parts:
-            for block in getattr(model_part, "layers", {}).values():
-                moe = getattr(block, "moe", None)
+            layers = getattr(model_part, "layers", None)
+            if layers is None:
+                continue
+            for layer in layers.values():
+                moe = getattr(layer, "moe", None)
+                # `_log_expert_metrics` is a dict the MoE fills in, not a method.
                 expert_metrics = getattr(moe, "_log_expert_metrics", None)
-                if expert_metrics is not None:
-                    extra_metrics.update(expert_metrics())
+                if expert_metrics:
+                    extra_metrics.update(expert_metrics)
         self.metrics_processor.log(
             engine.num_completed_steps,
             global_avg_loss,

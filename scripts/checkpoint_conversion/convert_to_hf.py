@@ -12,6 +12,7 @@ import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, is_dataclass, replace as dc_replace
+from types import SimpleNamespace
 from pathlib import Path
 from typing import get_args
 
@@ -22,6 +23,7 @@ from torch.distributed._shard._utils import narrow_tensor_by_index
 from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.planner import LoadItemType
 from torch.futures import Future
+from torchtitan.config.configs import ParallelismConfig, TrainingConfig
 from torchtitan.components.checkpointer import ModelWrapper
 from torchtitan.config import TORCH_DTYPE_MAP
 
@@ -161,7 +163,26 @@ def _apply_dataclass_overrides(target_obj, overrides: dict, *, field_path: str):
         field_info = field_map[key]
         nested_type = _resolve_dataclass_type(field_info.type)
         if isinstance(value, dict):
-            if is_dataclass(current_value):
+            if isinstance(current_value, dict) and not any(
+                is_dataclass(v) for v in current_value.values()
+            ):
+                # A LEAF mapping -- flex `kernel_options` and the like. Narrow
+                # deliberately: `model.layers` is also a dict, but of layer
+                # CONFIGS, and assigning raw JSON over it replaces dataclasses
+                # with dicts that blow up later inside Decoder.__init__.
+                setattr(target_obj, key, value)
+            elif isinstance(current_value, dict):
+                # dict of dataclasses (per-layer configs): recurse per entry.
+                for sub_key, sub_value in value.items():
+                    if sub_key in current_value and is_dataclass(
+                        current_value[sub_key]
+                    ):
+                        _apply_dataclass_overrides(
+                            current_value[sub_key],
+                            sub_value,
+                            field_path=f"{field_path}.{key}.{sub_key}",
+                        )
+            elif is_dataclass(current_value):
                 _apply_dataclass_overrides(
                     current_value,
                     value,
@@ -177,8 +198,33 @@ def _apply_dataclass_overrides(target_obj, overrides: dict, *, field_path: str):
                         field_path=f"{field_path}.{key}",
                     ),
                 )
+            elif current_value is None:
+                # An `Any`-annotated field the model's own config expansion
+                # fills in -- lm_head, tok_embeddings, the per-layer configs.
+                # Since llm-0.5.2 the dumped job_config contains them EXPANDED,
+                # and they are not reconstructible: their param_init holds
+                # reprs like "functools.partial(<function scion_normal_ at
+                # 0x4003a13c40e0>)", a function address from a dead process.
+                # Skipping is correct as well as necessary -- build() re-derives
+                # them from dim/vocab_size/init settings, which ARE restored
+                # from this same job_config.
+                print(
+                    f"[job_config] '{field_path}.{key}' is expansion-derived; "
+                    "skipping the serialized copy and letting build() re-derive it."
+                )
             else:
                 raise ValueError(f"Expected '{field_path}.{key}' to be a scalar value.")
+        elif isinstance(value, list) and value and all(
+            isinstance(v, dict) for v in value
+        ):
+            # A list of CONFIGS -- `layers`, which expansion derives from
+            # `layer` plus n_layers/swa_pattern. Same story as the Any-annotated
+            # fields above: assigning the raw JSON list would replace dataclasses
+            # with dicts, and Decoder.__init__ then dies on `layer.attention`.
+            print(
+                f"[job_config] '{field_path}.{key}' is expansion-derived; "
+                "skipping the serialized copy and letting build() re-derive it."
+            )
         else:
             setattr(target_obj, key, value)
 
@@ -244,6 +290,37 @@ def _resolve_model_spec_for_conversion(
         model_overrides,
         field_path="model_spec.model",
     )
+    # Run the model's OWN config expansion rather than trusting the serialized
+    # copy. Since llm-0.5.2 the dumped job_config contains the model config
+    # fully EXPANDED -- tok_embeddings, lm_head, the per-layer list -- and those
+    # are not reconstructible: their param_init holds reprs like
+    # "functools.partial(<function scion_normal_ at 0x4003a13c40e0>)", a
+    # function address from a dead process. `update_from_config` derives them
+    # from the scalar fields (dim, vocab_size, n_layers, the init settings)
+    # that ARE restored above, which is exactly what the trainer does before
+    # building the model.
+    def _rebuild(cls, data: dict):
+        """Construct a real config dataclass from the job_config's dict.
+
+        Upstream asserts the concrete type (`config.parallelism must be a
+        ParallelismConfig`), so a SimpleNamespace will not do. Only scalar
+        fields the class actually declares are carried across.
+        """
+        known = {f.name: f for f in fields(cls)}
+        kwargs = {
+            k: v
+            for k, v in (data or {}).items()
+            if k in known and not isinstance(v, (dict, list))
+        }
+        return cls(**kwargs)
+
+    expansion_config = SimpleNamespace(
+        parallelism=_rebuild(ParallelismConfig, job_config.get("parallelism")),
+        training=_rebuild(TrainingConfig, job_config.get("training")),
+    )
+    if hasattr(model_spec.model, "update_from_config"):
+        model_spec.model.update_from_config(config=expansion_config)
+
     # Sync training.seq_len → rope.max_seq_len so max_position_embeddings in the
     # exported HF config reflects the actual training context length, not the default.
     # Mirrors OPTMoEModel.Config.update_from_config (model.py:283-285).

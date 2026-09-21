@@ -331,7 +331,7 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
                 # fine and then died at the first checkpoint with
                 # "Optimizer must be built with (name, param) tuples".
                 # Upstream's own `_build_param_groups` always sets it, and
-                # EMAOptimizersContainer already does the same thing.
+                # upstream's EMA container does the same thing.
                 named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
                 params = [
                     {

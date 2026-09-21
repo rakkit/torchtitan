@@ -16,6 +16,8 @@ mask real failures elsewhere in the suite.
 
 import importlib.util
 
+import pytest
+
 
 def _has_attr_module(module: str, submodule: str) -> bool:
     try:
@@ -81,3 +83,33 @@ def pytest_ignore_collect(collection_path, config):
     if _HELION_ABSENT and name in _HELION_MODULES:
         return True
     return None
+
+
+@pytest.fixture(autouse=True)
+def _reset_aux_loss_registry():
+    """Clear the global aux-loss registry between tests.
+
+    `AuxLoss._group_counts` is a ClassVar that every AuxLoss construction
+    increments and nothing ever clears, so a test that builds an MoE leaks its
+    registration into every test that runs after it. `collect_aux_loss_metrics`
+    then returns a non-empty dict where the next test expects `{}` --
+    test_trainer_accumulates_reused_cuda_graph_losses fails with
+
+        Expected: extra_metrics={'n_tokens_seen': 3}
+          Actual: extra_metrics={'n_tokens_seen': 3, 'load_balance_loss/mean': 0.0}
+
+    but only when an opt_moe test ran first, which is why it passed in
+    isolation and failed in the full suite. Snapshot and restore rather than
+    blanket-clear, so a test that deliberately sets up state still sees it.
+    """
+    try:
+        from torchtitan.models.common.aux_loss import AuxLoss
+    except Exception:
+        yield
+        return
+    before = dict(AuxLoss._group_counts)
+    try:
+        yield
+    finally:
+        AuxLoss._group_counts.clear()
+        AuxLoss._group_counts.update(before)

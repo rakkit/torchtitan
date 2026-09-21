@@ -174,8 +174,8 @@ class AbstractDiSCO(torch.optim.Optimizer):
         self.gram_vector_names: list[str] = []
         # Whether the full singular-value spectrum is wanted this step. Only
         # optimizers/spectrum_logging.py consumes it, and it discards every
-        # `track_spectrum_*` entry unless enable_spectrum_plot or
-        # enable_spectrum_export is set -- both of which default to False. The
+        # `track_spectrum_*` entry unless enable_spectrum_export is set,
+        # which it is not by default. The
         # spectra are nonetheless computed, packed into the logging buffer,
         # all-gathered and moved to CPU on the way there, and they are ~99% of
         # that gather's payload. Threaded from the config through

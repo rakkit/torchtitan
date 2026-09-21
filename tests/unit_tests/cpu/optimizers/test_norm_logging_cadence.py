@@ -116,7 +116,7 @@ def _container_with(fake, monkeypatch, **attrs):
     container.norms_to_log = ["all"]
     container.gram_level = 2
     container.log_metrics_locally = True
-    container.spectrum_logging_config = MagicMock(enable_plot=True, enable_export=False)
+    container.spectrum_logging_config = MagicMock(enable_export=True)
     for k, v in attrs.items():
         setattr(container, k, v)
     return container
@@ -134,6 +134,8 @@ def test_arming_reaches_the_optimizer_with_the_containers_settings(monkeypatch):
     assert fake.arm_kwargs["log_metrics_locally"] is True
     # track_spectrum is derived, not copied: the optimizer can skip computing,
     # packing and all-gathering the spectra when nothing will consume them.
+    # The plot path is gone, so the parquet export is the only consumer and
+    # this now tracks enable_export alone.
     assert fake.arm_kwargs["track_spectrum"] is True
 
 
@@ -160,3 +162,18 @@ def test_an_unarmed_step_produces_no_norms(monkeypatch):
     fake.step()
 
     assert fake.get_norms_at_current_step() == {}
+
+
+def test_spectra_are_not_computed_when_nothing_consumes_them(monkeypatch):
+    """The whole point of `track_spectrum`: skip the work when it is discarded.
+
+    The spectra are ~99% of the logging gather's payload, so computing them
+    with the export off would be pure waste.
+    """
+    fake = _FakeDiSCO()
+    container = _container_with(fake, monkeypatch)
+    container.spectrum_logging_config = MagicMock(enable_export=False)
+
+    DiSCOOptimizersContainer.arm_norm_computation(container)
+
+    assert fake.arm_kwargs["track_spectrum"] is False

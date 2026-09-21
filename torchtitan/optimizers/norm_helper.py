@@ -851,8 +851,8 @@ def calculate_norm(
     `want_spectrum` controls whether the full singular-value vector is returned
     under the "spectrum" key. It used to be injected unconditionally, but the
     only consumer (optimizers/spectrum_logging.py) pops every `track_spectrum_*`
-    entry and discards it unless `enable_spectrum_plot` or
-    `enable_spectrum_export` is set -- both default to False. Since disco.py
+    entry and discards it unless `enable_spectrum_export` is set, which it is
+    not by default. Since disco.py
     packs, all-gathers and moves those vectors to CPU on the way there, and
     they are ~99% of that gather's payload, the flag is threaded from the
     optimizer config rather than assumed. When it is False AND no requested

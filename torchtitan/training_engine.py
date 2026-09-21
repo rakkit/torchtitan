@@ -729,10 +729,15 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.optimizers.calculate_norm_at_next_step()
         self.optimizers.step()
         self.lr_schedulers.step()
-        if self.ema is not None:
+        # getattr, not attribute access: `ema` is only assigned in
+        # _initialize_optimizer, and optimizer_step is reachable without it
+        # (upstream's trainer tests drive the step directly on a partly built
+        # engine). Hard access makes those fail on an attribute they never set.
+        ema = getattr(self, "ema", None)
+        if ema is not None:
             # current_step is the step just optimized, which is what the EMA
             # schedule's start_step/update_every_n_steps are defined against.
-            self.ema.step(current_step)
+            ema.step(current_step)
         self.num_completed_steps = current_step
         self._num_optimizer_steps_since_cuda_graph_init += 1
         return grad_norm

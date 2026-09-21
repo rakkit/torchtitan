@@ -33,7 +33,7 @@ from torchtitan.components.data.parquet_manifest import (
     MANIFEST_FILENAME,
     write_manifest,
 )
-from torchtitan.components.data_mix_metrics import (
+from torchtitan.observability.data_consumption import (
     build_data_mix_metrics,
     DataMixMetrics,
 )

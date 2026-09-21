@@ -54,6 +54,7 @@ from torchtitan.optimizers.gram_vector_logging import (
     GramVectorLoggingConfig,
     process_gram_vectors_for_logging,
 )
+from torchtitan.optimizers import norm_helper
 from torchtitan.optimizers.spectrum_logging import process_norms_for_logging
 
 __all__ = [
@@ -162,11 +163,29 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
         - more info: https://pytorch.org/docs/stable/optim.html
         """
 
+        log_norm_freq: int = 0
+        """How often, in steps, to log DiSCO's per-parameter norms. 0 disables.
+
+        Lives here rather than on MetricsProcessor.Config because it is
+        OPTIMIZER behaviour: the norms are produced inside step(). It must be a
+        multiple of metrics.log_freq, which the trainer validates -- norms only
+        land on steps that are also metric-logging steps, so otherwise they
+        arrive on lcm(log_freq, log_norm_freq) instead of the cadence asked for.
+        """
+
+        norms_to_log: list[str] = field(default_factory=lambda: ["default"])
+        """Which norm families to log. "default" is the curated set; see
+        torchtitan.optimizers.norm_helper.get_norms_to_log."""
+
+        gram_level: int = 0
+        """Gram-matrix metric depth, on the same cadence as log_norm_freq.
+        0 disables. Levels 2-3 need batched eigh and are expensive."""
+
         enable_spectrum_plot: bool = False
         """
         Whether to render each tracked parameter's singular-value spectrum as
         a plot image for W&B (see optimizers/spectrum_logging.py). Only
-        takes effect when metrics.log_norm_freq > 0.
+        takes effect when log_norm_freq > 0.
         """
 
         enable_spectrum_export: bool = False
@@ -176,14 +195,14 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
         versioned W&B Artifact, for offline/programmatic analysis beyond what
         the plot shows. Off by default: can be large for big MoE models (see
         optimizers/spectrum_logging.py). Only takes effect when
-        metrics.log_norm_freq > 0.
+        log_norm_freq > 0.
         """
 
         enable_gram_plot: bool = False
         """
         Whether to render each tracked vector-valued gram metric as an
         atlas-grid plot image for W&B (see optimizers/gram_vector_logging.py).
-        Only takes effect when metrics.gram_level > 0.
+        Only takes effect when gram_level > 0.
         """
 
         enable_gram_export: bool = False
@@ -193,7 +212,7 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
         offline/programmatic analysis beyond what the plot shows. Off by
         default: can be large, there are far more distinct gram vector
         metrics than spectrum has (see optimizers/gram_vector_logging.py).
-        Only takes effect when metrics.gram_level > 0.
+        Only takes effect when gram_level > 0.
         """
 
     optimizers: list[T]
@@ -253,8 +272,14 @@ class OptimizersContainer(BaseOptimizersContainer, Generic[T]):
         self.model_parts = model_parts
 
         self.preserve_lrs_when_loading = False
-        self.norms_to_log: list[str] | None = None
-        self.gram_level: int = 0
+        # Set from config at build time. They used to be assigned onto the
+        # container by the trainer after construction, which meant the object
+        # was briefly in a state its own methods did not expect.
+        self.norms_to_log: list[str] | None = norm_helper.get_norms_to_log(
+            config.norms_to_log
+        )
+        self.gram_level: int = config.gram_level
+        self.log_norm_freq: int = config.log_norm_freq
         self.log_queue: queue.Queue | None = None
         self.log_thread: threading.Thread | None = None
         # Set by the trainer from MetricsProcessor.Config.save_all_shard_ranks;

@@ -227,11 +227,16 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         config: Config,
         *,
         model_parts: list[nn.Module],
-        **kwargs: Any,
+        parallel_dims: ParallelDims | None = None,
     ) -> None:
-        # The trainer passes parallel_dims for containers whose parameter
-        # grouping depends on the mesh topology (DiSCO). Ignored here.
-        del kwargs
+        # Declared, not swallowed through **kwargs. A container whose parameter
+        # grouping or metric ownership depends on the MESH rather than on FQN
+        # regexes needs the job-level topology at construction time -- DiSCO
+        # derives both from it. Upstream's own DistMuon reads layout off each
+        # DTensor parameter instead, which is enough for a per-parameter
+        # decision but not for one that spans named job meshes ("loss", "tp",
+        # "dp_replicate"). This container does not use it.
+        del parallel_dims
         impl_kwargs = self._build_impl_kwargs(config)
         param_group_configs = config.param_groups
         all_params = []

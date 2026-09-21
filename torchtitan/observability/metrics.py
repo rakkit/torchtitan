@@ -328,26 +328,6 @@ class MetricsProcessor(Configurable):
         only stage that computes loss metrics.
         """
 
-        log_norm_freq: int = 0
-        """How often to log parameter-norm metrics, in iterations. 0 disables."""
-
-        norms_to_log: list[str] = field(default_factory=lambda: ["default"])
-        """
-        Which parameter norms to log. "all"/"everything" logs every available
-        norm; "default" logs rms_to_rms, l1_to_rms, rms_to_inf, supremum and
-        condition_number.
-        """
-
-        gram_level: int = 0
-        """
-        Level of Gram-based weight/momentum-geometry metrics (see
-        optimizers/gram_helper.py), on the same log_norm_freq cadence:
-        - 0: off (default, zero overhead)
-        - 1: cheap O(m^2) entrywise geometry
-        - 2: adds O(m^3) spectral metrics (cumulative)
-        - 3: adds whitened/generalised metrics (cumulative)
-        """
-
         save_all_shard_ranks: bool = False
         """
         Whether every shard rank saves its own metrics instead of one rank

@@ -20,7 +20,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
-from torchtitan.components.data_mix_metrics import build_data_mix_metrics
+from torchtitan.observability.data_consumption import build_data_mix_metrics
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validate import BaseValidator, Validator
 from torchtitan.config import Configurable
@@ -32,7 +32,6 @@ from torchtitan.distributed.cuda_graph import cuda_graphs_supported
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.metrics import ensure_pp_loss_visible, MetricsProcessor
-from torchtitan.optimizers import norm_helper
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.training_engine import TrainingEngine
 
@@ -323,23 +322,27 @@ class Trainer(Configurable):
         )
 
     def _setup_norm_logging(self, config: "Trainer.Config", parallel_dims) -> None:
-        """Wire DiSCO's norm/spectrum/gram logging and the per-rank gate.
+        """Cross-check DiSCO's logging against the metrics side, and site its exports.
+
+        The cadence, norm selection and gram level now live on the optimizer
+        config, where they belong -- they are optimizer behaviour. What still
+        has to happen here is the part that genuinely spans both configs:
 
         DiSCO may only skip the logging all_gather when the metrics side
-        genuinely gives EVERY shard rank a logger.
-
-        `save_all_shard_ranks` alone is not enough: it is applied inside
-        `_build_metric_logger` only after `should_log` is already true, and with
-        `save_for_all_ranks=False` that has been narrowed to a single global
-        rank. Enabling local mode on the raw flag would have every rank skip the
-        gather while only one rank owns a logger -- so that rank logs its own
-        1/N of the parameters and the rest are silently dropped.
+        genuinely gives EVERY shard rank a logger. `save_all_shard_ranks` alone
+        is not enough: it is applied inside `_build_metric_logger` only after
+        `should_log` is already true, and with `save_for_all_ranks=False` that
+        has been narrowed to a single global rank. Enabling local mode on the
+        raw flag would have every rank skip the gather while only one rank owns
+        a logger -- so that rank logs its own 1/N of the parameters and the rest
+        are silently dropped.
 
         It also has to be decided from config alone, identically on every rank:
         the gather is a collective, so if some ranks skipped it and others did
         not the job would hang rather than misreport.
         """
-        if not hasattr(self.engine.optimizers, "calculate_norm_at_next_step"):
+        optimizers = self.engine.optimizers
+        if not hasattr(optimizers, "calculate_norm_at_next_step"):
             # Upstream container: no DiSCO norm machinery to wire.
             return
 
@@ -347,23 +350,22 @@ class Trainer(Configurable):
         logging_on = bool(
             metrics_config.enable_wandb or metrics_config.enable_tensorboard
         )
-        # `need_to_calculate_norm` in train_step is gated on `should_log`, so a
-        # norms only land on steps divisible by BOTH frequencies, i.e. on
-        # lcm(log_freq, log_norm_freq) rather than the requested cadence. With
-        # log_freq=100 and log_norm_freq=250 you silently get norms every 500
-        # steps, not every 250. Require the multiple so the configured cadence
-        # is the real one.
+        log_norm_freq = getattr(optimizers, "log_norm_freq", 0)
+        # Norm logging is gated on `should_log`, so norms would otherwise land
+        # on lcm(log_freq, log_norm_freq) rather than the requested cadence:
+        # log_freq=100 with log_norm_freq=250 silently gives norms every 500
+        # steps. Require the multiple so the configured cadence is the real one.
         if (
-            metrics_config.log_norm_freq > 0
+            log_norm_freq > 0
             and metrics_config.log_freq > 0
-            and metrics_config.log_norm_freq % metrics_config.log_freq != 0
+            and log_norm_freq % metrics_config.log_freq != 0
         ):
             raise ValueError(
-                f"metrics.log_norm_freq ({metrics_config.log_norm_freq}) must be a "
-                f"multiple of metrics.log_freq ({metrics_config.log_freq}); norm "
-                "logging only happens on steps that are also metric-logging steps, "
-                "so otherwise norms land on lcm(log_freq, log_norm_freq) "
-                "instead of the cadence you asked for."
+                f"optimizer.log_norm_freq ({log_norm_freq}) must be a multiple "
+                f"of metrics.log_freq ({metrics_config.log_freq}); norm logging "
+                "only happens on steps that are also metric-logging steps, so "
+                "otherwise norms land on lcm(log_freq, log_norm_freq) instead "
+                "of the cadence you asked for."
             )
         if (
             metrics_config.save_all_shard_ranks
@@ -375,12 +377,12 @@ class Trainer(Configurable):
                 "logging all_gather would silently drop every parameter owned by "
                 "the other shard ranks."
             )
-        self.engine.optimizers.log_metrics_locally = bool(
+        optimizers.log_metrics_locally = bool(
             metrics_config.save_all_shard_ranks
             and metrics_config.save_for_all_ranks
             and logging_on
         )
-        if self.engine.optimizers.log_metrics_locally:
+        if optimizers.log_metrics_locally:
             # The invariant that actually matters: every rank owning a distinct
             # slice of the metrics must hold a logger to write it to. Both sides
             # derive that from `rank_owns_metrics_shard`, so this is inert -- it
@@ -415,19 +417,15 @@ class Trainer(Configurable):
                     "two rank predicates disagree."
                 )
 
-        self.engine.optimizers.norms_to_log = norm_helper.get_norms_to_log(
-            config.metrics.norms_to_log
-        )
-        self.engine.optimizers.gram_level = config.metrics.gram_level
         # enable_plot/enable_export live on the optimizer config itself and are
         # already set by its __init__; only export_dir depends on dump_folder.
-        self.engine.optimizers.spectrum_logging_config = (
-            self.engine.optimizers.spectrum_logging_config._replace(
+        optimizers.spectrum_logging_config = (
+            optimizers.spectrum_logging_config._replace(
                 export_dir=os.path.join(config.dump_folder, "spectrum_export")
             )
         )
-        self.engine.optimizers.gram_vector_logging_config = (
-            self.engine.optimizers.gram_vector_logging_config._replace(
+        optimizers.gram_vector_logging_config = (
+            optimizers.gram_vector_logging_config._replace(
                 export_dir=os.path.join(config.dump_folder, "gram_export")
             )
         )
@@ -488,12 +486,10 @@ class Trainer(Configurable):
         # snapshot. getattr for the same reason as `should_log` above: this
         # DiSCO-only block must not make upstream's trainer tests fail on a fake
         # config carrying no `metrics` / `training.steps`.
-        log_norm_freq = getattr(
-            getattr(self.config, "metrics", None), "log_norm_freq", 0
-        )
+        log_norm_freq = getattr(engine.optimizers, "log_norm_freq", 0)
         if not isinstance(log_norm_freq, int):
-            # Those same tests pass a MagicMock config, where getattr returns a
-            # mock rather than falling back to the default.
+            # Upstream's trainer tests pass a MagicMock optimizer, where getattr
+            # returns a mock rather than falling back to the default.
             log_norm_freq = 0
         need_to_calculate_norm = log_norm_freq > 0 and (
             current_step == getattr(self.config.training, "steps", None)
@@ -600,12 +596,19 @@ class Trainer(Configurable):
             **lr_metrics,
             **collect_aux_loss_metrics(parallel_dims),
         }
-        data_mix, data_docs, data_tokens = self.data_mix_metrics.get_log_dict_at_step(
-            engine.num_completed_steps
-        )
-        extra_metrics.update(data_mix)
-        extra_metrics.update({k: int(v) for k, v in data_docs.items()})
-        extra_metrics.update({k: int(v) for k, v in data_tokens.items()})
+        # getattr for the same reason as `should_log` above: per-dataset
+        # consumption reporting is a fork-only addition, and upstream's trainer
+        # tests build a fake trainer that carries no `data_mix_metrics`. Hard
+        # attribute access made those tests fail on our addition rather than on
+        # anything they were testing.
+        data_mix_metrics = getattr(self, "data_mix_metrics", None)
+        if data_mix_metrics is not None:
+            data_mix, data_docs, data_tokens = data_mix_metrics.get_log_dict_at_step(
+                engine.num_completed_steps
+            )
+            extra_metrics.update(data_mix)
+            extra_metrics.update({k: int(v) for k, v in data_docs.items()})
+            extra_metrics.update({k: int(v) for k, v in data_tokens.items()})
         optimizers = engine.optimizers
         if need_to_calculate_norm and hasattr(optimizers, "get_parameter_norms"):
             extra_metrics.update(

@@ -64,11 +64,20 @@ _DEFAULT_RESHARDER_ABSENT = not _has_attr_module(
     "torch_checkpointing", "default_resharder"
 )
 
+# `helion` is an optional kernel-authoring library backing
+# `overrides/helion_rope.py`. It is not installed here and nothing this fork
+# trains selects that override, so its whole test module is environmental
+# noise -- 15 failures that say only "no module named helion".
+_HELION_MODULES = frozenset({"test_helion_rope.py"})
+_HELION_ABSENT = _missing("helion")
+
 
 def pytest_ignore_collect(collection_path, config):
     name = collection_path.name
     if _TORCHVISION_ABSENT and name in _TORCHVISION_MODULES:
         return True
     if _DEFAULT_RESHARDER_ABSENT and name in _TORCH_CHECKPOINTING_MODULES:
+        return True
+    if _HELION_ABSENT and name in _HELION_MODULES:
         return True
     return None

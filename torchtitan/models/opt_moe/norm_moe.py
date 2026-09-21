@@ -41,9 +41,7 @@ TENSOR parallelism.
 """
 
 import logging
-from collections.abc import Iterable
 from dataclasses import dataclass
-from fractions import Fraction
 from typing import Any, Literal, NamedTuple
 
 import spmd_types as spmd
@@ -1184,62 +1182,3 @@ class MoE:
                 router_init_std=self.router_init_std,
                 _debug_force_load_balance=self._debug_force_load_balance,
             )
-
-
-def get_nparams_and_active_nparams(
-    model: nn.Module,
-    *,
-    modules_excluded_from_active_params: "Iterable[nn.Module | None]" = (),
-) -> tuple[int, int]:
-    """Count total and matmul-active parameters.
-
-    Vendored from ``models/utils.get_nparams_and_active_nparams``, which weights
-    routed-expert parameters only for ``isinstance(module, MoE)``. NormMoE is
-    vendored rather than derived from that class, so it would count at full
-    weight there and inflate active params -- and every FLOP/MFU number derived
-    from them -- by the whole inactive expert mass. The only change from
-    upstream is the module type tested below -- the signature is kept identical
-    to upstream's so this file stays diffable against it.
-    """
-    named_parameters = list(model.named_parameters())
-    nparams = sum(param.numel() for _, param in named_parameters)
-    parameter_weights = {id(param): Fraction(1) for _, param in named_parameters}
-
-    for module in model.modules():
-        if isinstance(module, NormMoE):
-            active_expert_ratio = Fraction(
-                module.router.top_k, module.router.num_experts
-            )
-            for param in module.routed_experts.parameters():
-                parameter_weights[id(param)] = active_expert_ratio
-
-    # Embedding tables do not participate in per-token matmuls unless the
-    # parameter is shared with the output head.
-    lm_head = getattr(model, "lm_head", None)
-    lm_head_parameter_ids = (
-        {id(param) for param in lm_head.parameters()}
-        if isinstance(lm_head, nn.Module)
-        else set()
-    )
-    for module in model.modules():
-        if isinstance(module, nn.Embedding):
-            for param in module.parameters(recurse=False):
-                if id(param) not in lm_head_parameter_ids:
-                    parameter_weights[id(param)] = Fraction(0)
-
-    for module_excluded_from_active_params in modules_excluded_from_active_params:
-        if module_excluded_from_active_params is None:
-            continue
-        for param in module_excluded_from_active_params.parameters():
-            parameter_weights[id(param)] = Fraction(0)
-
-    nparams_for_matmul = sum(
-        param.numel() * parameter_weights[id(param)] for _, param in named_parameters
-    )
-    assert nparams_for_matmul.denominator == 1
-    active_nparams = nparams_for_matmul.numerator
-
-    logger.info(
-        f"Total parameter count: {nparams:,}, active parameters: {active_nparams:,}"
-    )
-    return nparams, active_nparams

@@ -95,6 +95,28 @@ def _shares_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch._C._is_alias_of(a, b)
 
 
+def apply_reconfigure_lrs(reconfigure_lrs: bool, optimizers: Any) -> None:
+    """Arm "load optimizer state but keep this run's learning rates".
+
+    Only some containers implement it. Setting the attribute on one that does
+    not would accept the flag and silently ignore it -- which is exactly the
+    "resumed with the stale LR schedule" failure it exists to prevent -- so an
+    unsupported container is refused instead.
+
+    Shared by both checkpointers; it used to be a copy of this block in each.
+    """
+    if not reconfigure_lrs:
+        return
+    if not hasattr(optimizers, "preserve_lrs_when_loading"):
+        raise ValueError(
+            "checkpointer.reconfigure_lrs is set, but "
+            f"{type(optimizers).__name__} does not support preserving learning "
+            "rates across a load. Use "
+            "torchtitan.optimizers.container.DiSCOOptimizersContainer."
+        )
+    optimizers.preserve_lrs_when_loading = True
+
+
 class ModelWrapper(Stateful):
     """
     A wrapper for `nn.Module` (or a list of modules) that provides a unified `Stateful`

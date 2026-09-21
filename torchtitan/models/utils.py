@@ -462,6 +462,7 @@ def get_nparams_and_active_nparams(
     model: nn.Module,
     *,
     modules_excluded_from_active_params: Iterable[nn.Module | None] = (),
+    moe_types: tuple[type, ...] = (MoE,),
 ) -> tuple[int, int]:
     """Count total and matmul-active parameters for a native decoder.
 
@@ -474,6 +475,9 @@ def get_nparams_and_active_nparams(
         model: Built model whose parameters are counted.
         modules_excluded_from_active_params: Module subtrees whose cost does not
             scale per text token, such as a vision encoder.
+        moe_types: Module types whose routed-expert parameters are weighted by
+            the active expert ratio. A model with its own MoE class passes it
+            here rather than re-implementing this function.
 
     Returns:
         Total parameter count and effective parameter count for the conventional
@@ -484,7 +488,7 @@ def get_nparams_and_active_nparams(
     parameter_weights = {id(param): Fraction(1) for _, param in named_parameters}
 
     for module in model.modules():
-        if isinstance(module, MoE):
+        if isinstance(module, moe_types):
             active_expert_ratio = Fraction(
                 module.router.top_k, module.router.num_experts
             )

@@ -34,6 +34,7 @@ from torchtitan.tools import filesystem
 from torchtitan.tools.utils import GarbageCollection
 
 from .base import (
+    apply_reconfigure_lrs,
     BaseCheckpointManager,
     DATALOADER,
     EMA,
@@ -190,19 +191,7 @@ class CheckpointManager(BaseCheckpointManager):
         # Loading & Saving Policy
         self.load_only = config.load_only
         self.exclude_from_loading = config.exclude_from_loading
-        if config.reconfigure_lrs:
-            # Load the optimizer state but keep this run's learning rates.
-            # Only some containers implement this; setting the attribute on one that
-            # does not would accept the flag and silently ignore it, which is exactly
-            # the "resumed with the stale LR schedule" failure it exists to prevent.
-            if not hasattr(optimizers, "preserve_lrs_when_loading"):
-                raise ValueError(
-                    "checkpoint.reconfigure_lrs is set, but "
-                    f"{type(optimizers).__name__} does not support preserving learning "
-                    "rates across a load. Use torchtitan.optimizers.container."
-                    "OptimizersContainer (or an EMA wrapper around it)."
-                )
-            optimizers.preserve_lrs_when_loading = True
+        apply_reconfigure_lrs(config.reconfigure_lrs, optimizers)
 
         self.initial_load_path = config.initial_load_path
         self.initial_load_model_only = config.initial_load_model_only
@@ -624,36 +613,6 @@ class CheckpointManager(BaseCheckpointManager):
         if MODEL in states:
             sd.update(states[MODEL].state_dict())
         return sd
-
-    def _checkpoint_has_prefix(self, checkpoint_id: str, prefix: str) -> bool:
-        """Whether the on-disk checkpoint has any key starting with ``prefix``.
-
-        Only a genuinely absent / non-DCP checkpoint counts as "no such state".
-        A blanket ``except Exception: return False`` here silently turned a
-        transient metadata read failure into "this checkpoint has no EMA", which
-        drops `ema_optimizer` from the load set and cold-starts EMA from the
-        resumed weights -- a silent quality regression on the EMA branch,
-        announced only at INFO level. Real I/O errors must surface instead.
-        """
-        try:
-            metadata = dcp.FileSystemReader(checkpoint_id).read_metadata()
-        except FileNotFoundError:
-            # No .metadata file: not a DCP checkpoint directory, or not written
-            # yet. This is the one case that legitimately means "state absent".
-            logger.debug(
-                "No DCP metadata at %s; treating %r as absent.", checkpoint_id, prefix
-            )
-            return False
-        except Exception:
-            logger.error(
-                "Failed to read DCP metadata at %s while checking for %r. "
-                "Refusing to silently treat it as absent, because that would "
-                "cold-start the state from the resumed weights.",
-                checkpoint_id,
-                prefix,
-            )
-            raise
-        return any(k.startswith(prefix) for k in metadata.state_dict_metadata)
 
     def _save_last_step(self, curr_step: int) -> None:
         """Execute the final checkpoint save at the completion of training.

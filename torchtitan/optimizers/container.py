@@ -173,7 +173,9 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         )
         """Extra parameter group splitting rules for DiSCO optimizers"""
 
-        implementation: Literal["for-loop", "foreach", "fused"] = "fused"
+        implementation: Literal[
+            "for-loop", "foreach", "fused", "fused_opt_states_bf16"
+        ] = "fused"
         """
         Specify which optimizer implementation to use:
         - 'fused': Use fused implementation (CUDA only) for best performance.
@@ -269,9 +271,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
     ) -> dict[str, Any]:
         name = config.name
         if name in ["Adam", "AdamW"]:
-            optim_implementation = config.implementation
-            assert optim_implementation in ["fused", "foreach", "for-loop"]
-
             width_multiplier = config.mup_width_multiplier
 
             optimizer_kwargs = {
@@ -280,8 +279,12 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                 "eps": config.eps / width_multiplier,
                 "weight_decay": config.weight_decay
                 * width_multiplier,  # WD is coupled with LR in torch AdamW
-                "fused": config.implementation == "fused",
-                "foreach": config.implementation == "foreach",
+                # Delegated, not re-implemented: this used to spell out
+                # fused/foreach itself and assert a THREE-value literal, which
+                # silently dropped upstream's `fused_opt_states_bf16` and with
+                # it the bf16 optimizer-state hooks. Deriving it from upstream
+                # keeps the two from drifting again on the next rebase.
+                **BaseOptimizersContainer._build_impl_kwargs(config),
             }
         elif name in ["DiSCO"]:
             optimizer_kwargs = create_disco_optimizer_kwargs_from_optimizer_config(
@@ -386,6 +389,12 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
             f"{len(self.optimizers)} optimizers for {len(self.model_parts)} "
             "model parts; this container builds exactly one per part."
         )
+        # Mirrors upstream's __init__, which this container overrides
+        # wholesale: without this the option is accepted and the bf16
+        # optimizer-state hooks never run, which is a silent no-op rather
+        # than an error.
+        if config.implementation == "fused_opt_states_bf16":
+            self._register_bf16_optimizer_state_hook()
         self._post_init(all_params, optimizer_kwargs)
 
     def __iter__(self) -> Iterator[T]:

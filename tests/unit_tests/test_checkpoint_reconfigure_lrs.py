@@ -18,24 +18,51 @@ import unittest
 
 class TestReconfigureLrs(unittest.TestCase):
     def test_a_container_that_cannot_preserve_lrs_is_refused(self):
-        from torchtitan.components.checkpointer.dcp import CheckpointManager
+        """Behaviour, not source text.
+
+        This used to assert on `inspect.getsource(CheckpointManager.__init__)`,
+        which proved nothing about what the code does and broke the moment the
+        block moved into a shared helper. Both checkpointers now call
+        `apply_reconfigure_lrs`, so testing it tests both.
+        """
+        from torchtitan.components.checkpointer.base import apply_reconfigure_lrs
 
         class ContainerWithoutSupport:
             """Upstream's OptimizersContainer has no preserve_lrs_when_loading."""
 
-        self.assertFalse(
-            hasattr(ContainerWithoutSupport(), "preserve_lrs_when_loading")
-        )
-        # The guard is the `hasattr` check at the assignment site; assert the error text
-        # names the fix so an operator is not left guessing.
-        source = CheckpointManager.__init__.__doc__ or ""
-        del source
+        with self.assertRaises(ValueError) as caught:
+            apply_reconfigure_lrs(True, ContainerWithoutSupport())
+        # The message must name the fix, or an operator is left guessing.
+        self.assertIn("does not support preserving learning", str(caught.exception))
+        self.assertIn("DiSCOOptimizersContainer", str(caught.exception))
+
+    def test_a_supporting_container_is_armed(self):
+        from torchtitan.components.checkpointer.base import apply_reconfigure_lrs
+
+        class ContainerWithSupport:
+            preserve_lrs_when_loading = False
+
+        container = ContainerWithSupport()
+        apply_reconfigure_lrs(True, container)
+        self.assertTrue(container.preserve_lrs_when_loading)
+
+    def test_the_flag_off_is_a_no_op_even_for_an_unsupported_container(self):
+        from torchtitan.components.checkpointer.base import apply_reconfigure_lrs
+
+        class ContainerWithoutSupport:
+            pass
+
+        apply_reconfigure_lrs(False, ContainerWithoutSupport())  # must not raise
+
+    def test_both_checkpointers_use_the_shared_helper(self):
+        """The duplication this replaced was two byte-identical 13-line blocks."""
         import inspect
 
-        body = inspect.getsource(CheckpointManager.__init__)
-        self.assertIn("reconfigure_lrs", body)
-        self.assertIn('hasattr(optimizers, "preserve_lrs_when_loading")', body)
-        self.assertIn("does not support preserving learning", body)
+        from torchtitan.components.checkpointer.dcp import CheckpointManager
+
+        self.assertIn(
+            "apply_reconfigure_lrs", inspect.getsource(CheckpointManager.__init__)
+        )
 
     def test_the_fork_container_does_support_it(self):
         from torchtitan.optimizers.container import DiSCOOptimizersContainer

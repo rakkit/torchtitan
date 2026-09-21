@@ -193,15 +193,8 @@ class Decoder(BaseModel):
 
             if isinstance(config, Trainer.Config):
                 for layer_cfg in self.layers:
-                    if not hasattr(layer_cfg, "moe") or layer_cfg.moe is None:
-                        continue
-                    # A model may supply its own MoE without a nested router
-                    # config (OPT MoE carries the flag on the MoE config
-                    # itself), so set whichever one exists.
-                    router_cfg = getattr(layer_cfg.moe, "router", None)
-                    target = router_cfg if router_cfg is not None else layer_cfg.moe
-                    if hasattr(target, "_debug_force_load_balance"):
-                        target._debug_force_load_balance = (
+                    if hasattr(layer_cfg, "moe") and layer_cfg.moe is not None:
+                        layer_cfg.moe.router._debug_force_load_balance = (
                             config.debug.moe_force_load_balance
                         )
 

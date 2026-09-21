@@ -12,8 +12,8 @@ import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, is_dataclass, replace as dc_replace
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import get_args
 
 import torch
@@ -23,9 +23,9 @@ from torch.distributed._shard._utils import narrow_tensor_by_index
 from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.planner import LoadItemType
 from torch.futures import Future
-from torchtitan.config.configs import ParallelismConfig, TrainingConfig
 from torchtitan.components.checkpointer import ModelWrapper
 from torchtitan.config import TORCH_DTYPE_MAP
+from torchtitan.config.configs import ParallelismConfig, TrainingConfig
 
 
 class ParallelFileSystemReader(FileSystemReader):
@@ -214,8 +214,10 @@ def _apply_dataclass_overrides(target_obj, overrides: dict, *, field_path: str):
                 )
             else:
                 raise ValueError(f"Expected '{field_path}.{key}' to be a scalar value.")
-        elif isinstance(value, list) and value and all(
-            isinstance(v, dict) for v in value
+        elif (
+            isinstance(value, list)
+            and value
+            and all(isinstance(v, dict) for v in value)
         ):
             # A list of CONFIGS -- `layers`, which expansion derives from
             # `layer` plus n_layers/swa_pattern. Same story as the Any-annotated
@@ -290,6 +292,7 @@ def _resolve_model_spec_for_conversion(
         model_overrides,
         field_path="model_spec.model",
     )
+
     # Run the model's OWN config expansion rather than trusting the serialized
     # copy. Since llm-0.5.2 the dumped job_config contains the model config
     # fully EXPANDED -- tok_embeddings, lm_head, the per-layer list -- and those
@@ -382,7 +385,7 @@ def _validate_exported_hf_config(
 
 def _checkpoint_has_prefix(input_dir: Path, prefix: str) -> bool:
     """Whether the on-disk DCP checkpoint's metadata has any key starting with
-    ``prefix``. Mirrors CheckpointManager._checkpoint_has_prefix -- duplicated
+    ``prefix``. Local to this script -- the CheckpointManager copy was dead and removed
     here since this script calls dcp.load directly rather than through
     CheckpointManager, so it needs the same guard against a missing key
     raising inside DCP's load planner.
@@ -561,7 +564,6 @@ def convert_to_hf(
     try_to_copy_tokenizer(output_dir, hf_assets_path)
 
     print(f"model is saved to {output_dir}")
-
 
 
 if __name__ == "__main__":

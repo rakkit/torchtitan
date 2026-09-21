@@ -27,9 +27,12 @@ from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.common.rope import RoPE
-from torchtitan.models.utils import quadratic_attention_flops_per_token
+from torchtitan.models.utils import (
+    get_nparams_and_active_nparams,
+    quadratic_attention_flops_per_token,
+)
 from .gated_norm_swattention import GatedNormSWAttention
-from .norm_moe import get_nparams_and_active_nparams
+from .norm_moe import NormMoE
 from .utils.inits import (
     make_param_init,
     parse_depth_init,
@@ -568,7 +571,12 @@ class OPTMoEModel(Decoder):
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
-            nparams, active_nparams = get_nparams_and_active_nparams(model)
+            # `moe_types=(NormMoE,)`: opt_moe's MoE is not upstream's `MoE`,
+            # and without this its routed experts would count at full weight,
+            # inflating active params and every FLOP/MFU number from them.
+            nparams, active_nparams = get_nparams_and_active_nparams(
+                model, moe_types=(NormMoE,)
+            )
             base_attn = self.layer.attention
             assert isinstance(base_attn, GatedNormSWAttention.Config)
             # Per layer, not n_layers * template: with `swa_pattern` the windowed

@@ -7,6 +7,7 @@
 import logging
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,14 +36,14 @@ class _EMAParamOptimizer(Optimizer):
     ``expert_bias_E``), which is why tensors need not be ``nn.Parameter``s.
     """
 
-    def __init__(self, named_tensors: list[tuple[str, torch.Tensor]]) -> None:
+    def __init__(self, named_tensors: Sequence[tuple[str, torch.Tensor]]) -> None:
         tensors = [t for _, t in named_tensors]
         names = [canonical_fqn(name) for name, _ in named_tensors]
         super().__init__([{"params": tensors, "param_names": names}], {})
         for t in tensors:
             self.state[t]["ema_params"] = t.detach().clone()
 
-    def step(self, *args, **kwargs) -> None:
+    def step(self, closure=None) -> None:  # pyrefly: ignore[bad-override]
         raise RuntimeError(
             "_EMAParamOptimizer must not be step()-ed; call "
             "EMA.step(current_step) instead."
@@ -61,8 +62,11 @@ class EMA(OptimizersContainer):
     from ``train_step()``.
     """
 
+    # Deliberately extends Configurable.Config, not OptimizersContainer.Config:
+    # inheriting the optimizer's fields would put lr/param_groups on the EMA's
+    # command-line surface.
     @dataclass(kw_only=True, slots=True)
-    class Config(Configurable.Config):
+    class Config(Configurable.Config):  # pyrefly: ignore[bad-override]
         decay: float | None = None
         """Fixed decay per firing: ema_params = decay * ema_params +
         (1 - decay) * param. If None (default), computed dynamically from
@@ -223,8 +227,10 @@ class EMA(OptimizersContainer):
     def zero_grad(self, *args, **kwargs) -> None:
         pass  # never called by the training loop; no-op for safety
 
+    # Takes the step rather than an optimizer closure: the firing count has to
+    # be derived from it, and this is never merged into Trainer.optimizers.
     @torch.no_grad()
-    def step(self, current_step: int) -> None:
+    def step(self, current_step: int) -> None:  # pyrefly: ignore[bad-override]
         """Call directly with the trainer's global step -- never merged into
         Trainer.optimizers, so there's no closure/zero-arg step() to honor."""
         elapsed = current_step - self.start_step
@@ -255,10 +261,12 @@ class EMA(OptimizersContainer):
     def _update(self, num_updates: int) -> None:
         decay = self._decay_at(num_updates)
         for ema_opt, model in zip(self._param_optimizers, self.model_parts):
-            params = [p for p in model.parameters() if p.requires_grad]
+            params: list[torch.Tensor] = [
+                p for p in model.parameters() if p.requires_grad
+            ]
             self._update_group(ema_opt, params, decay)
         for ema_opt, model in zip(self._buffer_optimizers, self.model_parts):
-            buffers = [
+            buffers: list[torch.Tensor] = [
                 b
                 for name, b in model.named_buffers()
                 if any(p.search(name) for p in self._buffer_patterns)

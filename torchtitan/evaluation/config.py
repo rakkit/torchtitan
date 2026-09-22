@@ -197,16 +197,16 @@ def load_training_config(snapshot_path: str | Path) -> LoadedTrainingConfig:
         _required_mapping(snapshot, "parallelism"),
         "parallelism",
     )
-    _overlay_dataclass(
-        config.compile,
-        _required_mapping(snapshot, "compile"),
-        "compile",
-    )
-    _overlay_dataclass(
-        config.activation_checkpoint,
-        _required_mapping(snapshot, "activation_checkpoint"),
-        "activation_checkpoint",
-    )
+    # compile and activation_checkpoint are both legitimately None -- opt_moe's
+    # own template leaves compile unset.
+    compile_snapshot = _optional_mapping(snapshot, "compile")
+    if compile_snapshot and config.compile is not None:
+        _overlay_dataclass(config.compile, compile_snapshot, "compile")
+    ac_snapshot = _optional_mapping(snapshot, "activation_checkpoint")
+    if ac_snapshot and config.activation_checkpoint is not None:
+        _overlay_dataclass(
+            config.activation_checkpoint, ac_snapshot, "activation_checkpoint"
+        )
     debug_snapshot = _optional_mapping(snapshot, "debug")
     if debug_snapshot:
         _overlay_dataclass(config.debug, debug_snapshot, "debug")

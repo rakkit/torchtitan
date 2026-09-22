@@ -16,6 +16,7 @@ from torchtitan.models.common.attention import (
     FlexInnerAttention,
     GQAttention,
     InnerAttention,
+    QKVLinear,
 )
 from torchtitan.models.common.config_utils import get_attention_config
 from torchtitan.models.common.linear import Linear
@@ -25,6 +26,31 @@ from torchtitan.protocols.module import Module
 from .split_qkv import SplitQKVLinear
 from .utils.inits import make_param_init
 from .utils.norms import build_norm_config
+
+
+def _fused_qkv_init(wq_init, wk_init, wv_init, *, n_heads, n_kv_heads, head_dim):
+    """Init a fused wqkv as the three split projections would be.
+
+    Rows are interleaved per KV group, and `scaled_orthogonal` scales by the
+    shape it is given, so each projection is drawn at its own split shape.
+    """
+    heads_per_kv = n_heads // n_kv_heads
+
+    def _init(weight):
+        in_features = weight.shape[-1]
+        view = weight.view(n_kv_heads, heads_per_kv + 2, head_dim, in_features)
+        for init_fn, rows, slot in (
+            (wq_init, n_heads, slice(0, heads_per_kv)),
+            (wk_init, n_kv_heads, slice(heads_per_kv, heads_per_kv + 1)),
+            (wv_init, n_kv_heads, slice(heads_per_kv + 1, heads_per_kv + 2)),
+        ):
+            buffer = torch.empty(
+                rows * head_dim, in_features, dtype=weight.dtype, device=weight.device
+            )
+            init_fn(buffer)
+            view[:, slot] = buffer.view(n_kv_heads, -1, head_dim, in_features)
+
+    return _init
 
 
 class GatedNormSWAttention(GQAttention):
@@ -61,6 +87,8 @@ class GatedNormSWAttention(GQAttention):
         norm_everywhere: bool = False
         gated_attention_type: str | None = None  # "none", "head-wise", "element-wise"
         gate_only: bool = False
+        fuse_qkv: bool = False
+        """One fused wqkv projection instead of split wq/wkv."""
         norm_eps: float = 1e-30
         norm_type: str = "np_rmsnorm"
         mid_norm_position: str = "after"  # "after" or "before"
@@ -142,33 +170,55 @@ class GatedNormSWAttention(GQAttention):
             wkv_init = {
                 "weight": make_param_init(self.wk_init_fn_type, self.wk_init_std)
             }
-            if (self.wk_init_fn_type, self.wk_init_std) != (
-                self.wv_init_fn_type,
-                self.wv_init_std,
-            ):
-                # SplitQKVLinear builds wk and wv from one shared config, so it cannot
-                # express different initializers for them. Fail loudly rather
-                # than silently applying wk's to both.
-                raise ValueError(
-                    "wk and wv initializers must match "
-                    f"(got wk={self.wk_init_fn_type}/{self.wk_init_std}, "
-                    f"wv={self.wv_init_fn_type}/{self.wv_init_std}): upstream's "
-                    "SplitQKVLinear shares one config between them."
+            if self.fuse_qkv:
+                wv_init = {
+                    "weight": make_param_init(self.wv_init_fn_type, self.wv_init_std)
+                }
+                qkv = QKVLinear.Config(
+                    head_dim=head_dim,
+                    n_heads=self.n_heads,
+                    n_kv_heads=n_kv,
+                    wqkv=Linear.Config(
+                        in_features=self.dim,
+                        out_features=(self.n_heads + 2 * n_kv) * head_dim,
+                        param_init={
+                            "weight": _fused_qkv_init(
+                                wq_init["weight"],
+                                wkv_init["weight"],
+                                wv_init["weight"],
+                                n_heads=self.n_heads,
+                                n_kv_heads=n_kv,
+                                head_dim=head_dim,
+                            )
+                        },
+                    ),
                 )
-
-            qkv = SplitQKVLinear.Config(
-                head_dim=head_dim,
-                wq=Linear.Config(
-                    in_features=self.dim,
-                    out_features=self.n_heads * head_dim,
-                    param_init=wq_init,
-                ),
-                wkv=Linear.Config(
-                    in_features=self.dim,
-                    out_features=n_kv * head_dim,
-                    param_init=wkv_init,
-                ),
-            )
+            else:
+                if (self.wk_init_fn_type, self.wk_init_std) != (
+                    self.wv_init_fn_type,
+                    self.wv_init_std,
+                ):
+                    # SplitQKVLinear shares one config for wk and wv; fuse_qkv
+                    # does not, hence split-path only.
+                    raise ValueError(
+                        "wk and wv initializers must match "
+                        f"(got wk={self.wk_init_fn_type}/{self.wk_init_std}, "
+                        f"wv={self.wv_init_fn_type}/{self.wv_init_std}): "
+                        "SplitQKVLinear shares one config between them."
+                    )
+                qkv = SplitQKVLinear.Config(
+                    head_dim=head_dim,
+                    wq=Linear.Config(
+                        in_features=self.dim,
+                        out_features=self.n_heads * head_dim,
+                        param_init=wq_init,
+                    ),
+                    wkv=Linear.Config(
+                        in_features=self.dim,
+                        out_features=n_kv * head_dim,
+                        param_init=wkv_init,
+                    ),
+                )
 
             qk_norm = None
             if self.qk_norm or self.norm_everywhere:
@@ -180,10 +230,11 @@ class GatedNormSWAttention(GQAttention):
                 )
 
             if self.linear_sharding_config is not None:
-                # SplitQKVLinear.Config has exactly wq and wkv; the old loop
-                # also tried wqkv/wk/wv, which never existed.
-                qkv.wq.sharding_config = self.linear_sharding_config
-                qkv.wkv.sharding_config = self.linear_sharding_config
+                if self.fuse_qkv:
+                    qkv.wqkv.sharding_config = self.linear_sharding_config
+                else:
+                    qkv.wq.sharding_config = self.linear_sharding_config
+                    qkv.wkv.sharding_config = self.linear_sharding_config
 
             return GQAttention.Config(
                 n_heads=self.n_heads,

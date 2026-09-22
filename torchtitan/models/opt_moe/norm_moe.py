@@ -366,10 +366,20 @@ class NormGroupedExperts(Module):
     """Grouped experts with a mid-norm and a configurable activation.
 
     Upstream's ``forward`` is mirrored -- including the DTensor-to-local
-    conversion, which the previous fork was missing and which expert parallelism
-    needs, since EP feeds dynamic shapes that cannot be expressed as DTensors.
-    The only changes are the activation and the norm applied between the gated
-    activation and the down projection.
+    conversion, which expert parallelism needs, since EP feeds dynamic shapes
+    that cannot be expressed as DTensors. The only changes are the activation
+    and the norm applied between the gated activation and the down projection.
+
+    NOT a subclass of ``common.moe.GroupedExperts``, deliberately. Subclassing
+    would remove real duplication (``_grouped_mm`` is identical bar its
+    docstring, and ``silu(gate) * up`` is bitwise equal to upstream's
+    ``SwiGLU``), but ``Config.traverse`` matches by ``isinstance``, so deriving
+    the Config would silently enrol these experts in the three quantization
+    transforms that traverse ``GroupedExperts.Config``. Those swap in a
+    quantized class chosen from ``type(config)._owner``, which knows nothing
+    about ``mid_norm``. opt_moe never enables quantization today, so it would be
+    a latent trap rather than a visible break -- which is the worse kind.
+    Revisit if the Config hierarchy stops driving transform matching.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -995,6 +1005,7 @@ def make_norm_moe_config(
         activate_experts=top_k,
         scaling_factor=scaling_factor,
     )
+
     return NormMoE.Config(
         num_experts=num_experts,
         load_balance_coeff=load_balance_coeff,

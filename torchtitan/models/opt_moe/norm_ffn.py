@@ -30,14 +30,19 @@ from .utils.norms import build_norm_config
 #     computing `w2(mid_norm(silu_and_mul(w13(x))))`; it still gets both wins
 #     (w1+w3 in one GEMM, fused silu_and_mul kernel). The other 45 flavors can
 #     use the stock class directly.
-#  3. DiSCO's parameter classifier. Upstream's stacked w13 is `[2, F, D]`, and
-#     `optimizers/disco.py::get_param_type` uses `ndim == 3` as its proxy for
-#     "routed expert" -- so a stacked w13 is MISFILED as an expert and handed to
-#     `step_experts`, which orthogonalizes the local buffer with NO gather. The
-#     `Shard(!=0)` guard does not catch it: it inspects only `expert_params[0]`,
-#     and the sort puts a real expert first. Tighten that classifier (check the
-#     parameter name, or `num_linears`) BEFORE fusing. Latent today only because
-#     this class keeps `num_linears=1`.
+#  3. DiSCO's parameter classifier -- the hard blocker. Upstream's stacked w13
+#     is `[2, F, D]`, and `get_param_type` uses `ndim == 3` as its proxy for
+#     "routed expert". Measured: a (2, 16, 8) w13 classifies as
+#     ParamType.Expert, so it would be handed to `step_experts` and
+#     orthogonalized per-rank with NO gather. Silently wrong, not a crash: the
+#     `Shard(!=0)` guard inspects only `expert_params[0]`, which the sort makes
+#     a real expert. Tighten the classifier (parameter name, or `num_linears`)
+#     BEFORE fusing. Latent today only because this class keeps
+#     `num_linears=1`.
+#
+#     NOTE the MoE side is NOT blocked by this and already has its branch (see
+#     norm_moe.py::_plain_grouped_experts_config): GroupedExperts keeps three
+#     separate `[E, F, D]` tensors, so classification is unchanged.
 # Checkpoints are NOT safe any more: #4808 DELETED FusedSwiGLU's
 # _split_w13_on_save / _merge_w13_on_load and moved the split to the HF adapter
 # boundary, so `named_parameters()` now equals `state_dict()` (measured on
@@ -59,6 +64,11 @@ class FeedForward(Module):
         norm_type: str = "np_rmsnorm"
         norm_eps: float = 1e-30
         activation_type: str = "silu"
+        fuse_w13: bool = False
+        """Gate and up in one `[2, F, D]` weight, so they run as one GEMM.
+
+        AdamW only for now: `get_param_type` reads a rank-3 tensor as a routed
+        expert. See the TODO at the top of this file."""
 
         w1_init_fn_type: str = "scaled_orthogonal"
         w2_init_fn_type: str = "scaled_orthogonal"
@@ -96,30 +106,43 @@ class FeedForward(Module):
         # Configurable Linear rather than nn.Linear: every submodule has to
         # satisfy the Module protocol, and param_init then lives on the config.
         w3_residual_div = config.residual_div if config.init_gate_as_residual else 1.0
-        self.w1 = Linear.Config(
-            in_features=dim,
-            out_features=config.hidden_dim,
-            param_init={
-                "weight": make_param_init(config.w1_init_fn_type, config.w1_init_std)
-            },
-            sharding_config=config.linear_sharding_config,
-        ).build()
+        self.fuse_w13 = config.fuse_w13
+        w1_init = make_param_init(config.w1_init_fn_type, config.w1_init_std)
+        w3_init = make_param_init(
+            config.w3_init_fn_type, config.w3_init_std, w3_residual_div
+        )
+        if config.fuse_w13:
+            # Slot 0 gate, slot 1 up.
+            def _init_w13(w):
+                w1_init(w[0])
+                w3_init(w[1])
+
+            self.w13 = Linear.Config(
+                in_features=dim,
+                out_features=config.hidden_dim,
+                num_linears=2,
+                param_init={"weight": _init_w13},
+                sharding_config=config.linear_sharding_config,
+            ).build()
+        else:
+            self.w1 = Linear.Config(
+                in_features=dim,
+                out_features=config.hidden_dim,
+                param_init={"weight": w1_init},
+                sharding_config=config.linear_sharding_config,
+            ).build()
+            self.w3 = Linear.Config(
+                in_features=dim,
+                out_features=config.hidden_dim,
+                param_init={"weight": w3_init},
+                sharding_config=config.linear_sharding_config,
+            ).build()
         self.w2 = Linear.Config(
             in_features=config.hidden_dim,
             out_features=dim,
             param_init={
                 "weight": make_param_init(
                     config.w2_init_fn_type, config.w2_init_std, config.residual_div
-                )
-            },
-            sharding_config=config.linear_sharding_config,
-        ).build()
-        self.w3 = Linear.Config(
-            in_features=dim,
-            out_features=config.hidden_dim,
-            param_init={
-                "weight": make_param_init(
-                    config.w3_init_fn_type, config.w3_init_std, w3_residual_div
                 )
             },
             sharding_config=config.linear_sharding_config,
@@ -137,4 +160,8 @@ class FeedForward(Module):
             self.mid_norm = Identity.Config().build()
 
     def forward(self, x):
-        return self.w2(self.mid_norm(self.act_fn(self.w1(x)) * self.w3(x)))
+        if self.fuse_w13:
+            gate, up = self.w13(x).unbind(-2)
+        else:
+            gate, up = self.w1(x), self.w3(x)
+        return self.w2(self.mid_norm(self.act_fn(gate) * up))

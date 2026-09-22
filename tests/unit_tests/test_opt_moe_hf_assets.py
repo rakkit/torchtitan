@@ -7,8 +7,9 @@
 import unittest
 
 import torch
+from torch.nn.attention.flex_attention import create_block_mask
 
-from torchtitan.models.common.rope import RoPE
+from torchtitan.models.common.rope import CosSinRoPE
 from torchtitan.models.opt_moe.gated_norm_swattention import GatedNormSWAttention
 from torchtitan.models.opt_moe.hf_assests.configuration_opt_moe import OptMoEConfig
 from torchtitan.models.opt_moe.hf_assests.modeling_opt_moe import OptMoEAttention
@@ -28,10 +29,11 @@ def _build_native_model_config(
     mid_norm: bool = False,
     norm_everywhere: bool = True,
     qk_rope_dim: int | None = None,
+    head_dim: int = 4,
 ) -> OPTMoEModel.Config:
-    head_dim = 4
+    dim = 2 * head_dim
     return OPTMoEModel.Config(
-        dim=8,
+        dim=dim,
         n_layers=1,
         vocab_size=32,
         norm_eps=1e-30,
@@ -39,6 +41,7 @@ def _build_native_model_config(
             n_dense_layers=1,
             norm_eps=1e-30,
             attention=GatedNormSWAttention.Config(
+                dim=dim,
                 n_heads=2,
                 n_kv_heads=2,
                 head_dim=head_dim,
@@ -51,20 +54,34 @@ def _build_native_model_config(
                 head_wise_mid_norm=head_wise_mid_norm,
                 use_rope=False,
                 qk_rope_dim=qk_rope_dim,
-                attn_backend="sdpa",
+                attn_backend="flex",
             ),
             feed_forward=FeedForward.Config(
                 hidden_dim=16,
                 norm_everywhere=False,
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=qk_rope_dim or head_dim,
-            max_seq_len=8,
+            max_context_length=8,
             theta=10000.0,
-            backend="cos_sin",
         ),
     )
+
+
+def _build_expanded(model_config):
+    """Build a model the way the trainer does: expand the config first."""
+    from types import SimpleNamespace
+
+    from torchtitan.config import ParallelismConfig, TrainingConfig
+
+    model_config.update_from_config(
+        config=SimpleNamespace(
+            parallelism=ParallelismConfig(),
+            training=TrainingConfig(max_context_length=8),
+        )
+    )
+    return model_config.build()
 
 
 def _build_hf_attention(
@@ -76,12 +93,13 @@ def _build_hf_attention(
     mid_norm: bool = False,
     norm_everywhere: bool = True,
     qk_rope_dim: int | None = None,
+    head_dim: int = 4,
 ) -> OptMoEAttention:
     config = OptMoEConfig(
-        hidden_size=8,
+        hidden_size=2 * head_dim,
         num_attention_heads=2,
         num_key_value_heads=2,
-        head_dim=4,
+        head_dim=head_dim,
         max_position_embeddings=8,
         qk_norm=qk_norm,
         mid_norm=mid_norm,
@@ -142,17 +160,15 @@ def _build_native_moe_model_config() -> OPTMoEModel.Config:
                 activation_type="silu",
             ),
         ),
-        rope=RoPE.Config(
+        rope=CosSinRoPE.Config(
             dim=2,
-            max_seq_len=32,
+            max_context_length=32,
             theta=10000.0,
-            backend="cos_sin",
         ),
-        rope_of_swa=RoPE.Config(
+        rope_of_swa=CosSinRoPE.Config(
             dim=2,
-            max_seq_len=32,
+            max_context_length=32,
             theta=5000.0,
-            backend="cos_sin",
         ),
     )
 
@@ -169,9 +185,10 @@ def _copy_attention_weights(
     hf_attention: OptMoEAttention,
 ) -> None:
     with torch.no_grad():
-        hf_attention.q_proj.weight.copy_(native_attention.wq.weight)
-        hf_attention.k_proj.weight.copy_(native_attention.wk.weight)
-        hf_attention.v_proj.weight.copy_(native_attention.wv.weight)
+        qkv = native_attention.qkv_linear
+        hf_attention.q_proj.weight.copy_(qkv.wq.weight)
+        hf_attention.k_proj.weight.copy_(qkv.wk.weight)
+        hf_attention.v_proj.weight.copy_(qkv.wv.weight)
         hf_attention.o_proj.weight.copy_(native_attention.wo.weight)
         hf_attention.gate_proj.weight.copy_(native_attention.gate_proj.weight)
 
@@ -183,7 +200,7 @@ class TestOptMoEHFAssets(unittest.TestCase):
             mid_norm_position="before",
             qk_rope_dim=2,
         )
-        model = model_config.build()
+        model = _build_expanded(model_config)
 
         exported = overwrite_config(model)
 
@@ -192,6 +209,12 @@ class TestOptMoEHFAssets(unittest.TestCase):
         self.assertEqual(exported["qk_rope_dim"], 2)
         self.assertEqual(exported["partial_rotary_factor"], 0.5)
 
+    @unittest.skipUnless(
+        torch.cuda.is_available(),
+        "flex attention needs torch.compile, unsupported on this CPU platform; "
+        "sdpa is no longer accepted for language models, so there is no CPU "
+        "path for this comparison",
+    )
     def test_hf_attention_matches_native_for_new_attention_modes(self):
         for (
             gate_only,
@@ -219,14 +242,16 @@ class TestOptMoEHFAssets(unittest.TestCase):
             ):
                 torch.manual_seed(0)
                 native_attention = _build_native_model_config(
+                    head_dim=16,
                     gate_only=gate_only,
                     mid_norm_position=mid_norm_position,
                     head_wise_mid_norm=head_wise_mid_norm,
                     qk_norm=qk_norm,
                     mid_norm=mid_norm,
                     norm_everywhere=norm_everywhere,
-                ).layer.attention.build(dim=8)
+                ).layer.attention.build()
                 hf_attention = _build_hf_attention(
+                    head_dim=16,
                     gate_only=gate_only,
                     mid_norm_position=mid_norm_position,
                     head_wise_mid_norm=head_wise_mid_norm,
@@ -240,21 +265,44 @@ class TestOptMoEHFAssets(unittest.TestCase):
                     self.assertIsInstance(hf_attention.v_norm, torch.nn.Identity)
 
                 _copy_attention_weights(native_attention, hf_attention)
+                native_attention.to("cuda")
+                hf_attention.to("cuda")
 
-                hidden_states = torch.randn(2, 1, 8, dtype=torch.float32)
-
-                native_output = native_attention(
-                    hidden_states,
-                    rope_cache=torch.empty(0),
-                    attention_masks=None,
+                device = "cuda"
+                num_tokens = 4
+                hidden_states = torch.randn(
+                    num_tokens, 32, dtype=torch.float32, device=device
                 )
-                hf_output, _ = hf_attention(
-                    hidden_states=hidden_states,
-                    position_embeddings=None,
-                    attention_mask=None,
+                block_mask = create_block_mask(
+                    # All-True: HF is called with attention_mask=None, so the
+                    # two must see the same (unmasked) attention.
+                    lambda b, h, q_idx, kv_idx: q_idx >= 0,
+                    B=1,
+                    H=None,
+                    Q_LEN=num_tokens,
+                    KV_LEN=num_tokens,
+                    device=device,
                 )
 
-                torch.testing.assert_close(native_output, hf_output)
+                # FlexAttention has no CPU backward; this test only compares
+                # forward values.
+                with torch.no_grad():
+                    native_output = native_attention(
+                        hidden_states,
+                        attention_masks=block_mask,
+                        positions=torch.arange(num_tokens),
+                    )
+                    # Native is token-flat [T, D] since 0.5.0; HF is still
+                    # batched [B, T, D].
+                    hf_output, _ = hf_attention(
+                        hidden_states=hidden_states.unsqueeze(0),
+                        position_embeddings=None,
+                        attention_mask=None,
+                    )
+
+                torch.testing.assert_close(
+                    native_output, hf_output.squeeze(0), rtol=1e-4, atol=1e-4
+                )
 
     def test_state_dict_adapter_rejects_unsupported_norm_tensors(self):
         adapter = OPTMoEStateDictAdapter(_build_native_model_config(), None)

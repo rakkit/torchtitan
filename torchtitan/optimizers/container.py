@@ -498,13 +498,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
             config=self.spectrum_logging_config,
         )
 
-    def get_lrs(self):
-        lrs = {}
-        for i, optimizer in enumerate(self.optimizers):
-            for k, group in enumerate(optimizer.param_groups):
-                lrs[f"lr/opt_{i}/group_{k}"] = group["lr"]
-        return lrs
-
     def set_up_async_logging(self, log_fn: Callable):
         self.log_queue = queue.Queue()
         # daemon=True is the safety net for the teardown hang: the worker sits
@@ -574,7 +567,13 @@ def moe_metrics_worker(log_queue: queue.Queue):
             log_queue.task_done()
             break
 
-        moe_layers_info: list[dict] = []
+        # Seeded BEFORE the try: if the tuple unpack below raises (a producer/
+        # worker arity skew), an empty list would make the except-handler's
+        # clearing loop a no-op and the previous step's metrics would be
+        # republished as current.
+        moe_layers_info: list[dict] = (
+            data[0] if isinstance(data, tuple) and data else []
+        )
         # Any exception here used to kill the worker silently -- and then
         # `join_log_queue()`, which the trainer calls every logging step,
         # would block the MAIN thread forever on a queue nobody drains.
@@ -588,7 +587,10 @@ def moe_metrics_worker(log_queue: queue.Queue):
                 all_load_balance_losses_cpu,
                 all_maxvio_batch_cpu,
                 all_maxvio_ema_cpu,
+                all_bias_mean_cpu,
+                all_bias_std_cpu,
                 num_experts,
+                has_aux_loss,
             ) = data
 
             usage_offset = bias_offset = 0
@@ -598,24 +600,17 @@ def moe_metrics_worker(log_queue: queue.Queue):
 
                 layer_usages = all_usages_cpu[usage_offset : usage_offset + num_experts]
                 layer_biases = all_biases_cpu[bias_offset : bias_offset + num_experts]
-                usage_tensor = torch.tensor(layer_usages, dtype=torch.float32)
-                bias_tensor = torch.tensor(layer_biases, dtype=torch.float32)
                 metrics = {
                     f"moe_entropy/L-{layer_id}": all_entropies_cpu[i],
                     f"moe_maxvio_batch/L-{layer_id}": all_maxvio_batch_cpu[i],
                     f"moe_maxvio_ema/L-{layer_id}": all_maxvio_ema_cpu[i],
-                    f"moe_load_balance_loss/L-{layer_id}": all_load_balance_losses_cpu[
-                        i
-                    ],
-                    f"moe_ep_usage_mean/L-{layer_id}": usage_tensor.mean().item(),
-                    f"moe_ep_usage_std/L-{layer_id}": usage_tensor.std(
-                        unbiased=False
-                    ).item(),
-                    f"moe_bias_mean/L-{layer_id}": bias_tensor.mean().item(),
-                    f"moe_bias_std/L-{layer_id}": bias_tensor.std(
-                        unbiased=False
-                    ).item(),
+                    f"moe_bias_mean/L-{layer_id}": all_bias_mean_cpu[i],
+                    f"moe_bias_std/L-{layer_id}": all_bias_std_cpu[i],
                 }
+                if has_aux_loss:
+                    metrics[f"moe_load_balance_loss/L-{layer_id}"] = (
+                        all_load_balance_losses_cpu[i]
+                    )
                 pre_usage = f"moe_ep_usage/L-{layer_id}_EP-"
                 pre_bias = f"moe_bias/L-{layer_id}_EP-"
                 metrics.update(
@@ -725,10 +720,54 @@ def fused_hier_reduce_loss_stats(
     # Tokens: SUM (no division)
     all_tokens.copy_(out_tokens.to(all_tokens.dtype))
 
-    # Stats: AVG (Divide SUM by world_size)
-    # We do the division *after* unpacking to keep the buffer operations clean
+    # Entropy: AVG (divide SUM by world size) -- a per-forward mean per rank.
     all_entropies.copy_((out_ent / ws_loss).to(all_entropies.dtype))
-    all_load_balance_losses.copy_((out_lb / ws_loss).to(all_load_balance_losses.dtype))
+    # Load-balance loss: SUM, matching upstream's `collect_aux_loss_metrics`,
+    # which all-reduces `group_acc` with SUM and divides only by the layer
+    # count. Each rank holds its own token share, so the sum IS the global
+    # value; the old `/ws_loss` made it 1/world_size of the truth.
+    all_load_balance_losses.copy_(out_lb.to(all_load_balance_losses.dtype))
+
+
+@torch.no_grad()
+def _quantile_update_expert_bias(
+    balancers: list,
+    bias_params: list[torch.Tensor],
+    parallel_dims: ParallelDims,
+    loss_mesh,
+) -> None:
+    """Solve each layer's expert bias from its required-bias histogram.
+
+    Replaces the DeepSeek-V3 sign nudge: instead of stepping the bias by
+    +/-coeff on the sign of the load error, this reads off the bias quantile
+    that would have given each expert exactly ``top_k / num_experts`` of the
+    tokens. There is no learning rate, so it converges in one step rather than
+    over many.
+    """
+    reduction_groups = []
+    # With EP the router is token-sharded on the dense TP axis even when
+    # model-wide sequence parallelism is off.
+    if parallel_dims.ep_enabled and parallel_dims.tp > 1:
+        reduction_groups.append(parallel_dims.get_dense_tp_mesh().get_group())
+    if loss_mesh is not None:
+        reduction_groups.append(loss_mesh.get_group())
+
+    histograms = [b.required_bias_histogram_EB for b in balancers]
+    if reduction_groups:
+        stacked_LEB = torch.stack(histograms)
+        for group in reduction_groups:
+            torch.distributed.all_reduce(
+                stacked_LEB, group=group, op=torch.distributed.ReduceOp.SUM
+            )
+        histograms = list(stacked_LEB.unbind())
+
+    for histogram_EB, balancer, expert_bias_E in zip(
+        histograms, balancers, bias_params, strict=True
+    ):
+        expert_bias_E.copy_(
+            balancer.estimate_expert_bias(histogram_EB, expert_bias_E)
+        )
+        balancer.required_bias_histogram_EB.zero_()
 
 
 def register_moe_load_balancing_hook(
@@ -879,7 +918,10 @@ def register_moe_load_balancing_hook(
         sf = torch.cat(acc_fwd_times_buffers).to(all_tokens.dtype).clamp_min(1.0)
         all_tokens = all_tokens / sf.unsqueeze(1)
         all_entropies = all_entropies / sf
-        all_load_balance_losses = all_load_balance_losses / sf
+        # NOT all_load_balance_losses: AuxLoss.instance_acc already carries
+        # `raw_sum / global_valid_tokens`, and that denominator spans the whole
+        # step and every rank. Dividing again by acc_fwd_times made the metric
+        # scale as 1/gas.
 
         if loss_mesh is not None:
             fused_hier_reduce_loss_stats(
@@ -927,16 +969,32 @@ def register_moe_load_balancing_hook(
                         f"has {norm_factor!r}."
                     )
 
-            updates_2d = lmo_for_moe_bias(delta_2d, norm_factor=norm_factor)
-
-            if norm_factor.endswith("zero_mean"):
-                updates_2d = updates_2d - updates_2d.mean(dim=1, keepdim=True)
-
-            # Collect all bias parameters and update them with a single multi-tensor op
             bias_params = [info["module"].expert_bias_E for info in moe_layers_info]
-            torch._foreach_add_(
-                bias_params, list(updates_2d.unbind(0)), alpha=load_balance_coeff
-            )
+            balancers = [
+                getattr(info["module"].router, "quantile_balancer", None)
+                for info in moe_layers_info
+            ]
+            if any(b is not None for b in balancers):
+                if not all(b is not None for b in balancers):
+                    raise ValueError(
+                        "quantile_balance_bins must be set on every MoE layer "
+                        "or none: the bias update is applied layer-wise from a "
+                        "single stacked histogram."
+                    )
+                _quantile_update_expert_bias(
+                    balancers, bias_params, parallel_dims, loss_mesh
+                )
+            else:
+                updates_2d = lmo_for_moe_bias(delta_2d, norm_factor=norm_factor)
+
+                if norm_factor.endswith("zero_mean"):
+                    updates_2d = updates_2d - updates_2d.mean(dim=1, keepdim=True)
+
+                # Collect all bias parameters and update them with a single
+                # multi-tensor op
+                torch._foreach_add_(
+                    bias_params, list(updates_2d.unbind(0)), alpha=load_balance_coeff
+                )
 
             # Reset router stats in bulk. NOT load_balance_loss_buffers: those
             # are now AuxLoss.instance_acc, whose lifecycle upstream's
@@ -953,14 +1011,20 @@ def register_moe_load_balancing_hook(
                 # One packed D2H copy. Six separate `.cpu()` calls meant six
                 # device syncs per logging step for a few KB of scalars.
                 dt = usage_2d.dtype
+                # Summaries are reduced HERE, on device, so they ride the same
+                # single D2H copy. Doing them in the worker meant rebuilding two
+                # CPU tensors per layer per step for three scalars.
+                bias_2d = torch.stack(bias_params).to(dt)  # [L, E]
                 packed = torch.cat(
                     [
                         usage_2d.reshape(-1),
-                        torch.stack(bias_params).reshape(-1).to(dt),
+                        bias_2d.reshape(-1),
                         all_entropies.to(dt),
                         all_load_balance_losses.to(dt),
                         maxvio_batch.to(dt),
                         maxvio_ema.to(dt),
+                        bias_2d.mean(dim=1),
+                        bias_2d.std(dim=1, unbiased=False),
                     ]
                 ).cpu()
                 n_le = num_layers * num_experts
@@ -974,6 +1038,10 @@ def register_moe_load_balancing_hook(
                 all_maxvio_batch_cpu = packed[off : off + num_layers].tolist()
                 off += num_layers
                 all_maxvio_ema_cpu = packed[off : off + num_layers].tolist()
+                off += num_layers
+                all_bias_mean_cpu = packed[off : off + num_layers].tolist()
+                off += num_layers
+                all_bias_std_cpu = packed[off : off + num_layers].tolist()
                 payload = (
                     moe_layers_info,
                     all_usages_cpu,
@@ -982,7 +1050,13 @@ def register_moe_load_balancing_hook(
                     all_load_balance_losses_cpu,
                     all_maxvio_batch_cpu,
                     all_maxvio_ema_cpu,
+                    all_bias_mean_cpu,
+                    all_bias_std_cpu,
                     num_experts,
+                    any(
+                        getattr(x["module"], "aux_loss", None) is not None
+                        for x in moe_layers_info
+                    ),
                 )
                 log_queue.put(payload)
 

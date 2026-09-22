@@ -55,7 +55,7 @@ from torchtitan.distributed.spmd_types import spmd_mesh_size
 from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.config_utils import make_token_dispatcher_config
 from torchtitan.models.common.linear import RouterGateLinear
-from torchtitan.models.common.moe import RoutedExperts
+from torchtitan.models.common.moe import QuantileBalancer, RoutedExperts
 from torchtitan.models.common.nn_modules import Identity
 from torchtitan.protocols.module import Module
 
@@ -518,7 +518,7 @@ class NormRouter(Module):
 
     Upstream's ``TokenChoiceTopKRouter`` returns only
     ``(topk_scores_TK, topk_expert_ids_TK, scores_TE)``. The metrics this fork
-    logs per layer -- routing entropy, masked per-expert token counts, and the
+    logs per layer -- gate entropy, masked per-expert token counts, and the
     *unbiased* top-k used by the complementary balance loss -- cannot be
     recovered from that return without recomputing work the router already did,
     so the class is copied here and extended rather than wrapped.
@@ -528,12 +528,15 @@ class NormRouter(Module):
     * ``forward`` also returns ``experts_entropy`` and ``unbiased_expert_ids_TK``.
       (``counted_per_expert_E`` is NOT on ``RouterOutput``; it is computed in
       ``NormMoE.forward``, which is where the loss mask is available.)
-    * Entropy is measured on the renormalised weights, before ``route_scale`` is
-      applied -- scaled weights are not a distribution and their entropy is
-      meaningless.
-    * ``loss_mask`` marks padding tokens. It affects the *counted* statistics
-      only; dispatch counts must include every routed token because they size
-      the grouped GEMM.
+    * Entropy is measured on the renormalised TOP-K weights, before
+      ``route_scale`` is applied -- scaled weights are not a distribution. Note
+      what this is: the peakedness of the k gate weights, bounded by
+      ``ln(top_k)``. It is NOT the routing distribution over all experts, and
+      says nothing about load balance -- use maxvio for that.
+    * ``loss_mask`` marks VALID tokens (it is ``labels != IGNORE_INDEX``), so a
+      consumer wanting a padding mask must invert it. It affects the *counted*
+      statistics only; dispatch counts must include every routed token because
+      they size the grouped GEMM.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -551,6 +554,9 @@ class NormRouter(Module):
         calibrated against a distribution that never occurs."""
         route_scale: float = 1.0
         track_metrics: bool = True
+        quantile_balance_bins: int | None = None
+        """Histogram bins for quantile-balanced bias updates. None keeps the
+        DeepSeek-V3 sign nudge. Requires sigmoid scores and an expert bias."""
         _debug_force_load_balance: bool = False
 
     def __init__(self, config: Config):
@@ -565,6 +571,31 @@ class NormRouter(Module):
         self.route_scale = config.route_scale
         self.track_metrics = config.track_metrics
         self._debug_force_load_balance = config._debug_force_load_balance
+
+        self.quantile_balancer = None
+        if config.quantile_balance_bins is not None:
+            if config.score_func != "sigmoid":
+                raise ValueError(
+                    "quantile_balance_bins requires score_func='sigmoid'; the "
+                    f"required-bias histogram assumes scores in [0, 1], got "
+                    f"{config.score_func!r}."
+                )
+            if config._debug_force_load_balance:
+                raise ValueError(
+                    "quantile_balance_bins cannot be combined with "
+                    "_debug_force_load_balance."
+                )
+            if config.num_expert_groups is not None:
+                raise ValueError(
+                    "quantile_balance_bins does not support node-limited "
+                    "routing: the top-(k+1) cutoff is taken over all experts, "
+                    "so a group-masked -inf would poison the histogram."
+                )
+            self.quantile_balancer = QuantileBalancer.Config(
+                num_experts=config.num_experts,
+                top_k=config.top_k,
+                num_bins=config.quantile_balance_bins,
+            ).build()
 
     def _debug_force_load_balance_routing(
         self, scores_TE: torch.Tensor
@@ -643,7 +674,27 @@ class NormRouter(Module):
         scores_for_choice_TE = (
             scores_TE if expert_bias_E is None else scores_TE + expert_bias_E
         )
-        topk_expert_ids_TK = self._select_experts(scores_for_choice_TE)
+        if self.quantile_balancer is not None and self.training:
+            if expert_bias_E is None:
+                raise ValueError(
+                    "quantile_balance_bins requires an expert bias; set "
+                    "load_balance_coeff so NormMoE allocates expert_bias_E."
+                )
+            # Top-(k+1): the (k+1)-th biased score is the cutoff each token had
+            # to clear, so `cutoff - score` is the bias expert e needed to win.
+            cutoff_scores_TK1, ids_TK1 = torch.topk(
+                scores_for_choice_TE, k=self.top_k + 1, dim=-1, sorted=True
+            )
+            # opt_moe's loss_mask marks VALID tokens; observe() wants padding.
+            self.quantile_balancer.observe(
+                scores_TE,
+                cutoff_scores_TK1[:, self.top_k :],
+                expert_bias_E,
+                None if loss_mask is None else ~loss_mask.reshape(-1),
+            )
+            topk_expert_ids_TK = ids_TK1[:, : self.top_k].contiguous()
+        else:
+            topk_expert_ids_TK = self._select_experts(scores_for_choice_TE)
         topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)
 
         if self._debug_force_load_balance:
@@ -721,6 +772,12 @@ class LoadBalanceLoss(AuxLoss):
         """Which balance formula to use. Upstream declares one AuxLoss subclass
         per loss; we keep both DeepSeek variants behind one class."""
 
+        reduce_mesh: str = "loss"
+        """dp+cp, not AuxLoss's "dp" default. NormMoE weights this loss by its
+        own CP-sharded `loss_mask.sum()`, so the rank-local values are
+        per-token-additive across cp; reducing over dp alone under-reports by
+        the cp degree."""
+
     def __init__(self, config: Config):
         super().__init__(config)
         self.loss_type = config.loss_type
@@ -750,9 +807,12 @@ class NormMoE(Module):
         upstream's ``aux_loss: AuxLoss.Config | None``; ``coeff`` is the only
         coefficient."""
         bias_update_norm_factor: str = "sign"
-        track_router_metrics: bool = True
-        """Accumulate router entropy and max-violation. Costs a log() over the
-        (T, K) scores each step, so it can be turned off."""
+        # NOTE: no `track_router_metrics` here. It would never be read --
+        # `make_norm_moe_config` passes the same value to
+        # `NormRouter.Config.track_metrics`, which is the flag that actually
+        # gates the work. Declaring it here too made
+        # `NormMoE.Config(track_router_metrics=False)` a silent no-op, the same
+        # trap this file removed for `force_router_on_fp32`.
 
     def __init__(self, config: Config):
         super().__init__()
@@ -785,7 +845,8 @@ class NormMoE(Module):
         # nothing has to be returned up through the blocks or across PP stages.
         self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
         self.bias_update_norm_factor = config.bias_update_norm_factor
-        self.track_router_metrics = config.track_router_metrics
+        # track_router_metrics is not stored: it is plumbed to the router as
+        # `track_metrics`, which is what gates the work.
 
         num_experts = config.num_experts
         self.register_buffer(
@@ -982,6 +1043,7 @@ def make_norm_moe_config(
     bias_update_norm_factor: str = "sign",
     moe_comm_backend: str = "standard",
     track_router_metrics: bool = True,
+    quantile_balance_bins: int | None = None,
     w1_init_fn_type: str = "scaled_orthogonal",
     w2_init_fn_type: str = "scaled_orthogonal",
     w3_init_fn_type: str = "scaled_orthogonal",
@@ -1011,7 +1073,6 @@ def make_norm_moe_config(
         load_balance_coeff=load_balance_coeff,
         aux_loss=aux_loss,
         bias_update_norm_factor=bias_update_norm_factor,
-        track_router_metrics=track_router_metrics,
         router=NormRouter.Config(
             num_experts=num_experts,
             # RouterGateLinear keeps the gate in FP32 through the backward pass
@@ -1025,6 +1086,7 @@ def make_norm_moe_config(
             ),
             top_k=top_k,
             score_func=score_func,
+            quantile_balance_bins=quantile_balance_bins,
             # `calc_gate_scaling_factor` derives `route_scale` from top-k weights
             # that have already been normalised to sum to 1 (`p = p / p.sum()`),
             # so `route_norm` MUST stay on: with it off, `route_scale` is
@@ -1125,6 +1187,9 @@ class MoE:
         aux_loss: LoadBalanceLoss.Config | None = None
         bias_update_norm_factor: str = "sign"
         track_router_metrics: bool = True
+        quantile_balance_bins: int | None = None
+        """Histogram bins for quantile-balanced expert bias. None keeps the
+        DeepSeek-V3 sign nudge."""
         moe_comm_backend: str = "standard"
         """EP communication backend: "standard" (all-to-all, falls back to local
         dispatch at EP=1), "deepep" or "hybridep". Upstream selects this per
@@ -1182,6 +1247,7 @@ class MoE:
                 residual_div=self.residual_div,
                 init_gate_as_residual=self.init_gate_as_residual,
                 track_router_metrics=self.track_router_metrics,
+                quantile_balance_bins=self.quantile_balance_bins,
                 bias_update_norm_factor=self.bias_update_norm_factor,
                 moe_comm_backend=self.moe_comm_backend,
                 w1_init_fn_type=self.w1_init_fn_type,

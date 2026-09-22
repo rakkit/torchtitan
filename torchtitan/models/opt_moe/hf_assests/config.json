@@ -37,7 +37,6 @@
   "attention_norm_everywhere": true,
   "ffn_norm_everywhere": true,
   "moe_norm_everywhere": true,
-  "force_router_on_fp32": true,
   "gated_attention_type": null,
   "gate_only": false,
   "mid_norm_position": "after",
@@ -57,5 +56,5 @@
   "rope_parameters_swa": null,
   "residual_scale": "identity",
   "torch_dtype": "bfloat16",
-  "transformers_version": "4.57.3"
+  "transformers_version": "5.3.0"
 }

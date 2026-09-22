@@ -5,289 +5,46 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from functools import wraps
-from typing import Callable, Optional, Union
+
+from collections.abc import Callable
+from typing import Unpack
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
 
-try:
-    from typing import TypedDict, Unpack
-except ImportError:
-    from typing_extensions import TypedDict, Unpack
-
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
+
+from transformers.integrations import use_kernel_forward_from_hub
+
+from transformers.masking_utils import (
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
+
+from transformers.modeling_layers import (
+    GenericForQuestionAnswering,
+    GenericForSequenceClassification,
+    GenericForTokenClassification,
+    GradientCheckpointingLayer,
+)
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from transformers.modeling_utils import PreTrainedModel
 
-try:
-    from transformers.integrations import use_kernel_forward_from_hub
-except ImportError:
-    try:
-        from transformers.integrations.hub_kernels import use_kernel_forward_from_hub
-    except ImportError:
+from transformers.modeling_rope_utils import dynamic_rope_update, ROPE_INIT_FUNCTIONS
 
-        def use_kernel_forward_from_hub(_kernel_name):
-            def decorator(obj):
-                return obj
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 
-            return decorator
-
-
-try:
-    from transformers.masking_utils import (
-        create_causal_mask,
-        create_sliding_window_causal_mask,
-    )
-except ImportError:
-
-    def _legacy_get_mask_sizes(
-        cache_position: torch.Tensor,
-        past_key_values: Optional[Cache],
-        query_length: int,
-    ) -> tuple[int, int]:
-        if past_key_values is not None and hasattr(past_key_values, "get_mask_sizes"):
-            try:
-                return past_key_values.get_mask_sizes(cache_position, 0)
-            except TypeError:
-                return past_key_values.get_mask_sizes(cache_position)
-        if cache_position.numel() == 0:
-            return query_length, 0
-        kv_offset = int(cache_position[0].item())
-        kv_length = int(cache_position[-1].item()) - kv_offset + 1
-        return kv_length, kv_offset
-
-    def _legacy_create_additive_causal_mask(
-        input_embeds: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        cache_position: Optional[torch.Tensor],
-        past_key_values: Optional[Cache],
-        sliding_window: Optional[int] = None,
-    ) -> torch.Tensor:
-        if input_embeds is None:
-            raise ValueError("`input_embeds` must be provided to build a causal mask.")
-        if attention_mask is not None and attention_mask.dim() == 4:
-            return attention_mask
-
-        batch_size, query_length = input_embeds.shape[:2]
-        dtype = input_embeds.dtype
-        device = input_embeds.device
-        min_dtype = torch.finfo(dtype).min
-
-        if cache_position is None:
-            past_seen_tokens = 0
-            if past_key_values is not None and hasattr(
-                past_key_values, "get_seq_length"
-            ):
-                try:
-                    past_seen_tokens = int(past_key_values.get_seq_length())
-                except TypeError:
-                    past_seen_tokens = int(past_key_values.get_seq_length(0))
-            cache_position = torch.arange(
-                past_seen_tokens,
-                past_seen_tokens + query_length,
-                device=device,
-            )
-
-        kv_length, kv_offset = _legacy_get_mask_sizes(
-            cache_position, past_key_values, query_length
-        )
-        key_positions = torch.arange(kv_length, device=device) + kv_offset
-        allowed = key_positions.view(1, kv_length) <= cache_position.view(
-            query_length, 1
-        )
-        if sliding_window is not None and sliding_window > 0:
-            allowed = allowed & (
-                key_positions.view(1, kv_length)
-                > (cache_position.view(query_length, 1) - sliding_window)
-            )
-        allowed = allowed.unsqueeze(0).expand(batch_size, -1, -1)
-
-        if attention_mask is not None and attention_mask.dim() == 2:
-            if attention_mask.shape[-1] < kv_length + kv_offset:
-                attention_mask = nn.functional.pad(
-                    attention_mask,
-                    (0, kv_length + kv_offset - attention_mask.shape[-1]),
-                    value=0,
-                )
-            mask_indices = torch.arange(kv_length, device=device) + kv_offset
-            allowed = (
-                allowed
-                & attention_mask.to(device=device)[:, mask_indices].to(torch.bool)[
-                    :, None, :
-                ]
-            )
-
-        return torch.where(
-            allowed.unsqueeze(1),
-            torch.zeros((), dtype=dtype, device=device),
-            torch.full((), min_dtype, dtype=dtype, device=device),
-        )
-
-    def create_causal_mask(
-        config,
-        input_embeds=None,
-        attention_mask=None,
-        cache_position=None,
-        past_key_values=None,
-        position_ids=None,
-        **kwargs,
-    ):
-        del config, position_ids, kwargs
-        return _legacy_create_additive_causal_mask(
-            input_embeds=input_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-        )
-
-    def create_sliding_window_causal_mask(
-        config,
-        input_embeds=None,
-        attention_mask=None,
-        cache_position=None,
-        past_key_values=None,
-        position_ids=None,
-        **kwargs,
-    ):
-        del position_ids, kwargs
-        sliding_window = getattr(config, "sliding_window", None)
-        if sliding_window is None:
-            sliding_window = getattr(config, "sliding_window_size", None)
-        if sliding_window is None or sliding_window <= 0:
-            raise ValueError(
-                "Could not find a positive `sliding_window` in the config."
-            )
-        return _legacy_create_additive_causal_mask(
-            input_embeds=input_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            sliding_window=sliding_window,
-        )
-
-
-try:
-    from transformers.modeling_layers import (
-        GenericForQuestionAnswering,
-        GenericForSequenceClassification,
-        GenericForTokenClassification,
-        GradientCheckpointingLayer,
-    )
-except ImportError:
-
-    class GradientCheckpointingLayer(nn.Module):
-        gradient_checkpointing = False
-
-    class _UnsupportedHeadMixin:
-        _compat_message = (
-            "This OptMoE task head requires `transformers.modeling_layers`, "
-            "which is not available in this transformers version."
-        )
-
-        def __init__(self, *args, **kwargs):
-            raise ImportError(self._compat_message)
-
-    class GenericForSequenceClassification(_UnsupportedHeadMixin):
-        pass
-
-    class GenericForQuestionAnswering(_UnsupportedHeadMixin):
-        pass
-
-    class GenericForTokenClassification(_UnsupportedHeadMixin):
-        pass
-
-
-try:
-    from transformers.modeling_rope_utils import (
-        dynamic_rope_update,
-        ROPE_INIT_FUNCTIONS,
-    )
-except ImportError:
-    try:
-        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-    except ImportError:
-        ROPE_INIT_FUNCTIONS = {}
-
-    def dynamic_rope_update(fn):
-        return fn
-
-
-try:
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-except ImportError:
-    ALL_ATTENTION_FUNCTIONS = {}
-
-try:
-    from transformers.utils import auto_docstring
-except ImportError:
-    try:
-        from transformers.utils.auto_docstring import auto_docstring
-    except ImportError:
-
-        def auto_docstring(obj=None, **_kwargs):
-            if obj is None:
-
-                def decorator(inner):
-                    return inner
-
-                return decorator
-            return obj
-
-
-try:
-    from transformers.utils import can_return_tuple
-except ImportError:
-    try:
-        from transformers.utils.generic import can_return_tuple
-    except ImportError:
-
-        def can_return_tuple(func):
-            @wraps(func)
-            def wrapper(self, *args, **kwargs):
-                return_dict = getattr(
-                    getattr(self, "config", None), "return_dict", True
-                )
-                return_dict = kwargs.pop("return_dict", return_dict)
-                output = func(self, *args, **kwargs)
-                if not return_dict and not isinstance(output, tuple):
-                    output = output.to_tuple()
-                return output
-
-            return wrapper
-
-
-try:
-    from transformers.utils import TransformersKwargs
-except ImportError:
-    try:
-        from transformers.utils.generic import TransformersKwargs
-    except ImportError:
-
-        class TransformersKwargs(TypedDict, total=False):
-            output_hidden_states: Optional[bool]
-            output_attentions: Optional[bool]
-            position_ids: Optional[torch.LongTensor]
-            is_causal: Optional[bool]
-
+from transformers.utils import auto_docstring, can_return_tuple, TransformersKwargs
 
 from .configuration_opt_moe import OptMoEConfig
 
 
 logger = logging.getLogger(__name__)
-
-
-def _warning_once(message):
-    if hasattr(logger, "warning_once"):
-        logger.warning_once(message)
-    else:
-        logger.warning(message)
 
 
 def _get_attention_interface(attn_implementation: str) -> Callable:
@@ -463,7 +220,7 @@ class OptMoERotaryEmbedding(nn.Module):
     @staticmethod
     def compute_default_rope_parameters(
         config: OptMoEConfig | None = None,
-        device: Optional["torch.device"] = None,
+        device: "torch.device | None" = None,
         seq_len: int | None = None,
     ) -> tuple["torch.Tensor", float]:
         """Compute inverse frequencies for the non-scaled/default RoPE path."""
@@ -583,7 +340,7 @@ def eager_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
+    attention_mask: torch.Tensor | None,
     scaling: float,
     dropout: float = 0.0,
     **kwargs,
@@ -703,7 +460,7 @@ class OptMoEAttention(nn.Module):
 
         # Per-layer flags — set by OptMoEModel after layer creation
         self.use_rope: bool = True
-        self.sliding_window: Optional[int] = None
+        self.sliding_window: int | None = None
         # True when this layer is a SWA layer that should use rotary_emb_swa
         # (i.e. rope_theta_swa is configured and this layer uses SWA + RoPE)
         self.use_swa_rope: bool = False
@@ -711,10 +468,10 @@ class OptMoEAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
@@ -1083,16 +840,14 @@ class OptMoEDecoderLayer(GradientCheckpointingLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[
-        torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
-    ]:
+    ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -1227,13 +982,13 @@ class OptMoEModel(OptMoEPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1335,15 +1090,15 @@ class OptMoEForCausalLM(OptMoEPreTrainedModel, GenerationMixin):
     @auto_docstring
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""

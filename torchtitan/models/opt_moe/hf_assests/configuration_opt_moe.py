@@ -92,7 +92,9 @@ class OptMoEConfig(PretrainedConfig):
         qk_norm=False,
         mid_norm=False,
         norm_everywhere=False,
-        force_router_on_fp32=True,
+        attention_norm_everywhere=None,
+        ffn_norm_everywhere=None,
+        moe_norm_everywhere=None,
         gated_attention_type=None,
         gate_only=False,
         mid_norm_position="after",
@@ -140,7 +142,22 @@ class OptMoEConfig(PretrainedConfig):
             else self.hidden_size // self.num_attention_heads
         )
         self.norm_everywhere = norm_everywhere
-        self.force_router_on_fp32 = bool(force_router_on_fp32)
+        # None means inherit the global flag.
+        self.attention_norm_everywhere = (
+            norm_everywhere
+            if attention_norm_everywhere is None
+            else bool(attention_norm_everywhere)
+        )
+        self.ffn_norm_everywhere = (
+            norm_everywhere
+            if ffn_norm_everywhere is None
+            else bool(ffn_norm_everywhere)
+        )
+        self.moe_norm_everywhere = (
+            self.ffn_norm_everywhere
+            if moe_norm_everywhere is None
+            else bool(moe_norm_everywhere)
+        )
         self.qk_norm = qk_norm
         self.mid_norm = bool(mid_norm)
         self.gated_attention_type = _normalize_gated_attention_type(

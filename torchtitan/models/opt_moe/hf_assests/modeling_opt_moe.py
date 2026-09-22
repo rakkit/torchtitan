@@ -38,6 +38,10 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import dynamic_rope_update, ROPE_INIT_FUNCTIONS
 
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.models.llama.modeling_llama import (
+    apply_rotary_pos_emb,
+    eager_attention_forward,
+)
 
 from transformers.utils import auto_docstring, can_return_tuple, TransformersKwargs
 
@@ -45,40 +49,6 @@ from .configuration_opt_moe import OptMoEConfig
 
 
 logger = logging.getLogger(__name__)
-
-
-def _get_attention_interface(attn_implementation: str) -> Callable:
-    if attn_implementation in (None, "eager"):
-        return eager_attention_forward
-    if hasattr(ALL_ATTENTION_FUNCTIONS, "get_interface"):
-        try:
-            return ALL_ATTENTION_FUNCTIONS.get_interface(
-                attn_implementation, eager_attention_forward
-            )
-        except TypeError:
-            return ALL_ATTENTION_FUNCTIONS.get_interface(attn_implementation)
-    if isinstance(ALL_ATTENTION_FUNCTIONS, dict):
-        return ALL_ATTENTION_FUNCTIONS[attn_implementation]
-    return ALL_ATTENTION_FUNCTIONS[attn_implementation]
-
-
-def _build_dynamic_cache(config: OptMoEConfig) -> DynamicCache:
-    try:
-        return DynamicCache(config=config)
-    except TypeError:
-        return DynamicCache()
-
-
-def _causal_lm_loss(
-    logits: torch.Tensor, labels: torch.Tensor, vocab_size: int
-) -> torch.Tensor:
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    return nn.functional.cross_entropy(
-        shift_logits.view(-1, vocab_size),
-        shift_labels.view(-1),
-        ignore_index=-100,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -160,40 +130,6 @@ def _normalize_mid_norm_position(value: str) -> str:
     return normalized
 
 
-def _get_attention_norm_everywhere(config) -> bool:
-    return bool(
-        getattr(
-            config,
-            "attention_norm_everywhere",
-            getattr(config, "norm_everywhere", False),
-        )
-    )
-
-
-def _get_ffn_norm_everywhere(config) -> bool:
-    return bool(
-        getattr(
-            config,
-            "ffn_norm_everywhere",
-            getattr(config, "norm_everywhere", False),
-        )
-    )
-
-
-def _get_moe_norm_everywhere(config) -> bool:
-    return bool(
-        getattr(
-            config,
-            "moe_norm_everywhere",
-            getattr(
-                config,
-                "ffn_norm_everywhere",
-                getattr(config, "norm_everywhere", False),
-            ),
-        )
-    )
-
-
 @use_kernel_forward_from_hub("RMSNorm")
 class OptMoERMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -227,9 +163,7 @@ class OptMoERotaryEmbedding(nn.Module):
         assert config is not None
         base = config.rope_parameters["rope_theta"]
         partial_rotary_factor = config.rope_parameters.get("partial_rotary_factor", 1.0)
-        head_dim = getattr(config, "head_dim", None) or (
-            config.hidden_size // config.num_attention_heads
-        )
+        head_dim = config.head_dim or (config.hidden_size // config.num_attention_heads)
         dim = int(head_dim * partial_rotary_factor)
         attention_factor = 1.0
         inv_freq = 1.0 / (
@@ -287,84 +221,6 @@ class OptMoERotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`, *optional*):
-            Deprecated and unused.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-        query.dtype
-    )
-    attn_weights = nn.functional.dropout(
-        attn_weights, p=dropout, training=module.training
-    )
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
-
-
 class OptMoEAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -372,10 +228,8 @@ class OptMoEAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        self.qk_rope_dim = getattr(config, "qk_rope_dim", self.head_dim)
+        self.head_dim = config.head_dim
+        self.qk_rope_dim = config.qk_rope_dim
         if not (0 < self.qk_rope_dim <= self.head_dim):
             raise ValueError(
                 f"qk_rope_dim must be in (0, head_dim], got {self.qk_rope_dim} "
@@ -387,11 +241,9 @@ class OptMoEAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.gate_only = bool(getattr(config, "gate_only", False))
-        self.mid_norm_position = _normalize_mid_norm_position(
-            getattr(config, "mid_norm_position", "after")
-        )
-        self.head_wise_mid_norm = bool(getattr(config, "head_wise_mid_norm", False))
+        self.gate_only = bool(config.gate_only)
+        self.mid_norm_position = _normalize_mid_norm_position(config.mid_norm_position)
+        self.head_wise_mid_norm = bool(config.head_wise_mid_norm)
 
         self.q_proj = nn.Linear(
             config.hidden_size,
@@ -414,7 +266,7 @@ class OptMoEAttention(nn.Module):
             bias=config.attention_bias,
         )
 
-        attention_norm_everywhere = _get_attention_norm_everywhere(config)
+        attention_norm_everywhere = config.attention_norm_everywhere
         qk_norm = config.qk_norm or attention_norm_everywhere
         if qk_norm:
             self.q_norm = OptMoERMSNorm(self.head_dim, config.rms_norm_eps)
@@ -428,9 +280,7 @@ class OptMoEAttention(nn.Module):
         else:
             self.v_norm = nn.Identity()
 
-        use_mid_norm = (
-            bool(getattr(config, "mid_norm", False)) or attention_norm_everywhere
-        )
+        use_mid_norm = bool(config.mid_norm) or attention_norm_everywhere
         if use_mid_norm:
             if self.mid_norm_position == "after" and not self.head_wise_mid_norm:
                 self.mid_norm = OptMoERMSNorm(
@@ -444,7 +294,7 @@ class OptMoEAttention(nn.Module):
 
         # Gated attention: head-wise or element-wise gate projection
         self.gated_attention_type = _normalize_gated_attention_type(
-            getattr(config, "gated_attention_type", None)
+            config.gated_attention_type
         )
         self.gate_proj = nn.Identity()
         if self.gated_attention_type == "head-wise":
@@ -526,8 +376,8 @@ class OptMoEAttention(nn.Module):
         ):
             use_backend_attention = False
         if use_backend_attention:
-            attention_interface = _get_attention_interface(
-                self.config._attn_implementation
+            attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation, eager_attention_forward
             )
 
         attn_output, attn_weights = attention_interface(
@@ -594,7 +444,7 @@ class OptMoEMLP(nn.Module):
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-        if _get_ffn_norm_everywhere(config):
+        if config.ffn_norm_everywhere:
             self.mid_norm = OptMoERMSNorm(self.intermediate_size, config.rms_norm_eps)
         else:
             self.mid_norm = nn.Identity()
@@ -681,9 +531,9 @@ class OptMoEMoE(nn.Module):
     ):
         super().__init__()
         shared_hidden = int(config.moe_intermediate_size) * max(
-            1, int(getattr(config, "n_shared_experts", 1))
+            1, int(config.n_shared_experts)
         )
-        moe_norm_everywhere = _get_moe_norm_everywhere(config)
+        moe_norm_everywhere = config.moe_norm_everywhere
         self.shared_experts = OptMoESharedExperts(
             hidden_size=config.hidden_size,
             moe_intermediate_size=shared_hidden,
@@ -815,7 +665,7 @@ class OptMoEDecoderLayer(GradientCheckpointingLayer):
         self.layer_idx = layer_idx
         self.attention_type = "full_attention"
 
-        residual_scale = getattr(config, "residual_scale", "identity")
+        residual_scale = config.residual_scale
         self.block_scale, self.identity_scale = _compute_residual_scales(
             residual_scale, config.num_hidden_layers
         )
@@ -901,23 +751,23 @@ class OptMoEModel(OptMoEPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        base_use_rope = bool(getattr(config, "use_rope", True))
-        base_use_swa = int(getattr(config, "sliding_window_size", -1)) > 0
+        base_use_rope = bool(config.use_rope)
+        base_use_swa = int(config.sliding_window_size) > 0
         self.use_rope_list = _parse_pattern(
-            getattr(config, "rope_pattern", None),
+            config.rope_pattern,
             config.num_hidden_layers,
             true_char="R",
             false_char="N",
             default=base_use_rope,
         )
         self.use_swa_list = _parse_pattern(
-            getattr(config, "swa_pattern", None),
+            config.swa_pattern,
             config.num_hidden_layers,
             true_char="S",
             false_char="F",
             default=base_use_swa,
         )
-        sliding_window_size = getattr(config, "sliding_window_size", -1)
+        sliding_window_size = config.sliding_window_size
         config.layer_types = [
             "sliding_attention" if use_swa else "full_attention"
             for use_swa in self.use_swa_list
@@ -942,7 +792,7 @@ class OptMoEModel(OptMoEPreTrainedModel):
 
         # Second rotary embedding for SWA layers — fully independent from the global one.
         # Mirrors native model's rope_of_swa: separate theta AND separate rope_parameters.
-        rope_theta_swa = getattr(config, "rope_theta_swa", None)
+        rope_theta_swa = config.rope_theta_swa
         if rope_theta_swa is not None:
             from copy import deepcopy
 
@@ -950,7 +800,7 @@ class OptMoEModel(OptMoEPreTrainedModel):
             # Override both theta and scaling independently so the two RoPE
             # configurations are completely decoupled.
             _swa_config.rope_theta = rope_theta_swa
-            _swa_config.rope_parameters = getattr(config, "rope_parameters_swa", None)
+            _swa_config.rope_parameters = config.rope_parameters_swa
             self.rotary_emb_swa = OptMoERotaryEmbedding(config=_swa_config)
         else:
             self.rotary_emb_swa = None
@@ -1000,7 +850,7 @@ class OptMoEModel(OptMoEPreTrainedModel):
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = _build_dynamic_cache(self.config)
+            past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
             past_seen_tokens = (
@@ -1140,15 +990,12 @@ class OptMoEForCausalLM(OptMoEPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
-            if hasattr(self, "loss_function"):
-                loss = self.loss_function(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.vocab_size,
-                    **kwargs,
-                )
-            else:
-                loss = _causal_lm_loss(logits, labels, self.config.vocab_size)
+            loss = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                **kwargs,
+            )
 
         return CausalLMOutputWithPast(
             loss=loss,

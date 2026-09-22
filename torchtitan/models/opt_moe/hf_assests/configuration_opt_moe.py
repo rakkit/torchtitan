@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import inspect
 import logging
 import math
 from numbers import Real
@@ -13,13 +12,6 @@ from transformers.configuration_utils import PretrainedConfig
 
 
 logger = logging.getLogger(__name__)
-
-
-def _warning_once(message):
-    if hasattr(logger, "warning_once"):
-        logger.warning_once(message)
-    else:
-        logger.warning(message)
 
 
 def _normalize_gated_attention_type(value):
@@ -229,118 +221,6 @@ class OptMoEConfig(PretrainedConfig):
             **kwargs,
         )
 
-    def standardize_rope_params(self):
-        parent_impl = getattr(PretrainedConfig, "standardize_rope_params", None)
-        if parent_impl is not None:
-            return parent_impl(self)
-
-        rope_theta = getattr(self, "rope_theta", None)
-        partial_rotary_factor = getattr(self, "partial_rotary_factor", None)
-        rope_parameters = dict(getattr(self, "rope_parameters", None) or {})
-        layer_types = getattr(self, "layer_types", None)
-
-        if not (rope_parameters or rope_theta is not None):
-            _warning_once(
-                "`standardize_rope_params` was called but no RoPE parameters were found."
-            )
-            return
-
-        if (
-            layer_types is None
-            or rope_parameters == {}
-            or not set(rope_parameters.keys()).issubset(set(layer_types))
-        ):
-            rope_parameters.setdefault(
-                "rope_type", rope_parameters.get("type", "default")
-            )
-            if rope_theta is not None:
-                rope_parameters.setdefault("rope_theta", rope_theta)
-            if partial_rotary_factor is not None:
-                rope_parameters["partial_rotary_factor"] = partial_rotary_factor
-
-            if rope_parameters["rope_type"] in {"llama3", "yarn", "longrope"}:
-                original_max_position_embeddings = getattr(
-                    self,
-                    "original_max_position_embeddings",
-                    self.max_position_embeddings,
-                )
-                rope_parameters.setdefault(
-                    "original_max_position_embeddings",
-                    original_max_position_embeddings,
-                )
-        else:
-            for layer_type in set(layer_types):
-                layer_rope_parameters = dict(rope_parameters.get(layer_type) or {})
-                layer_rope_parameters.setdefault(
-                    "rope_type", layer_rope_parameters.get("type", "default")
-                )
-                if rope_theta is not None:
-                    layer_rope_parameters.setdefault("rope_theta", rope_theta)
-                if partial_rotary_factor is not None:
-                    layer_rope_parameters[
-                        "partial_rotary_factor"
-                    ] = partial_rotary_factor
-                if layer_rope_parameters["rope_type"] in {"llama3", "yarn", "longrope"}:
-                    layer_rope_parameters.setdefault(
-                        "original_max_position_embeddings",
-                        self.max_position_embeddings,
-                    )
-                rope_parameters[layer_type] = layer_rope_parameters
-
-        self.rope_parameters = rope_parameters
-
-    def validate_rope(self, ignore_keys=None):
-        parent_impl = getattr(PretrainedConfig, "validate_rope", None)
-        if parent_impl is not None:
-            if "ignore_keys" in inspect.signature(parent_impl).parameters:
-                return parent_impl(self, ignore_keys=ignore_keys)
-
-            if ignore_keys is None:
-                return parent_impl(self)
-
-            previous_ignore_keys = getattr(self, "ignore_keys_at_rope_validation", None)
-            self.ignore_keys_at_rope_validation = set(previous_ignore_keys or ()) | set(
-                ignore_keys
-            )
-            try:
-                return parent_impl(self)
-            finally:
-                if previous_ignore_keys is None:
-                    self.ignore_keys_at_rope_validation = set()
-                else:
-                    self.ignore_keys_at_rope_validation = previous_ignore_keys
-
-        rope_parameters_dict = getattr(self, "rope_parameters", None)
-        if rope_parameters_dict is None:
-            return
-        if not isinstance(rope_parameters_dict, dict):
-            raise ValueError(
-                f"`rope_parameters` must be a dictionary but got {rope_parameters_dict!r}"
-            )
-
-        if getattr(self, "layer_types", None) is not None and set(
-            rope_parameters_dict.keys()
-        ).issubset(set(self.layer_types)):
-            rope_parameter_sets = rope_parameters_dict.values()
-        else:
-            rope_parameter_sets = (rope_parameters_dict,)
-
-        for rope_parameters in rope_parameter_sets:
-            rope_type = rope_parameters.get(
-                "rope_type", rope_parameters.get("type", "default")
-            )
-            rope_parameters["rope_type"] = rope_type
-            validation_fn = getattr(
-                self, f"_validate_{rope_type}_rope_parameters", None
-            )
-            if validation_fn is None:
-                _warning_once(
-                    "Missing RoPE validation function for "
-                    f"`rope_type`={rope_type!r}; skipping validation."
-                )
-                continue
-            validation_fn(rope_parameters, ignore_keys=ignore_keys)
-
     @staticmethod
     def _check_received_keys(
         rope_type, received_keys, required_keys, optional_keys=None, ignore_keys=None
@@ -367,7 +247,7 @@ class OptMoEConfig(PretrainedConfig):
 
         unused_keys = received_keys - required_keys - optional_keys
         if unused_keys:
-            _warning_once(
+            logger.warning_once(
                 "Unrecognized keys in `rope_parameters` for "
                 f"`rope_type`={rope_type!r}: {unused_keys}"
             )
@@ -389,7 +269,7 @@ class OptMoEConfig(PretrainedConfig):
         )
         factor = rope_parameters["factor"]
         if factor is None or not isinstance(factor, Real) or factor < 1.0:
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['factor']` must be a real number >= 1, "
                 f"got {factor!r}"
             )
@@ -403,7 +283,7 @@ class OptMoEConfig(PretrainedConfig):
         )
         factor = rope_parameters["factor"]
         if factor is None or not isinstance(factor, Real) or factor < 1.0:
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['factor']` must be a real number >= 1, "
                 f"got {factor!r}"
             )
@@ -430,7 +310,7 @@ class OptMoEConfig(PretrainedConfig):
         )
         factor = rope_parameters["factor"]
         if factor is None or not isinstance(factor, Real) or factor < 1.0:
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['factor']` must be a real number >= 1, "
                 f"got {factor!r}"
             )
@@ -439,27 +319,27 @@ class OptMoEConfig(PretrainedConfig):
         if attention_factor is not None and (
             not isinstance(attention_factor, Real) or attention_factor < 0.0
         ):
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['attention_factor']` must be a real number > 0, "
                 f"got {attention_factor!r}"
             )
 
         beta_fast = rope_parameters.get("beta_fast")
         if beta_fast is not None and not isinstance(beta_fast, Real):
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['beta_fast']` must be a real number, "
                 f"got {beta_fast!r}"
             )
 
         beta_slow = rope_parameters.get("beta_slow")
         if beta_slow is not None and not isinstance(beta_slow, Real):
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['beta_slow']` must be a real number, "
                 f"got {beta_slow!r}"
             )
 
         if (beta_fast or 32) < (beta_slow or 1):
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['beta_fast']` must be >= `beta_slow`; "
                 f"got beta_fast={beta_fast!r}, beta_slow={beta_slow!r}"
             )
@@ -480,9 +360,7 @@ class OptMoEConfig(PretrainedConfig):
         )
 
         partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
-        head_dim = getattr(
-            self, "head_dim", self.hidden_size // self.num_attention_heads
-        )
+        head_dim = self.head_dim
         dim = int(head_dim * partial_rotary_factor)
 
         short_factor = rope_parameters.get("short_factor")
@@ -490,12 +368,12 @@ class OptMoEConfig(PretrainedConfig):
             isinstance(short_factor, list)
             and all(isinstance(x, Real) for x in short_factor)
         ):
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['short_factor']` must be a list of real numbers, "
                 f"got {short_factor!r}"
             )
         elif len(short_factor) != dim // 2:
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['short_factor']` must have length "
                 f"{dim // 2}, got {len(short_factor)}"
             )
@@ -505,19 +383,19 @@ class OptMoEConfig(PretrainedConfig):
             isinstance(long_factor, list)
             and all(isinstance(x, Real) for x in long_factor)
         ):
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['long_factor']` must be a list of real numbers, "
                 f"got {long_factor!r}"
             )
         elif len(long_factor) != dim // 2:
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['long_factor']` must have length "
                 f"{dim // 2}, got {len(long_factor)}"
             )
 
         factor = rope_parameters.get("factor")
         if factor is not None and (not isinstance(factor, Real) or factor < 1.0):
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['factor']` must be a real number >= 1, "
                 f"got {factor!r}"
             )
@@ -526,7 +404,7 @@ class OptMoEConfig(PretrainedConfig):
         if attention_factor is not None and (
             not isinstance(attention_factor, Real) or attention_factor < 0.0
         ):
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['attention_factor']` must be a real number > 0, "
                 f"got {attention_factor!r}"
             )
@@ -548,26 +426,26 @@ class OptMoEConfig(PretrainedConfig):
 
         factor = rope_parameters["factor"]
         if factor is None or not isinstance(factor, Real) or factor < 1.0:
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['factor']` must be a real number >= 1, "
                 f"got {factor!r}"
             )
 
         low_freq_factor = rope_parameters["low_freq_factor"]
         if low_freq_factor is None or not isinstance(low_freq_factor, Real):
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['low_freq_factor']` must be a real number, "
                 f"got {low_freq_factor!r}"
             )
 
         high_freq_factor = rope_parameters["high_freq_factor"]
         if high_freq_factor is None or not isinstance(high_freq_factor, Real):
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['high_freq_factor']` must be a real number, "
                 f"got {high_freq_factor!r}"
             )
         elif high_freq_factor <= low_freq_factor:
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['high_freq_factor']` must be greater than "
                 f"`low_freq_factor`; got high={high_freq_factor!r}, low={low_freq_factor!r}"
             )
@@ -578,12 +456,12 @@ class OptMoEConfig(PretrainedConfig):
         if original_max_position_embeddings is None or not isinstance(
             original_max_position_embeddings, int
         ):
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['original_max_position_embeddings']` must be "
                 f"an integer, got {original_max_position_embeddings!r}"
             )
         elif original_max_position_embeddings >= self.max_position_embeddings:
-            _warning_once(
+            logger.warning_once(
                 "`rope_parameters['original_max_position_embeddings']` must be less "
                 "than `max_position_embeddings`; got "
                 f"{original_max_position_embeddings} vs {self.max_position_embeddings}"

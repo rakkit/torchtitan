@@ -24,7 +24,6 @@ from torchtitan.distributed.utils import rank_owns_metrics_shard
 from torchtitan.tools import utils
 from torchtitan.tools.utils import Color, device_module, device_type, NoColor
 
-
 # named tuple for passing device memory stats for logging
 logger = logging.getLogger(__name__)
 
@@ -197,7 +196,7 @@ class WandBLogger(BaseLogger):
             (k if self.tag is None else f"{self.tag}/{k}"): v
             for k, v in metrics.items()
         }
-        self.wandb.log(wandb_metrics, step=step)
+        self.wandb.log(wandb_metrics, step=step, commit=True)
 
     def close(self) -> None:
         if self.wandb.run is not None:

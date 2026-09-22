@@ -159,7 +159,7 @@ def main():
         # `update_from_config` populates tok_embeddings/layers, which
         # set_opt_moe_sharding_config walks.
         job = moe_template_config()
-        job.model_spec = spec
+        job.model = spec
         spec.update_from_config(config=job)
         set_opt_moe_sharding_config(
             spec, enable_sp=False, enable_tp=False, enable_ep=False

@@ -6,23 +6,17 @@
 
 import copy
 
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common.rope import CosSinRoPE
 
-from torchtitan.optimizers.container import register_moe_load_balancing_hook
 
-from torchtitan.protocols.model_spec import ModelSpec
 from .gated_norm_swattention import GatedNormSWAttention
-from .hf_assests import setup_hf
 
 from .model import OPTMoEModel, OPTMoETransformerBlock
 from .norm_ffn import FeedForward
 from .norm_moe import MoE
 
-from .parallelize import parallelize_opt_moe
-from .state_dict_adapter import OPTMoEStateDictAdapter
 
-__all__ = ["parallelize_opt_moe", "OPTMoEModel", "moe_opt_moe_configs"]
+__all__ = ["model_registry", "OPTMoEModel", "moe_opt_moe_configs"]
 
 
 moe_opt_moe_configs = {
@@ -3356,16 +3350,8 @@ moe_opt_moe_configs = {
 }
 
 
-def model_registry(flavor: str) -> ModelSpec:
+def model_registry(flavor: str) -> OPTMoEModel.Config:
     model_config = copy.deepcopy(moe_opt_moe_configs[flavor])
-    return ModelSpec(
-        name="opt_moe",
-        flavor=flavor,
-        model=model_config,
-        max_context_length=model_config.rope.max_context_length,
-        parallelize_fn=parallelize_opt_moe,
-        pipelining_fn=pipeline_llm,
-        post_optimizer_build_fn=register_moe_load_balancing_hook,
-        state_dict_adapter=OPTMoEStateDictAdapter,
-        hf_assets_setup_fn=setup_hf.copy_and_overwrite_model_config,
-    )
+    model_config.flavor = flavor
+    model_config.max_context_length = model_config.rope.max_context_length
+    return model_config

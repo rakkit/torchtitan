@@ -44,6 +44,7 @@ from torchtitan.evaluation.runtime import (
     upsert_result,
 )
 from torchtitan.models.llama3.config_registry import llama3_debugmodel
+from torchtitan.models.opt_moe.config_registry import moe_template_config
 
 
 class DummyTokenizer(BaseTokenizer):
@@ -93,9 +94,9 @@ class TestOfflineEvaluationConfig(unittest.TestCase):
     def test_latest_job_config_and_model_rehydration(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            original = llama3_debugmodel()
+            original = moe_template_config()
             original.hf_assets_path = "/tmp/tokenizer-assets"
-            original.model_spec.model.dim = 123
+            original.model.dim = 123
             original.training.max_context_length = 777
 
             older = root / "job_config_20260101-0000.json"
@@ -107,7 +108,7 @@ class TestOfflineEvaluationConfig(unittest.TestCase):
             restored = load_training_config(newest)
             self.assertEqual(restored.config.hf_assets_path, "/tmp/tokenizer-assets")
             self.assertEqual(restored.config.training.max_context_length, 777)
-            self.assertEqual(restored.config.model_spec.model.dim, 123)
+            self.assertEqual(restored.config.model.dim, 123)
 
     def test_rejects_model_converter_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -64,7 +64,7 @@ class TestConvertEmaToHf(unittest.TestCase):
             f"torchtitan.models.{self.model_name}"
         ).model_registry(self.model_flavor)
         with torch.device("cpu"):
-            model = spec.model.build()
+            model = spec.build()
         ema = EMA.Config(buffer_patterns=self.buffer_patterns).build(
             model_parts=[model]
         )
@@ -223,7 +223,7 @@ class TestConvertEmaToHf(unittest.TestCase):
             f"torchtitan.models.{self.model_name}"
         ).model_registry(self.model_flavor)
         with torch.device("meta"):
-            model = spec.model.build()
+            model = spec.build()
         param_fqns = {name for name, _ in model.named_parameters()}
         fused = {n for n in param_fqns if n.endswith((".wqkv.weight", ".w13.weight"))}
         self.assertTrue(
@@ -232,7 +232,7 @@ class TestConvertEmaToHf(unittest.TestCase):
             "longer detect the fused/split mismatch",
         )
         # And the split really does happen downstream of the state dict.
-        sd_adapter = spec.state_dict_adapter(spec.model, None)
+        sd_adapter = type(model).state_dict_adapter_cls(spec, None)
         hf_keys = set(sd_adapter.to_hf(dict(model.state_dict())))
         self.assertGreater(
             len(hf_keys),
@@ -246,7 +246,7 @@ class TestConvertEmaToHf(unittest.TestCase):
             f"torchtitan.models.{self.model_name}"
         ).model_registry(self.model_flavor)
         with torch.device("cpu"):
-            model = spec.model.build()
+            model = spec.build()
         ckpt = str(Path(self.tmp) / "no-ema")
         dcp.save(dict(ModelWrapper(model).state_dict()), checkpoint_id=ckpt)
         with self.assertRaises(ValueError) as caught:
@@ -352,7 +352,7 @@ class TestConvertEmaToHfFrozenParameters(unittest.TestCase):
             f"torchtitan.models.{self.model_name}"
         ).model_registry(self.model_flavor)
         with torch.device("cpu"):
-            model = spec.model.build()
+            model = spec.build()
         params = dict(model.named_parameters())
         self.assertIn(self.frozen_fqn, params, "this flavor has no fused QKV")
         params[self.frozen_fqn].requires_grad_(False)

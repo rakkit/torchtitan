@@ -240,7 +240,7 @@ def _load_job_config(job_config_path: Path) -> dict:
         raise ValueError(f"Malformed job_config JSON at {job_config_path}: {e}") from e
 
 
-def _resolve_model_spec_for_conversion(
+def _resolve_model_config_for_conversion(
     *,
     model_name: str,
     model_flavor: str | None,
@@ -259,38 +259,31 @@ def _resolve_model_spec_for_conversion(
         )
 
     job_config = _load_job_config(job_config_path)
-    model_spec_data = job_config.get("model_spec")
-    if not isinstance(model_spec_data, dict):
+    model_overrides = job_config.get("model")
+    if not isinstance(model_overrides, dict):
         raise ValueError(
-            f"Malformed job_config at {job_config_path}: missing object 'model_spec'."
+            f"Malformed job_config at {job_config_path}: missing object 'model'."
         )
 
-    job_config_flavor = model_spec_data.get("flavor")
+    job_config_flavor = model_overrides.get("flavor")
     if not isinstance(job_config_flavor, str) or not job_config_flavor:
         raise ValueError(
             f"Malformed job_config at {job_config_path}: missing string "
-            "'model_spec.flavor'."
+            "'model.flavor'."
         )
 
     if model_flavor is not None and model_flavor != job_config_flavor:
         raise ValueError(
             "opt_moe conversion flavor mismatch: "
             f"--model_flavor={model_flavor!r} but "
-            f"job_config.model_spec.flavor={job_config_flavor!r}."
+            f"job_config.model.flavor={job_config_flavor!r}."
         )
 
-    model_overrides = model_spec_data.get("model")
-    if not isinstance(model_overrides, dict):
-        raise ValueError(
-            f"Malformed job_config at {job_config_path}: missing object "
-            "'model_spec.model'."
-        )
-
-    model_spec = model_module.model_registry(job_config_flavor)
+    model_config = model_module.model_registry(job_config_flavor)
     _apply_dataclass_overrides(
-        model_spec.model,
+        model_config,
         model_overrides,
-        field_path="model_spec.model",
+        field_path="model",
     )
 
     # Run the model's OWN config expansion rather than trusting the serialized
@@ -321,23 +314,23 @@ def _resolve_model_spec_for_conversion(
         parallelism=_rebuild(ParallelismConfig, job_config.get("parallelism")),
         training=_rebuild(TrainingConfig, job_config.get("training")),
     )
-    if hasattr(model_spec.model, "update_from_config"):
-        model_spec.model.update_from_config(config=expansion_config)
+    if hasattr(model_config, "update_from_config"):
+        model_config.update_from_config(config=expansion_config)
 
     # Sync training.seq_len → rope.max_seq_len so max_position_embeddings in the
     # exported HF config reflects the actual training context length, not the default.
     # Mirrors OPTMoEModel.Config.update_from_config (model.py:283-285).
-    training_seq_len = job_config.get("training", {}).get("seq_len")
+    training_seq_len = job_config.get("training", {}).get("max_context_length")
     if isinstance(training_seq_len, int) and training_seq_len > 0:
-        if getattr(model_spec.model, "rope", None) is not None:
-            model_spec.model.rope = dc_replace(
-                model_spec.model.rope, max_seq_len=training_seq_len
+        if getattr(model_config, "rope", None) is not None:
+            model_config.rope = dc_replace(
+                model_config.rope, max_context_length=training_seq_len
             )
-        if getattr(model_spec.model, "rope_of_swa", None) is not None:
-            model_spec.model.rope_of_swa = dc_replace(
-                model_spec.model.rope_of_swa, max_seq_len=training_seq_len
+        if getattr(model_config, "rope_of_swa", None) is not None:
+            model_config.rope_of_swa = dc_replace(
+                model_config.rope_of_swa, max_context_length=training_seq_len
             )
-    return model_spec
+    return model_config
 
 
 def _validate_exported_hf_config(
@@ -493,25 +486,21 @@ def convert_to_hf(
     """Convert a DCP checkpoint to HuggingFace safetensors format.
 
     Steps:
-      1. Load ModelSpec from the model registry.
+      1. Resolve the model config from the registry (+ the dumped job_config).
       2. Build an empty CPU model and wrap it.
       3. Create a state dict adapter.
       4. Load the DCP checkpoint.
-      5. Convert native → HF state dict.
+      5. Convert native -> HF state dict.
       6. Optionally cast dtype.
       7. Write HF safetensors.
       8. Copy HF config/modeling files and generate config.json.
     """
-    # 1. Get ModelSpec from the model registry
-    model_spec = _resolve_model_spec_for_conversion(
+    model_config = _resolve_model_config_for_conversion(
         model_name=model_name,
         model_flavor=model_flavor,
         job_config_path=job_config,
     )
-    model_flavor = model_spec.flavor
-
-    # 2. Build empty model on CPU
-    model_config = model_spec.model
+    model_flavor = getattr(model_config, "flavor", None) or model_flavor
 
     set_init_fn_type(model_config)
     # for field in fields(model_config):
@@ -522,15 +511,15 @@ def convert_to_hf(
     with torch.device("cpu"):
         actual_model = model_config.build()
     model_config = getattr(actual_model, "config", model_config)
+    adapter_cls = type(actual_model).state_dict_adapter_cls
     model = ModelWrapper(actual_model)
 
     print(" Model is build, now loading the state")
-    # 3. Create state dict adapter (new API: model_config, not model_args)
-    assert model_spec.state_dict_adapter is not None, (
-        "state_dict_adapter is required for HF checkpoint conversion. "
+    assert adapter_cls is not None, (
+        "state_dict_adapter_cls is required for HF checkpoint conversion. "
         f"Model '{model_name}/{model_flavor}' has none registered."
     )
-    sd_adapter = model_spec.state_dict_adapter(model_config, hf_assets_path)
+    sd_adapter = adapter_cls(model_config, hf_assets_path)
 
     # 4. Load DCP checkpoint into empty state dict
     state_dict = model._get_state_dict()
@@ -545,8 +534,9 @@ def convert_to_hf(
     _export_hf_weights(state_dict, sd_adapter, target_dtype, output_dir)
 
     # 8. Copy HF config/modeling files and generate config.json
-    if model_spec.hf_assets_setup_fn is not None:
-        model_spec.hf_assets_setup_fn(actual_model, model_config, str(output_dir))
+    hf_assets_setup_fn = getattr(type(actual_model), "hf_assets_setup_fn", None)
+    if hf_assets_setup_fn is not None:
+        hf_assets_setup_fn(actual_model, model_config, str(output_dir))
         _validate_exported_hf_config(
             model_name=model_name,
             model_config=model_config,

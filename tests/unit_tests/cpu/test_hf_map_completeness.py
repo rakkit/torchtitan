@@ -41,8 +41,7 @@ def _build(flavor: str):
 
     from torchtitan.config import ParallelismConfig, TrainingConfig
 
-    spec = model_registry(flavor)
-    model_config = spec.model
+    model_config = model_registry(flavor)
     model_config.update_from_config(
         config=SimpleNamespace(
             parallelism=ParallelismConfig(),

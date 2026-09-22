@@ -19,7 +19,7 @@ def moe_template_config() -> Trainer.Config:
     return Trainer.Config(
         hf_assets_path="./assets/hf/gpt-oss-120b",
         metrics=MetricsProcessor.Config(log_freq=1),
-        model_spec=model_registry("bsc-1B-7B-opt-g"),
+        model=model_registry("bsc-1B-7B-opt-g"),
         # No `dataloader=` default. Every recipe assigns `config.dataloader` from
         # `components/data/mix.make_pretrain_dataloader_config`, and a template default
         # that no run uses is a trap: it decides the shape of anything that forgets to.

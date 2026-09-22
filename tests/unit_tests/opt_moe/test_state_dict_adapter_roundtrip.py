@@ -51,7 +51,7 @@ def main() -> int:
     spec = copy.deepcopy(moe_opt_moe_configs[FLAVOR])
     spec.n_layers = 2
     job = moe_template_config()
-    job.model_spec = spec
+    job.model = spec
     spec.update_from_config(config=job)
     with torch.device("meta"):
         model = spec.build()

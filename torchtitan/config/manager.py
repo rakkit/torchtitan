@@ -87,10 +87,21 @@ class ConfigManager:
         return remaining, model_flavor
 
     @staticmethod
+    def _model_package_of(model_config) -> str | None:
+        """Recover the model package (e.g. "opt_moe") from its config class."""
+        if model_config is None:
+            return None
+        parts = type(model_config).__module__.split(".")
+        if len(parts) >= 3 and parts[0] == "torchtitan":
+            if parts[1] in ("models", "experiments"):
+                return parts[2]
+        return None
+
+    @staticmethod
     def _model_registry_candidates(
         *,
         module_name: str | None,
-        model_spec_name: str | None,
+        model_package: str | None,
     ) -> list[str]:
         candidates: list[str] = []
         if module_name:
@@ -100,8 +111,8 @@ class ConfigManager:
                     f"torchtitan.experiments.{module_name}",
                 ]
             )
-        if model_spec_name:
-            normalized = model_spec_name.replace("/", ".")
+        if model_package:
+            normalized = model_package.replace("/", ".")
             candidates.extend(
                 [
                     f"torchtitan.models.{normalized}",
@@ -127,14 +138,13 @@ class ConfigManager:
         module_name: str | None,
     ) -> None:
         """
-        Replace loaded_config.model_spec via module's model_registry(model_flavor),
-        while preserving user overrides under model_spec.model when possible.
+        Replace loaded_config.model via module's model_registry(model_flavor),
+        while preserving user overrides under model when possible.
         """
-        model_spec = getattr(loaded_config, "model_spec", None)
-        model_spec_name = getattr(model_spec, "name", None)
+        previous_model = getattr(loaded_config, "model", None)
         candidates = self._model_registry_candidates(
             module_name=module_name,
-            model_spec_name=model_spec_name,
+            model_package=self._model_package_of(previous_model),
         )
 
         registry_fn = None
@@ -157,32 +167,30 @@ class ConfigManager:
                 "Provide --module with an importable model/experiment module."
             )
 
-        previous_model_spec = getattr(loaded_config, "model_spec", None)
         try:
-            new_model_spec = registry_fn(model_flavor)
+            new_model = registry_fn(model_flavor)
         except Exception as e:
             raise ValueError(
                 f"Failed to apply --model-flavor='{model_flavor}' "
                 f"via {chosen_module}.model_registry(...): {e}"
             ) from e
 
-        # Preserve explicit user overrides under model_spec.model from the previous
-        # config object. This keeps external-config changes even when flavor is switched.
-        old_flavor = getattr(previous_model_spec, "flavor", None)
+        # Preserve explicit user overrides from the previous config object, so
+        # external-config changes survive a flavor switch.
+        old_flavor = getattr(previous_model, "flavor", None)
         if (
             old_flavor is not None
             and old_flavor != model_flavor
-            and is_dataclass(getattr(previous_model_spec, "model", None))
-            and is_dataclass(getattr(new_model_spec, "model", None))
+            and is_dataclass(previous_model)
+            and is_dataclass(new_model)
         ):
-            old_base_spec = registry_fn(old_flavor)
             overrides = self._dataclass_overrides(
-                old_base_spec.model,
-                previous_model_spec.model,
+                registry_fn(old_flavor), previous_model
             )
-            self._apply_dataclass_overrides(new_model_spec.model, overrides)
+            overrides.pop("flavor", None)
+            self._apply_dataclass_overrides(new_model, overrides)
 
-        loaded_config.model_spec = new_model_spec
+        loaded_config.model = new_model
 
     @staticmethod
     def _dataclass_overrides(base_obj, current_obj) -> dict[str, Any]:
@@ -299,7 +307,7 @@ class ConfigManager:
     def _load_config(self, args: list[str]) -> tuple[object, list[str]]:
         # --model.flavor / --model-flavor swaps the arch config after the
         # config file or registry function has produced it, keeping any
-        # overrides the config made under model_spec.model. Upstream has no
+        # overrides the config made under model. Upstream has no
         # equivalent: flavor is baked into the registry function name.
         args, model_flavor = self._extract_model_flavor_override(args)
         """Parse --module and --config from args, load config from config_registry.

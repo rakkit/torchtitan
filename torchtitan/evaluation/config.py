@@ -19,7 +19,7 @@ from typing import Any
 from torchtitan.components.data.mix import DatasetSpec
 
 from torchtitan.config.configs import ParallelismConfig
-from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.protocols.model import BaseModel
 from torchtitan.trainer import Trainer
 
 
@@ -153,9 +153,8 @@ def load_evaluation_suite(config_spec: str) -> EvaluationSuiteConfig:
 def load_training_config(snapshot_path: str | Path) -> LoadedTrainingConfig:
     """Rehydrate a model-construction config from a saved ``job_config`` JSON.
 
-    The JSON intentionally omits ``ModelSpec`` callables. We recreate those
-    from the installed model registry and only overlay the serialized model
-    dataclass values. Optimizers, schedulers, checkpointing, and the training
+    We recreate the model config from the installed model registry and only
+    overlay the serialized model dataclass values. Optimizers, schedulers, checkpointing, and the training
     dataloader are intentionally not reconstructed or used by the evaluator.
     """
 
@@ -166,16 +165,6 @@ def load_training_config(snapshot_path: str | Path) -> LoadedTrainingConfig:
         snapshot = json.load(handle)
     if not isinstance(snapshot, dict):
         raise EvaluationConfigError(f"job config must contain a JSON object: {path}")
-
-    model_snapshot = _required_mapping(snapshot, "model_spec")
-    name = _required_string(model_snapshot, "name")
-    flavor = _required_string(model_snapshot, "flavor")
-    model_spec = _resolve_model_spec(name, flavor)
-    _overlay_dataclass(
-        model_spec.model,
-        _required_mapping(model_snapshot, "model"),
-        "model_spec.model",
-    )
 
     converters = _optional_mapping(snapshot, "model_converters")
     if converters and converters.get("converters"):
@@ -188,8 +177,14 @@ def load_training_config(snapshot_path: str | Path) -> LoadedTrainingConfig:
             "offline evaluation v1 requires a HuggingFace tokenizer configuration"
         )
 
+    model_snapshot = _required_mapping(snapshot, "model")
+    name = _required_string(model_snapshot, "name")
+    flavor = _required_string(model_snapshot, "flavor")
+    model_config = _resolve_model_config(name, flavor)
+    _overlay_dataclass(model_config, model_snapshot, "model")
+
     config = Trainer.Config(
-        model_spec=model_spec,
+        model=model_config,
         hf_assets_path=_required_string(snapshot, "hf_assets_path"),
     )
     _overlay_dataclass(
@@ -267,7 +262,7 @@ def _split_python_spec(config_spec: str) -> tuple[str, str]:
     return path, factory
 
 
-def _resolve_model_spec(name: str, flavor: str) -> ModelSpec:
+def _resolve_model_config(name: str, flavor: str) -> BaseModel.Config:
     normalized_name = name.replace("/", ".")
     module_candidates = (
         f"torchtitan.models.{normalized_name}",
@@ -280,13 +275,13 @@ def _resolve_model_spec(name: str, flavor: str) -> ModelSpec:
         except ImportError as error:
             errors.append(f"{module_name}: {error}")
             continue
-        registry: Callable[[str], ModelSpec] | None = getattr(
+        registry: Callable[[str], BaseModel.Config] | None = getattr(
             module, "model_registry", None
         )
         if callable(registry):
             return registry(flavor)
     raise EvaluationConfigError(
-        f"could not resolve model registry for model_spec.name={name!r}; "
+        f"could not resolve model registry for model.name={name!r}; "
         f"tried {module_candidates}. Import errors: {'; '.join(errors)}"
     )
 

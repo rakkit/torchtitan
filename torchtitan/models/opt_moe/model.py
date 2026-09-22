@@ -7,12 +7,14 @@
 import dataclasses as _dc
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
 
+from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.config.transform import convert_config_type
+from torchtitan.distributed.parallel_dims import ParallelDims
 
 from torchtitan.models.common.attention import (
     AttentionMasksType,
@@ -32,7 +34,9 @@ from torchtitan.models.utils import (
     quadratic_attention_flops_per_token,
 )
 from .gated_norm_swattention import GatedNormSWAttention
+from .hf_assests import setup_hf
 from .norm_moe import NormMoE
+from .state_dict_adapter import OPTMoEStateDictAdapter
 from .utils.inits import (
     make_param_init,
     parse_depth_init,
@@ -294,8 +298,60 @@ class OPTMoETransformerBlock(TransformerBlock):
 class OPTMoEModel(Decoder):
     """OPT MoE Transformer model with attention and feed-forward layers."""
 
+    state_dict_adapter_cls = OPTMoEStateDictAdapter
+
+    # Copies config.json / modeling_*.py / chat template into the checkpoint
+    # dir so exports load with trust_remote_code. Was ModelSpec.hf_assets_setup_fn.
+    hf_assets_setup_fn: ClassVar[Any] = staticmethod(
+        setup_hf.copy_and_overwrite_model_config
+    )
+
+    @classmethod
+    def _register_optimizer_hooks(cls, optimizers, model_parts, parallel_dims) -> None:
+        from torchtitan.optimizers.container import register_moe_load_balancing_hook
+
+        register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
+
+    def _apply_fsdp(
+        self,
+        *,
+        parallel_dims: ParallelDims,
+        training: TrainingConfig,
+        parallelism: ParallelismConfig,
+    ) -> None:
+        from torchtitan.distributed.fsdp import (
+            apply_fsdp_to_decoder,
+            resolve_fsdp_mesh,
+            resolve_sparse_fsdp_mesh,
+        )
+
+        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
+        apply_fsdp_to_decoder(
+            self,
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            pp_enabled=parallel_dims.pp_enabled,
+            cpu_offload=training.enable_cpu_offload,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            ep_degree=parallel_dims.ep,
+            edp_mesh=edp_mesh,
+            dp_mesh_dims=dp_mesh_dims,
+            edp_mesh_dims=edp_mesh_dims,
+            symm_mem_scope=parallelism.fsdp_symm_mem_scope,
+            # DiSCO's step_experts runs the LMO on each rank's LOCAL expert
+            # buffer with no gather, so a rank must own whole expert matrices.
+            expert_shard_dim=0,
+        )
+
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
+        # Were ModelSpec.name/.flavor; kept here so they survive into the
+        # dumped job_config, which convert_to_hf and the evaluator read back.
+        name: str = "opt_moe"
+        flavor: str = ""
+        max_context_length: int = 8192
         dim: int = 2048
         n_layers: int = 24
         vocab_size: int = 201088
@@ -521,6 +577,7 @@ class OPTMoEModel(Decoder):
                 )
 
             # Sync rope length (both global and SWA-local caches)
+            self.max_context_length = max_context_length
             self.rope = _dc.replace(self.rope, max_context_length=max_context_length)
             if self.rope_of_swa is not None:
                 self.rope_of_swa = _dc.replace(

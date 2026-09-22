@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from convert_to_hf import (  # noqa: E402
     _copy_hf_assets,
     _export_hf_weights,
-    _resolve_model_spec_for_conversion,
+    _resolve_model_config_for_conversion,
     _validate_exported_hf_config,
     ParallelFileSystemReader,
     set_init_fn_type,
@@ -88,7 +88,7 @@ def convert_ema_to_hf(
     """Export the EMA weights of a DCP checkpoint in HF safetensors format.
 
     Steps mirror ``convert_to_hf``:
-      1. Resolve ModelSpec (for opt_moe, from the saved job_config).
+      1. Resolve the model config (for opt_moe, from the saved job_config).
       2. Build an empty CPU model and wrap it.
       3. Create a state dict adapter.
       4. Rebuild the EMA container the run trained with.
@@ -107,27 +107,27 @@ def convert_ema_to_hf(
             "trained weights."
         )
 
-    # 1. ModelSpec
-    model_spec = _resolve_model_spec_for_conversion(
+    # 1. Model config
+    model_config = _resolve_model_config_for_conversion(
         model_name=model_name,
         model_flavor=model_flavor,
         job_config_path=job_config,
     )
-    model_flavor = model_spec.flavor
+    model_flavor = getattr(model_config, "flavor", None) or model_flavor
 
     # 2. Build empty model on CPU
-    model_config = model_spec.model
     set_init_fn_type(model_config)
     with torch.device("cpu"):
         actual_model = model_config.build()
     model_config = getattr(actual_model, "config", model_config)
 
     # 3. State dict adapter
-    assert model_spec.state_dict_adapter is not None, (
-        "state_dict_adapter is required for HF checkpoint conversion. "
+    adapter_cls = type(actual_model).state_dict_adapter_cls
+    assert adapter_cls is not None, (
+        "state_dict_adapter_cls is required for HF checkpoint conversion. "
         f"Model '{model_name}/{model_flavor}' has none registered."
     )
-    sd_adapter = model_spec.state_dict_adapter(model_config, hf_assets_path)
+    sd_adapter = adapter_cls(model_config, hf_assets_path)
 
     # 4. Rebuild the container the run trained with. Parameters are always
     #    tracked, so only buffer EMA has to be recovered from the checkpoint:
@@ -196,8 +196,9 @@ def convert_ema_to_hf(
     _export_hf_weights(state_dict, sd_adapter, target_dtype, output_dir)
 
     # 8. HF config/modeling files
-    if model_spec.hf_assets_setup_fn is not None:
-        model_spec.hf_assets_setup_fn(actual_model, model_config, str(output_dir))
+    hf_assets_setup_fn = getattr(type(actual_model), "hf_assets_setup_fn", None)
+    if hf_assets_setup_fn is not None:
+        hf_assets_setup_fn(actual_model, model_config, str(output_dir))
         _validate_exported_hf_config(
             model_name=model_name,
             model_config=model_config,

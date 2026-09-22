@@ -713,7 +713,7 @@ def dispatch_tokens(
         (routed_tokens [num_recv, hidden], tokens_per_expert [num_local_experts], state)
     """
     # The expand layout is inference-only ("must not be backward"), so gate it on a
-    # no-grad context. With a single model_spec shared by trainer and generator, this
+    # no-grad context. With a single model_config shared by trainer and generator, this
     # auto-selects: the trainer (autograd enabled) takes the compact path, while the
     # generator -- which runs the forward under torch.no_grad()/inference_mode -- takes
     # the CUDA-graph-compatible expand path. A cuda_graph_compatible=True spec used in a grad context

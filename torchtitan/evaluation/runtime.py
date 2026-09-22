@@ -97,8 +97,8 @@ class EvaluationRuntime:
 
     @classmethod
     def build(cls, config: Trainer.Config, *, base_folder: str) -> "EvaluationRuntime":
-        if config.model_spec is None:
-            raise EvaluationConfigError("saved job config did not produce a model spec")
+        if config.model is None:
+            raise EvaluationConfigError("saved job config did not produce a model config")
 
         device_module, device_type = utils.device_module, utils.device_type
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -141,8 +141,7 @@ class EvaluationRuntime:
             raise EvaluationConfigError("offline evaluation requires a tokenizer")
         tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
 
-        model_spec = config.model_spec
-        model_config = model_spec.model
+        model_config = config.model
         model_config.update_from_config(trainer_config=config)
         with (
             torch.device("meta"),
@@ -159,11 +158,9 @@ class EvaluationRuntime:
             ),
         )
         model_converters.convert(model)
-        model = model_spec.parallelize_fn(
-            model,
+        model = model.parallelize(
             parallel_dims=parallel_dims,
             training=config.training,
-            model_converters=config.model_converters,
             parallelism=config.parallelism,
             compile_config=config.compile,
             ac_config=config.activation_checkpoint,

@@ -131,12 +131,9 @@ class FeedForward(Module):
                 param_init={"weight": w1_init},
                 sharding_config=config.linear_sharding_config,
             ).build()
-            self.w3 = Linear.Config(
-                in_features=dim,
-                out_features=config.hidden_dim,
-                param_init={"weight": w3_init},
-                sharding_config=config.linear_sharding_config,
-            ).build()
+        # w2 before w3, matching the original assignment order: module
+        # registration order drives init_weights()'s RNG draws, so reordering
+        # these silently changes every w2/w3 weight.
         self.w2 = Linear.Config(
             in_features=config.hidden_dim,
             out_features=dim,
@@ -147,6 +144,13 @@ class FeedForward(Module):
             },
             sharding_config=config.linear_sharding_config,
         ).build()
+        if not config.fuse_w13:
+            self.w3 = Linear.Config(
+                in_features=dim,
+                out_features=config.hidden_dim,
+                param_init={"weight": w3_init},
+                sharding_config=config.linear_sharding_config,
+            ).build()
         self.act_fn = build_activation(config.activation_type)
 
         if config.norm_everywhere:

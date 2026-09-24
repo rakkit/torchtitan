@@ -57,6 +57,7 @@ from torchtitan.models.common.config_utils import make_token_dispatcher_config
 from torchtitan.models.common.linear import RouterGateLinear
 from torchtitan.models.common.moe import QuantileBalancer, RoutedExperts
 from torchtitan.models.common.nn_modules import Identity
+from torchtitan.models.common.param_layout import named, ParamLayout
 from torchtitan.protocols.module import Module
 
 from .norm_ffn import FeedForward
@@ -405,6 +406,13 @@ class NormGroupedExperts(Module):
         residual_div: float = 1.0
         init_gate_as_residual: bool = False
 
+    def param_layouts(self) -> dict:
+        """Dim 0 of every expert weight is the batch of experts."""
+        return {
+            n: ParamLayout("expert_batch")
+            for n, _ in self.named_parameters(recurse=False)
+        }
+
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
@@ -558,6 +566,10 @@ class NormRouter(Module):
         """Histogram bins for quantile-balanced bias updates. None keeps the
         DeepSeek-V3 sign nudge. Requires sigmoid scores and an expert bias."""
         _debug_force_load_balance: bool = False
+
+    def param_layouts(self) -> dict:
+        """The gate's rows are the experts."""
+        return {named(self, self.gate.weight): ParamLayout("router")}
 
     def __init__(self, config: Config):
         super().__init__()

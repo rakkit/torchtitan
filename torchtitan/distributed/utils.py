@@ -705,7 +705,7 @@ def get_param_dtype(module: torch.nn.Module) -> torch.dtype | None:
 # hypothetical -- it is what pure DDP did before these helpers existed.
 #
 # Keep this the single source of truth. `components/metrics.py` uses it to
-# decide who builds a logger, and `optimizers/disco.py` uses it to decide who
+# decide who builds a logger, and DiSCO's metric sink uses it to decide who
 # keeps replicated (embed/scalar) metrics and to assert the two agree.
 # ---------------------------------------------------------------------------
 
@@ -753,17 +753,17 @@ def fsdp_shard_mesh(parallel_dims: "ParallelDims") -> DeviceMesh | None:
 def metrics_shard_mesh(parallel_dims: "ParallelDims") -> DeviceMesh | None:
     """The mesh DiSCO spreads per-parameter metric ownership over.
 
-    This mirrors ``disco.get_param_type``'s own branch, and must keep mirroring
-    it:
+    This mirrors DiSCO's family classifier (``disco.layout.classify``), and
+    must keep mirroring it:
 
     * ``fsdp_enabled`` -- every non-scalar param is FSDP or Expert, and both are
       owned ``param_idx % fsdp_world_size`` on the ``fsdp`` mesh.
       ``dp_replicate`` then holds bit-identical replicas, so only one replica
       should log.
-    * otherwise -- every non-scalar param is DDP, owned ``i % world_size`` on
-      the ``dp_replicate`` mesh (``disco._precompute_ddp_metadata``). Here
-      ``dp_replicate`` *is* the shard dimension, so every replica owns a
-      distinct slice and every replica must log.
+    * otherwise -- every non-scalar param is replicated, owned
+      ``i % world_size`` on the ``dp_replicate`` mesh (DiSCO's replicated
+      family). Here ``dp_replicate`` *is* the shard dimension, so every
+      replica owns a distinct slice and every replica must log.
 
     Returns None when there is no data-parallel sharding at all (single rank,
     or PP/TP only), i.e. one rank owns everything.
@@ -791,8 +791,7 @@ def rank_owns_metrics_shard(parallel_dims: "ParallelDims") -> bool:
     mesh.*
 
     ``tp`` must be rank 0 in both cases -- TP ranks hold shards of the *same*
-    parameter and DiSCO gathers them internally, so they are not distinct
-    logging work.
+    parameter, so they are not distinct logging work.
     """
     is_tp_0 = (
         parallel_dims.get_optional_mesh("tp").get_local_rank() == 0

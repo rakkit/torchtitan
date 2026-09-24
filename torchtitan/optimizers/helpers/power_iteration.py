@@ -34,11 +34,6 @@ So this is exact, and it is cheaper than the iteration it replaces:
 and batched -- the shape that matters, since the expert path decomposes
 hundreds of matrices at once -- `eigh` costs 1.19x `eigvalsh` on 1344
 `[384,1024]` (+47 ms in total) and 1.11x on 282 `[768,2048]` (+32 ms).
-
-The iteration-shaped arguments (`v0`, `n_iter`, `n_iter_cold`, `tol`,
-`early_exit`) are accepted and ignored, so callers that were written against
-the iterative contract keep working; `v0` in particular is harmless to keep
-passing, there is simply no warm start to carry any more.
 """
 
 import torch
@@ -48,30 +43,12 @@ from .norm_helper import gram_top_singular_pair
 __all__ = [
     "top_singular_pair",
     "spectral_norm",
-    "IS_STUB",
-    "DEFAULT_N_ITER",
-    "DEFAULT_N_ITER_COLD",
 ]
-
-# No longer a stub: the values below are exact. Kept as a public flag because
-# disco.py branches on it to decide whether the spectral radial metrics are
-# meaningful enough to compute.
-IS_STUB: bool = False
-
-# Retained for signature compatibility; unused.
-DEFAULT_N_ITER = 2
-DEFAULT_N_ITER_COLD = 24
 
 
 @torch.no_grad()
 def top_singular_pair(
     W: torch.Tensor,
-    v0: torch.Tensor | None = None,
-    n_iter: int = DEFAULT_N_ITER,
-    n_iter_cold: int = DEFAULT_N_ITER_COLD,
-    tol: float = 1e-7,
-    early_exit: bool = False,
-    backend: str = "torch",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Leading singular triple of `W`.
@@ -80,9 +57,6 @@ def top_singular_pair(
         W: `[..., m, n]`. Arbitrary leading batch dimensions -- a bare `[m, n]`
             matrix, a `[E, d_out, d_in]` expert stack, or a stack of
             same-shaped dense params all work with the same call.
-        v0, n_iter, n_iter_cold, tol, early_exit: accepted and ignored, see the
-            module docstring. There is no iteration and no warm start.
-        backend: reserved for a fused implementation.
 
     Returns:
         `(sigma, u1, v1)` with shapes `[...]`, `[..., m]`, `[..., n]`, float32,
@@ -90,14 +64,6 @@ def top_singular_pair(
         or non-finite slice, `sigma` is 0 with deterministic unit vectors, so
         callers that divide by sigma stay finite.
     """
-    if backend != "torch":
-        impl = _BACKENDS.get(backend)
-        if impl is None:
-            raise ValueError(
-                f"unknown backend {backend!r}; available: {sorted(_BACKENDS)}"
-            )
-        return impl(W)
-
     if W.ndim < 2:
         raise ValueError(
             f"top_singular_pair needs a matrix, got shape {tuple(W.shape)}"
@@ -117,10 +83,8 @@ def top_singular_pair(
     v1 = v1 / v1.norm(dim=-1, keepdim=True).clamp_min(tiny)
     # Unconditional `torch.where`, NOT `if bool(degenerate.any())`: reading a
     # device tensor into a Python bool forces a device-to-host sync on every
-    # call, which is exactly the stall disco.py goes to some length to avoid
-    # elsewhere (see `_materialize_gathered`). The two zero-vectors are tiny
-    # and the `where` is cheap, so paying them always is far better than
-    # paying a sync always.
+    # call. The two zero-vectors are tiny and the `where` is cheap, so paying
+    # them always is far better than paying a sync always.
     e_u = torch.zeros(m, device=W.device, dtype=u1.dtype)
     e_v = torch.zeros(n, device=W.device, dtype=v1.dtype)
     e_u[0] = 1.0
@@ -133,14 +97,33 @@ def top_singular_pair(
 
 
 @torch.no_grad()
-def spectral_norm(
-    W: torch.Tensor,
-    v0: torch.Tensor | None = None,
-    n_iter: int = DEFAULT_N_ITER,
-    n_iter_cold: int = DEFAULT_N_ITER_COLD,
-) -> torch.Tensor:
+def spectral_norm(W: torch.Tensor) -> torch.Tensor:
     """`sigma_max(W)` only, for callers that do not need the singular vectors."""
     return top_singular_pair(W)[0]
 
 
-_BACKENDS: dict = {}
+@torch.no_grad()
+def sigma_max_warm(
+    W: torch.Tensor, v: torch.Tensor | None = None, n_iter: int = 4
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Warm-started power iteration for `sigma_max` of `[..., m, n]`: a lower
+    bound (Rayleigh quotient at the iterate), cheap enough for every step.
+    Deterministic cold start (`ones`), so replicas agree. Returns `(sigma, v)`;
+    feed `v` back next step. Zero for an all-zero or non-finite slice."""
+    if W.ndim < 2:
+        raise ValueError(f"sigma_max_warm needs a matrix, got {tuple(W.shape)}")
+    n = W.shape[-1]
+    tiny = torch.finfo(torch.float32).tiny
+    finite = torch.isfinite(W).all(dim=-1).all(dim=-1)
+    Wc = torch.where(finite[..., None, None], W, torch.zeros_like(W))
+    if v is None or v.shape != Wc.shape[:-2] + (n,) or v.dtype != Wc.dtype:
+        v = torch.ones(*Wc.shape[:-2], n, device=Wc.device, dtype=Wc.dtype)
+    else:  # an all-zero row (a fresh slot, or an all-zero W before) starts cold
+        v = torch.where(v.norm(dim=-1, keepdim=True) > 0, v, torch.ones_like(v))
+    v = v / v.norm(dim=-1, keepdim=True).clamp_min(tiny)
+    for _ in range(n_iter):
+        Wv = torch.einsum("...mn,...n->...m", Wc, v)
+        v = torch.einsum("...mn,...m->...n", Wc, Wv)
+        v = v / v.norm(dim=-1, keepdim=True).clamp_min(tiny)
+    sigma = torch.einsum("...mn,...n->...m", Wc, v).norm(dim=-1)
+    return torch.where(finite, sigma, torch.zeros_like(sigma)), v

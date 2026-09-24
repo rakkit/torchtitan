@@ -6,27 +6,23 @@
 
 """
 Gram-based metrics comparing a weight's before/after-update geometry against
-its raw momentum -- see gram_matrix.md (repo root) for the full math
-writeup this ports; formulas below follow that spec's reference
-`get_gram_metrics` implementation directly.
+its raw momentum; the formulas follow the reference `get_gram_metrics`
+implementation directly.
 
 Three tensors, all the same shape:
   - `W_before` -- the weight before this step's update.
-  - `V_raw`    -- the RAW effective gradient/momentum (whatever's fed into
-                  `AbstractDiSCO.lmo()`), not the LMO-processed update.
-  - `W_after`  -- the weight after this step's update. disco.py passes the
-                  cheap `pseudo_w` approximation here (the same tensor
-                  already used for track_param_* norms), not a fresh real
-                  post-update read.
+  - `V_raw`    -- the RAW effective gradient/momentum (what the rule's
+                  compute receives), not the update it returns.
+  - `W_after`  -- the weight after this step's update, as the apply writes
+                  it (the same tensor the track_param_* norms use).
 
 `U = W_after - W_before` (the exact realised displacement) and `A = -U` are
-derived internally and used throughout -- see gram_matrix.md's "which tensor
-answers which question" table for the intuition (raw momentum `V` studies
-emergent optimizer-state geometry; the realised displacement `U` studies the
-actual trajectory that moved the weights).
+derived internally and used throughout (raw momentum `V` studies emergent
+optimizer-state geometry; the realised displacement `U` studies the actual
+trajectory that moved the weights).
 
 Three cumulative levels, gated by a single `level: int` argument:
-  0: nothing (returns {} immediately -- the cheap no-op every disco.py call
+  0: nothing (returns {} immediately -- the cheap no-op every DiSCO call
      site relies on).
   1: O(m^2) entrywise geometry (row-dominance ratios, off-diagonal
      correlation stats, weight/momentum/update self- and cross-alignment,
@@ -58,13 +54,13 @@ trivially derivable from an already-logged vector: `raw_trace_normalised`/
 `K_U_eigenvalues`, both already returned).
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 from torch.distributed.tensor import DTensor
 
-from torchtitan.optimizers.norm_helper import _gram_spectrum, fp64_gram
+from .norm_helper import _gram_spectrum, fp64_gram
 
 _DEFAULT_GRAM_EPS: float = 1e-6
 _DEFAULT_GRAM_TOPK: int = 8
@@ -88,13 +84,13 @@ def gram_matrix_is_transposed(shape: tuple[int, ...]) -> bool:
 def gram_vector_len(shape: tuple[int, ...], transpose: bool = False) -> int:
     """
     Static, shape-derived length of every vector-valued gram metric for a
-    parameter of this local shape -- for disco.py's per-param offset-table
-    precompute (DDP/FSDP/experts). `transpose` is accepted only for
+    parameter of this local shape -- for the metric sink's per-unit offset
+    tables. `transpose` is accepted only for
     call-site compatibility and is ignored: `calculate_gram_metrics`
     decides orientation itself from the tensor's actual shape (always
     `rows <= cols`, see its docstring), so this must independently track
     `min(shape[-2], shape[-1])` regardless of what's passed here -- a
-    mismatch between the two would corrupt disco.py's packed offset
+    mismatch between the two would corrupt the sink's packed offset
     tables.
     """
     if len(shape) == 1:
@@ -443,9 +439,9 @@ class _GramCore:
     C_WV: torch.Tensor
     C_WU: torch.Tensor
     C_VA: torch.Tensor
-    delta_GW: torch.Tensor
-    delta_CW: torch.Tensor
-    naive_delta_GW: torch.Tensor
+    delta_GW: torch.Tensor  # noqa: N815
+    delta_CW: torch.Tensor  # noqa: N815
+    naive_delta_GW: torch.Tensor  # noqa: N815
     # Row-normalized factors (C_X = X_hat @ X_hat.T) -- stored so level 2's
     # SVD-based C_* eigenvalues (_svd_eigenvalues(X_hat)) reuse the same
     # normalization computed here, instead of row-normalizing a second time.
@@ -998,18 +994,17 @@ def calculate_gram_metrics(
 ) -> dict[str, torch.Tensor]:
     """
     Cheap no-op ({}) for level <= 0 -- the single early-return point; every
-    disco.py call site stays unconditional (see module docstring). `V_raw`
-    should be the raw effective grad/momentum (whatever's fed into
-    AbstractDiSCO.lmo()); `W_after` should be the post-update weight
-    (disco.py passes `pseudo_w`) -- see readme.md.
+    DiSCO call site stays unconditional (see module docstring). `V_raw`
+    should be the raw effective grad/momentum (what the rule's compute
+    receives); `W_after` the post-update weight as the apply writes it.
 
     Mirrors norm_helper.calculate_norm's unwrap contract for all three
     tensors (Parameter/DTensor -> local tensor, 1-D -> diag_embed), then
     upcasts each to float32 if in fp16/bf16 (Gram/eigh/svd are unreliable
     in half precision).
 
-    `transpose` is accepted for call-site compatibility (disco.py's
-    embedding path passes its name-based `need_T`) but is IGNORED here:
+    `transpose` is accepted for call-site compatibility but is IGNORED
+    here:
     orientation is instead decided unconditionally from shape -- rows are
     always transposed to be <= cols. This both (a) guarantees the reduced
     SVD used internally (see `_gram_eigh_from_factor`) always spans the
@@ -1034,8 +1029,8 @@ def calculate_gram_metrics(
 
     Returns a dict whose key set is a deterministic function of `level`
     alone (gram_scalar_names(level) + gram_vector_names(level)),
-    independent of parameter shape -- disco.py's DDP/FSDP/experts packing
-    code relies on this fixed arity. Degenerate shapes (m < 2) return {}
+    independent of parameter shape -- the metric sink's packing relies on
+    this fixed arity. Degenerate shapes (m < 2) return {}
     rather than ill-defined values, same as level <= 0.
     """
     if level <= 0:

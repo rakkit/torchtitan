@@ -6,53 +6,23 @@
 
 """
 Helpers for visualizing and exporting a parameter's singular-value spectrum
-(see optimizers/norm_helper.py / optimizers/disco.py, which compute and
+(see helpers/norm_helper.py and disco/metrics.py, which compute and
 gather the raw values into `track_spectrum_update/...` and
 `track_spectrum_param/...` metric entries) via Weights & Biases.
 
-Two things can happen to each spectrum, independently controlled by
-`SpectrumLoggingConfig` (built from `DiSCOOptimizersContainer.Config`'s
-`enable_spectrum_plot`/`enable_spectrum_export` fields -- i.e.
-`config.optimizer.enable_spectrum_plot`/`enable_spectrum_export` in the job
-config -- see `components/optimizer.py`'s
-`DiSCOOptimizersContainer.spectrum_logging_config`):
+Controlled by `SpectrumLoggingConfig`, built from
+`DiSCOOptimizersContainer.Config`'s `enable_spectrum_export` field:
 
-- `enable_plot`: instead of one image per parameter (illegible/unusable at
-  ~31k tracked parameters), render a small number of "atlas" grid images —
-  one small-multiples cell per parameter, arranged so the whole model's
-  structure is visible at a glance. Up to two grids, each split by kind
-  (`plot_dense_update`/`plot_dense_param`/`plot_moe_update`/
-  `plot_moe_param`):
-  - dense grid: rows = layers, columns = attention/FFN matrix types (WQ,
-    WK, WV, WO, W1, W2, W3, plus any other per-layer matrix that's tracked,
-    e.g. the MoE router's gate), discovered dynamically from the tracked
-    keys rather than hardcoded. Embedding/lm-head (and anything else
-    outside a "layers.N." prefix) have no meaningful layer index or matrix
-    type of their own, so rather than wasting a row/column across the whole
-    grid for them, they get one dedicated top row with their own per-cell
-    titles instead of the shared column header — still one image, see
-    `_render_grid`.
-  - MoE grid: rows = MoE-enabled layers, columns = one distribution column
-    per weight type (`W1*`/`W2*`/`W3*` -- both curves overlaid across
-    *every* gathered expert, see `_draw_distribution_cell`) followed by
-    `E{expert_idx}{type}` (e.g. "E0W1", "E1W2", ...) for individual
-    experts, capped at `_MAX_EXPERTS_TO_PLOT` experts — a plotting-only cap
-    on the individual columns only: it thins out what's *drawn* there, not
-    what disco.py computes/gathers upstream (see `_MAX_EXPERTS_TO_PLOT`),
-    and the distribution columns always reflect every expert regardless.
-  Each cell is the same normalized-spectrum + cumulative-energy curve as
-  before, minus per-cell axis ticks (illegible at grid-cell size); row/
-  column headers plus one figure-level legend carry the labeling instead.
 - `enable_export`: write every tracked parameter's spectrum for the event
-  into a Parquet file and upload it as a versioned W&B Artifact -- a
-  "database" companion meant for offline/programmatic analysis, since the
-  plot already covers in-UI visualization. Spectra longer than
+  into a Parquet file and upload it as a versioned W&B Artifact, for
+  offline/programmatic analysis. Spectra longer than
   `_MAX_RESAMPLE_POINTS` are linearly resampled down to that many points
   along the rank-index axis purely to bound per-event file size;
   `param_name`'s original length is kept in the `num_singular_values`
   column, so shorter spectra (the common case) stay exact and the tradeoff
-  is always visible. Unlike the plot, this is never expert-capped -- it's
-  meant to be the lossless record.
+  is always visible. Nothing is expert-capped: this is the lossless record.
+  (An in-UI "atlas" plot mode lived here too, and went with its config
+  field.)
 
 `process_norms_for_logging` is the entry point: given the raw norms dict
 produced by `DiSCOOptimizersContainer.get_parameter_norms()`
@@ -87,45 +57,10 @@ class SpectrumLoggingConfig(NamedTuple):
     export_dir: str | None = None
 
 
-# Rendering is CPU-bound (matplotlib draw calls + PNG encode) — parallelize
-# the (small, fixed) number of grid images across a small process pool
-# rather than doing it serially in the training process. Threads were tried
-# first in an earlier per-parameter version of this module and measured to
-# give only ~7% speedup: matplotlib's cost is dominated by pure-Python
-# layout/text work that holds the GIL, so threads mostly serialize anyway.
-# Processes side-step the GIL entirely. Sized to the max number of grids
-# `_build_grids` can ever produce in one event (dense/moe x update/param) --
-# an earlier per-parameter version of this module needed far more workers
-# (hundreds of small renders per event); consolidating into a handful of
-# "atlas" images made that unnecessary, but the pool itself (built once,
-# persistent) is still worth keeping for the ~4x wall-clock win on what's
-# now a few hundred-subplot renders instead of thousands of tiny ones.
-
-
-# Shared resolution cap, for two unrelated reasons:
-# - plotting: grid cells are tiny (a few tens of px at most), so no more
-#   than a few hundred distinct x-positions are ever visually
-#   distinguishable — drawing every point of a multi-thousand-length
-#   spectrum costs render time for detail nobody can see.
-# - export: bounds per-event Parquet size (see `_export_spectrum`) —
-#   storage-only, `num_singular_values` in the exported row always records
-#   the true, pre-resample length.
-# Either way, spectra at or below this length are handled exact/unsampled.
+# Bounds per-event Parquet size (see `_export_spectrum`); storage only, since
+# `num_singular_values` in the exported row keeps the true pre-resample
+# length. Spectra at or below this length are exported exact.
 _MAX_RESAMPLE_POINTS = 512
-
-# Plotting-only cap on how many experts' columns appear in the MoE grid —
-# thins out what's *drawn*; disco.py's step_experts still computes/gathers
-# every expert's spectrum regardless (see module docstring). Bump this when
-# you want to look at more experts; it's just a rendering knob.
-
-# Fixed preferred column order for the dense grid — anything else tracked
-# per-layer (e.g. the MoE router's "gate") is appended after these, sorted.
-
-# Sentinel rows for the dense grid's top, one each for embedding/lm-head/
-# anything else that isn't inside a "layers.N." prefix. These aren't real
-# matrix "types" or layers, so `_build_grids` routes them (any row < 0) into
-# their own small standalone grid instead of the per-layer dense one — see
-# `_build_grids`, `_order_embed_columns`.
 
 
 @functools.lru_cache(maxsize=128)
@@ -209,7 +144,7 @@ def _export_spectrum(
         )
 
     os.makedirs(export_dir, exist_ok=True)
-    path = os.path.join(export_dir, f"step_{step}.parquet")
+    path = export_path(export_dir, step)
     pq.write_table(pa.Table.from_pylist(rows), path, compression="zstd")
 
     if wandb.run is None:
@@ -219,6 +154,13 @@ def _export_spectrum(
     wandb.run.log_artifact(artifact, aliases=[f"step_{step}"])
 
 
+def export_path(export_dir: str, step: int) -> str:
+    """One file per writing rank: with per-rank logging or PP, several ranks
+    export at the same step into the same folder."""
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    return os.path.join(export_dir, f"step_{step}_rank{rank}.parquet")
+
+
 def process_norms_for_logging(
     all_norms: dict[str, Any],
     step: int,
@@ -226,15 +168,10 @@ def process_norms_for_logging(
 ) -> dict[str, Any]:
     """
     Pull every raw singular-value spectrum tensor out of `all_norms` (keys
-    containing "track_spectrum_", produced by DiSCO's norm tracking — see
-    disco.py). Raw spectrum tensors are never valid values for a scalar
+    containing "track_spectrum_", produced by DiSCO's norm tracking -- see
+    disco/metrics.py). Raw spectrum tensors are never valid values for a scalar
     logger, so they're always popped out; what (if anything) then happens to
     them is controlled by `config` (see `SpectrumLoggingConfig`):
-    - `config.enable_plot`: bucket every tensor into up to 4 "atlas" grids
-      (see `_build_grids`) and render each in parallel across a small
-      process pool (`_get_executor`, `_render_grid`), adding
-      `plot_dense_update`/`plot_dense_param`/`plot_moe_update`/
-      `plot_moe_param` back into the dict as `wandb.Image` objects.
     - `config.enable_export`: write+upload the full spectrum for every
       tracked parameter this event (see `_export_spectrum`) — nothing is
       added back into the dict for this, since it's not a per-step scalar
@@ -249,10 +186,6 @@ def process_norms_for_logging(
     if not spectrum_keys:
         return all_norms
 
-    # Move to CPU here, in the main process, before crossing the process
-    # boundary for rendering — see _get_executor's "spawn" note. Both the
-    # export and the plot branches need CPU tensors, so do this once
-    # regardless of which flags are on.
     # One batched device->host transfer, not one `.cpu()` per spectrum: there
     # are 2 per tracked parameter (update + weight), ~672 per rank per logging
     # step for qwen30b-a3b at dp_shard=64, and each individual `.cpu()` is its

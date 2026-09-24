@@ -28,6 +28,7 @@ from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Identity
+from torchtitan.models.common.param_layout import by_rank, named, ParamLayout
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import (
     get_nparams_and_active_nparams,
@@ -308,9 +309,34 @@ class OPTMoEModel(Decoder):
 
     @classmethod
     def _register_optimizer_hooks(cls, optimizers, model_parts, parallel_dims) -> None:
-        from torchtitan.optimizers.container import register_moe_load_balancing_hook
+        from torchtitan.optimizers.moe_balance import register_moe_load_balancing_hook
 
         register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
+
+    def param_layouts(self) -> dict:
+        """What every parameter is, keyed by FQN (see
+        `models/common/param_layout.py`): modules declare what only they know
+        (expert batches, fused projections, the router gate), the model the two
+        vocabulary matrices, and the rest is stated by rank."""
+        layouts = {}
+        for module_name, module in self.named_modules():
+            declare = getattr(module, "param_layouts", None)
+            if module is self or declare is None:
+                continue
+            for param_name, layout in declare().items():
+                layouts[
+                    f"{module_name}.{param_name}" if module_name else param_name
+                ] = layout
+        for module, kind in (
+            (self.tok_embeddings, "embedding"),
+            (self.lm_head, "unembedding"),
+        ):
+            if module is not None:  # PP stages hold one or neither
+                layouts[named(self, module.weight)] = ParamLayout(kind)
+        for name, p in self.named_parameters():
+            if name not in layouts:
+                layouts[name] = by_rank(p.shape)
+        return layouts
 
     def _apply_fsdp(
         self,
@@ -340,8 +366,8 @@ class OPTMoEModel(Decoder):
             dp_mesh_dims=dp_mesh_dims,
             edp_mesh_dims=edp_mesh_dims,
             symm_mem_scope=parallelism.fsdp_symm_mem_scope,
-            # DiSCO's step_experts runs the LMO on each rank's LOCAL expert
-            # buffer with no gather, so a rank must own whole expert matrices.
+            # DiSCO runs each expert's rule on the rank's LOCAL expert rows
+            # with no gather, so a rank must own whole expert matrices.
             expert_shard_dim=0,
         )
 
@@ -697,6 +723,21 @@ class OPTMoEModel(Decoder):
         Returns:
             ``output``.
         """
+        h = self._trunk(tokens, positions, attention_masks, loss_mask, doc_id)
+        if self._skip_lm_head:
+            return h
+        return self.lm_head(h) if self.lm_head is not None else h
+
+    def _trunk(
+        self,
+        tokens: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        attention_masks: AttentionMasksType | None = None,
+        loss_mask: torch.Tensor | None = None,
+        doc_id: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Everything up to and including the final norm: the head's input,
+        which ``forward`` returns as is under the chunked loss."""
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         # PP nulls any root child not in [tok_embeddings, layers.*, norm,
@@ -715,11 +756,9 @@ class OPTMoEModel(Decoder):
         for layer in self.layers.values():
             h = layer(h, attention_masks, positions, loss_mask, doc_id)
 
-        h = self.norm(h) if self.norm is not None else h
-        if self._skip_lm_head:
-            return h
-        return self.lm_head(h) if self.lm_head is not None else h
+        return self.norm(h) if self.norm is not None else h
 
+    @torch.no_grad()
     def get_attention_masks(
         self,
         positions: torch.Tensor,

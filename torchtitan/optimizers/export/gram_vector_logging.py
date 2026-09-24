@@ -54,6 +54,8 @@ from typing import Any, NamedTuple
 
 import torch
 
+from .spectrum_logging import export_path
+
 __all__ = [
     "GramVectorLoggingConfig",
     "process_gram_vectors_for_logging",
@@ -88,8 +90,8 @@ _GRAM_PREFIX = "track_gram_"
 _MAX_RESAMPLE_POINTS = 512
 
 # Plotting-only cap on how many experts' columns appear in the MoE grid --
-# disco.py's step_experts still computes/gathers every expert's gram vector
-# regardless (see module docstring).
+# DiSCO still computes and gathers every expert's gram vector regardless (see
+# module docstring).
 
 
 # Sentinel rows for the dense grid's top -- see _build_grids/_order_embed_columns.
@@ -196,7 +198,7 @@ def _export_gram_vectors(
         )
 
     os.makedirs(export_dir, exist_ok=True)
-    path = os.path.join(export_dir, f"step_{step}.parquet")
+    path = export_path(export_dir, step)
     pq.write_table(pa.Table.from_pylist(rows), path, compression="zstd")
 
     if wandb.run is None:
@@ -214,15 +216,11 @@ def process_gram_vectors_for_logging(
     """
     Pull every vector-valued gram metric out of `all_norms` (keys containing
     "track_gram_" whose value has more than one element -- produced by
-    DiSCO's gram tracking at gram_level >= 1, see disco.py/gram_helper.py).
+    DiSCO's gram tracking at gram_level >= 1, see gram_helper.py).
     Raw multi-element tensors are never valid values for a scalar logger, so
     they're always popped out; what (if anything) then happens to them is
     controlled by `config` (see `GramVectorLoggingConfig`, mirrors
     `spectrum_logging.SpectrumLoggingConfig` exactly):
-    - `config.enable_plot`: bucket into one atlas grid per (metric_name,
-      dense|moe) pair and render each in parallel across a small process
-      pool, adding `plot_gram_{metric_name}_dense`/`plot_gram_{metric_name}
-      _moe` back into the dict as `wandb.Image` objects.
     - `config.enable_export`: write+upload every tracked gram vector for
       this event (see `_export_gram_vectors`) -- nothing added back into the
       dict for this, it's a side-channel artifact upload, not a per-step

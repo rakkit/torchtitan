@@ -11,7 +11,7 @@
 set -u
 D="$(cd "$(dirname "$0")" && pwd)"
 rc=0
-for t in verify_power_iteration verify_norm_helper verify_radial_helper verify_disco_ordering verify_disco_construct verify_shard_predicate verify_radial_batched verify_gram_helper; do
+for t in verify_power_iteration verify_norm_helper verify_radial_helper verify_disco_construct verify_shard_predicate verify_radial_batched verify_gram_helper verify_head_geometry; do
   printf '%-28s ' "$t"
   if python "$D/$t.py" > "/tmp/$t.out" 2>&1; then echo PASS; else echo "FAIL  (see /tmp/$t.out)"; rc=1; fi
 done

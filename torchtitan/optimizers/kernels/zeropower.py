@@ -7,14 +7,9 @@
 from itertools import repeat
 
 import torch
-from torch import Tensor
 
+from .floors import NORM_FLOOR
 from .newton_schulz_triton import newton_schulz_triton, polar_express_triton
-
-# def zeropower_via_svd(G, **kwargs):
-#     U, S, V = G.svd()
-#     X = U @ V.T
-#     return X
 
 
 def zeropower_via_svd(G, **kwargs):
@@ -34,7 +29,13 @@ def zeropower_via_svd(G, **kwargs):
     X_list = []
     for b in range(G32.shape[0]):
         U, S, V = G32[b].svd()  # per-matrix SVD (matches your API choice)
-        Xb = U @ V.t()  # orthogonal factor
+        # Pseudo-polar: a singular direction at the noise floor carries no
+        # information and its singular vectors are arbitrary, so send it to 0
+        # as the iterative backends do -- `U @ V.t()` would send it to 1.
+        # Tolerance is LAPACK's rank rule, max(m, n) * eps * sigma_max.
+        tol = S[..., :1] * (max(G32.shape[-2:]) * torch.finfo(torch.float32).eps)
+        Xb = (U * (S > tol)) @ V.t()
+        Xb = Xb * (torch.linalg.vector_norm(G32[b]) >= NORM_FLOOR)  # as the others
         X_list.append(Xb)
 
     X = torch.stack(X_list, dim=0)
@@ -106,7 +107,7 @@ def zeropower_via_polar_express(G, steps=5, eps=1e-7):
 
     # Per-matrix normalisation; matches your scalar normalisation when batch=1.
     norm = torch.linalg.norm(X, dim=(-2, -1), keepdim=True)
-    X = X / (norm * 1.01 + eps)  # ensure top singular value <= 1
+    X = X / torch.where(norm >= NORM_FLOOR, norm * 1.01 + eps, torch.inf)
 
     # Main loop (batched matmuls).
     for k in range(steps):
@@ -160,7 +161,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
 
     # Normalize each matrix in the batch individually
     norm = torch.linalg.norm(X, dim=(-2, -1), keepdim=True)
-    X = X / (norm + eps)  # ensure top singular value <= 1 for each matrix
+    X = X / torch.where(norm >= NORM_FLOOR, norm + eps, torch.inf)
 
     # Perform the iteration using batched matrix multiplication (torch.bmm)
     for _ in range(steps):
@@ -182,61 +183,18 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     return X.to(original_dtype)
 
 
-@torch.compile(dynamic=False, fullgraph=True)
-def hybrid_polar_express_triton_gate_up(
-    G: Tensor,
-    steps: int = 5,
-    eps: float = 1e-7,
-):
-    dtype = G.dtype
-    G_fp32 = G.float()
-    norm = G_fp32.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-8)
-    G = (G_fp32 / norm).to(dtype)
-    return polar_express_triton(G, steps, eps)
-
-
-@torch.compile(dynamic=False, fullgraph=True)
-def hybrid_polar_express_triton_down(
-    G: Tensor,
-    steps: int = 5,
-    eps: float = 1e-7,
-) -> Tensor:
-    # nn.Linear layout: [D_out, D_in]
-    # w2: [D_model, D_ff]
-    # Compute one FP32 norm per input column.
-    original_dtype = G.dtype
-    G_fp32 = G.float()
-
-    column_norm = G_fp32.norm(
-        p=2,
-        dim=0,
-        keepdim=True,
-    ).clamp_min(1e-8)
-
-    G_normalized = (G_fp32 / column_norm).to(original_dtype)
-
-    return polar_express_triton(G_normalized, steps, eps)
-
-
 zeropower_backends = dict(
     svd=zeropower_via_svd,
     newtonschulz5=zeropower_via_newtonschulz5,
     polar_express=zeropower_via_polar_express,
     newtonschulz5_triton=newton_schulz_triton,
     polar_express_triton=polar_express_triton,
-    hybrid_polar_express_triton_gate_up=hybrid_polar_express_triton_gate_up,
-    hybrid_polar_express_triton_down=hybrid_polar_express_triton_down,
     identity=lambda x, **kwargs: x,
 )
 
-# Registered after the dict so `gram_newton_schulz` can import
-# `polar_express_coefficients` from this module without a cycle. Opt in with
-# `--optimizer.zeropower_backend gram_polar_express`; the default is unchanged.
-# This one is on the *update path*, so switching it changes the training
-# trajectory -- see that module's docstring for the measured speed and accuracy.
-try:
-    from .gram_newton_schulz import gram_polar_express as _gram_polar_express
-
-    zeropower_backends["gram_polar_express"] = _gram_polar_express
-except Exception:  # pragma: no cover - optional, never break import
-    pass
+# `gram_polar_express` adds itself to the dict at the end of its own module,
+# which is the only order that works both ways round: it needs
+# `polar_express_coefficients` from here, and whichever of the two is imported
+# first leaves the other partially initialised. Imported here for that side
+# effect, so the backend exists however the caller reached this module.
+from . import gram_newton_schulz as _gram_newton_schulz  # noqa: E402,F401

@@ -30,7 +30,7 @@ import torch
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
-from torchtitan.optimizers.radial_helper import (  # noqa: E402
+from torchtitan.optimizers.helpers.radial_helper import (  # noqa: E402
     calculate_radial_metrics,
     new_radial_state,
     RADIAL_METRIC_NAMES,
@@ -55,7 +55,7 @@ def check(name, ok, detail=""):
 
 
 def mkspec(W, U, batched):
-    """SpectralInputs built from real SVDs, the way disco.py supplies them."""
+    """SpectralInputs built from real SVDs, the way DiSCO supplies them."""
     Ws = W if batched else W.unsqueeze(0)
     Us = U if batched else U.unsqueeze(0)
     uw, sw, vw = torch.linalg.svd(Ws.float(), full_matrices=False)

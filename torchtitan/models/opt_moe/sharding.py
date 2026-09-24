@@ -24,8 +24,6 @@ from typing import TYPE_CHECKING
 
 import spmd_types as spmd
 
-from torch.distributed.tensor import Shard
-
 from torchtitan.models.common.decoder_sharding import (
     dense_param_placement,
     norm_config,
@@ -40,11 +38,6 @@ from torchtitan.models.common.moe_sharding import (
 from torchtitan.models.opt_moe.utils.norms import ALL_NORM_PARAM_NAMES
 
 from torchtitan.protocols.sharding import ShardingConfig
-
-# Dense (TP) placement per routed-expert parameter, as upstream's GroupedExperts
-# declares it. Unused while TP is refused, but `_routed_experts_sharding_configs`
-# requires it, and norm_moe uses the same parameter names.
-_EXPERT_PARAM_LAYOUT = {"w1_EFD": Shard(1), "w2_EDF": Shard(2), "w3_EFD": Shard(1)}
 
 
 def _cover_all_norm_params(cfg: ShardingConfig) -> ShardingConfig:
@@ -229,8 +222,7 @@ def set_opt_moe_sharding_config(
             if enable_ep:
                 # EXPERT PARALLEL. Take the routed-expert plan from upstream's
                 # own helpers rather than re-deriving it: `w1_EFD/w2_EDF/w3_EFD`
-                # are the same parameter names upstream's GroupedExperts uses,
-                # so `expert_param_layout` transfers directly.
+                # are the same parameter names upstream's GroupedExperts uses.
                 #
                 # Only the ROUTED-expert pieces come from upstream. Two parts of
                 # `set_moe_sharding_config` are deliberately not used:
@@ -248,10 +240,12 @@ def set_opt_moe_sharding_config(
                 routed_cfg, inner_cfg = _routed_experts_sharding_configs(
                     enable_ep=True,
                     enable_sp=enable_sp,
-                    expert_param_layout=_EXPERT_PARAM_LAYOUT,
                 )
                 moe_cfg.routed_experts.sharding_config = routed_cfg
                 inner.sharding_config = inner_cfg
-                moe_cfg.router.gate.sharding_config = _router_sharding_config(
+                # The router MODULE gets the token redistribution plan; the gate
+                # keeps the replicated-weight plan set above (upstream's
+                # `_router_gate_sharding_config` at tp=1).
+                moe_cfg.router.sharding_config = _router_sharding_config(
                     enable_ep=True, enable_sp=enable_sp
                 )

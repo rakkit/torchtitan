@@ -56,6 +56,18 @@ from torchtitan.training_engine import TrainingEngine
 logger = logging.getLogger(__name__)
 
 
+def logs_metrics_locally(metrics) -> bool:
+    """Whether every shard rank logs its own slice of DiSCO's metrics, so its
+    logging gather can be skipped. From config alone, so every rank agrees (the
+    gather is a collective); `save_all_shard_ranks` alone narrows to one
+    logger, which would then log only its own slice."""
+    return bool(
+        metrics.save_all_shard_ranks
+        and metrics.save_for_all_ranks
+        and (metrics.enable_wandb or metrics.enable_tensorboard)
+    )
+
+
 class Trainer(Configurable):
     """Dataset-driven training application that owns a :class:`TrainingEngine`.
 
@@ -179,23 +191,6 @@ class Trainer(Configurable):
                     "silently drop every parameter owned by the other shard "
                     "ranks."
                 )
-            # DiSCO may only skip its logging all_gather when the metrics side
-            # really gives EVERY shard rank a logger. `save_all_shard_ranks`
-            # alone is not enough: it is applied inside `_build_metric_logger`
-            # only after `should_log` is already true, and with
-            # `save_for_all_ranks=False` that has been narrowed to a single
-            # global rank -- every rank would skip the gather while only one
-            # owns a logger, so that rank logs its 1/N of the parameters and
-            # the rest are silently dropped.
-            #
-            # Derived from config alone so it is identical on every rank: the
-            # gather is a collective, and ranks that disagree hang rather than
-            # misreport.
-            self.optimizer.log_metrics_locally = bool(
-                self.metrics.save_all_shard_ranks
-                and self.metrics.save_for_all_ranks
-                and (self.metrics.enable_wandb or self.metrics.enable_tensorboard)
-            )
 
         def to_dict(self) -> dict[str, Any]:
             d = {}
@@ -342,6 +337,9 @@ class Trainer(Configurable):
         self.metrics_processor.optimizers = engine.optimizers
         self.metrics_processor.model_parts = engine.model_parts
 
+        disco = _disco_container(engine.optimizers)
+        if disco is not None:
+            disco.log_metrics_locally = logs_metrics_locally(config.metrics)
         self._check_per_rank_metric_logging()
 
         self.data_mix_metrics = build_data_mix_metrics(self.dataloader)
@@ -399,9 +397,8 @@ class Trainer(Configurable):
     def _check_per_rank_metric_logging(self) -> None:
         """Assert the optimizer's and the metrics side's rank predicates agree.
 
-        `Trainer.Config._resolve_norm_logging` already decided
-        `log_metrics_locally` from config. This is the post-build half it could
-        not do: confirming that a rank which owns a disjoint slice of the
+        `log_metrics_locally` is decided from config right before this. This is
+        the half config cannot do: confirming that a rank which owns a disjoint slice of the
         per-parameter metrics actually has a logger to write it to.
 
         Inert today -- both sides derive ownership from
@@ -491,15 +488,19 @@ class Trainer(Configurable):
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
         parallel_dims = engine.parallel_dims
+        # DiSCO computes its metrics inside step(), so the step is armed before
+        # the forward: the LM-head geometry takes the head's input from it.
+        disco = _disco_container(engine.optimizers)
+        if disco is not None:
+            rows = disco.begin_step(
+                current_step,
+                should_log=should_log,
+                is_final_step=is_final_step,
+                head_input=engine.take_head_input_rows,
+            )
+            engine.keep_head_input_rows(rows, seed=current_step)
         # All groups form one optimizer step. Each microbatch group forms one
         # complete PP step, or one local forward/backward when PP is disabled.
-        # Decided BEFORE the optimizer step, because DiSCO produces the norms
-        # inside step(). The cadence itself lives on the container, with the
-        # config that defines it.
-        disco = _disco_container(engine.optimizers)
-        compute_param_norms = disco is not None and disco.wants_norms_at(
-            current_step, should_log=should_log, is_final_step=is_final_step
-        )
         microbatch_groups: list[list[TrainingMicrobatch]] = []
         local_valid_tokens = 0
         for _ in range(self.gradient_accumulation_steps):
@@ -553,11 +554,6 @@ class Trainer(Configurable):
         # Capture the learning rates used by this optimizer update before the
         # scheduler advances in engine.optimizer_step().
         lr_metrics = engine.lr_schedulers.get_metrics() if should_log else {}
-        if compute_param_norms:
-            # Armed here, not in the engine, so the engine needs no knowledge
-            # of which container it drives. Correct with and without PP.
-            assert disco is not None  # implied by compute_param_norms
-            disco.arm_norm_computation()
         grad_norm = engine.optimizer_step()
 
         # log metrics
@@ -613,11 +609,7 @@ class Trainer(Configurable):
         extra_metrics.update(data_mix)
         extra_metrics.update({k: int(v) for k, v in data_docs.items()})
         if disco is not None:
-            extra_metrics.update(
-                disco.collect_metrics(
-                    engine.num_completed_steps, include_norms=compute_param_norms
-                )
-            )
+            extra_metrics.update(disco.collect_metrics(engine.num_completed_steps))
         self.metrics_processor.log(
             engine.num_completed_steps,
             global_avg_loss,

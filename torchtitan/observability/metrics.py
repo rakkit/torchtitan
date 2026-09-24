@@ -10,7 +10,7 @@ import logging
 import os
 import time
 from collections import namedtuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -157,14 +157,32 @@ class TensorBoardLogger(BaseLogger):
         self.writer.close()
 
 
+def wandb_run_per_rank(config, *, pp_enabled: bool) -> bool:
+    """Whether more than one rank writes a W&B run (see `_build_metric_logger`):
+    `save_first_dp_and_tp` still logs once per PP stage."""
+    return config.save_for_all_ranks and (
+        config.save_all_shard_ranks or not config.save_first_dp_and_tp or pp_enabled
+    )
+
+
 class WandBLogger(BaseLogger):
-    """Logger implementation for Weights & Biases."""
+    """Logger implementation for Weights & Biases.
+
+    With `rank` set (several ranks log), each rank writes its own run,
+    `<name>-rank<N>` / `<id>-rank<N>`, all in one group (`WANDB_RUN_GROUP`, else
+    the run name, else `default_group`), which the W&B UI folds into one row.
+    One id on every rank would make the offline runs overwrite each other on
+    `wandb sync`.
+    """
 
     def __init__(
         self,
         log_dir: str,
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
+        *,
+        rank: int | None = None,
+        default_group: str | None = None,
     ):
         # Import wandb here to avoid startup import
         import wandb
@@ -175,14 +193,23 @@ class WandBLogger(BaseLogger):
         # Create logging directory
         os.makedirs(log_dir, exist_ok=True)
 
+        name = os.getenv("WANDB_RUN_NAME", None)
+        run_id = os.getenv("WANDB_RUN_ID", None)
+        group = os.getenv("WANDB_RUN_GROUP", None)
+        if rank is not None:
+            name = name or os.getenv("WANDB_NAME", None)
+            group = group or name or run_id or default_group
+            name = f"{name or group}-rank{rank}"
+            run_id = f"{run_id}-rank{rank}" if run_id else None
+
         self.wandb.init(
             entity=os.getenv("WANDB_TEAM", None),
             project=os.getenv("WANDB_PROJECT", "torchtitan"),
-            name=os.getenv("WANDB_RUN_NAME", None),
-            id=os.getenv("WANDB_RUN_ID", None),
+            name=name,
+            id=run_id,
             notes=os.getenv("WANDB_RUN_NOTES", None),
             tags=os.getenv("WANDB_RUN_TAGS", None),
-            group=os.getenv("WANDB_RUN_GROUP", None),
+            group=group,
             job_type=os.getenv("WANDB_RUN_JOB_TYPE", None),
             resume_from=os.getenv("WANDB_RESUME_FROM", None),
             fork_from=os.getenv("WANDB_FORK_FROM", None),
@@ -525,7 +552,17 @@ class MetricsProcessor(Configurable):
             logger.debug("Attempting to create WandB logger")
             try:
                 wandb_logger = WandBLogger(
-                    base_log_dir, config_dict=config_dict, tag=tag
+                    base_log_dir,
+                    config_dict=config_dict,
+                    tag=tag,
+                    rank=(
+                        torch.distributed.get_rank()
+                        if wandb_run_per_rank(
+                            config, pp_enabled=parallel_dims.pp_enabled
+                        )
+                        else None
+                    ),
+                    default_group=os.path.basename(os.path.normpath(dump_folder)),
                 )
                 logger_container.add_logger(wandb_logger)
             except Exception as e:

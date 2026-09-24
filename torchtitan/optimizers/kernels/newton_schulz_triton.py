@@ -13,6 +13,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from .floors import NORM_FLOOR
+
 
 def _get_autotune_configs():
     return [
@@ -318,7 +320,7 @@ def newton_schulz_triton(G: Tensor, steps: int = 10, eps: float = 1e-7):
     Triton implementation of Newton-Schulz iteration
     """
     # Newton-Schulz constants -- the same quintic (a, b, c) at every step, so
-    # this kernel is numerically `zeropower_via_newtonschulz5` (muon_utils.py),
+    # this kernel is numerically `zeropower_via_newtonschulz5` (zeropower.py),
     # just faster. That equivalence is the whole point of the name: it used to
     # special-case `steps == 5` to a tuned per-step schedule, which made
     # switching between the two backends silently change training.
@@ -338,7 +340,8 @@ def newton_schulz_triton(G: Tensor, steps: int = 10, eps: float = 1e-7):
         X = X.mT
 
     # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+    norm = X.norm(dim=(-2, -1), keepdim=True)
+    X = X / torch.where(norm >= NORM_FLOOR, norm + eps, torch.inf)
 
     # Allocate buffers
     X = X.contiguous()
@@ -385,7 +388,7 @@ def polar_express_triton(G: Tensor, steps: int = 5, eps: float = 1e-7):
     # The truncation is the fix for a real bug: the loop below used to iterate
     # the whole `coeffs` list, which is 8 entries long regardless of `steps`.
     # So `backend_steps=5` silently ran 8 Newton-Schulz iterations here while
-    # `muon_utils.zeropower_via_polar_express` ran 5 for the same setting --
+    # `zeropower.zeropower_via_polar_express` ran 5 for the same setting --
     # the two "polar express" backends were not the same computation, and the
     # config knob did nothing on this path. Measured before the fix: this
     # function's error against the exact polar factor was a flat 0.0064 for
@@ -401,7 +404,8 @@ def polar_express_triton(G: Tensor, steps: int = 5, eps: float = 1e-7):
         X = X.mT
 
     # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + eps)
+    norm = X.norm(dim=(-2, -1), keepdim=True)
+    X = X / torch.where(norm >= NORM_FLOOR, norm * 1.01 + eps, torch.inf)
 
     # Allocate buffers
     X = X.contiguous()

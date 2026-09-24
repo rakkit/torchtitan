@@ -9,42 +9,27 @@
 Upstream consolidated ``QKVLinear`` onto a single FUSED ``wqkv`` parameter
 (#4526 removed ``BaseQKVLinear``/the split variant, #4815 moved the Q/K/V
 conversion into the HF adapters), so the split projection has no upstream
-equivalent any more. opt_moe keeps it for two reasons:
-
-* **Checkpoints.** Every existing opt_moe checkpoint stores ``wq``/``wk``/``wv``
-  as separate parameters. A fused ``wqkv`` changes the native DCP layout.
-* **DiSCO.** The optimizer orthogonalizes each 2-D parameter on its own.
-  Orthogonalizing one stacked ``[(n_heads + 2 * n_kv) * head_dim, dim]`` matrix
-  is not the same operation as orthogonalizing ``wq``, ``wk`` and ``wv``
-  separately, so fusing would silently change the update.
+equivalent any more. opt_moe keeps it for its checkpoints: every existing one
+stores ``wq``/``wk``/``wv`` as separate parameters, and a fused ``wqkv``
+changes the native DCP layout.
 
 Ported verbatim from upstream ``models/common/attention.py`` as of
 ``3dadef77c``, with the dead ``get_spmd_backend() == "spmd_types"`` guard
 dropped (``spmd_types`` is the only backend since #4217/#4419).
 
-TODO(fused-qkv): evaluate adopting upstream's fused ``QKVLinear`` and deleting
-this file. DiSCO handles it MECHANICALLY already -- ``wqkv`` is 2-D
-``[(n_heads + 2 * n_kv) * head_dim, dim]``, so ``get_param_type`` files it
-FSDP/DDP and orthogonalizes it like any other matrix; nothing needs changing in
-the optimizer. Two open questions, both numerics rather than plumbing:
-
-  1. Orthogonalizing the CONCATENATION is not orthogonalizing wq/wk/wv
-     separately. Whether that is better, worse or neutral for DiSCO is an
-     experiment, not a refactor -- run it at fixed seed against a split-QKV arm
-     before switching.
-  2. The native DCP layout changes (one ``wqkv`` where there were three
-     tensors), so existing checkpoints do not load. HF export is unaffected:
-     the adapters split Q/K/V at the external boundary.
-
-The throughput argument for fusing is one GEMM instead of three. Pair this with
-TODO(fused-swiglu) in ``norm_ffn.py``; they are the same decision twice.
+TODO(fused-qkv): evaluate adopting upstream's fused ``QKVLinear`` (the
+``fuse_qkv`` flag) and deleting this file. DiSCO is not in the way: the fused
+``wqkv`` is declared as three units (``qkv_units``), so its update is the same
+as for split ``wq``/``wk``/``wv``. What remains is the native DCP layout (one
+``wqkv`` where there were three tensors), so existing checkpoints do not load;
+HF export is unaffected, the adapters split Q/K/V at the external boundary.
 """
 
 from dataclasses import dataclass
 
-import torch
-
 import spmd_types as spmd
+
+import torch
 
 from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module

@@ -13,6 +13,7 @@ expression it replaced, and that one arm covers exactly one step.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from unittest.mock import MagicMock
 
 import pytest
@@ -66,10 +67,12 @@ class _FakeDiSCO:
 
     `calculate_norm_at_next_step` sets a flag and clears the stash; `step`
     fills the stash only if armed and then clears the flag -- which is what
-    `DiSCO.step` does at disco.py:3166, its last statement before `return`.
+    `DiSCO.step` does at its end.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, has_head_geometry: bool = True) -> None:
+        self.has_head_geometry = has_head_geometry
+        self.head_probe_h = None
         self.need_to_calculate_norm = False
         self.norms_at_current_step: dict[str, float] = {}
         self.arm_kwargs: dict | None = None
@@ -168,3 +171,84 @@ def test_spectra_are_not_computed_when_nothing_consumes_them(monkeypatch):
     DiSCOOptimizersContainer.arm_norm_computation(container)
 
     assert fake.arm_kwargs["track_spectrum"] is False
+
+
+def _live_container(fake, monkeypatch, *, log_norm_freq: int = 5):
+    """The container's real methods over `fake`, built without a model."""
+    import torchtitan.optimizers.container as container_mod
+
+    monkeypatch.setattr(container_mod, "DiSCO", _FakeDiSCO)
+    container = object.__new__(DiSCOOptimizersContainer)
+    # torch wraps `step` with its hook runner once any container is built.
+    container._optimizer_step_pre_hooks = OrderedDict()
+    container._optimizer_step_post_hooks = OrderedDict()
+    container.optimizers = [fake]
+    container.model_parts = []
+    container.log_norm_freq = log_norm_freq
+    container.norms_to_log = ["all"]
+    container.gram_level = 0
+    container.log_metrics_locally = False
+    container.spectrum_logging_config = MagicMock(enable_export=False)
+    container._moe_publish_armed = False
+    container._norms_armed = False
+    container._head_input = None
+    container.head_diag_probes = 512
+    container.get_parameter_norms = lambda step: dict(fake.norms_at_current_step)
+    return container
+
+
+def test_the_head_input_is_asked_for_and_handed_over_on_norm_steps_only(monkeypatch):
+    """begin_step (before the forward) says how many rows to keep; step()
+    hands them to DiSCO, for that step only."""
+    fake = _FakeDiSCO()
+    container = _live_container(fake, monkeypatch)
+    calls = []
+
+    def head_input():
+        calls.append(1)
+        return "h"
+
+    rows = container.begin_step(
+        4, should_log=True, is_final_step=False, head_input=head_input
+    )
+    container.step()
+    assert rows == 0 and calls == [] and fake.head_probe_h is None
+    rows = container.begin_step(
+        5, should_log=True, is_final_step=False, head_input=head_input
+    )
+    assert rows == 512 and calls == []  # nothing is taken before the step
+    container.step()
+    assert calls == [1] and fake.head_probe_h == "h"
+
+
+def test_begin_step_arms_the_moe_metrics_on_logging_steps_only(monkeypatch):
+    container = _live_container(_FakeDiSCO(), monkeypatch)
+    container.begin_step(4, should_log=False, is_final_step=False)
+    assert not container.consume_moe_publish_arm()
+    container.begin_step(4, should_log=True, is_final_step=False)
+    assert container.consume_moe_publish_arm()
+
+
+def test_collect_reads_norms_back_only_after_an_armed_step(monkeypatch):
+    fake = _FakeDiSCO()
+    container = _live_container(fake, monkeypatch)
+    container.begin_step(5, should_log=True, is_final_step=False)
+    fake.step()
+    assert "weight_norm/w" in container.collect_metrics(5)
+    # The fake keeps its stash; the container must not read it unarmed.
+    container.begin_step(6, should_log=True, is_final_step=False)
+    fake.step()
+    assert container.collect_metrics(6) == {}
+
+
+def test_no_head_input_when_no_disco_holds_the_head(monkeypatch):
+    """A head on AdamW, or no head at all: nothing to keep."""
+    fake = _FakeDiSCO(has_head_geometry=False)
+    container = _live_container(fake, monkeypatch)
+    calls = []
+    rows = container.begin_step(
+        5, should_log=True, is_final_step=False, head_input=lambda: calls.append(1)
+    )
+    assert rows == 0 and fake.need_to_calculate_norm  # the norms are still armed
+    container.step()
+    assert calls == []

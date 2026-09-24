@@ -30,6 +30,7 @@ import os
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torchtitan.models.common.param_layout import by_rank  # noqa: E402
 
 from torchtitan.optimizers.disco import DiSCO
 
@@ -54,6 +55,8 @@ def check(name, cond, detail=""):
 
 
 model = nn.Sequential(nn.Linear(32, 64, bias=False), nn.Linear(64, 32, bias=False))
+# Every parameter must be declared; this model's are plain matrices.
+model.param_layouts = lambda: {n: by_rank(p.shape) for n, p in model.named_parameters()}
 named = list(model.named_parameters())
 groups = [{"params": [p for _, p in named], "param_names": [n for n, _ in named]}]
 
@@ -83,16 +86,11 @@ class _NoParallel:
 try:
     opt = DiSCO(
         groups,
-        is_light=False,
-        weight_decay=0.0,
+        parallel_dims=_NoParallel(),
         lr=0.1,
         momentum=0.0,
-        nesterov=False,
-        eps=1e-20,
-        norm_factor="spectral",
-        backend="identity",
-        backend_steps=5,
-        parallel_dims=_NoParallel(),
+        args={"compute": "sign", "scale": "inv_n"},
+        param_layouts=model.param_layouts(),
     )
     built = True
 except Exception as e:  # pragma: no cover
@@ -110,33 +108,21 @@ if built:
     )
     # attributes __init__ sets AFTER the point where the property was wrongly
     # inserted -- these are exactly what a truncated __init__ loses
-    for attr in [
-        "experts_need_transpose",
-        "extra_reduce_for_HSDP",
-        "is_dp_rank_0",
-        "scale_params",
-        "embed_params",
-        "ddp_params",
-        "fsdp_params",
-        "expert_params",
-    ]:
+    for attr in ["is_dp_rank_0", "entries", "fam", "_sink"]:
         check(f"__init__ ran past the property: .{attr}", hasattr(opt, attr))
     # the flags this work added
     for attr in ["track_spectrum", "log_metrics_locally", "need_to_calculate_norm"]:
         check(f"has .{attr}", hasattr(opt, attr))
     check(
-        "_stores_norms is a property returning bool",
-        isinstance(type(opt)._stores_norms, property)
-        and isinstance(opt._stores_norms, bool),
+        "sink.stores_norms is a bool",
+        isinstance(opt._sink.stores_norms, bool),
     )
-    check(
-        "_stores_norms follows log_metrics_locally",
-        (setattr(opt, "log_metrics_locally", True) or opt._stores_norms is True),
-    )
+    opt.log_metrics_locally = True
+    check("stores_norms follows log_metrics_locally", opt._sink.stores_norms is True)
     opt.log_metrics_locally = False
     check(
-        "_stores_norms falls back to is_dp_rank_0",
-        opt._stores_norms == opt.is_dp_rank_0,
+        "stores_norms falls back to is_dp_rank_0",
+        opt._sink.stores_norms == opt.is_dp_rank_0,
     )
     check(
         "calculate_norm_at_next_step accepts the new kwargs",
@@ -149,6 +135,45 @@ if built:
         and opt.track_spectrum is False
         and opt.log_metrics_locally is True,
     )
+
+print("\n== the container arms every DiSCO, not optimizers[part_index] ==")
+try:
+    from torchtitan.optimizers.container import DiSCOOptimizersContainer
+
+    cfg = DiSCOOptimizersContainer.Config()
+    # AdamW first on purpose: one optimizer is built per (model part, group
+    # name), so `optimizers[0]` is AdamW's and indexing by part skips DiSCO.
+    cfg.groups = {
+        "head": {"match": r"1\.weight", "optimizer": "AdamW", "lr": 1e-3},
+        "default": {
+            "lr": 0.1,
+            "momentum": 0.0,
+            "rule": "muon",
+            "args": {"compute": "sign", "scale": "inv_n"},
+        },
+    }
+    cfg.log_norm_freq = 1
+    container = DiSCOOptimizersContainer(
+        cfg, model_parts=[model], parallel_dims=_NoParallel()
+    )
+    discos = [o for o in container.optimizers if isinstance(o, DiSCO)]
+    check("container built one optimizer per group", len(container.optimizers) == 2)
+    check("a DiSCO exists", len(discos) == 1)
+    check(
+        "DiSCO is not at index 0",
+        discos and container.optimizers[0] is not discos[0],
+    )
+    container.arm_norm_computation()
+    check(
+        "arm_norm_computation reached it",
+        bool(discos) and discos[0].need_to_calculate_norm,
+    )
+    rows = container.begin_step(
+        1, should_log=True, is_final_step=False, head_input=lambda: torch.zeros(1)
+    )
+    check("no head, so no head input is asked for", rows == 0)
+except Exception as e:  # pragma: no cover
+    check("container arming", False, f"{type(e).__name__}: {str(e)[:140]}")
 
 if dist.is_initialized():
     dist.destroy_process_group()

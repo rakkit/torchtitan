@@ -9,15 +9,15 @@ Whole-tensor "radial dynamics" metrics -- how a weight's norm and direction
 evolve under training. Unlike gram_helper.py's row-wise Gram-matrix
 framework (which needs the raw momentum/gradient `V_raw` and is gated
 behind `gram_level`), these only need the weight before/after this step's
-update (`W_before`, `W_after` -- disco.py passes the same `pseudo_w`
-already used as gram's `W_after`) and are all whole-tensor Frobenius-norm
+update (`W_before`, `W_after` -- the post-update weight as the apply writes
+it, the same one gram uses) and are all whole-tensor Frobenius-norm
 -scale scalars, never a row-wise vector -- cheap enough to always compute
 whenever any per-param logging fires at all, independent of `gram_level`
 and `norms_to_log`.
 
 Notation:
   W_t    = W_before, the weight before this step's update.
-  W_t+1  = W_after, the weight after (disco.py's `pseudo_w` approximation).
+  W_t+1  = W_after, the weight after this step's update.
   dW_t   = W_after - W_before, the realised displacement.
   r_t    = ||W_t||  (Frobenius norm -- "radius").
   a_t    = ||dW_t|| (Frobenius norm -- "raw step").
@@ -27,7 +27,7 @@ Notation:
 
 Four running accumulators (`raw_A2`, `angular_A1`, `angular_A2`, `R1`)
 persist across steps in the caller-supplied `state` dict, mutated in
-place -- disco.py stores the canonical values in
+place -- DiSCO stores the canonical values in
 `self.state[p]["radial_state"]` (the same place `momentum_buffer` lives),
 so they survive checkpoint save/restore via the optimizer's default
 `state_dict()`/`load_state_dict()` with no extra plumbing. `R2(t)` from
@@ -75,8 +75,15 @@ RADIAL_METRIC_NAMES: list[str] = [
     "radiality_rms_to_rms",
     "radiality_rms_to_inf",
     "radiality_l1_to_rms",
-    # Distance between the normalised weight and the normalised update,
-    # N(W/N(W) - U/N(U)), under the same four norms.
+    # The generalised angle of the step, in chord form: the distance between
+    # the normalised pre- and post-update weights,
+    #     N(W_before/N(W_before) - W_after/N(W_after)),
+    # under the same four norms. `angle` above is the Frobenius special case in
+    # radians; the two are related exactly by chord = 2*sin(angle/2). Outside
+    # Frobenius there is no inner product and so no angle in radians -- the
+    # chord is what generalises. It is NOT recoverable from the other logged
+    # scalars: for an operator norm, N(W_after) is not determined by N(W),
+    # N(U) and any scalar alignment between them.
     "aus_frobenius",
     "aus_rms_to_rms",
     "aus_rms_to_inf",
@@ -86,7 +93,7 @@ RADIAL_METRIC_NAMES: list[str] = [
 # Metrics that cannot be computed without `SpectralInputs` (they need
 # sigma_max, or the leading singular vectors, of the pre-update weight). They
 # are still always present in the output -- filled with the degenerate 0
-# sentinel -- because disco.py sizes its flat logging buffers from
+# sentinel -- because the metric sink sizes its flat logging buffers from
 # len(RADIAL_METRIC_NAMES) and needs the arity fixed.
 _SPECTRAL_METRIC_NAMES: tuple[str, ...] = (
     "spectral_radius",
@@ -120,9 +127,9 @@ _REL_DEGENERACY_EPS = 1e-6
 class SpectralInputs(NamedTuple):
     """Spectral quantities `calculate_radial_metrics` cannot get on its own.
 
-    Two of these are genuinely free at every disco.py call site and one is not:
+    Two of these are genuinely free at every DiSCO call site and one is not:
 
-      * `sigma_after` -- `calculate_norm(pseudo_w)["spectrum"][0]`.
+      * `sigma_after` -- `calculate_norm(W_after)["spectrum"][0]`.
       * `sigma_update` -- `calculate_norm(-lr*u)["spectrum"][0]`.
       * `sigma_before`, `u1_before`, `v1_before` -- NOT free. `calculate_norm`
         is never called on the pre-update weight in any of the four `step_*`
@@ -138,7 +145,8 @@ class SpectralInputs(NamedTuple):
     v1_before: torch.Tensor | None = None
     sigma_after: torch.Tensor | None = None
     sigma_update: torch.Tensor | None = None
-    # sigma_max(W/sigma_max(W) - U/sigma_max(U)), for `aus_rms_to_rms`. Needs a
+    # sigma_max(W_before/sigma_before - W_after/sigma_after), for
+    # `aus_rms_to_rms`. Needs a
     # decomposition of a matrix this function does not otherwise form, so the
     # caller computes it (it already owns the power-iteration machinery) rather
     # than this module allocating an extra m-by-n temporary per call.
@@ -170,14 +178,9 @@ def _axis_reductions(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-row (`dim=1`) or per-column (`dim=0`) squared norms and cross dots.
 
-    Returns `(sq_W, sq_U, dot_WU)`. These three feed BOTH the radiality and the
-    aus metric for that axis, which is why they are computed once here instead
-    of separately: the aus norm expands without ever forming the difference
-    matrix,
-
-        ||axis_i(W/a - U/b)||^2 = sq_W[i]/a^2 + sq_U[i]/b^2 - 2*dot[i]/(a*b),
-
-    so a full m-by-n temporary is never allocated for it.
+    Returns `(sq_W, sq_U, dot_WU)`, which feed the radiality metric for that
+    axis. (These also used to feed an expanded form of the aus norm; see
+    `_axis_aus_direct` for why that was removed.)
     """
     return (W * W).sum(dim), (U * U).sum(dim), (W * U).sum(dim)
 
@@ -189,9 +192,10 @@ def _axis_radiality(
     largest row/column, which is where that induced norm's norming covector
     concentrates.
 
-    Returns `(radiality, max_norm_W, max_norm_U)` -- the two maxima come back
-    because `_axis_aus` needs exactly the same pair, and recomputing them would
-    repeat a reduction over the whole axis.
+    Returns the radiality only. (It used to also return the two axis maxima,
+    for an `_axis_aus` that derived the aus norm from these same reductions;
+    that expansion was removed because it cancels catastrophically now that aus
+    compares the two weights rather than the weight and the update.)
 
     The induced norms' dimension factors (`sqrt(d_in)` for rms->inf,
     `1/sqrt(d_out)` for l1->rms) appear in both `N(W)` and `N(U)` and cancel in
@@ -207,32 +211,38 @@ def _axis_radiality(
     max_U = sq_U.max(dim=-1).values.clamp_min(0).sqrt()
     tiny = torch.finfo(sq_W.dtype).tiny
     raw = dot.gather(-1, idx).squeeze(-1) / (max_W * max_U).clamp_min(tiny)
-    return _guarded_radiality(raw, max_W, max_U), max_W, max_U
-
-
-def _axis_aus(
-    sq_W: torch.Tensor,
-    sq_U: torch.Tensor,
-    dot: torch.Tensor,
-    max_W: torch.Tensor,
-    max_U: torch.Tensor,
-) -> torch.Tensor:
-    """`N(W/N(W) - U/N(U))` along one axis, computed from the reductions alone.
-
-    As in `_axis_radiality`, the dimension factor cancels: it scales `N(W)`,
-    `N(U)` and `N(difference)` identically, so what is left is the max over the
-    axis of the normalised difference's L2 norm.
-    """
-    tiny = torch.finfo(sq_W.dtype).tiny
-    a = max_W.clamp_min(tiny)
-    b = max_U.clamp_min(tiny)
-    # `a`/`b` carry the leading batch dims but not the reduced axis, so they
-    # need a trailing singleton to broadcast against the per-axis vectors.
-    a = a.unsqueeze(-1)
-    b = b.unsqueeze(-1)
-    per_axis = sq_W / (a * a) + sq_U / (b * b) - 2.0 * dot / (a * b)
-    raw = per_axis.clamp_min(0.0).max(dim=-1).values.sqrt()
     return _guarded_radiality(raw, max_W, max_U)
+
+
+def _axis_aus_direct(A: torch.Tensor, B: torch.Tensor, dim: int) -> torch.Tensor:
+    """`N(A/N(A) - B/N(B))` along one axis, forming the difference explicitly.
+
+    `_axis_aus` below computes the same thing from the reductions alone, via
+        ||axis(A/a - B/b)||^2 = sq_A/a^2 + sq_B/b^2 - 2*dot/(a*b),
+    which avoids an m-by-n temporary. That expansion is well-conditioned when A
+    and B point in different directions -- the case it was written for, A=weight
+    and B=update -- but it cancels catastrophically when they nearly coincide.
+    Since `aus` now compares the pre- and post-update WEIGHTS, which differ by
+    ~0.05% per step, the two large terms cancel to leave a result ~1e-6 of their
+    size: measured error at a 5e-4 step is 12% (rows) and 50% (columns).
+
+    Forming the difference costs one temporary on logging steps only, and is
+    accurate because the subtraction happens before any squaring. The three
+    other full-size temporaries the obvious spelling would allocate are avoided
+    with fused reductions -- see the body.
+    """
+    tiny = torch.finfo(A.dtype).tiny
+    # vector_norm is a fused reduction: `A.pow(2).sum(dim)` would materialise a
+    # whole [m, n] temporary first, and at a 200k-row head that is 1.6 GB each.
+    # The difference below is the one unavoidable full-size allocation.
+    a = torch.linalg.vector_norm(A, dim=dim).amax(-1)
+    b = torch.linalg.vector_norm(B, dim=dim).amax(-1)
+    shape = [1] * A.ndim
+    D = A / a.reshape(*a.shape, *shape[a.ndim :]).clamp_min(tiny) - B / b.reshape(
+        *b.shape, *shape[b.ndim :]
+    ).clamp_min(tiny)
+    raw = torch.linalg.vector_norm(D, dim=dim).amax(-1)
+    return _guarded_radiality(raw, a, b)
 
 
 def new_radial_state(
@@ -282,7 +292,7 @@ def calculate_radial_metrics(
     The returned key set is exactly `RADIAL_METRIC_NAMES`, always, for every
     input shape and regardless of whether `spectral` was given -- unavailable
     metrics take the same deterministic 0 sentinel as the other degenerate
-    cases here. disco.py sizes its flat logging buffers from
+    cases here. The metric sink sizes its flat logging buffers from
     `len(RADIAL_METRIC_NAMES)`, so the arity must not depend on the input.
 
     `batch_ndim` runs many independent tensors through in one call: with
@@ -422,12 +432,18 @@ def calculate_radial_metrics(
     zero = torch.zeros_like(r_t)
     extra: dict[str, torch.Tensor] = {name: zero for name in RADIAL_METRIC_NAMES[15:]}
 
-    # ||W/||W||_F - U/||U||_F||_F == sqrt(2 - 2*cos) with cos == radial_cosine,
-    # so this needs no second pass over the data and no difference tensor. It
-    # is defined for any shape, unlike the operator-norm variants below.
-    extra["aus_frobenius"] = _guarded_radiality(
-        (2.0 - 2.0 * radial_cosine).clamp_min(0.0).sqrt(), r_t, a_t
-    )
+    # ||W_before/r_t - W_after/r_next||_F, i.e. the chord of `angle`. Written as
+    # 2*sin(angle/2) rather than sqrt(2 - 2*cos_angle): the two agree in exact
+    # arithmetic, but at the small angles this metric actually sees (theta ~
+    # 1e-3 late in training) `2 - 2*cos` cancels catastrophically -- at a 5e-4
+    # step the sqrt form carries 53% relative error in fp32 against 4e-8 for
+    # this one. `angle` is computed via atan2 precisely so that it stays
+    # well-conditioned as the step shrinks, and this inherits that. Needs no
+    # second pass and no difference tensor, and is defined for any shape unlike
+    # the operator-norm variants below. Gated on `valid_ww` (both radii
+    # positive) rather than on the update's magnitude: the chord between two
+    # weights is well defined however small the step between them.
+    extra["aus_frobenius"] = torch.where(valid_ww, 2.0 * torch.sin(angle / 2.0), zero)
 
     if mat_ndim == 2:
         # `.T` is only valid for a strictly-2-D tensor; transposing the two
@@ -443,16 +459,20 @@ def calculate_radial_metrics(
         row_sq_W, row_sq_U, row_dot = _axis_reductions(Wm, Um, -1)
         col_sq_W, col_sq_U, col_dot = _axis_reductions(Wm, Um, -2)
 
-        rad_row, row_max_W, row_max_U = _axis_radiality(row_sq_W, row_sq_U, row_dot)
-        rad_col, col_max_W, col_max_U = _axis_radiality(col_sq_W, col_sq_U, col_dot)
+        # radiality stays weight-vs-update: it asks whether the step is radial
+        # or tangential, which is a question about W and U.
+        rad_row = _axis_radiality(row_sq_W, row_sq_U, row_dot)
+        rad_col = _axis_radiality(col_sq_W, col_sq_U, col_dot)
         extra["radiality_rms_to_inf"] = rad_row
         extra["radiality_l1_to_rms"] = rad_col
-        extra["aus_rms_to_inf"] = _axis_aus(
-            row_sq_W, row_sq_U, row_dot, row_max_W, row_max_U
-        )
-        extra["aus_l1_to_rms"] = _axis_aus(
-            col_sq_W, col_sq_U, col_dot, col_max_W, col_max_U
-        )
+
+        # aus is weight-vs-weight: a second set of reductions, this time
+        # between W_before and W_after. No decomposition is involved for these
+        # two -- they are row/column reductions, so unlike aus_rms_to_rms they
+        # cost only the extra pass.
+        Wa = W_after if not transpose else W_after.transpose(-2, -1)
+        extra["aus_rms_to_inf"] = _axis_aus_direct(Wm, Wa, -1)
+        extra["aus_l1_to_rms"] = _axis_aus_direct(Wm, Wa, -2)
 
     if spectral is not None:
         sig_w = spectral.sigma_before
@@ -503,13 +523,21 @@ def calculate_radial_metrics(
         elif sig_next is not None:
             extra["spectral_radius_next"] = sig_next.to(dtype)
 
-        if spectral.aus_sigma is not None and sig_w is not None and sig_u is not None:
-            # N(W/N(W) - U/N(U)) for the rms->rms norm. The dimension factor
-            # cancels exactly as above, so this is sigma_max of the normalised
-            # difference -- which needs a second decomposition and therefore
-            # has to be supplied by the caller rather than computed here.
-            extra["aus_rms_to_rms"] = _guarded_radiality(
-                spectral.aus_sigma.to(dtype), sig_w, sig_u
+        if (
+            spectral.aus_sigma is not None
+            and sig_w is not None
+            and sig_next is not None
+        ):
+            # N(W_before/N(W_before) - W_after/N(W_after)) for the rms->rms
+            # norm. The dimension factor cancels exactly as above, so this is
+            # sigma_max of the normalised difference -- which needs a second
+            # decomposition and therefore has to be supplied by the caller
+            # rather than computed here. Guarded on the two radii, matching
+            # aus_frobenius.
+            extra["aus_rms_to_rms"] = torch.where(
+                (sig_w > 0) & (sig_next > 0),
+                spectral.aus_sigma.to(dtype),
+                torch.zeros_like(sig_w),
             )
 
     return {

@@ -4,69 +4,49 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""DiSCO-aware optimizer container, carried forward from the 0.4.0 base.
+"""DiSCO-aware optimizer container.
 
-Upstream rebuilt ``OptimizersContainer`` around ``ParamGroupConfig``: a list of
-regex/optimizer pairs, with no top-level ``name``/``lr``/``betas``. DiSCO does
-not fit that shape -- its parameter groups are derived from module structure by
-``create_disco_param_groups`` (norm factors per tensor role, embedding vs
-unembedding vs router), not from FQN regexes, and its per-group kwargs are
-computed together from one set of hyperparameters.
-
-So construction is overridden wholesale while everything else -- the
-``Optimizer``/``Stateful``/``Configurable`` machinery, hooks, and the flat
-checkpoint state-dict format -- is inherited from upstream's container.
-
-This module also carries the OPT MoE load-balancing hook, which differs from
-upstream's: it drives the expert bias through an LMO step rather than a plain
-sign update, and reports router entropy / max-violation metrics through an
-async logging queue.
+Groups are the named `optimizer.groups` (`default` required, the others
+matched by `kind` or `match`, first match wins), or upstream's
+`optimizer.param_groups` instead; a group's kwargs are DiSCO's
+`lr / weight_decay / momentum / nesterov / rule / args`. On top of upstream:
+the MoE load-balance hook, and the arming and collection of the optimizer's
+per-parameter metrics (`log_norm_freq`, `norms_to_log`, `gram_level`,
+spectrum / gram-vector export).
 """
 
+import dataclasses
 import logging
 import os
-import queue
-import threading
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Generic, Literal, TypeVar
 
 import torch
-import torch.distributed as dist
 import torch.distributed.tensor
 import torch.nn as nn
 from torch.optim import Optimizer
 
-from torchtitan.components.checkpointer.utils import canonical_fqn
-
 from torchtitan.components.optimizer.optimizer import (
     OptimizersContainer as BaseOptimizersContainer,
+    ParamGroupConfig,
 )
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.utils import fsdp_shard_mesh
-from torchtitan.models.common.aux_loss import register_aux_loss_zero_hook
-from torchtitan.optimizers import (
-    create_disco_optimizer_kwargs_from_optimizer_config,
-    create_disco_param_groups,
-    DiSCO,
-    norm_helper,
-    spectrum_logging,
-)
-from torchtitan.optimizers.gram_vector_logging import (
+from torchtitan.optimizers import DiSCO, disco_factory_kwargs
+from torchtitan.optimizers.export import spectrum_logging
+from torchtitan.optimizers.export.gram_vector_logging import (
     GramVectorLoggingConfig,
     process_gram_vectors_for_logging,
 )
-from torchtitan.optimizers.spectrum_logging import process_norms_for_logging
+from torchtitan.optimizers.export.spectrum_logging import process_norms_for_logging
+from torchtitan.optimizers.helpers import norm_helper
 
-__all__ = [
-    "DiSCOOptimizersContainer",
-    "register_moe_load_balancing_hook",
-]
+__all__ = ["DiSCOOptimizersContainer"]
 logger = logging.getLogger(__name__)
 
-
-MAXVIO_EMA_BETA = 0.995
-MAXVIO_EPS = 1e-12
+_DISCO_ONLY_KEYS = frozenset({"rule", "args", "momentum", "nesterov"})
+_KIND = "\x00kind:"  # a group pattern resolved per model part from its declarations
 
 
 T = TypeVar("T", bound=Optimizer)
@@ -76,91 +56,33 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
     """Upstream's optimizer container, extended for DiSCO.
 
     Adds mesh-derived parameter groups (hence ``parallel_dims``), per-parameter
-    norm/spectrum/gram metrics, and the async MoE metrics worker. The norms are
+    norm/spectrum/gram metrics, and the MoE router metrics. The norms are
     produced inside ``step()``, so a reporting step must be armed first:
-    ``wants_norms_at`` decides, ``arm_norm_computation`` arms,
-    ``collect_metrics`` reads back. Also accepts Adam/AdamW.
-
-    Upstream's own docstring follows.
-
-    This class is used to wrap multiple optimizers into a single object that can be
-    used to reduce the complexity of the training loop. This mimics the behavior of
-    ``torch.optim.Optimizer``. This class currently only supports ``Adam`` and ``AdamW``.
-
-    **Note**
-    Users who want to customize the optimizer behavior can inherit from this class and
-    extend the functionality as needed. The following methods must follow the same signature
-    as ``torch.optim.Optimizer`` class: ``step()``, ``zero_grad()``, ``state_dict()``,
-    ``load_state_dict()``.
-
-    **Limitations**
-    This class assumes that all the optimizers are the same type and have the same
-    configurations. With this assumption, TorchTitan can support lr scheduler resharding
-    (e.g., loading a checkpoint with a different number of GPUs and/or different
-    parallelization strategy). Note that ``get_optimizer_state_dict`` already enables the
-    resharding for the optimizer state but not for the lr scheduler state, hence the limitation.
-
-    Args:
-        model_parts (List[nn.Module]): List of model parts to be optimized.
-        optimizer_kwargs (Dict[str, Any]): Keyword arguments for the optimizers.
-        name (str): Name of the optimizers.
+    ``begin_step`` arms it, ``collect_metrics`` reads back. Also accepts
+    Adam/AdamW.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseOptimizersContainer.Config):
-        name: str = "AdamW"
-        """Optimizer to use"""
+        groups: dict[str, dict[str, Any]] = field(default_factory=dict)
+        """Named parameter groups. `default` is required and is the group every
+        other group inherits from; every other entry selects its parameters
+        with exactly one of `kind` (what the model declares them to be:
+        "embedding", "unembedding", "router", "expert_batch", "matrix", ...)
+        or `match` (a regex on the FQN). Entries are tried in order, first
+        match wins, the rest go to `default`. Other keys: `optimizer` (default
+        "DiSCO"), and that optimizer's kwargs -- for DiSCO `lr`,
+        `weight_decay`, `momentum`, `nesterov`, `rule`, `args` (`args` merge
+        over the default's). Every key of a group is a CLI flag:
+        `--optimizer.groups.default.lr 0.05`."""
 
-        lr: float = 8e-4
-        """Learning rate to use"""
-
-        beta1: float = 0.9
-        beta2: float = 0.95
-        """Exponential moving average hyperparameters to use"""
-
-        eps: float = 1e-8
-        """Epsilon value to use"""
-
-        weight_decay: float = 0.1
-        """Weight decay to use"""
-
-        mup_width_multiplier: float = 1.0
-        """
-        Width multiplier for the model to apply μP scaling (only used
-        for Adam/Muon-based optimizers).
-        """
-
-        is_light: bool = False
-        """Whether to use Scion's light (memory-saving) version"""
-
-        norm_factor: str = "spectral"
-        """Which norm factor to use"""
-
-        pre_norm: str = "identity"
-        """
-        Pre-norm applied to the effective gradient before any communication
-        for LMO. "identity" is a no-op. Prefix before the first "-" selects
-        the variant: "row-*" (local, no comm), "col-*"/"mat-*" (one fused
-        all-reduce across FSDP-sharded params using this pre_norm that
-        step). See optimizers/pre_norm_helper.py.
-        """
-
-        zeropower_backend: str = "newtonschulz5"
-        "Which `zeropower_backend` to use."
-
-        backend_steps: int = 5
-        """Number of steps for the DiSCO backend"""
-
-        momentum: float = 0.95
-        """DiSCO momentum to use"""
-
-        nesterov: bool = False
-        """Whether to use Nesterov momentum in DiSCO"""
-
-        extra_param_group_split_rules: list[dict[str, Any]] = field(
-            default_factory=list
-        )
-        """Extra parameter group splitting rules for DiSCO optimizers"""
+        communication_dtype: Literal["float32", "bfloat16"] = "float32"
+        """dtype of the FSDP all-to-all and DDP all-gather buffers. Parameters,
+        gradients and momentum stay fp32; this is only what travels between
+        ranks for the LMO and what the update is cast to on the way back.
+        bfloat16 halves those bytes but moves the update direction by ~3%
+        (up to 16%) on real momenta; float16 flushes them (CONFIG_MIGRATION
+        section 70)."""
 
         implementation: Literal[
             "for-loop", "foreach", "fused", "fused_opt_states_bf16"
@@ -173,23 +95,13 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         - more info: https://pytorch.org/docs/stable/optim.html
         """
 
-        log_metrics_locally: bool = False
-        """Whether every shard rank logs its own slice instead of gathering.
-
-        Derived, not user-set: ``Trainer.Config.__post_init__`` computes it
-        from ``metrics.save_all_shard_ranks``/``save_for_all_ranks`` and
-        whether any logger backend is on, because the decision spans two
-        configs. It has to be identical on every rank -- the gather it skips is
-        a collective, so ranks that disagree hang rather than misreport.
-        """
-
         enable_step_tracing: bool = False
         """Emit DiSCO's per-step structured-logger spans. Off by default.
 
-        These are 8 records per step per rank (one scalar plus seven spans
-        around prepare_grads / workspaces / embedding / experts / fsdp / ddp /
-        scalar). At 32 nodes x 4 GPUs that is 1024 records per step, which is a
-        lot of storage for something only wanted while profiling the optimizer.
+        These are 6 records per step per rank (one scalar plus five spans
+        around prepare_grads / local / experts / sharded / replicated). At 32
+        nodes x 4 GPUs that is 768 records per step, which is a lot of storage
+        for something only wanted while profiling the optimizer.
 
         Separate from `debug.enable_structured_logging`, which is global: this
         silences DiSCO's spans without also silencing the trainer's.
@@ -207,11 +119,23 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
 
         norms_to_log: list[str] = field(default_factory=lambda: ["default"])
         """Which norm families to log. "default" is the curated set; see
-        torchtitan.optimizers.norm_helper.get_norms_to_log."""
+        torchtitan.optimizers.helpers.norm_helper.get_norms_to_log."""
 
         gram_level: int = 0
         """Gram-matrix metric depth, on the same cadence as log_norm_freq.
         0 disables. Levels 2-3 need batched eigh and are expensive."""
+
+        head_diag_probes: int = 512
+        """Tokens of the last microbatch whose LM-head input the head geometry
+        metrics (eta, rho_RI, gamma_H) use, on the log_norm_freq cadence; 0
+        disables them. Taken from the training forward (the model's output
+        under the chunked loss), so they cost no extra forward. Only mean/RMS
+        over probes are reported, so a few hundred suffice."""
+
+        head_diag_diameter_iters: int = 10
+        """Power-iteration count and farthest-point restarts for the row
+        diameter behind gamma_H. Fixed, not convergence-tested, so the sweep
+        stays fullgraph-safe. Recovers ~98%; past ~20 does not help."""
 
         enable_spectrum_export: bool = False
         """
@@ -219,7 +143,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         parameter, every norm-logging step) to a Parquet file uploaded as a
         versioned W&B Artifact, for offline/programmatic analysis beyond what
         the plot shows. Off by default: can be large for big MoE models (see
-        optimizers/spectrum_logging.py). Only takes effect when
+        export/spectrum_logging.py). Only takes effect when
         log_norm_freq > 0.
         """
 
@@ -229,7 +153,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         step) to a Parquet file uploaded as a versioned W&B Artifact, for
         offline/programmatic analysis beyond what the plot shows. Off by
         default: can be large, there are far more distinct gram vector
-        metrics than spectrum has (see optimizers/gram_vector_logging.py).
+        metrics than spectrum has (see export/gram_vector_logging.py).
         Only takes effect when gram_level > 0.
         """
 
@@ -255,30 +179,103 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         return optimizer_factories[name]
 
     @staticmethod
-    def _build_optimizer_kwargs(
-        config: Config, parallel_dims: ParallelDims
-    ) -> dict[str, Any]:
-        name = config.name
-        if name in ["Adam", "AdamW"]:
-            width_multiplier = config.mup_width_multiplier
+    def _validate(config: Config) -> None:
+        if not 0 <= config.gram_level <= 3:
+            raise ValueError(f"optimizer.gram_level {config.gram_level}: use 0-3")
 
-            optimizer_kwargs = {
-                "lr": config.lr / width_multiplier,
-                "betas": (config.beta1, config.beta2),
-                "eps": config.eps / width_multiplier,
-                "weight_decay": config.weight_decay
-                * width_multiplier,  # WD is coupled with LR in torch AdamW
-                # Delegated so it cannot drift from upstream again.
-                **BaseOptimizersContainer._build_impl_kwargs(config),
-            }
-        elif name in ["DiSCO"]:
-            optimizer_kwargs = create_disco_optimizer_kwargs_from_optimizer_config(
-                config, parallel_dims
+    @staticmethod
+    def _param_group_configs(config: Config) -> list[ParamGroupConfig]:
+        """`groups` -> upstream's ordered `ParamGroupConfig`s (`default` last as `.*`)."""
+        if not config.groups:
+            if not config.param_groups:
+                raise ValueError("optimizer.groups needs at least a `default` entry")
+            return list(config.param_groups)
+        if config.param_groups:
+            raise ValueError("set optimizer.groups or optimizer.param_groups, not both")
+        if "default" not in config.groups:
+            raise ValueError("optimizer.groups needs a `default` entry")
+        for name, g in config.groups.items():
+            stray = sorted(set(g) & _DISCO_ONLY_KEYS)
+            if g.get("optimizer", "DiSCO") != "DiSCO" and stray:
+                raise ValueError(
+                    f"optimizer.groups[{name!r}] runs {g['optimizer']}, which does "
+                    f"not use {stray}"
+                )
+        out = []
+        for name, g in config.groups.items():
+            if name == "default":
+                continue
+            if ("match" in g) == ("kind" in g):
+                raise ValueError(
+                    f"optimizer.groups[{name!r}] needs exactly one of `kind` (a "
+                    "declared parameter kind) or `match` (an FQN regex)"
+                )
+            kw = {k: v for k, v in g.items() if k not in ("match", "kind", "optimizer")}
+            out.append(
+                ParamGroupConfig(
+                    pattern=g["match"] if "match" in g else _KIND + g["kind"],
+                    optimizer_name=g.get("optimizer", "DiSCO"),
+                    optimizer_kwargs=kw,
+                )
             )
-        else:
-            raise NotImplementedError(f"Optimizer {name} not added.")
+        out.append(
+            ParamGroupConfig(
+                pattern=".*",
+                optimizer_name=config.groups["default"].get("optimizer", "DiSCO"),
+            )
+        )
+        return out
 
-        return optimizer_kwargs
+    @staticmethod
+    def _by_kind(
+        configs, model: nn.Module, layouts: dict, *, pp: bool = False
+    ) -> list[ParamGroupConfig]:
+        """Groups that select by declared kind, as exact-name patterns for this
+        model part (the names and the declarations come from the same module
+        tree, so no FQN spelling can drift between them). Under PP a stage
+        holds only its own parameters, so a group that matches none of them
+        (first match wins, as upstream claims them) is dropped for this part."""
+        trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+        claimed: set[str] = set()
+        out = []
+        for c in configs:
+            if c.pattern.startswith(_KIND):
+                kind = c.pattern[len(_KIND) :]
+                names = [
+                    n for n in trainable if n in layouts and layouts[n].kind == kind
+                ]
+                if not names and not pp:
+                    raise ValueError(
+                        f"an optimizer group selects kind {kind!r}, which no parameter "
+                        "of this model part is declared as"
+                    )
+                c = dataclasses.replace(
+                    c, pattern="^(?:" + "|".join(map(re.escape, names)) + ")$"
+                )
+            hits = [
+                n for n in trainable if n not in claimed and re.search(c.pattern, n)
+            ]
+            if pp and not hits:
+                continue
+            claimed.update(hits)
+            out.append(c)
+        return out
+
+    @staticmethod
+    def _build_optimizer_kwargs(
+        config: Config, parallel_dims: ParallelDims, name: str
+    ) -> dict[str, Any]:
+        if name == "DiSCO":
+            return disco_factory_kwargs(config, parallel_dims)
+        # Any other optimizer: its `default` group (when it is the default) or
+        # upstream's factory kwargs, plus the implementation switches.
+        default = config.groups.get("default", {})
+        base = (
+            {k: v for k, v in default.items() if k not in ("match", "optimizer")}
+            if default.get("optimizer", "DiSCO") == name
+            else config.optimizer_factory_kwargs_by_name.get(name, {})
+        )
+        return {**BaseOptimizersContainer._build_impl_kwargs(config), **base}
 
     def __init__(
         self,
@@ -288,8 +285,8 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         parallel_dims: ParallelDims,
         output_dir: str | None = None,
     ) -> None:
-        optimizer_cls = self._resolve_optimizer_factory(config.name)
-        optimizer_kwargs = self._build_optimizer_kwargs(config, parallel_dims)
+        self._validate(config)
+        group_configs = self._param_group_configs(config)
         all_params = []
         self.optimizers = []
         self.model_parts = model_parts
@@ -303,9 +300,13 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         )
         self.gram_level: int = config.gram_level
         self.log_norm_freq: int = config.log_norm_freq
-        self.log_queue: queue.Queue | None = None
-        self.log_thread: threading.Thread | None = None
-        self.log_metrics_locally: bool = config.log_metrics_locally
+        self.head_diag_probes: int = config.head_diag_probes
+        self.head_diag_diameter_iters: int = config.head_diag_diameter_iters
+        self._moe_publish_armed: bool = False
+        self._norms_armed: bool = False
+        self._head_input: Callable[[], torch.Tensor | None] | None = None
+        # Every shard rank logs its own slice; set by the trainer from metrics.
+        self.log_metrics_locally = False
         # `output_dir` is a build kwarg so these are set at construction
         # rather than patched on by the trainer afterwards.
         self.spectrum_logging_config = spectrum_logging.SpectrumLoggingConfig(
@@ -319,63 +320,46 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
             export_dir=os.path.join(output_dir, "gram_export") if output_dir else None,
         )
 
-        # `param_groups` and `optimizer_factory_kwargs_by_name` are inherited
-        # from BaseOptimizersContainer.Config but this container does NOT honour
-        # them: DiSCO derives its groups from mesh topology and tensor role via
-        # `create_disco_param_groups` (+ `extra_param_group_split_rules`), and
-        # the non-DiSCO branch below takes a flat `model.parameters()`. Silently
-        # dropping a user's param_groups would mean training with different
-        # hyper-parameters than the config asks for, so refuse instead. Not
-        # implemented rather than not wanted -- wiring upstream's grouping into
-        # DiSCO's role-based split needs its own design.
-        if getattr(config, "param_groups", None):
-            raise ValueError(
-                "optimizers.param_groups is not supported by this container: "
-                "DiSCO builds its own groups from tensor role and mesh topology "
-                "(create_disco_param_groups). Use "
-                "optimizer.extra_param_group_split_rules instead."
+        for part_idx, model in enumerate(self.model_parts):
+            declare = getattr(model, "param_layouts", None)
+            layouts = declare() if declare is not None else {}
+            configs = self._by_kind(
+                group_configs,
+                model,
+                layouts,
+                pp=parallel_dims is not None and parallel_dims.pp_enabled,
             )
-        if getattr(config, "optimizer_factory_kwargs_by_name", None):
-            raise ValueError(
-                "optimizers.optimizer_factory_kwargs_by_name is not supported "
-                "by this container; it is never read. Set the optimizer kwargs "
-                "directly on the optimizer config."
+            by_name, patterns = self._build_param_groups(model, configs, {})
+            for opt_name, groups in by_name.items():
+                cls = self._resolve_optimizer_factory(opt_name)
+                kwargs = self._build_optimizer_kwargs(config, parallel_dims, opt_name)
+                if issubclass(cls, DiSCO):
+                    if "lr" not in kwargs:
+                        raise ValueError(
+                            "DiSCO has no default lr: set it in optimizer.groups."
+                            "default, or, when the default group is another "
+                            "optimizer (or upstream's param_groups is used), in "
+                            "optimizer_factory_kwargs_by_name['DiSCO']"
+                        )
+                    kwargs["param_layouts"] = layouts
+                optimizer = cls(groups, **kwargs)
+                if isinstance(optimizer, DiSCO):
+                    optimizer.head_diag_diameter_iters = config.head_diag_diameter_iters
+                self.optimizers.append(optimizer)
+                self._log_optimizer(optimizer, part_idx, patterns[opt_name])
+                for g in groups:
+                    all_params.extend(g["params"])
+        if config.log_norm_freq > 0 and not any(
+            isinstance(o, DiSCO) for o in self.optimizers
+        ):
+            logger.warning(
+                f"optimizer.log_norm_freq={config.log_norm_freq} has no effect: "
+                "no DiSCO optimizer computes parameter norms."
             )
-
-        for model in self.model_parts:
-            if issubclass(optimizer_cls, DiSCO):
-                params, optimizer_kwargs = create_disco_param_groups(
-                    model, optimizer_kwargs
-                )
-            else:
-                # `param_names` is REQUIRED by the inherited upstream
-                # `state_dict()` (components/optimizer/utils.py), which the
-                # 0.5.0 port started using when it dropped 0.4.0's override.
-                # Building from a bare parameter list left the group without it,
-                # so a non-DiSCO run (name="AdamW", the Config default) trained
-                # fine and then died at the first checkpoint with
-                # "Optimizer must be built with (name, param) tuples".
-                # Upstream's own `_build_param_groups` always sets it, and
-                # upstream's EMA container does the same thing.
-                named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-                params = [
-                    {
-                        "params": [p for _, p in named],
-                        "param_names": [canonical_fqn(n) for n, _ in named],
-                    }
-                ]
-            self.optimizers.append(optimizer_cls(params, **optimizer_kwargs))
-            all_params.extend(params)
-
-        assert len(self.optimizers) == len(self.model_parts), (
-            f"{len(self.optimizers)} optimizers for {len(self.model_parts)} "
-            "model parts; this container builds exactly one per part."
-        )
-        # Mirrors upstream's __init__, which this class overrides wholesale;
-        # without it the option is accepted and does nothing.
+        self._validate_params(all_params)
         if config.implementation == "fused_opt_states_bf16":
             self._register_bf16_optimizer_state_hook()
-        self._post_init(all_params, optimizer_kwargs)
+        self._post_init(all_params)
 
     def __iter__(self) -> Iterator[T]:
         return iter(self.optimizers)
@@ -385,6 +369,11 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
 
     # pyrefly: ignore [bad-override]
     def step(self, *args, **kwargs) -> None:
+        if self._head_input is not None:
+            h, self._head_input = self._head_input(), None
+            for optimizer in self.optimizers:
+                if isinstance(optimizer, DiSCO):
+                    optimizer.head_probe_h = h
         for optimizer in self.optimizers:
             optimizer.step(*args, **kwargs)
 
@@ -399,6 +388,14 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         would otherwise silently restore the checkpoint's learning rates and
         undo the new schedule.
         """
+        # DiSCO leaves its rule config out of checkpoints (the run's config
+        # wins); the flat loader wants every live group key, so supply them.
+        state_dict = dict(state_dict)
+        for optimizer in self.optimizers:
+            for group in optimizer.param_groups:
+                for key in getattr(optimizer, "_CONFIG_ONLY_GROUP_KEYS", ()):
+                    for fqn in group.get("param_names", ()):
+                        state_dict.setdefault(f"param_groups.{fqn}.{key}", group[key])
         if not self.preserve_lrs_when_loading:
             super().load_state_dict(state_dict)
             return
@@ -431,18 +428,47 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
             return True
         return should_log and (step == 1 or step % self.log_norm_freq == 0)
 
+    def begin_step(
+        self,
+        step: int,
+        *,
+        should_log: bool,
+        is_final_step: bool,
+        head_input: Callable[[], "torch.Tensor | None"] | None = None,
+    ) -> int:
+        """Arm the next `step()` for what `collect_metrics` reads back; call it
+        before the forward. Returns how many rows of the LM head's input the
+        head geometry wants from that forward (0: none), which `step()` then
+        takes from `head_input` and hands to DiSCO for that step only.
+        """
+        self._head_input = None
+        if should_log:
+            self.arm_moe_publish()
+        if not self.wants_norms_at(
+            step, should_log=should_log, is_final_step=is_final_step
+        ):
+            return 0
+        self.arm_norm_computation()
+        discos = [o for o in self.optimizers if isinstance(o, DiSCO)]
+        if head_input is None or not any(o.has_head_geometry for o in discos):
+            return 0
+        self._head_input = head_input
+        return self.head_diag_probes
+
     def arm_norm_computation(self):
         """Tell DiSCO to produce norms during the next `step()`."""
-        for i, _ in enumerate(self.model_parts):
-            optimizer = self.optimizers[i]
+        self._norms_armed = True
+        # Every DiSCO instance, not `optimizers[part_index]`: a config that
+        # sends some parameters to AdamW builds one optimizer per (part, name),
+        # so the indices stopped lining up with the parts.
+        for optimizer in self.optimizers:
             if isinstance(optimizer, DiSCO):
                 optimizer.calculate_norm_at_next_step(
                     self.norms_to_log,
                     self.gram_level,
-                    # The spectra are only ever consumed by
-                    # process_norms_for_logging, which drops them unless the
-                    # parquet export is on. Telling the optimizer up front lets
-                    # it skip computing, packing and all-gathering them.
+                    # Dropped by process_norms_for_logging unless the parquet
+                    # export is on, so let the optimizer skip computing,
+                    # packing and all-gathering them.
                     track_spectrum=self.spectrum_logging_config.enable_export,
                     # Single source of truth with the logger: the optimizer must
                     # only skip the gather on ranks that actually have a logger,
@@ -450,22 +476,38 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                     log_metrics_locally=self.log_metrics_locally,
                 )
 
-    def collect_metrics(self, step: int, *, include_norms: bool) -> dict[str, Any]:
-        """Everything this container reports for `step`.
+    def arm_moe_publish(self) -> None:
+        """Tell the MoE hook to publish router metrics during the next `step()`.
 
-        `include_norms` must match what `wants_norms_at` said before the step;
-        unarmed norms yield an empty dict rather than an error.
+        The metrics cost a device-to-host copy, so the hook only pays it on
+        steps whose `collect_metrics` will read them back.
         """
+        self._moe_publish_armed = True
+
+    def consume_moe_publish_arm(self) -> bool:
+        """One-shot read by the MoE hook: publish, or do the bias update alone."""
+        armed = self._moe_publish_armed
+        self._moe_publish_armed = False
+        return armed
+
+    def collect_metrics(self, step: int) -> dict[str, Any]:
+        """Everything this container reports for `step`; the norms only when
+        the step was armed for them."""
         metrics: dict[str, Any] = {}
-        if include_norms:
+        armed, self._norms_armed = self._norms_armed, False
+        if armed:
             metrics.update(self.get_parameter_norms(step=step))
         metrics.update(self.collect_moe_metrics())
         return metrics
 
     def collect_moe_metrics(self) -> dict[str, Any]:
-        """Drain the async MoE worker and gather what it wrote per layer."""
-        self.join_log_queue()
+        """The router metrics the MoE hook published per layer."""
         metrics: dict[str, Any] = {}
+        for moe in self._moe_modules():
+            metrics.update(getattr(moe, "_log_expert_metrics", None) or {})
+        return metrics
+
+    def _moe_modules(self) -> Iterator[nn.Module]:
         for model_part in self.model_parts:
             layers = getattr(model_part, "layers", None)
             if layers is None:
@@ -473,22 +515,19 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
             for layer in layers.values():
                 moe = getattr(layer, "moe", None)
                 if moe is not None:
-                    metrics.update(getattr(moe, "_log_expert_metrics", None) or {})
-        return metrics
+                    yield moe
+
+    def _drop_moe_metrics(self) -> None:
+        """Forget the cached per-layer dicts; nothing stale can be logged."""
+        for moe in self._moe_modules():
+            moe._log_expert_metrics = {}
 
     def get_parameter_norms(self, step: int):
         """Post-process the norms DiSCO computed during the armed `step()`."""
         all_norms = {}
         for optimizer in self.optimizers:
             if isinstance(optimizer, DiSCO):
-                # One read per optimizer: this returns the dict the armed
-                # step stashed, so re-reading per param group was wasted.
                 all_norms.update(optimizer.get_norms_at_current_step())
-            else:
-                logger.warning(
-                    f"Optimizer {optimizer.__class__.__name__} does not support "
-                    "norm calculation."
-                )
         all_norms = process_gram_vectors_for_logging(
             all_norms, step=step, config=self.gram_vector_logging_config
         )
@@ -498,625 +537,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
             config=self.spectrum_logging_config,
         )
 
-    def set_up_async_logging(self, log_fn: Callable):
-        self.log_queue = queue.Queue()
-        # daemon=True is the safety net for the teardown hang: the worker sits
-        # in a blocking `log_queue.get()` until it receives the None sentinel,
-        # and that sentinel is only sent by `close()`. Nothing in the tree
-        # called `close()`, so a NON-daemon worker kept the process alive after
-        # training finished -- jobs appeared to "hang in teardown" and had to be
-        # killed by the sbatch timeout. `Trainer.close()` now calls `close()`
-        # for a clean drain; daemon=True makes sure a missed call can never
-        # block process exit again.
-        self.log_thread = threading.Thread(
-            target=log_fn, args=(self.log_queue,), daemon=True
-        )
-        self.log_thread.start()
-        return self.log_queue
-
     def close(self):
-        """Drain and stop the async metrics worker. Idempotent."""
-        if self.log_queue is not None:
-            self.log_queue.put(None)
-        if self.log_thread is not None:
-            # Bounded: a wedged worker must not turn shutdown into a hang.
-            self.log_thread.join(timeout=30.0)
-            if self.log_thread.is_alive():
-                logger.warning(
-                    "async metrics worker did not exit within 30s; abandoning it "
-                    "(it is a daemon thread, so it cannot block process exit)."
-                )
-        self.log_queue = None
-        self.log_thread = None
-
-    def join_log_queue(self):
-        if self.log_queue is not None:
-            self.log_queue.join()
-
-    def _post_init(
-        self, all_params: list[nn.Parameter], optimizer_kwargs: dict[str, Any]
-    ) -> None:
-        # We need to call Optimizer.__init__() to initialize some necessary optimizer
-        # functionality such as hooks.
-        wrapper_optimizer_kwargs = optimizer_kwargs.copy()
-        wrapper_optimizer_kwargs.pop("parallel_dims", None)
-        Optimizer.__init__(self, all_params, wrapper_optimizer_kwargs)
-        self._strip_wrapper_runtime_only_keys()
-
-    def _strip_wrapper_runtime_only_keys(self) -> None:
-        # `parallel_dims` is a runtime topology object containing DeviceMesh. The
-        # wrapper optimizer only needs standard Optimizer hook machinery, so keeping
-        # this key in wrapper defaults/param_groups only risks accidental serialization.
-        self.defaults.pop("parallel_dims", None)
-        for group in self.param_groups:
-            group.pop("parallel_dims", None)
-
-
-def moe_metrics_worker(log_queue: queue.Queue):
-    """
-    This function runs in the background. It waits for data,
-    does the slow CPU work, and assigns the final dictionary.
-    """
-    while True:
-        # 1. Wait for data from the main thread
-        data = log_queue.get()
-        if data is None:  # Sentinel to stop the thread
-            # Balance the get() before leaving, or `join_log_queue()` (called
-            # every logging step from the trainer) waits forever on an
-            # unfinished_tasks count that can never reach zero.
-            log_queue.task_done()
-            break
-
-        # Seeded BEFORE the try: if the tuple unpack below raises (a producer/
-        # worker arity skew), an empty list would make the except-handler's
-        # clearing loop a no-op and the previous step's metrics would be
-        # republished as current.
-        moe_layers_info: list[dict] = (
-            data[0] if isinstance(data, tuple) and data else []
-        )
-        # Any exception here used to kill the worker silently -- and then
-        # `join_log_queue()`, which the trainer calls every logging step,
-        # would block the MAIN thread forever on a queue nobody drains.
-        # daemon=True does not help there. Log and keep serving instead.
-        try:
-            (
-                moe_layers_info,
-                all_usages_cpu,
-                all_biases_cpu,
-                all_entropies_cpu,
-                all_load_balance_losses_cpu,
-                all_maxvio_batch_cpu,
-                all_maxvio_ema_cpu,
-                all_bias_mean_cpu,
-                all_bias_std_cpu,
-                num_experts,
-                has_aux_loss,
-            ) = data
-
-            usage_offset = bias_offset = 0
-            for i, info in enumerate(moe_layers_info):
-                moe = info["module"]
-                layer_id = info["layer_id"]
-
-                layer_usages = all_usages_cpu[usage_offset : usage_offset + num_experts]
-                layer_biases = all_biases_cpu[bias_offset : bias_offset + num_experts]
-                metrics = {
-                    f"moe_entropy/L-{layer_id}": all_entropies_cpu[i],
-                    f"moe_maxvio_batch/L-{layer_id}": all_maxvio_batch_cpu[i],
-                    f"moe_maxvio_ema/L-{layer_id}": all_maxvio_ema_cpu[i],
-                    f"moe_bias_mean/L-{layer_id}": all_bias_mean_cpu[i],
-                    f"moe_bias_std/L-{layer_id}": all_bias_std_cpu[i],
-                }
-                if has_aux_loss:
-                    metrics[f"moe_load_balance_loss/L-{layer_id}"] = (
-                        all_load_balance_losses_cpu[i]
-                    )
-                pre_usage = f"moe_ep_usage/L-{layer_id}_EP-"
-                pre_bias = f"moe_bias/L-{layer_id}_EP-"
-                metrics.update(
-                    {f"{pre_usage}{j}": v for j, v in enumerate(layer_usages)}
-                )
-                metrics.update(
-                    {f"{pre_bias}{j}": v for j, v in enumerate(layer_biases)}
-                )
-                moe._log_expert_metrics = metrics
-                usage_offset += num_experts
-                bias_offset += num_experts
-
-            # Aggregated scalars across all MoE layers — attached to first layer
-            num_moe_layers = len(moe_layers_info)
-            moe_layers_info[0]["module"]._log_expert_metrics.update(
-                {
-                    "moe_maxvio_batch/aggregate": sum(all_maxvio_batch_cpu)
-                    / num_moe_layers,
-                    "moe_maxvio_ema/aggregate": sum(all_maxvio_ema_cpu)
-                    / num_moe_layers,
-                }
-            )
-
-        except Exception:
-            logger.exception("async MoE metrics worker failed on one payload")
-            # Clear, or collect_moe_metrics republishes the previous step's
-            # values as current -- a flat chart segment rather than a gap.
-            for info in moe_layers_info:
-                info["module"]._log_expert_metrics = {}
-        finally:
-            log_queue.task_done()
-
-
-def fused_hier_reduce_loss_stats(
-    parallel_dims,
-    all_tokens: torch.Tensor,
-    all_entropies: torch.Tensor,
-    all_load_balance_losses: torch.Tensor,
-):
-    loss_mesh = parallel_dims.get_optional_mesh("loss")
-    if loss_mesh is None:
-        return
-
-    # 1. Determine Topology
-    fsdp_mesh = fsdp_shard_mesh(parallel_dims)
-    dp_mesh = parallel_dims.get_optional_mesh("dp_replicate")
-
-    # Hierarchical reduction applies only under HSDP (both meshes present); every
-    # other topology takes the flat path. The two are mathematically equivalent --
-    # both SUM over the same rank set, both normalised by |loss mesh| -- verified
-    # across 18 mesh configurations under a fake process group, so the choice is a
-    # communication-cost one and needs no knob. (An env override lived here to
-    # isolate the reduce while chasing an apparent HSDP loss spread; that turned
-    # out to be seed noise, so the knob is gone.)
-    use_hierarchical = (fsdp_mesh is not None) and (dp_mesh is not None)
-
-    # 2. Fuse & Pack (float32)
-    #
-    # fp32 is sufficient here, measured rather than assumed. Simulating the
-    # reduce (sequential-ring and tree orders, E=128, T=40960) at 64/128/1024
-    # ranks across expert spreads of 20%/1%/0.05% gives ZERO sign flips in all
-    # 18 cells. Error: at gas=1 the per-rank values are integral and the fp32
-    # reduce is EXACT; at gas=8 the `/sf` normalisation makes them non-integral
-    # and max relative error is ~1.3e-6 at 1024 ranks.
-    #
-    # Sign flips are the dominant concern because the default
-    # `bias_update_norm_factor` is `sign`, but NOT the only one: the `spectral`
-    # and `rms` factors are magnitude-sensitive, and at least one recorded
-    # config uses `bias_spectral`. 1.3e-6 relative is far below any meaningful
-    # change to those updates, but they are not sign-quantised, so the margin
-    # is the argument rather than exactness.
-    #
-    # Exact integer representation is also not at risk: fp32 is exact to 2^24 =
-    # 16.7M and the summed counts land near 2.6M. That is independent of
-    # gradient accumulation because `_update_expert_bias` divides by
-    # `acc_fwd_times` BEFORE calling this, so each rank contributes a
-    # per-forward mean. Do not move that division after the reduce -- a raw sum
-    # at gas=8 x 1024 ranks reaches 21M and would start rounding.
-    acc = torch.float32
-    t0 = all_tokens.reshape(-1).to(acc)
-    t1 = all_entropies.reshape(-1).to(acc)
-    t2 = all_load_balance_losses.reshape(-1).to(acc)
-
-    buf = torch.cat([t0, t1, t2])
-
-    # 3. Perform Reduction
-    if use_hierarchical:
-        # Hierarchical: FSDP (Intra-node) -> DP (Inter-node)
-        # Using SUM for all, we will normalize averaging later
-        dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=fsdp_mesh.get_group())
-        dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=dp_mesh.get_group())
-    else:
-        # Fallback: Flat all-reduce on the global loss mesh
-        dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=loss_mesh.get_group())
-
-    # 4. Unpack & Normalize
-    ws_loss = dist.get_world_size(group=loss_mesh.get_group())
-
-    n0, n1, n2 = t0.numel(), t1.numel(), t2.numel()
-
-    # Slicing views
-    out_tokens = buf[0:n0].view_as(all_tokens)
-    out_ent = buf[n0 : n0 + n1].view_as(all_entropies)
-    out_lb = buf[n0 + n1 : n0 + n1 + n2].view_as(all_load_balance_losses)
-
-    # 5. Copy back to inputs
-    # Tokens: SUM (no division)
-    all_tokens.copy_(out_tokens.to(all_tokens.dtype))
-
-    # Entropy: AVG (divide SUM by world size) -- a per-forward mean per rank.
-    all_entropies.copy_((out_ent / ws_loss).to(all_entropies.dtype))
-    # Load-balance loss: SUM, matching upstream's `collect_aux_loss_metrics`,
-    # which all-reduces `group_acc` with SUM and divides only by the layer
-    # count. Each rank holds its own token share, so the sum IS the global
-    # value; the old `/ws_loss` made it 1/world_size of the truth.
-    all_load_balance_losses.copy_(out_lb.to(all_load_balance_losses.dtype))
-
-
-@torch.no_grad()
-def _quantile_update_expert_bias(
-    balancers: list,
-    bias_params: list[torch.Tensor],
-    parallel_dims: ParallelDims,
-    loss_mesh,
-) -> None:
-    """Solve each layer's expert bias from its required-bias histogram.
-
-    Replaces the DeepSeek-V3 sign nudge: instead of stepping the bias by
-    +/-coeff on the sign of the load error, this reads off the bias quantile
-    that would have given each expert exactly ``top_k / num_experts`` of the
-    tokens. There is no learning rate, so it converges in one step rather than
-    over many.
-    """
-    reduction_groups = []
-    # With EP the router is token-sharded on the dense TP axis even when
-    # model-wide sequence parallelism is off.
-    if parallel_dims.ep_enabled and parallel_dims.tp > 1:
-        reduction_groups.append(parallel_dims.get_dense_tp_mesh().get_group())
-    if loss_mesh is not None:
-        reduction_groups.append(loss_mesh.get_group())
-
-    histograms = [b.required_bias_histogram_EB for b in balancers]
-    if reduction_groups:
-        stacked_LEB = torch.stack(histograms)
-        for group in reduction_groups:
-            torch.distributed.all_reduce(
-                stacked_LEB, group=group, op=torch.distributed.ReduceOp.SUM
-            )
-        histograms = list(stacked_LEB.unbind())
-
-    for histogram_EB, balancer, expert_bias_E in zip(
-        histograms, balancers, bias_params, strict=True
-    ):
-        expert_bias_E.copy_(
-            balancer.estimate_expert_bias(histogram_EB, expert_bias_E)
-        )
-        balancer.required_bias_histogram_EB.zero_()
-
-
-def register_moe_load_balancing_hook(
-    optimizers: DiSCOOptimizersContainer,
-    model_parts: list[nn.Module],
-    parallel_dims: ParallelDims,
-) -> DiSCOOptimizersContainer:
-
-    # NOTE: the worker thread is started lazily, at the bottom of this
-    # function, only once `_should_register_moe_balancing_hook` says the hook
-    # will actually be registered. It cannot be decided here: the predicate is
-    # a nested `def` further down in this same function, so referencing it at
-    # this point makes Python treat the name as an unassigned local
-    # (UnboundLocalError) and kills every run.
-    log_queue = None
-
-    def lmo_for_moe_bias(
-        g,
-        norm_factor="sign",
-        epsilon=1e-32,
-    ):
-        if norm_factor in ["sign", "sign_zero_mean"]:
-            return torch.sign(g)
-        elif norm_factor in ["spectral", "spectral_zero_mean"]:
-            is_flat = g.dim() == 1
-            g = g.unsqueeze(0) if is_flat else g
-            norms = torch.linalg.norm(g, ord=2, dim=1, keepdim=True)
-            g = g / torch.clamp(norms, min=epsilon)
-            g = g.squeeze(0) if is_flat else g
-            return g
-        elif norm_factor in ["rms", "rms_zero_mean"]:
-            is_flat = g.dim() == 1
-            g = g.unsqueeze(0) if is_flat else g
-            rms = torch.sqrt(torch.mean(g.square(), dim=1, keepdim=True))
-            g = g / torch.clamp(rms, min=epsilon)
-            g = g.squeeze(0) if is_flat else g
-            return g
-        raise ValueError(
-            f"unknown bias_update_norm_factor {norm_factor!r}. Returning None "
-            "here would reach torch._foreach_add_ as a None element, and a "
-            "near-miss like 'sign_zeromean' would silently drop zero-centring "
-            "because the zero_mean check is endswith('zero_mean'). Valid: "
-            "sign, spectral, rms, and their *_zero_mean variants."
-        )
-
-    def _update_expert_bias(
-        model_parts: list[nn.Module],
-        parallel_dims: ParallelDims,
-    ):
-        """
-        Lets assume all MoE layers have same amount of experts.
-        """
-
-        loss_mesh = parallel_dims.get_optional_mesh("loss")
-
-        # above is adapted from the upstream code
-        #
-        # The `loss` mesh is dp_replicate x dp_shard x cp -- it does NOT contain
-        # tp (parallel_dims.py:311). So loss-rank 0 alone is true on EVERY tp
-        # rank, and under tp > 1 every one of them would push a payload for the
-        # same layers. TP ranks hold shards of the same router, not distinct
-        # work, so require tp local rank 0 as well. This mirrors the predicate
-        # in `components/metrics.py:478-481`. Inert at tp=1.
-        tp_mesh = parallel_dims.get_optional_mesh("tp")
-        is_dp_rank_0 = (loss_mesh is None or loss_mesh.get_local_rank() == 0) and (
-            tp_mesh is None or tp_mesh.get_local_rank() == 0
-        )
-        # TODO: Currently this sync is blocking (thus exposed) and happens on the
-        # default compute stream. Need to assess if this is OK performance-wise.
-
-        moe_layers_info = []
-        tok_buffers, ent_buffers, load_balance_loss_buffers = [], [], []
-        ema_buffers = []
-        acc_fwd_times_buffers = []
-        num_experts = 0
-
-        for part in model_parts:
-            for block in part.layers.values():
-                if not block.moe_enabled:
-                    continue
-                moe = block.moe
-                # Assuming num_experts is the same for all, so we can just grab it once
-                layer_num_experts = moe.tokens_per_expert_E.numel()
-                if num_experts and layer_num_experts != num_experts:
-                    raise ValueError(
-                        "All MoE layers must have the same expert count: "
-                        f"layer {block.layer_id} has {layer_num_experts}, an "
-                        f"earlier layer has {num_experts}. The stats below are "
-                        "packed with `.view(num_layers, num_experts)`, which "
-                        "would silently mis-attribute them."
-                    )
-                num_experts = layer_num_experts
-                moe_layers_info.append(
-                    {
-                        "module": moe,
-                        "layer_id": block.layer_id,
-                    }
-                )
-                tok_buffers.append(moe.tokens_per_expert_E)
-                ema_buffers.append(moe.tokens_per_expert_cumul)
-                ent_buffers.append(moe.router_entropy)
-                acc_fwd_times_buffers.append(moe.acc_fwd_times)
-                # Per-layer load-balance value. The old `moe.load_balance_loss`
-                # buffer is gone: the loss now goes through upstream's AuxLoss,
-                # which keeps a PER-INSTANCE (i.e. per-layer) accumulator, so the
-                # `moe_load_balance_loss/L-*` breakdown survives the migration --
-                # upstream's own `collect_aux_loss_metrics` only reports the mean
-                # over layers. Falls back to a zero scalar when the layer has no
-                # aux loss (moe.aux_loss is None).
-                aux = getattr(moe, "aux_loss", None)
-                load_balance_loss_buffers.append(
-                    aux.instance_acc.reshape(1)
-                    if aux is not None
-                    else torch.zeros(
-                        1, dtype=torch.float32, device=moe.acc_fwd_times.device
-                    )
-                )
-        # Early exit if no MoE layers were found
-        if not moe_layers_info:
-            return
-
-        # Everything below is [num_layers, num_experts]. The previous version
-        # flattened to 1-D and then rebuilt the per-layer structure with a
-        # `repeat_interleave` group index plus an `index_add_`; working 2-D
-        # directly drops that index tensor and four gather/scatter kernels, and
-        # removes a duplicated per-layer mean.
-        num_layers = len(moe_layers_info)
-        all_tokens = torch.stack(tok_buffers)  # [L, E]
-        all_entropies = torch.cat(ent_buffers)  # [L]
-        all_load_balance_losses = torch.cat(load_balance_loss_buffers)  # [L]
-
-        # Every buffer above accumulates once per FORWARD, so each is a sum over
-        # `gradient_accumulation_steps * (1 + AC recomputes)` passes. Divide by
-        # each layer's OWN counter: taking the last layer's and applying it to
-        # all was correct only while activation checkpointing was uniform across
-        # layers, and silently wrong under per-layer/selective AC.
-        #
-        # `all_load_balance_losses` is normalised here too. It was previously
-        # left as a raw sum while `all_entropies` right beside it was averaged,
-        # so the logged `moe_load_balance_loss/L-*` scaled with `gas` and with
-        # AC -- not comparable across configs.
-        #
-        # Division is unconditional: `x / 1.0` is exact, so guarding it on
-        # `sf != 1` bought nothing and cost a `bool()` host sync every step.
-        # True division, not `//`: `tokens_per_expert_E` is float32, so `//`
-        # floored it and could collapse two distinct expert loads onto the same
-        # value, zeroing a bias update that should have been +/-1.
-        sf = torch.cat(acc_fwd_times_buffers).to(all_tokens.dtype).clamp_min(1.0)
-        all_tokens = all_tokens / sf.unsqueeze(1)
-        all_entropies = all_entropies / sf
-        # NOT all_load_balance_losses: AuxLoss.instance_acc already carries
-        # `raw_sum / global_valid_tokens`, and that denominator spans the whole
-        # step and every rank. Dividing again by acc_fwd_times made the metric
-        # scale as 1/gas.
-
-        if loss_mesh is not None:
-            fused_hier_reduce_loss_stats(
-                parallel_dims, all_tokens, all_entropies, all_load_balance_losses
-            )
-
-        layer_sums = all_tokens.sum(dim=1, keepdim=True)  # [L, 1]
-        layer_means = layer_sums / num_experts  # [L, 1]
-
-        # Per-layer EMA: ema = beta * ema + (1 - beta) * step_counts.
-        torch._foreach_mul_(ema_buffers, MAXVIO_EMA_BETA)
-        torch._foreach_add_(
-            ema_buffers, list(all_tokens.unbind(0)), alpha=(1.0 - MAXVIO_EMA_BETA)
-        )
-
-        # MaxVio_batch: worst-case overload in the current step window.
-        means = layer_means.squeeze(1)  # [L]
-        maxvio_batch = (all_tokens.max(dim=1).values - means) / (means + MAXVIO_EPS)
-
-        # MaxVio_ema: worst-case overload over EMA-smoothed expert loads.
-        all_ema = torch.stack(ema_buffers)  # [L, E]
-        ema_means = all_ema.mean(dim=1)
-        maxvio_ema = (all_ema.max(dim=1).values - ema_means) / (ema_means + MAXVIO_EPS)
-
-        delta_2d = layer_means - all_tokens  # [L, E]
-        usage_2d = all_tokens / layer_sums.clamp_min(1.0)  # [L, E]
-
-        # Vectorized bias update calculation (replaces the loop)
-        with torch.no_grad():
-            # Get norm factor and load_balance_coeff from the first MoE layer (assuming they are all the same)
-            first_moe = moe_layers_info[0]["module"]
-            norm_factor = first_moe.bias_update_norm_factor
-            load_balance_coeff = first_moe.load_balance_coeff
-            # Both are read from layer 0 and applied to every layer.
-            # `load_balance_coeff` consistency is already enforced by
-            # `_should_register_moe_balancing_hook`; `bias_update_norm_factor`
-            # was not checked at all, so a per-layer override was silently
-            # ignored rather than rejected.
-            for info in moe_layers_info[1:]:
-                if info["module"].bias_update_norm_factor != norm_factor:
-                    raise ValueError(
-                        "All MoE layers must share bias_update_norm_factor; "
-                        f"layer {info['layer_id']} has "
-                        f"{info['module'].bias_update_norm_factor!r}, layer 0 "
-                        f"has {norm_factor!r}."
-                    )
-
-            bias_params = [info["module"].expert_bias_E for info in moe_layers_info]
-            balancers = [
-                getattr(info["module"].router, "quantile_balancer", None)
-                for info in moe_layers_info
-            ]
-            if any(b is not None for b in balancers):
-                if not all(b is not None for b in balancers):
-                    raise ValueError(
-                        "quantile_balance_bins must be set on every MoE layer "
-                        "or none: the bias update is applied layer-wise from a "
-                        "single stacked histogram."
-                    )
-                _quantile_update_expert_bias(
-                    balancers, bias_params, parallel_dims, loss_mesh
-                )
-            else:
-                updates_2d = lmo_for_moe_bias(delta_2d, norm_factor=norm_factor)
-
-                if norm_factor.endswith("zero_mean"):
-                    updates_2d = updates_2d - updates_2d.mean(dim=1, keepdim=True)
-
-                # Collect all bias parameters and update them with a single
-                # multi-tensor op
-                torch._foreach_add_(
-                    bias_params, list(updates_2d.unbind(0)), alpha=load_balance_coeff
-                )
-
-            # Reset router stats in bulk. NOT load_balance_loss_buffers: those
-            # are now AuxLoss.instance_acc, whose lifecycle upstream's
-            # `register_aux_loss_zero_hook` owns -- it rolls each into the group
-            # registers that `collect_aux_loss_metrics` reduces, then clears it.
-            # Zeroing here too would race that hook: whichever ran second would
-            # see zeros, silently reporting 0 for either our per-layer breakdown
-            # or upstream's layer-mean.
-            torch._foreach_zero_(tok_buffers)
-            torch._foreach_zero_(ent_buffers)
-            torch._foreach_zero_(acc_fwd_times_buffers)
-
-            if is_dp_rank_0:
-                # One packed D2H copy. Six separate `.cpu()` calls meant six
-                # device syncs per logging step for a few KB of scalars.
-                dt = usage_2d.dtype
-                # Summaries are reduced HERE, on device, so they ride the same
-                # single D2H copy. Doing them in the worker meant rebuilding two
-                # CPU tensors per layer per step for three scalars.
-                bias_2d = torch.stack(bias_params).to(dt)  # [L, E]
-                packed = torch.cat(
-                    [
-                        usage_2d.reshape(-1),
-                        bias_2d.reshape(-1),
-                        all_entropies.to(dt),
-                        all_load_balance_losses.to(dt),
-                        maxvio_batch.to(dt),
-                        maxvio_ema.to(dt),
-                        bias_2d.mean(dim=1),
-                        bias_2d.std(dim=1, unbiased=False),
-                    ]
-                ).cpu()
-                n_le = num_layers * num_experts
-                all_usages_cpu = packed[:n_le].tolist()
-                all_biases_cpu = packed[n_le : 2 * n_le].tolist()
-                off = 2 * n_le
-                all_entropies_cpu = packed[off : off + num_layers].tolist()
-                off += num_layers
-                all_load_balance_losses_cpu = packed[off : off + num_layers].tolist()
-                off += num_layers
-                all_maxvio_batch_cpu = packed[off : off + num_layers].tolist()
-                off += num_layers
-                all_maxvio_ema_cpu = packed[off : off + num_layers].tolist()
-                off += num_layers
-                all_bias_mean_cpu = packed[off : off + num_layers].tolist()
-                off += num_layers
-                all_bias_std_cpu = packed[off : off + num_layers].tolist()
-                payload = (
-                    moe_layers_info,
-                    all_usages_cpu,
-                    all_biases_cpu,
-                    all_entropies_cpu,
-                    all_load_balance_losses_cpu,
-                    all_maxvio_batch_cpu,
-                    all_maxvio_ema_cpu,
-                    all_bias_mean_cpu,
-                    all_bias_std_cpu,
-                    num_experts,
-                    any(
-                        getattr(x["module"], "aux_loss", None) is not None
-                        for x in moe_layers_info
-                    ),
-                )
-                log_queue.put(payload)
-
-    def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
-        # Presence of an MoE layer is NOT sufficient -- upstream also requires
-        # `load_balance_coeff is not None`. `NormMoE.__init__` leaves
-        # `expert_bias_E = None` when the coeff is None, so registering the hook
-        # anyway makes `_update_expert_bias` call `torch._foreach_add_` with a
-        # None element and die at the first optimizer step. Mirrors upstream's
-        # `components/optimizer/optimizer.py::_should_register_moe_balancing_hook`,
-        # including its consistency check across layers.
-        moes = []
-        for model_part in model_parts:
-            layers = model_part.get_submodule("layers")
-            assert isinstance(layers, nn.ModuleDict)
-            for transformer_block in layers.values():
-                if transformer_block.moe_enabled:
-                    moes.append(transformer_block.moe)
-        if not moes:
-            return False
-        enabled = moes[0].load_balance_coeff is not None
-        for moe in moes[1:]:
-            if (moe.load_balance_coeff is not None) != enabled:
-                raise ValueError(
-                    "MoE load_balance_coeff must be configured consistently "
-                    "across all MoE layers. Either set it for every MoE layer "
-                    "or leave it unset for all MoE layers."
-                )
-        return enabled
-
-    if _should_register_moe_balancing_hook(model_parts):
-        # Upstream's `_update_expert_bias` all-reduces `tokens_per_expert_E`
-        # over `get_dense_tp_mesh()` when `ep_enabled and tp > 1`
-        # (components/optimizer/optimizer.py). This container reduces only over
-        # the `loss` mesh, which excludes tp, so under EP+TP each rank would
-        # bias its experts on its own tp shard's token counts -- silently wrong,
-        # never crashing. Refuse rather than train on it. No recipe in the tree
-        # sets tensor_parallel_degree > 1, so this is inert today; implementing
-        # the reduction needs a real EP+TP run to validate, not a fake pg.
-        if parallel_dims.ep_enabled and parallel_dims.tp > 1:
-            raise NotImplementedError(
-                "MoE load-balancing bias updates are not implemented for "
-                f"EP + TP (ep={parallel_dims.ep}, tp={parallel_dims.tp}): the "
-                "expert token counts are reduced over the 'loss' mesh only, "
-                "which excludes the tp axis, so each rank would see just its "
-                "own tp shard's counts. Run with tensor_parallel_degree=1, or "
-                "add the dense-tp all_reduce that upstream performs."
-            )
-        # Start the async metrics worker only now: a dense run, or one with
-        # load_balance_coeff=None, would otherwise spawn an idle daemon
-        # thread that nothing ever feeds.
-        log_queue = optimizers.set_up_async_logging(moe_metrics_worker)
-        optimizers.register_step_pre_hook(
-            lambda *args, **kwargs: _update_expert_bias(
-                model_parts, parallel_dims=parallel_dims
-            )
-        )
-        # Upstream pairs the load-balancing hook with an aux-loss zero hook (see
-        # deepseek_v3's _post_optimizer_build_fn). It rolls each AuxLoss
-        # instance's `instance_acc` into the group registers that
-        # `collect_aux_loss_metrics` reduces at log time, then clears them, so
-        # the accumulators cover exactly one optimizer step.
-        register_aux_loss_zero_hook(optimizers, model_parts, parallel_dims)
+        """Forget any armed publish and the cached MoE metrics. Idempotent."""
+        self._moe_publish_armed = False
+        self._drop_moe_metrics()

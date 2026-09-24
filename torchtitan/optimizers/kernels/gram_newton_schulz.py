@@ -10,7 +10,7 @@
 #   "Gram Newton-Schulz: A Fast, Hardware-Aware Newton-Schulz Algorithm for Muon"
 # Vendored rather than imported so training does not depend on a checkout
 # outside this repository. Coefficients here are this repo's own polar-express
-# set (see muon_utils.zeropower_via_polar_express), not the upstream defaults,
+# set (see zeropower.zeropower_via_polar_express), not the upstream defaults,
 # so this is a numerical near-match to the existing backend rather than a
 # different iteration -- see the accuracy note below.
 
@@ -23,20 +23,16 @@ applies the accumulated polynomial to `X` once at the end. For the shapes DiSCO
 feeds the LMO that is a strict FLOP reduction, and the square symmetric products
 map onto better GEMM kernels.
 
-**Opt in only.** Register name `gram_polar_express`; the default
-`zeropower_backend` is unchanged. Unlike everything in norm_helper/radial_helper,
-this sits on the *update path* -- its output is the direction the optimizer
-applies -- so switching it changes the training trajectory and is a deliberate
-choice, not a free speedup.
+Register name `gram_polar_express` (a rule's `compute`; the opt_moe recipes
+use it with 6 steps). Unlike norm_helper/radial_helper, this sits on the
+*update path*: its output is the direction the optimizer applies, so switching
+to or from it changes the training trajectory.
 
-A note on iteration counts before the numbers: `polar_express_triton` iterates
-its whole coefficient table and so runs **8** Newton-Schulz iterations
-regardless of the `steps` argument, while `zeropower_via_polar_express` honours
-`steps` and runs 5 by default. Any comparison between them at "steps=5" is
-therefore 8 iterations against 5. Everything below is like-for-like at 8.
+The numbers below are like-for-like at 8 iterations for every backend (they
+were taken when `polar_express_triton` ignored `steps` and always ran 8).
 
 Measured on GH200 / torch 2.12, CUDA-event timed, 20 warmup + 5 trials x 20
-reps, at the two batched shapes step_experts produces per optimizer step for
+reps, at the two batched expert shapes DiSCO computes per optimizer step for
 qwen30b-a3b at EP=64 (`[188,768,2048]` and `[94,2048,768]`):
 
     backend                          err vs UV^T    expert LMO/step
@@ -44,16 +40,12 @@ qwen30b-a3b at EP=64 (`[188,768,2048]` and `[94,2048,768]`):
     this, float16 + quack kernels       0.0028          20.17 ms   (1.21x)
     this, float16 + torch backend       0.0027          27.14 ms   (slower)
 
-So with the kernels this is simultaneously ~2.3x more accurate and ~1.2x
-faster than the current default. Without quack it is slower than the default
-and not worth enabling.
+So with the kernels this is ~2.3x more accurate and ~1.2x faster than
+`polar_express_triton`; without quack it is slower.
 
-i.e. indistinguishable, and marginally closer. The two outputs differ from each
-other by ~2%, which is the expected spread between two ~9%-accurate
-approximations of the same quantity. Note the upstream default coefficients use
-a safety factor of 1.05 where this repo uses 1.01; that difference -- not the
-algorithm and not the working precision -- is what made upstream's defaults look
-less accurate (0.0967) in a first comparison.
+Upstream's default coefficients use a safety factor of 1.05 where this repo uses
+1.01; that difference, not the algorithm or the working precision, made
+upstream's defaults look less accurate (0.0967) in a first comparison.
 """
 
 import logging
@@ -63,7 +55,8 @@ from torch import Tensor
 
 logger = logging.getLogger(__name__)
 
-from .muon_utils import polar_express_coefficients
+from .floors import NORM_FLOOR, SUMSQ_FLOOR
+from .zeropower import polar_express_coefficients, zeropower_backends
 
 # Restarting the accumulated polynomial partway through keeps the Gram
 # iteration stable; upstream restarts once, before iteration 2.
@@ -95,11 +88,11 @@ def _quack_ops():
             # run. Selecting this backend without quack installed is a
             # misconfiguration, not a soft fallback.
             logger.warning(
-                "[DiSCO] zeropower_backend='gram_polar_express' selected but the "
+                "[DiSCO] compute='gram_polar_express' selected but the "
                 "quack symmetric-GEMM kernels are unavailable (%s). Falling back "
                 "to plain torch matmuls, which is SLOWER than "
                 "'polar_express_triton'. Install quack-kernels, or switch the "
-                "backend back.",
+                "compute back.",
                 type(exc).__name__,
             )
     if _QUACK is False:
@@ -123,7 +116,7 @@ def gram_polar_express(
 ) -> Tensor:
     """Drop-in for `zeropower_via_polar_express` with the Gram iteration.
 
-    Same signature as every other entry in `muon_utils.zeropower_backends`:
+    Same signature as every other entry in `zeropower.zeropower_backends`:
     `(G, steps=..., eps=...)`, 2-D or 3-D input, output in `G`'s dtype.
 
     `work_dtype` defaults to float16, not the bfloat16 that
@@ -161,7 +154,8 @@ def gram_polar_express(
     # Iterate on whichever side gives the smaller Gram matrix.
     tall = G.size(-2) > G.size(-1)
     X = G.to(torch.float32)
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + eps)
+    norm = X.norm(dim=(-2, -1), keepdim=True)
+    X = X / torch.where(norm >= NORM_FLOOR, norm * 1.01 + eps, torch.inf)
     X = X.to(work_dtype)
 
     R = sym_mm(X.mT, X) if tall else sym_mm(X, X.mT)
@@ -191,3 +185,57 @@ def gram_polar_express(
     if is_2d:
         X = X.squeeze(0)
     return X.to(original_dtype)
+
+
+@torch.no_grad()
+def gram_polar_factor(
+    R: Tensor,
+    steps: int = 5,
+    eps: float = 1e-7,
+    work_dtype: torch.dtype = torch.float16,
+) -> Tensor:
+    """`Q` with `X @ Q = polar(X)` from `R = X^T X` alone (`[n, n]` or
+    `[B, n, n]`), so a row-sharded tall `X` needs one all-reduce of its partial
+    Grams and no all-to-all: each rank then applies `rows @ Q`. Same recurrence
+    as `gram_polar_express`; a reset re-forms the Gram as `Q^T R Q` instead of
+    from `X`. Returns `Q` in fp32."""
+    coeffs = polar_express_coefficients(steps)
+    is_2d = R.dim() == 2
+    if is_2d:
+        R = R.unsqueeze(0)
+    trace = R.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(0)
+    scale = torch.where(trace >= SUMSQ_FLOOR, trace.sqrt() * 1.01 + eps, torch.inf)
+    scale2 = scale * scale
+    R0 = R.to(torch.float32) / scale2[:, None, None]  # fp32: the resets re-form from it
+    R = R0.to(work_dtype)
+    I = torch.eye(R.size(-1), device=R.device, dtype=R.dtype).expand_as(R).contiguous()
+    Q = None
+    Qtot = None  # product of the Q's up to the last reset
+    n = len(coeffs)
+    for i, (a, b, c) in enumerate(coeffs):
+        if i in _RESET_ITERATIONS and i != 0:
+            Qtot = Q if Qtot is None else Qtot @ Q
+            # From the fp32 Gram: an fp16 one leaves negative eigenvalues in a
+            # rank-deficient unit's null space, which the polynomial blows up.
+            Qf = Qtot.to(torch.float32)
+            R = (Qf.mT @ R0 @ Qf).to(work_dtype)
+            Q = None
+        Z = torch.baddbmm(R, R, R, alpha=c, beta=b)
+        if i == 0 or i in _RESET_ITERATIONS:
+            Q = Z + a * I
+        else:
+            Q = torch.baddbmm(Q, Q, Z, beta=a)
+        if i < n - 1 and (i + 1) not in _RESET_ITERATIONS:
+            RZ = torch.baddbmm(R, R, Z, beta=a)
+            R = torch.baddbmm(RZ, Z, RZ, beta=a)
+    Q = Q if Qtot is None else Qtot @ Q
+    Q = Q.to(torch.float32) / scale[:, None, None]
+    return Q.squeeze(0) if is_2d else Q
+
+
+# Registered from here, not from `zeropower`: this module imports that one, so
+# on the `gram_newton_schulz`-first path `zeropower` would be reaching into a
+# module that has not defined `gram_polar_express` yet. The dict exists by the
+# time this line runs either way. It is on the *update path*, so selecting it
+# changes the training trajectory -- see this module's docstring.
+zeropower_backends["gram_polar_express"] = gram_polar_express

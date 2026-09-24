@@ -6,14 +6,15 @@
 
 """Verification for optimizers/norm_helper.py (plan Verification step 3)."""
 import os as _os
-import sys, time
+import sys
+import time
 
 _REPO = _os.path.abspath(
     _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "..")
 )
 sys.path.insert(0, _REPO)
 import torch
-from torchtitan.optimizers import norm_helper as nh
+from torchtitan.optimizers.helpers import norm_helper as nh
 
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"device: {dev}   driver: {nh.SVDVALS_DRIVER}")
@@ -253,7 +254,8 @@ print("\n== 2-D path unchanged vs pre-change reference ==")
 # `_norm_helper_pre_change_reference.py` is a verbatim copy of norm_helper.py
 # from before this change, kept so the "2-D behaviour is untouched" claim is
 # checked against the real prior implementation rather than asserted.
-import importlib.util, os
+import importlib.util
+import os
 
 _ref = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "_norm_helper_pre_change_reference.py"
@@ -312,7 +314,9 @@ if dev == "cuda":
             for _ in range(3):
                 fn()
             torch.cuda.synchronize()
-            print(f"    d={d:<6} {lbl:<24} {(time.perf_counter()-t)/3*1e3:8.2f} ms")
+            print(
+                f"    d={d:<6} {lbl:<24} {(time.perf_counter() - t) / 3 * 1e3:8.2f} ms"
+            )
 
     print("\n== timing: svdvals driver comparison (2-D) ==")
     for shape in [(1024, 1024), (2048, 2048)]:
@@ -325,7 +329,7 @@ if dev == "cuda":
                 torch.linalg.svdvals(W, driver=drv)
             torch.cuda.synchronize()
             print(
-                f"    {str(shape):<14} driver={drv:<8} {(time.perf_counter()-t)/3*1e3:8.2f} ms"
+                f"    {str(shape):<14} driver={drv:<8} {(time.perf_counter() - t) / 3 * 1e3:8.2f} ms"
             )
         a = torch.linalg.svdvals(W, driver="gesvd")
         b = torch.linalg.svdvals(W, driver="gesvdj")

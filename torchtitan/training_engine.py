@@ -68,6 +68,16 @@ logger = logging.getLogger(__name__)
 _NUM_CUDA_GRAPH_WARMUP_STEPS = 2
 
 
+def sample_rows(x: torch.Tensor, n: int, seed: int) -> torch.Tensor:
+    """`n` rows of `x`'s `[T, D]` view in fp32, drawn with a generator seeded by
+    `seed` (never the global stream, so training is not perturbed)."""
+    x = x.detach().reshape(-1, x.shape[-1])
+    gen = torch.Generator(device=x.device)
+    gen.manual_seed(seed)
+    idx = torch.randperm(x.shape[0], device=x.device, generator=gen)[:n]
+    return x.index_select(0, idx).float()
+
+
 class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Stateful):
     """Shared distributed training engine.
 
@@ -349,6 +359,10 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                     model_part.init_weights(buffer_device=buffer_device)
                 model_part.train()
 
+        # With the chunked loss the model's output is the LM head's input.
+        self._output_is_head_input = False
+        self._head_input_rows, self._head_input_seed = 0, 0
+        self._head_input: torch.Tensor | None = None
         # A loss may wrap the chunked one, so walk `.inner` down to a fixed
         # point rather than probing exactly one level: two nested wrappers would
         # otherwise leave lm_head unset, and the failure is silent until the
@@ -378,6 +392,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             assert lm_head is not None, error_message
             chunked_loss_fn.set_lm_head(lm_head)
             model_with_lm_head._skip_lm_head = True
+            self._output_is_head_input = not self.parallel_dims.pp_enabled
 
         logger.info(
             f"Model {type(self.model_config).__qualname__} size: "
@@ -485,6 +500,32 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                     return cuda_graph_forward_backward_body_fn(**kwargs)
 
                 self.forward_backward_body_fn = run_with_cuda_graph
+
+    def keep_head_input_rows(self, n: int, *, seed: int) -> None:
+        """Keep `n` rows, drawn with `seed`, of the LM head's input from the
+        coming forwards (the last one wins), for `take_head_input_rows`. It is
+        the model's output under the chunked loss, so this costs one small
+        gather and no extra forward; without the chunked loss nothing is kept.
+        """
+        if n and not self._output_is_head_input:
+            n = 0
+        if (
+            n
+            and not self.config.training.disable_cuda_graphs
+            and cuda_graphs_supported()
+        ):
+            logger.warning(
+                "The LM-head geometry needs the eager forward; it is off under "
+                "CUDA graphs (training.disable_cuda_graphs)."
+            )
+            n = 0
+        self._head_input_rows, self._head_input_seed = n, seed
+        self._head_input = None
+
+    def take_head_input_rows(self) -> torch.Tensor | None:
+        rows, self._head_input = self._head_input, None
+        self._head_input_rows = 0
+        return rows
 
     @sl.log_trace_span("prepare_step")
     def prepare_step(
@@ -649,6 +690,10 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             spmd_typechecking=self.config.debug.spmd_typechecking,
         ):
             pred = self.model_parts[0](inputs, **model_kwargs)
+            if self._head_input_rows:
+                self._head_input = sample_rows(
+                    pred, self._head_input_rows, self._head_input_seed
+                )
             loss, self.loss_metrics = self.loss_fn(
                 pred,
                 labels,  # pyrefly: ignore[bad-argument-type]
@@ -786,8 +831,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             cuda_graph_teardown()
         if hasattr(self, "checkpointer"):
             self.checkpointer.close()
-        # DiSCO's optimizer container runs an async metrics worker thread;
-        # without this the process hangs at exit. getattr because close() is
+        # Drops DiSCO's cached MoE metrics. getattr because close() is
         # reachable on a partly built engine.
         if isinstance(getattr(self, "optimizers", None), DiSCOOptimizersContainer):
             self.optimizers.close()

@@ -35,11 +35,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
 from torchtitan.models.opt_moe import moe_opt_moe_configs  # noqa: E402
-from torchtitan.optimizers.norm_helper import (  # noqa: E402
+from torchtitan.optimizers.helpers.norm_helper import (  # noqa: E402
     calculate_norm_batched,
     get_norms_to_log,
 )
-from torchtitan.optimizers.radial_helper import (  # noqa: E402
+from torchtitan.optimizers.helpers.radial_helper import (  # noqa: E402
     calculate_radial_metrics,
     new_radial_state,
 )
@@ -53,7 +53,7 @@ def classify(name, shape):
     numel = math.prod(shape)
     if numel == 1:
         return "scalar"
-    # embed group == identity backend + embed/unembed norm_factor. In the real
+    # embed group == the row-l2 compute (row rules). In the real
     # configs that is the token embedding, the lm_head, and the MoE routers
     # (confirmed against a live run: embed_params == 2 + n_moe_layers).
     root = name.split(".")[0]
@@ -152,15 +152,15 @@ def main(flavors, shards=(64, 128)):
                     grand[k] += v * scale
                 print(
                     f"    [{m:>6} x {n:<6}] x{cnt:<4} "
-                    f"norm {r['norm']*scale:8.1f} ms | "
-                    f"radial batched {r['radial_batched']*scale:7.1f} ms  "
-                    f"loop {r['radial_loop']*scale:8.1f} ms"
+                    f"norm {r['norm'] * scale:8.1f} ms | "
+                    f"radial batched {r['radial_batched'] * scale:7.1f} ms  "
+                    f"loop {r['radial_loop'] * scale:8.1f} ms"
                 )
                 del r
                 torch.cuda.empty_cache()
             b_tot = grand["norm"] + grand["radial_batched"]
             l_tot = grand["norm"] + grand["radial_loop"]
-            print(f"  ---- per-rank logging compute (projection) ----")
+            print("  ---- per-rank logging compute (projection) ----")
             print(f"    norm                 {grand['norm']:9.1f} ms")
             print(f"    radial  (batched)    {grand['radial_batched']:9.1f} ms")
             print(f"    radial  (per-expert) {grand['radial_loop']:9.1f} ms")

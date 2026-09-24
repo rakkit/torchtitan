@@ -7,11 +7,9 @@
 """Regressions for the MoE router metrics pipeline.
 
 Producer: ``NormMoE``/``NormRouter`` buffers. Consumer:
-``optimizers/container.py``'s step pre-hook and its async worker.
+``optimizers/container.py``'s step pre-hook.
 """
 
-import queue
-import threading
 import types
 
 import torch
@@ -19,8 +17,8 @@ import torch.nn as nn
 
 from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.opt_moe.norm_moe import LoadBalanceLoss, make_norm_moe_config
-from torchtitan.optimizers.container import (
-    moe_metrics_worker,
+from torchtitan.optimizers.moe_balance import (
+    publish_moe_metrics,
     register_moe_load_balancing_hook,
 )
 
@@ -33,7 +31,9 @@ def _moe(**kw):
     dispatcher, whose collective path needs an ambient DeviceMesh that a CPU
     unit test has no business creating.
     """
-    moe = make_norm_moe_config(dim=32, hidden_dim=64, num_experts=8, top_k=2, **kw).build()
+    moe = make_norm_moe_config(
+        dim=32, hidden_dim=64, num_experts=8, top_k=2, **kw
+    ).build()
     moe.routed_experts = _StubExperts()
     return moe
 
@@ -43,8 +43,8 @@ class _StubExperts(nn.Module):
         return torch.zeros_like(x_TD)
 
 
-def _publish_load_balance_loss(gas: int) -> float:
-    """Drive the real step pre-hook and return the published per-layer metric."""
+def _run_bias_hook(gas: int, *, arm: bool = True) -> list:
+    """Drive the real step pre-hook and return the MoE layers it updated."""
     import torch.nn as nn
 
     class _Blk(nn.Module):
@@ -62,27 +62,24 @@ def _publish_load_balance_loss(gas: int) -> float:
     class _StubOptimizers:
         def __init__(self):
             self.hooks = []
-            self.log_queue = None
+            self.armed = False
+
+        def arm_moe_publish(self):
+            self.armed = True
+
+        def consume_moe_publish_arm(self):
+            armed, self.armed = self.armed, False
+            return armed
 
         def register_step_pre_hook(self, fn):
             self.hooks.append(fn)
-
-        def set_up_async_logging(self, fn):
-            self.log_queue = queue.Queue()
-            threading.Thread(target=fn, args=(self.log_queue,), daemon=True).start()
-            return self.log_queue
-
-        def join_log_queue(self):
-            self.log_queue.join()
 
         def fire(self):
             for h in self.hooks:
                 h()
 
     torch.manual_seed(0)
-    moes = [
-        _moe(aux_loss=LoadBalanceLoss.Config(coeff=1e-3)) for _ in range(2)
-    ]
+    moes = [_moe(aux_loss=LoadBalanceLoss.Config(coeff=1e-3)) for _ in range(2)]
     for m in moes:
         m.train()
     opt = _StubOptimizers()
@@ -94,15 +91,14 @@ def _publish_load_balance_loss(gas: int) -> float:
         ),
     )
     batches = [torch.randn(64, 32) for _ in range(gas)]
-    AuxLoss.set_step_denominator(
-        torch.tensor(float(sum(b.shape[0] for b in batches)))
-    )
+    AuxLoss.set_step_denominator(torch.tensor(float(sum(b.shape[0] for b in batches))))
     for b in batches:
         for m in moes:
             m(b)
+    if arm:
+        opt.arm_moe_publish()
     opt.fire()
-    opt.join_log_queue()
-    return moes[0]._log_expert_metrics["moe_load_balance_loss/L-0"]
+    return moes
 
 
 def test_published_load_balance_loss_is_gradient_accumulation_invariant():
@@ -111,9 +107,20 @@ def test_published_load_balance_loss_is_gradient_accumulation_invariant():
     The consumer therefore must not divide it by `acc_fwd_times`. It used to,
     which made `moe_load_balance_loss/L-*` scale as exactly 1/gas.
     """
-    seen = {gas: _publish_load_balance_loss(gas) for gas in (1, 2, 4)}
+    seen = {
+        gas: _run_bias_hook(gas)[0]._log_expert_metrics["moe_load_balance_loss/L-0"]
+        for gas in (1, 2, 4)
+    }
     lo, hi = min(seen.values()), max(seen.values())
     assert hi / lo < 1.05, f"published metric should be gas-invariant, got {seen}"
+
+
+def test_unarmed_step_updates_the_bias_without_publishing():
+    """Off-cadence steps do the bias update only: no D2H copy, no queue put."""
+    moes = _run_bias_hook(1, arm=False)
+    for moe in moes:
+        assert not getattr(moe, "_log_expert_metrics", None), "published unasked"
+    assert any(float(m.expert_bias_E.abs().sum()) > 0 for m in moes)
 
 
 def test_load_balance_loss_reduces_over_cp():
@@ -121,30 +128,32 @@ def test_load_balance_loss_reduces_over_cp():
     assert LoadBalanceLoss.Config(coeff=1e-3).reduce_mesh == "loss"
 
 
-def test_worker_clears_stale_metrics_when_the_payload_arity_is_wrong():
-    """A producer/worker skew must produce a gap, not last step's numbers."""
+def test_publish_clears_stale_metrics_when_the_payload_arity_is_wrong():
+    """A producer/consumer skew must produce a gap, not last step's numbers."""
     E, L = 4, 2
     info = [
         {"module": types.SimpleNamespace(_log_expert_metrics={}), "layer_id": i}
         for i in range(L)
     ]
-    q = queue.Queue()
-    threading.Thread(target=moe_metrics_worker, args=(q,), daemon=True).start()
     good = (
-        info, [0.25] * (L * E), [0.1] * (L * E), [1.0] * L,
-        [0.0] * L, [2.0] * L, [3.0] * L, [0.1] * L, [0.0] * L, E, False,
+        info,
+        [0.25] * (L * E),
+        [0.1] * (L * E),
+        [1.0] * L,
+        [0.0] * L,
+        [2.0] * L,
+        [3.0] * L,
+        [0.1] * L,
+        [0.0] * L,
+        E,
+        False,
     )
-    q.put(good)
-    q.join()
+    publish_moe_metrics(good)
     assert info[0]["module"]._log_expert_metrics["moe_entropy/L-0"] == 1.0
 
-    q.put((info, [0.25] * (L * E)))  # too few fields: the unpack itself raises
-    q.join()
+    publish_moe_metrics((info, [0.25] * (L * E)))  # too few fields: unpack raises
     for i in info:
         assert i["module"]._log_expert_metrics == {}, "stale metrics republished"
-
-    q.put(None)
-    q.join()
 
 
 def test_track_router_metrics_still_gates_entropy():

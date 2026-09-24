@@ -137,6 +137,12 @@ def gram_batch_capacity(m: int, n: int, budget_bytes: int = 2 << 30) -> int:
     return max(1, min(4096, budget_bytes // max(per_matrix, 1)))
 
 
+def _fp64_columns(Wo: torch.Tensor) -> int:
+    """How many columns of `Wo` (`[..., k, L]`) fit the float64 budget."""
+    per_col = max(Wo[..., 0].numel() * 8, 1)
+    return max(1, min(Wo.shape[-1], _GRAM_FP64_BUDGET_BYTES // per_col))
+
+
 def fp64_gram(W: torch.Tensor) -> torch.Tensor:
     """The symmetrised float64 Gram `W W^T`, oriented over the smaller dim.
 
@@ -169,11 +175,7 @@ def fp64_gram(W: torch.Tensor) -> torch.Tensor:
     Wo = W if m <= n else W.transpose(-2, -1)
     L = Wo.shape[-1]
     k = Wo.shape[-2]
-    batch = 1
-    for d in Wo.shape[:-2]:
-        batch *= d
-    per_col = max(batch * k * 8, 1)
-    chunk = max(1, min(L, _GRAM_FP64_BUDGET_BYTES // per_col))
+    chunk = _fp64_columns(Wo)
     if chunk < L:
         G = torch.zeros(*Wo.shape[:-2], k, k, device=W.device, dtype=torch.float64)
         for i in range(0, L, chunk):
@@ -245,11 +247,15 @@ def gram_top_singular_pair(
     sigma = ev[..., -1].clamp_min(0).sqrt()
     tiny = torch.finfo(torch.float64).tiny
     a = evec[..., -1]  # leading left vector
-    # v1 = W^T u1 / sigma, computed against the original (non-float64) operand
-    # and promoted only for the contraction, so no full float64 copy is needed.
-    b = torch.einsum("...mn,...m->...n", Wo.to(torch.float64), a) / sigma.clamp_min(
-        tiny
-    ).unsqueeze(-1)
+    # v1 = W^T u1 / sigma, promoted to float64 one column block at a time
+    # (each block is a separate slice of the output: no cross-block sum).
+    b = torch.empty(*Wo.shape[:-2], Wo.shape[-1], dtype=torch.float64, device=W.device)
+    step = _fp64_columns(Wo)
+    for i in range(0, Wo.shape[-1], step):
+        b[..., i : i + step] = torch.einsum(
+            "...mn,...m->...n", Wo[..., i : i + step].to(torch.float64), a
+        )
+    b = b / sigma.clamp_min(tiny).unsqueeze(-1)
     del G, ev, evec
 
     # `a` spans the row space of the oriented matrix; undo the orientation so
@@ -379,17 +385,6 @@ def effective_rank(W):
 
 
 @torch.no_grad()
-def effective_rank_normalized(W):
-    # Same as `effective_rank`, but divided by min(fan_in, fan_out) so the
-    # result lies in (0, 1] and is comparable across parameters/models of
-    # different sizes.
-    S = _svdvals(W.to(torch.float32))
-    p = (S / (S.sum() + 1e-12)).clamp_min(1e-12)
-    erank = torch.exp(-(p * p.log()).sum())
-    return erank / min(W.shape[-2], W.shape[-1])
-
-
-@torch.no_grad()
 def effective_rank_squared(W):
     # Same as `effective_rank`, but the probability distribution is over
     # squared singular values (spectral "energy", same p_i as the
@@ -412,7 +407,6 @@ NORM_FUNCTIONS = {
     "average_entry_size": average_entry_size,
     "stable_rank": stable_rank,
     "effective_rank": effective_rank,
-    # "effective_rank_normalized": effective_rank_normalized,
     "effective_rank_squared": effective_rank_squared,
 }
 
@@ -850,9 +844,9 @@ def calculate_norm(
 
     `want_spectrum` controls whether the full singular-value vector is returned
     under the "spectrum" key. It used to be injected unconditionally, but the
-    only consumer (optimizers/spectrum_logging.py) pops every `track_spectrum_*`
+    only consumer (export/spectrum_logging.py) pops every `track_spectrum_*`
     entry and discards it unless `enable_spectrum_export` is set, which it is
-    not by default. Since disco.py
+    not by default. Since the metric sink
     packs, all-gathers and moves those vectors to CPU on the way there, and
     they are ~99% of that gather's payload, the flag is threaded from the
     optimizer config rather than assumed. When it is False AND no requested

@@ -13,7 +13,7 @@ _REPO = _os.path.abspath(
 )
 sys.path.insert(0, _REPO)
 import torch
-from torchtitan.optimizers.radial_helper import (
+from torchtitan.optimizers.helpers.radial_helper import (
     calculate_radial_metrics,
     new_radial_state,
     RADIAL_METRIC_NAMES,
@@ -61,8 +61,11 @@ def ref_l1_to_rms(W, U):
     return torch.dot(W[:, j], U[:, j]) / (max_w * cu.max())
 
 
-def ref_aus(W, U, mode):
-    if mode == "fro":
+def ref_aus(A, B, mode):
+    """N(A/N(A) - B/N(B)). Generic in both operands: aus now compares the
+    pre- and post-update WEIGHTS, so callers pass (W, W+U)."""
+    W, U = A, B
+    if mode == "frobenius":
         a, b = W.norm(), U.norm()
         return (W / a - U / b).norm()
     dim = 1 if mode == "row" else 0
@@ -83,15 +86,18 @@ def exact_spectral(W, U):
     Uw, Sw, Vhw = torch.linalg.svd(W.float(), full_matrices=False)
     sig_w = Sw[0]
     sig_u = torch.linalg.matrix_norm(U.float(), ord=2)
+    sig_after = torch.linalg.matrix_norm((W + U).float(), ord=2)
+    # aus_* is the generalised angle of the step, so the normalised difference
+    # is between the two WEIGHTS, not between the weight and the update.
     Wn = W.float() / sig_w
-    Un = U.float() / sig_u
+    Wan = (W + U).float() / sig_after
     return SpectralInputs(
         sigma_before=sig_w,
         u1_before=Uw[:, 0],
         v1_before=Vhw[0, :],
-        sigma_after=torch.linalg.matrix_norm((W + U).float(), ord=2),
+        sigma_after=sig_after,
         sigma_update=sig_u,
-        aus_sigma=torch.linalg.matrix_norm(Wn - Un, ord=2),
+        aus_sigma=torch.linalg.matrix_norm(Wn - Wan, ord=2),
     )
 
 
@@ -114,16 +120,17 @@ for shape in [(64, 48), (48, 64), (100, 100)]:
     U = 0.05 * torch.randn(*shape, device=dev)
     m = run(W, U, exact_spectral(W, U))
     checks = [
-        ("fro", m["aus_frobenius"], ref_aus(W, U, "fro")),
-        ("row", m["aus_rms_to_inf"], ref_aus(W, U, "row")),
-        ("col", m["aus_l1_to_rms"], ref_aus(W, U, "col")),
+        ("frobenius", m["aus_frobenius"], ref_aus(W, W + U, "frobenius")),
+        ("row", m["aus_rms_to_inf"], ref_aus(W, W + U, "row")),
+        ("col", m["aus_l1_to_rms"], ref_aus(W, W + U, "col")),
     ]
     bad = [f"{n}:{rel(g, r):.1e}" for n, g, r in checks if rel(g, r) > 1e-4]
     check(f"aus {shape}", not bad, " ".join(bad))
-    # the documented identity aus_frobenius == sqrt(2 - 2*radial_cosine)
-    ident = torch.sqrt((2.0 - 2.0 * m["radial_cosine"]).clamp_min(0))
+    # aus_frobenius is the chord of the angle between the two weights, so it
+    # must equal 2*sin(angle/2) of the independently-computed `angle` metric.
+    ident = 2.0 * torch.sin(m["angle"] / 2.0)
     check(
-        f"aus_frobenius==sqrt(2-2cos) {shape}",
+        f"aus_frobenius==2sin(angle/2) {shape}",
         rel(m["aus_frobenius"], ident) < 1e-5,
         f"{float(m['aus_frobenius']):.6f} vs {float(ident):.6f}",
     )
@@ -148,18 +155,18 @@ check("aus_rms_to_rms", rel(m["aus_rms_to_rms"], sp.aus_sigma) < 1e-6)
 print("\n== transpose flips the row/col geometry ==")
 W = torch.randn(64, 40, device=dev)
 U = 0.02 * torch.randn(64, 40, device=dev)
-mF, mT = run(W, U, transpose=False), run(W, U, transpose=True)
+m_f, m_t = run(W, U, transpose=False), run(W, U, transpose=True)
 check(
     "transpose swaps rms_to_inf <-> l1_to_rms",
-    rel(mT["radiality_rms_to_inf"], mF["radiality_l1_to_rms"]) < 1e-5
-    and rel(mT["radiality_l1_to_rms"], mF["radiality_rms_to_inf"]) < 1e-5,
+    rel(m_t["radiality_rms_to_inf"], m_f["radiality_l1_to_rms"]) < 1e-5
+    and rel(m_t["radiality_l1_to_rms"], m_f["radiality_rms_to_inf"]) < 1e-5,
 )
 check(
     "transpose leaves aus_frobenius alone",
-    rel(mT["aus_frobenius"], mF["aus_frobenius"]) < 1e-6,
+    rel(m_t["aus_frobenius"], m_f["aus_frobenius"]) < 1e-6,
 )
 
-print("\n== FIXED ARITY (disco.py buffer sizing depends on this) ==")
+print("\n== FIXED ARITY (the metric sink's buffer sizing depends on this) ==")
 cases = {
     "2-D + spectral": (
         torch.randn(32, 24, device=dev),
@@ -245,9 +252,15 @@ for k in [
     "aus_frobenius",
     "aus_rms_to_inf",
     "aus_l1_to_rms",
-    "aus_rms_to_rms",
 ]:
     check(f"zero-update sentinel {k}", float(m[k]) == 0.0, f"{float(m[k])}")
+# aus_rms_to_rms is the caller's number, and with W_after == W_before the two
+# normalised copies differ by fp32 rounding rather than by exactly nothing.
+check(
+    "zero-update sentinel aus_rms_to_rms",
+    float(m["aus_rms_to_rms"]) < 1e-6,
+    f"{float(m['aus_rms_to_rms'])}",
+)
 
 print()
 if fails:

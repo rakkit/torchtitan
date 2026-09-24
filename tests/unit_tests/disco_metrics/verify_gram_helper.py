@@ -23,7 +23,7 @@ import torch
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
-import torchtitan.optimizers.gram_helper as G  # noqa: E402
+import torchtitan.optimizers.helpers.gram_helper as G  # noqa: E402
 
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 fails = []

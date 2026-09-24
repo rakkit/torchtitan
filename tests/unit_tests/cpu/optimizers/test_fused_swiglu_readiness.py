@@ -6,9 +6,10 @@
 
 """Preparation for adopting fused SwiGLU, which is not adopted yet.
 
-AdamW is the target for now: it builds a flat named-parameter list and never
-reaches `get_param_type`, so a fused model needs no DiSCO change. DiSCO does,
-because `FusedGroupedExperts.w13` is rank 4 and `ndim == 3` would miss it.
+AdamW is the target for now: it builds a flat named-parameter list, so a fused
+model needs no optimizer change. DiSCO needs a declaration first: an undeclared
+rank-3+ parameter is a build error, and `expert_batch` does not yet split an
+expert into w1 / w3 units.
 """
 
 from __future__ import annotations
@@ -20,19 +21,6 @@ import torch.nn as nn
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.optimizers.container import DiSCOOptimizersContainer
 from torchtitan.overrides.fused_swiglu import fused_grouped_experts, FusedGroupedExperts
-
-
-def test_adamw_never_reaches_the_expert_classifier():
-    """Why fused SwiGLU can land under AdamW without touching DiSCO."""
-    import inspect
-
-    source = inspect.getsource(DiSCOOptimizersContainer.__init__)
-    assert "create_disco_param_groups" in source
-    assert "issubclass(optimizer_cls, DiSCO)" in source, (
-        "the mesh-derived grouping (and with it get_param_type) must stay "
-        "gated on the optimizer actually being DiSCO; AdamW takes the flat "
-        "named_parameters() branch"
-    )
 
 
 def test_the_override_warns_instead_of_silently_doing_nothing(caplog):
@@ -58,11 +46,10 @@ def test_the_exact_config_is_converted():
 
 
 def test_the_fused_expert_weight_is_rank_4():
-    """The shape DiSCO's `ndim == 3` classifier would miss.
+    """`[E, F, 2, D]`, the shape a DiSCO declaration would have to describe.
 
-    Pinned so the TODO in disco.py cannot go stale again -- it previously
-    documented `[2, F, D]`, rank 3, which is the DENSE stacked shape and the
-    opposite failure mode.
+    `[2, F, D]`, rank 3, is the DENSE stacked shape (`fuse_w13`), which is
+    already declared as two units.
     """
     module = FusedGroupedExperts(
         FusedGroupedExperts.Config(num_experts=2, dim=8, hidden_dim=16)
@@ -76,7 +63,9 @@ def test_a_flat_adamw_container_groups_every_parameter_once():
     """AdamW's branch: one group, `param_names` present for state_dict."""
     model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
     container = DiSCOOptimizersContainer(
-        DiSCOOptimizersContainer.Config(name="AdamW", lr=1e-3),
+        DiSCOOptimizersContainer.Config(
+            groups={"default": {"optimizer": "AdamW", "lr": 1e-3}}
+        ),
         model_parts=[model],
         parallel_dims=None,
     )

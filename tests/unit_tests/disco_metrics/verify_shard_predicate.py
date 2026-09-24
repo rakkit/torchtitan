@@ -9,24 +9,24 @@ from torchtitan.distributed.utils import metrics_shard_mesh, rank_owns_metrics_s
 
 
 class M:
-    def __init__(s, r, n):
-        s.r, s.n = r, n
+    def __init__(self, r, n):
+        self.r, self.n = r, n
 
-    def get_local_rank(s):
-        return s.r
+    def get_local_rank(self):
+        return self.r
 
-    def size(s):
-        return s.n
+    def size(self):
+        return self.n
 
-    def _flatten(s, name):
+    def _flatten(self, name):
         # `fsdp_shard_mesh` flattens ["dp_shard", "cp"] into one axis under
         # spmd_types; without this the CP path could not be exercised at all.
-        return s
+        return self
 
 
 class PD:
     def __init__(
-        s,
+        self,
         fsdp,
         rep,
         tp,
@@ -39,14 +39,14 @@ class PD:
         cp=False,
         spmd_backend="partial_dtensor",
     ):
-        s.fsdp_enabled, s.dp_replicate_enabled, s.tp_enabled = fsdp, rep, tp
+        self.fsdp_enabled, self.dp_replicate_enabled, self.tp_enabled = fsdp, rep, tp
         # `fsdp_shard_mesh` resolves the shard mesh per spmd backend: the
         # "fsdp" axis exists only under partial_dtensor, while spmd_types names
         # the same devices "dp_shard" (+ "cp" when cp > 1). The stub models both
         # so the predicate is exercised on either backend.
-        s.cp_enabled = cp
-        s.spmd_backend = spmd_backend
-        s._m = {
+        self.cp_enabled = cp
+        self.spmd_backend = spmd_backend
+        self._m = {
             "fsdp": M(fsdp_r, fsdp_n),
             "dp_shard": M(fsdp_r, fsdp_n),
             "dp_replicate": M(rep_r, rep_n),
@@ -55,21 +55,23 @@ class PD:
         # Under spmd_types + CP the shard mesh is dp_shard x cp FLATTENED, so it
         # is strictly larger than dp_shard alone. Modelling them the same size
         # made this test blind to the cp axis being dropped.
-        s._m["dp_shard"] = M(fsdp_r, max(1, fsdp_n // 2)) if cp else M(fsdp_r, fsdp_n)
-        s._m["dp_shard, cp"] = M(fsdp_r, fsdp_n)
+        self._m["dp_shard"] = (
+            M(fsdp_r, max(1, fsdp_n // 2)) if cp else M(fsdp_r, fsdp_n)
+        )
+        self._m["dp_shard, cp"] = M(fsdp_r, fsdp_n)
 
-    def get_optional_mesh(s, n, **kw):
+    def get_optional_mesh(self, n, **kw):
         if isinstance(n, list):
             # spmd_types multi-axis lookup. Return the entry for the exact axis
-            # list requested; returning s._m["fsdp"] unconditionally made the
+            # list requested; returning self._m["fsdp"] unconditionally made the
             # ["dp_shard", "cp"] entry unreachable and the CP branch untested.
             key = ", ".join(n)
-            if key in s._m:
-                return s._m[key]
+            if key in self._m:
+                return self._m[key]
             # No silent fallback: an unexpected axis list must fail loudly, or a
             # dropped axis looks identical to the correct lookup.
             raise KeyError(f"stub has no mesh for axes {n!r}")
-        return s._m[n]
+        return self._m[n]
 
 
 def owners(pd_factory, ranks):
@@ -112,7 +114,7 @@ assert rank_owns_metrics_shard(PD(False, False, False))
 assert metrics_shard_mesh(PD(False, False, False)) is None
 print("  logs, shard mesh None. OK")
 
-print("\n=== shard mesh selection mirrors get_param_type ===")
+print("\n=== shard mesh selection ===")
 assert (
     metrics_shard_mesh(PD(True, True, False, fsdp_n=4, rep_n=2)).size() == 4
 )  # fsdp wins

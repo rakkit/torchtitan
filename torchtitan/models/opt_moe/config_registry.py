@@ -23,7 +23,38 @@ def moe_template_config() -> Trainer.Config:
         # No `dataloader=` default. Every recipe assigns `config.dataloader` from
         # `components/data/mix.make_pretrain_dataloader_config`, and a template default
         # that no run uses is a trap: it decides the shape of anything that forgets to.
-        optimizer=DiSCOOptimizersContainer.Config(lr=8e-4),
+        # The groups every recipe overrides (`config.optimizer.groups`); a
+        # valid DiSCO run on its own: Muon on the matrices, the row rules on
+        # the vocabulary matrices and the routers.
+        optimizer=DiSCOOptimizersContainer.Config(
+            groups={
+                "embedding": {
+                    "kind": "embedding",
+                    "args": {"compute": "row-l2", "scale": "sqrt_n"},
+                },
+                "unembedding": {
+                    "kind": "unembedding",
+                    "args": {"compute": "row-l2", "scale": "inv_sqrt_n"},
+                },
+                "router": {
+                    "kind": "router",
+                    "args": {"compute": "row-l2", "scale": "inv_sqrt_n"},
+                },
+                "default": {
+                    "lr": 8e-4,
+                    "weight_decay": 0.1,
+                    "momentum": 0.95,
+                    "nesterov": False,
+                    "rule": "muon",
+                    "args": {
+                        "compute": "newtonschulz5",
+                        "steps": 5,
+                        "scale": "spectral",
+                        "pre": "identity",
+                    },
+                },
+            }
+        ),
         # Plain chunked cross-entropy. The load-balance term is no longer added
         # here: NormMoE injects its gradient at the layer via LoadBalanceLoss,
         # so the model returns logits alone.

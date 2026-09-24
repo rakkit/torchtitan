@@ -7,6 +7,9 @@
 from dataclasses import dataclass
 from typing import Any
 
+import torch
+from torch.distributed.tensor import distribute_tensor, DTensor
+
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Identity
 from torchtitan.protocols.module import Module
@@ -17,7 +20,8 @@ from .utils.norms import build_norm_config
 
 
 # TODO(fused-swiglu): make this eligible for `overrides/fused_swiglu.py`.
-# Two things block it today:
+# Two things block it today (DiSCO does not: a fused w13 is declared as two
+# units, `stacked_units`, with the same update as split w1/w3):
 #  1. `fused_swiglu` is registered `@override(target=FeedForward.Config,
 #     exact=True)` and reads `cfg.w1.param_init` as a CONFIG field, but this
 #     class builds its `Linear.Config`s inside `__init__`. Lift w1/w2/w3 to
@@ -30,19 +34,6 @@ from .utils.norms import build_norm_config
 #     computing `w2(mid_norm(silu_and_mul(w13(x))))`; it still gets both wins
 #     (w1+w3 in one GEMM, fused silu_and_mul kernel). The other 45 flavors can
 #     use the stock class directly.
-#  3. DiSCO's parameter classifier -- the hard blocker. Upstream's stacked w13
-#     is `[2, F, D]`, and `get_param_type` uses `ndim == 3` as its proxy for
-#     "routed expert". Measured: a (2, 16, 8) w13 classifies as
-#     ParamType.Expert, so it would be handed to `step_experts` and
-#     orthogonalized per-rank with NO gather. Silently wrong, not a crash: the
-#     `Shard(!=0)` guard inspects only `expert_params[0]`, which the sort makes
-#     a real expert. Tighten the classifier (parameter name, or `num_linears`)
-#     BEFORE fusing. Latent today only because this class keeps
-#     `num_linears=1`.
-#
-#     NOTE the MoE side is NOT blocked by this and already has its branch (see
-#     norm_moe.py::_plain_grouped_experts_config): GroupedExperts keeps three
-#     separate `[E, F, D]` tensors, so classification is unchanged.
 # Checkpoints are NOT safe any more: #4808 DELETED FusedSwiGLU's
 # _split_w13_on_save / _merge_w13_on_load and moved the split to the HF adapter
 # boundary, so `named_parameters()` now equals `state_dict()` (measured on
@@ -65,10 +56,8 @@ class FeedForward(Module):
         norm_eps: float = 1e-30
         activation_type: str = "silu"
         fuse_w13: bool = False
-        """Gate and up in one `[2, F, D]` weight, so they run as one GEMM.
-
-        AdamW only for now: `get_param_type` reads a rank-3 tensor as a routed
-        expert. See the TODO at the top of this file."""
+        """Gate and up in one `[2, F, D]` weight, so they run as one GEMM. DiSCO
+        sees it as two units (`param_layouts`), same math as split w1/w3."""
 
         w1_init_fn_type: str = "scaled_orthogonal"
         w2_init_fn_type: str = "scaled_orthogonal"
@@ -112,10 +101,16 @@ class FeedForward(Module):
             config.w3_init_fn_type, config.w3_init_std, w3_residual_div
         )
         if config.fuse_w13:
-            # Slot 0 gate, slot 1 up.
+            # Slot 0 gate, slot 1 up; drawn full-shape, then written through
+            # the parameter's own placement.
             def _init_w13(w):
-                w1_init(w[0])
-                w3_init(w[1])
+                full = torch.empty(tuple(w.shape), dtype=w.dtype, device=w.device)
+                w1_init(full[0])
+                w3_init(full[1])
+                if isinstance(w, DTensor):
+                    w.copy_(distribute_tensor(full, w.device_mesh, w.placements))
+                else:
+                    w.copy_(full)
 
             self.w13 = Linear.Config(
                 in_features=dim,
@@ -162,6 +157,20 @@ class FeedForward(Module):
             ).build()
         else:
             self.mid_norm = Identity.Config().build()
+
+    def param_layouts(self) -> dict:
+        """The stacked w13 is two units: rows of slot 0 (w1) and slot 1 (w3)."""
+        if not self.fuse_w13:
+            return {}
+        from torchtitan.models.common.param_layout import (
+            named,
+            ParamLayout,
+            stacked_units,
+        )
+
+        w = self.w13.weight
+        units = stacked_units(("w1", "w3"), w.shape[1], w.shape[2])
+        return {named(self, w): ParamLayout("matrix", units=units)}
 
     def forward(self, x):
         if self.fuse_w13:

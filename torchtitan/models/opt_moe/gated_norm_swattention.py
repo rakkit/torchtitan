@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from torch.distributed.tensor import distribute_tensor, DTensor
 
 from torchtitan.models.common.attention import (
     AttentionMasksType,
@@ -38,7 +39,10 @@ def _fused_qkv_init(wq_init, wk_init, wv_init, *, n_heads, n_kv_heads, head_dim)
 
     def _init(weight):
         in_features = weight.shape[-1]
-        view = weight.view(n_kv_heads, heads_per_kv + 2, head_dim, in_features)
+        full = torch.empty(
+            tuple(weight.shape), dtype=weight.dtype, device=weight.device
+        )
+        view = full.view(n_kv_heads, heads_per_kv + 2, head_dim, in_features)
         for init_fn, rows, slot in (
             (wq_init, n_heads, slice(0, heads_per_kv)),
             (wk_init, n_kv_heads, slice(heads_per_kv, heads_per_kv + 1)),
@@ -49,8 +53,17 @@ def _fused_qkv_init(wq_init, wk_init, wv_init, *, n_heads, n_kv_heads, head_dim)
             )
             init_fn(buffer)
             view[:, slot] = buffer.view(n_kv_heads, -1, head_dim, in_features)
+        _copy_full(weight, full)
 
     return _init
+
+
+def _copy_full(weight, full):
+    """Write a full-shape plain tensor into a parameter, sharded or not."""
+    if isinstance(weight, DTensor):
+        weight.copy_(distribute_tensor(full, weight.device_mesh, weight.placements))
+    else:
+        weight.copy_(full)
 
 
 class GatedNormSWAttention(GQAttention):
@@ -392,6 +405,17 @@ class GatedNormSWAttention(GQAttention):
             torch.cat([xq_rot, xq_pass], dim=-1),
             torch.cat([xk_rot, xk_pass], dim=-1),
         )
+
+    def param_layouts(self) -> dict:
+        """The fused wqkv is three units (q / k / v rows interleaved per KV group)."""
+        wqkv = getattr(self.qkv_linear, "wqkv", None)
+        if wqkv is None:
+            return {}
+        from torchtitan.models.common.param_layout import named, ParamLayout, qkv_units
+
+        w = wqkv.weight
+        units = qkv_units(self.n_heads, self.n_kv_heads, self.head_dim, w.shape[-1])
+        return {named(self, w): ParamLayout("matrix", units=units)}
 
     def forward(
         self,

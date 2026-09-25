@@ -73,7 +73,14 @@ class TestQwen35MRoPEPositions(unittest.TestCase):
         for key in list(model.layers.keys()):
             model.layers[key] = _RecordingLayer(sink)
         parallel_dims = ParallelDims(
-            dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1
+            dp_replicate=1,
+            dp_shard=1,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=1,
+            enable_sequence_parallel=False,
         )
         parallelism = ParallelismConfig()
         return model, sink, parallel_dims, parallelism
@@ -93,7 +100,8 @@ class TestQwen35MRoPEPositions(unittest.TestCase):
                 parallel_dims=parallel_dims,
                 parallelism=parallelism,
             )
-        model(inputs, **batch)
+        with torch.no_grad():
+            model(inputs, **batch)
         return batch
 
     def test_text_batch_routes_1d_positions_to_layers(self):

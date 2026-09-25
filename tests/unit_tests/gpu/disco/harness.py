@@ -89,18 +89,23 @@ def trainer_config(
     momentum: float = 0.1,
     nesterov: bool = False,
     weight_decay: float = 0.0,
+    decoupled_wd: bool = False,
     compute: str = "newtonschulz5",
     steps: int = 5,
     scale: str = "spectral",
     pre: str = "identity",
     aus: bool = False,
+    rule: str | None = None,
+    rule_args: dict | None = None,
     extra_groups: dict | None = None,
     log_norm_freq: int = 0,
     norms_to_log=("all",),
     gram_level: int = 0,
     communication_dtype: str = "float32",
 ):
-    """A Trainer.Config whose model config has been expanded for `parallelism`."""
+    """A Trainer.Config whose model config has been expanded for `parallelism`.
+    `rule` overrides the default group's rule; `rule_args` merge over its
+    args, a None value dropping that arg."""
     config = moe_template_config()
     config.model = model_cfg
     par = config.parallelism
@@ -117,14 +122,20 @@ def trainer_config(
         "default": {
             "lr": lr,
             "weight_decay": weight_decay,
+            "decoupled_wd": decoupled_wd,
             "momentum": momentum,
             "nesterov": nesterov,
-            "rule": "aus" if aus else "muon",
+            "rule": rule or ("aus" if aus else "muon"),
             "args": {
-                "compute": compute,
-                "steps": steps,
-                "scale": scale,
-                "pre": pre,
+                k: v
+                for k, v in {
+                    "compute": compute,
+                    "steps": steps,
+                    "scale": scale,
+                    "pre": pre,
+                    **(rule_args or {}),
+                }.items()
+                if v is not None
             },
         },
         **{k: dict(v) for k, v in EMBED_GROUPS.items()},

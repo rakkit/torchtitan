@@ -43,6 +43,7 @@ from .norm_helper import gram_top_singular_pair
 __all__ = [
     "top_singular_pair",
     "spectral_norm",
+    "top_pair_warm",
 ]
 
 
@@ -103,27 +104,27 @@ def spectral_norm(W: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def sigma_max_warm(
+def top_pair_warm(
     W: torch.Tensor, v: torch.Tensor | None = None, n_iter: int = 4
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Warm-started power iteration for `sigma_max` of `[..., m, n]`: a lower
-    bound (Rayleigh quotient at the iterate), cheap enough for every step.
-    Deterministic cold start (`ones`), so replicas agree. Returns `(sigma, v)`;
-    feed `v` back next step. Zero for an all-zero or non-finite slice."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Warm-started power iteration for the top pair of `[..., m, n]`:
+    `(sigma, u, v)` with `W v = sigma u`, sigma a lower bound (the Rayleigh
+    quotient at the iterate), cheap enough for every step. Deterministic cold
+    start (`ones`), so replicas agree; feed `v` back next step. sigma and `u`
+    are zero for an all-zero slice."""
     if W.ndim < 2:
-        raise ValueError(f"sigma_max_warm needs a matrix, got {tuple(W.shape)}")
+        raise ValueError(f"top_pair_warm needs a matrix, got {tuple(W.shape)}")
     n = W.shape[-1]
     tiny = torch.finfo(torch.float32).tiny
-    finite = torch.isfinite(W).all(dim=-1).all(dim=-1)
-    Wc = torch.where(finite[..., None, None], W, torch.zeros_like(W))
-    if v is None or v.shape != Wc.shape[:-2] + (n,) or v.dtype != Wc.dtype:
-        v = torch.ones(*Wc.shape[:-2], n, device=Wc.device, dtype=Wc.dtype)
+    if v is None or v.shape != W.shape[:-2] + (n,) or v.dtype != W.dtype:
+        v = torch.ones(*W.shape[:-2], n, device=W.device, dtype=W.dtype)
     else:  # an all-zero row (a fresh slot, or an all-zero W before) starts cold
         v = torch.where(v.norm(dim=-1, keepdim=True) > 0, v, torch.ones_like(v))
     v = v / v.norm(dim=-1, keepdim=True).clamp_min(tiny)
     for _ in range(n_iter):
-        Wv = torch.einsum("...mn,...n->...m", Wc, v)
-        v = torch.einsum("...mn,...m->...n", Wc, Wv)
+        Wv = torch.einsum("...mn,...n->...m", W, v)
+        v = torch.einsum("...mn,...m->...n", W, Wv)
         v = v / v.norm(dim=-1, keepdim=True).clamp_min(tiny)
-    sigma = torch.einsum("...mn,...n->...m", Wc, v).norm(dim=-1)
-    return torch.where(finite, sigma, torch.zeros_like(sigma)), v
+    Wv = torch.einsum("...mn,...n->...m", W, v)
+    sigma = Wv.norm(dim=-1)
+    return sigma, Wv / sigma.clamp_min(tiny)[..., None], v

@@ -347,3 +347,38 @@ def test_a_fused_parameter_logs_the_radial_metrics_of_its_split_twin():
         assert logged[0] and logged[0].keys() == logged[1].keys()
         for k in logged[0]:
             assert logged[0][k] == pytest.approx(logged[1][k], rel=1e-5, abs=1e-7), k
+
+
+def test_the_weight_decay_pair_comes_from_the_config():
+    """`weight_decay` and `decoupled_wd` are both config-only: a resume never
+    pairs the checkpoint's decay with the config's mode."""
+    from torchtitan.optimizers.container import DiSCOOptimizersContainer
+
+    def build(wd, decoupled):
+        cfg = DiSCOOptimizersContainer.Config(
+            groups={
+                "default": {
+                    "lr": 0.1,
+                    "weight_decay": wd,
+                    "decoupled_wd": decoupled,
+                    "rule": "muon",
+                    "args": {"compute": "svd"},
+                }
+            }
+        )
+        model = torch.nn.Sequential(torch.nn.Linear(4, 8, bias=False))
+        model.param_layouts = lambda: {"0.weight": ParamLayout("matrix")}
+        return DiSCOOptimizersContainer(
+            cfg, model_parts=[model], parallel_dims=_NoParallel()
+        )
+
+    old = build(0.1, False)
+    sd = old.state_dict()
+    assert not any(k.endswith((".weight_decay", ".decoupled_wd")) for k in sd)
+    # An older checkpoint still carries weight_decay: the config wins.
+    fqn = old.optimizers[0].param_groups[0]["param_names"][0]
+    sd[f"param_groups.{fqn}.weight_decay"] = 0.1
+    new = build(1e-4, True)
+    new.load_state_dict(sd)
+    g = new.optimizers[0].param_groups[0]
+    assert (g["weight_decay"], g["decoupled_wd"]) == (1e-4, True)

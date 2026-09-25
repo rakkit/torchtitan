@@ -68,7 +68,7 @@ def test_map_matches_its_equations_and_keeps_the_radius():
     q0, q1 = W / s_ref[:, None, None], W_new / s_new[:, None, None]
     rel = torch.linalg.matrix_norm(q1 - q0, ord=2)
     assert torch.all(rel > 0.5 * eta) and torch.all(rel < 2.0 * eta)
-    assert res.state.shape == (3, 16) and res.beta is None
+    assert res.state.shape == (3, 16)
     # Weight decay scales W before the sigmas: alpha carries it.
     decayed = rule.run_whole(G, W, StepCtx(lr=0.1, wd=5.0, t=1))  # decay 0.5
     torch.testing.assert_close(decayed.alpha, res.alpha * 0.5, rtol=5e-2, atol=0)

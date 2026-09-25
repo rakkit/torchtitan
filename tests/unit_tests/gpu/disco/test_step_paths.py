@@ -144,6 +144,7 @@ class TestDiSCOStepPaths(DTensorTestBase):
         comm_dtype: torch.dtype,
         moe: bool = True,
         weight_decay=0.0,
+        decoupled_wd: bool = False,
         reload_after: int = 0,
         n_layers: int = 2,
         extra_groups: dict | None = None,
@@ -167,6 +168,7 @@ class TestDiSCOStepPaths(DTensorTestBase):
             compute=backend,
             communication_dtype=str(comm_dtype).removeprefix("torch."),
             weight_decay=weight_decay,
+            decoupled_wd=decoupled_wd,
             extra_groups=extra_groups,
             **topo,
         )
@@ -329,6 +331,16 @@ class TestDiSCOStepPaths(DTensorTestBase):
         )
 
     @with_comms
+    def test_fsdp4_fp32_decoupled_weight_decay(self):
+        """`decoupled_wd`: W scales by 1 - wd per step, not 1 - lr wd."""
+        self._check_topology(
+            TOPOLOGIES["fsdp4"],
+            comm_dtype=torch.float32,
+            weight_decay=0.1,
+            decoupled_wd=True,
+        )
+
+    @with_comms
     def test_fsdp4_ep2_fp32_reload(self):
         """A state-dict round trip mid-run: the experts' moments stay the
         block buffers, and the next steps still match the reference."""
@@ -390,6 +402,15 @@ class TestDiSCOStepPaths(DTensorTestBase):
     def test_ddp4_dense_aus_fp32(self):
         self._check_aus(TOPOLOGIES["ddp4"], moe=False)
 
+    @with_comms
+    def test_hsdp22_aus_fp32(self):
+        self._check_aus(TOPOLOGIES["hsdp22"], moe=True)
+
+    @with_comms
+    def test_fsdp4_ep2_aus_fp32(self):
+        """Experts over EP and FSDP: the per-run state and coefficient rows."""
+        self._check_aus(TOPOLOGIES["fsdp4_ep2"], moe=True)
+
     def _check_aus(self, topo, *, moe, reload_after: int = 0):
         device = self._device()
         pd = harness.parallel_dims(world_size=4, device_type=device.type, **topo)
@@ -430,6 +451,128 @@ class TestDiSCOStepPaths(DTensorTestBase):
             if step == reload_after:
                 model, container = _restart(model, container, cfg, pd, device)
                 opt = container.optimizers[0]
+            for name, p in harness.trainable(model):
+                got, want = harness.full_tensor(p).float(), ref.params[name]
+                d = (got - want).abs().max().item()
+                if d > 1e-5 * max(1.0, want.abs().max().item()):
+                    failures.append(f"step {step} {name}: max |diff| {d:.3e}")
+        ok = harness.all_ranks_agree(not failures, device)
+        if failures and self.rank == 0:
+            print("\n".join(failures[:40]))
+        self.assertTrue(ok, failures[:3])
+
+    # ---- sphere rules: weights on the owner, coefficients back ----
+    @with_comms
+    def test_fsdp4_hyperball_fp32(self):
+        self._check_sphere(TOPOLOGIES["fsdp4"], "hyperball", {"scale": None})
+
+    @with_comms
+    def test_fsdp4_hyperball_exact_tangent_fp32(self):
+        args = {"scale": None, "exact_angle": True, "tangent": True}
+        self._check_sphere(TOPOLOGIES["fsdp4"], "hyperball", args)
+
+    @with_comms
+    def test_ddp4_dense_elr_fp32(self):
+        self._check_sphere(
+            TOPOLOGIES["ddp4"], "elr", {"scale": None}, moe=False, weight_decay=0.1
+        )
+
+    @with_comms
+    def test_fsdp4_elr_exact_fp32(self):
+        args = {"scale": None, "exact_angle": True}
+        self._check_sphere(TOPOLOGIES["fsdp4"], "elr", args, weight_decay=0.1)
+
+    @with_comms
+    def test_fsdp4_elr_scheduled_decoupled_fp32(self):
+        """An eta schedule sets the angle, and decoupled weight decay the decay."""
+        args = {"scale": None, "exact_angle": True, "eta": {"kappa": 0.05, "warmup": 2}}
+        self._check_sphere(
+            TOPOLOGIES["fsdp4"], "elr", args, weight_decay=0.01, decoupled_wd=True
+        )
+
+    @with_comms
+    def test_fsdp4_sso_fp32(self):
+        self._check_sphere(TOPOLOGIES["fsdp4"], "sso", {})
+
+    @with_comms
+    def test_hsdp22_sso_fp32(self):
+        self._check_sphere(TOPOLOGIES["hsdp22"], "sso", {})
+
+    @with_comms
+    def test_fsdp4_ep2_sso_fp32(self):
+        self._check_sphere(TOPOLOGIES["fsdp4_ep2"], "sso", {})
+
+    @with_comms
+    def test_fsdp4_ep2_hyperball_exact_fp32(self):
+        args = {"scale": None, "exact_angle": True}
+        self._check_sphere(TOPOLOGIES["fsdp4_ep2"], "hyperball", args)
+
+    @with_comms
+    def test_ddp4_dense_sso_fp32(self):
+        self._check_sphere(TOPOLOGIES["ddp4"], "sso", {}, moe=False)
+
+    @with_comms
+    def test_fsdp4_sso_resumes(self):
+        """SSO's warm power-iteration vector survives a restart."""
+        self._check_sphere(TOPOLOGIES["fsdp4"], "sso", {}, restart_after=1)
+
+    @with_comms
+    def test_sphere_rules_refuse_weight_decay(self):
+        device = self._device()
+        topo = TOPOLOGIES["fsdp4"]
+        pd = harness.parallel_dims(world_size=4, device_type=device.type, **topo)
+        for rule, args in (("hyperball", {"scale": None}), ("sso", {})):
+            cfg = harness.trainer_config(
+                harness.tiny_model_config(moe=False),
+                rule=rule,
+                rule_args=args,
+                weight_decay=0.1,
+                **topo,
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(ValueError, "weight_decay: 0"):
+                    harness.build_model_and_optimizer(cfg, pd, device, tmp)
+
+    def _check_sphere(
+        self,
+        topo,
+        rule,
+        rule_args,
+        *,
+        moe=True,
+        weight_decay=0.0,
+        decoupled_wd=False,
+        restart_after=0,
+    ):
+        device = self._device()
+        pd = harness.parallel_dims(world_size=4, device_type=device.type, **topo)
+        cfg = harness.trainer_config(
+            harness.tiny_model_config(moe=moe),
+            compute="svd",
+            communication_dtype="float32",
+            rule=rule,
+            rule_args=rule_args,
+            lr=0.02,
+            weight_decay=weight_decay,
+            decoupled_wd=decoupled_wd,
+            **topo,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            model, container = harness.build_model_and_optimizer(cfg, pd, device, tmp)
+        params = {
+            n: harness.full_tensor(p).float() for n, p in harness.trainable(model)
+        }
+        ref = _SameLMOReference(params, rules_from_container(container, model))
+        spheres = [n for n, r in ref.rules.items() if r["sphere"] is not None]
+        self.assertTrue(spheres, "no parameter runs the sphere rule")
+        failures = []
+        for step in range(1, STEPS + 1):
+            grads = harness.set_synthetic_grads(model, step, device)
+            container.step()
+            container.zero_grad()
+            ref.step(grads)
+            if step == restart_after:
+                model, container = _restart(model, container, cfg, pd, device)
             for name, p in harness.trainable(model):
                 got, want = harness.full_tensor(p).float(), ref.params[name]
                 d = (got - want).abs().max().item()

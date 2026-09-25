@@ -9,7 +9,8 @@
 Groups are the named `optimizer.groups` (`default` required, the others
 matched by `kind` or `match`, first match wins), or upstream's
 `optimizer.param_groups` instead; a group's kwargs are DiSCO's
-`lr / weight_decay / momentum / nesterov / rule / args`. On top of upstream:
+`lr / weight_decay / decoupled_wd / momentum / nesterov / rule / args`. On
+top of upstream:
 the MoE load-balance hook, and the arming and collection of the optimizer's
 per-parameter metrics (`log_norm_freq`, `norms_to_log`, `gram_level`,
 spectrum / gram-vector export).
@@ -45,7 +46,7 @@ from torchtitan.optimizers.helpers import norm_helper
 __all__ = ["DiSCOOptimizersContainer"]
 logger = logging.getLogger(__name__)
 
-_DISCO_ONLY_KEYS = frozenset({"rule", "args", "momentum", "nesterov"})
+_DISCO_ONLY_KEYS = frozenset({"rule", "args", "momentum", "nesterov", "decoupled_wd"})
 _KIND = "\x00kind:"  # a group pattern resolved per model part from its declarations
 
 
@@ -72,7 +73,9 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         or `match` (a regex on the FQN). Entries are tried in order, first
         match wins, the rest go to `default`. Other keys: `optimizer` (default
         "DiSCO"), and that optimizer's kwargs -- for DiSCO `lr`,
-        `weight_decay`, `momentum`, `nesterov`, `rule`, `args` (`args` merge
+        `weight_decay`, `decoupled_wd` (weight decay `1 - weight_decay` per
+        step instead of `1 - lr weight_decay`), `momentum`, `nesterov`,
+        `rule`, `args` (`args` merge
         over the default's). Every key of a group is a CLI flag:
         `--optimizer.groups.default.lr 0.05`."""
 

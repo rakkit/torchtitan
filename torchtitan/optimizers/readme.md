@@ -32,7 +32,7 @@ optimizers/
     layout.py       families (classify), per-rank row tables
     rules.py        what a rule is: Phase, Compute, Chain, Rule, Result; the registry
     presets.py      the built-ins: pre phases, computes, presets sgd/muon/right_polar/
-                    lm_head/left_polar/aus
+                    lm_head/left_polar/aus/hyperball/elr/sso
     transport.py    Exchange (one packed all-to-all pair), Replicated (all-gather)
     metrics.py      MetricSink: per-unit registry, one flat buffer, one gather, unpack
   kernels/          orthogonaliser backends: zeropower, triton Newton-Schulz,
@@ -66,9 +66,14 @@ config.optimizer.groups = {
   kind, e.g. `{"kind": "unembedding"}`). Groups are tried in order, first match
   wins, the rest go to `default`.
 - Group keys: `optimizer` (default `"DiSCO"`; `"AdamW"` sends the group to an
-  AdamW beside DiSCO), `lr`, `weight_decay`, `momentum`, `nesterov`, `rule`,
-  `args`. Every key the config file sets is a CLI flag:
+  AdamW beside DiSCO), `lr`, `weight_decay`, `decoupled_wd`, `momentum`,
+  `nesterov`, `rule`, `args`. Every key the config file sets is a CLI flag:
   `--optimizer.groups.default.lr 0.05`, `--optimizer.groups.default.args.steps 8`.
+- Weight decay scales W by `1 - lr weight_decay` per step, or by
+  `1 - weight_decay` with `decoupled_wd: true`, independent of the lr and its
+  schedule. The rule's own step is unaffected. `weight_decay` and
+  `decoupled_wd` both come from the config, never the checkpoint, so a
+  resume cannot pair one run's decay with another's mode.
 - `args` merge over the default group's. A group with the default's `rule`
   takes all of the default's args; a group with another rule takes only the
   ones its preset accepts, minus the preset's `own` ones (below). So a group
@@ -77,8 +82,9 @@ config.optimizer.groups = {
   `{"rule": "sgd"}` group inherits that orthogonaliser.
 - Build errors: unknown keys; the renamed ones (`backend`, `norm_factor`,
   `pre_norm`, which name their replacement); DiSCO-only keys (`rule`, `args`,
-  `momentum`, `nesterov`) on another optimizer's group; a DiSCO with no default
-  `lr`; `gram_level` outside 0-3; an iterative compute with `steps < 1`; the
+  `momentum`, `nesterov`, `decoupled_wd`) on another optimizer's group; a
+  DiSCO with no default `lr`; `weight_decay` in a `hyperball` or `sso` group;
+  `gram_level` outside 0-3; an iterative compute with `steps < 1`; the
   vocabulary matrices under a gathering rule; a Gram compute on a wide unit;
   declared units that overlap or misstate their shape; a stateful rule whose
   state shape differs across one parameter's units.
@@ -153,13 +159,14 @@ rank holds, `gram` = those rows plus one `[n, n]` all-reduce, `unit` = whole on
 its owner), whether it needs the pre-update weight (`needs_weight`), whether it
 keeps state (`has_state`, shape `state_shape(m, n)`) and what it returns
 (`output`). One apply serves every output: `"update"` ->
-`w <- (1 - lr wd) w - lr U`; `"update_coeffs"` -> per unit `w <- alpha w - beta U`
-(alpha and beta ride one small all-reduce); `"weight"` -> `w <- W_next` (the step
-`W - W_next` travels in the update's slot). The apply adds lr and weight decay
-only to a plain update: a coefficient or weight output must fold them in
-itself, from the `ctx` it is given (`StepCtx(lr, wd, t)`), and cannot have
-post phases or a scale. A contract that cannot hold fails when the rule is
-built, not at the first step.
+`w <- decay w - lr U`; `"update_coeffs"` -> per unit `w <- alpha w - U`, the
+step's size folded into U (alpha rides one small all-reduce); `"weight"` ->
+`w <- W_next` (the step `W - W_next` travels in the update's slot). The apply
+adds lr and weight decay only to a plain update: a coefficient or weight
+output must fold them in itself, from the `ctx` it is given
+(`StepCtx(lr, wd, t, decoupled)`, whose `decay` is `1 - lr wd` or `1 - wd`),
+and cannot have post phases or a scale. A contract that cannot hold fails
+when the rule is built, not at the first step.
 
 Presets, each a function registered with `@register(name, own=...)` whose
 keyword arguments are its args and defaults:
@@ -171,7 +178,10 @@ keyword arguments are its args and defaults:
 | `right_polar` | `pre` -> `gram_polar` -> scale; no all-to-all | 5 steps, `spectral`, work dtype fp16 | `compute` |
 | `lm_head` | centre -> `gram_polar+row-l2` (`spectral: false`: `row-l2`) -> centre -> scale | 5 steps, `inv_sqrt_n` | `scale` |
 | `left_polar` | centre -> orthogonaliser -> centre -> scale (routers) | `newtonschulz5`, 5, `spectral` | |
-| `aus` | `AUSMap` around a muon direction: needs the weight, keeps a per-unit vector, returns `beta U` and `alpha` | as `muon`, `sigma_iters` 8, `eta`: an `EtaSchedule` dict (`kappa`, `tau`, `alpha`, `min`, `anneal_*`; default `0.1 / sqrt(t)`) or `"lr"` | |
+| `aus` | `AUSMap` around a muon direction: needs the weight, keeps a per-unit vector, returns `beta U` and `alpha` (beta folded into the update) | as `muon`, `sigma_iters` 8, `eta`: an `EtaSchedule` dict (`kappa`, `tau`, `alpha`, `min`, `anneal_*`, `warmup`; default `0.1 / sqrt(t)`) or `"lr"` | |
+| `hyperball` | `FrobeniusAUS`, radius kept: `W+ = r N(W - s r N(U))`, r = `\|\|W\|\|_F` | as `muon` without a scale; `tangent` false, `exact_angle` false, `eta` `"lr"` | `scale` |
+| `elr` | `FrobeniusAUS`, radius free: `W+ = d W - s r N(U)`, d the decay | as `hyperball` | `scale` |
+| `sso` | `SpectralSphere`: `W+ = (R / sigma) W - s R orth(M^ + lambda* u v^T)`, `R = scale(m, n)` | as `muon`; `sigma_iters` 8, `solve_steps` 12, `lambda0` 1e-3, `eta` `"lr"` | |
 
 `right_polar`, `lm_head` and `left_polar` are the symmetry-compatible rules of
 Lau & Su (arXiv 2605.18106); the paper's other two are configs: row-norm only
@@ -182,6 +192,68 @@ its compute and scale), the SwiGLU hybrid `{"rule": "muon", "args": {"pre":
 it is a build error. The production row rules are
 `compute: row-l2` with `scale: sqrt_n` (embedding) or `inv_sqrt_n` (head,
 routers). `lm_head` and `left_polar` take no `pre`: the centring is the rule.
+
+**Sphere rules.** `hyperball` (MuonH, arXiv 2606.16899), `elr` (Tencent's ELR,
+hy.tencent.ai/research/elr, their Eq. 2) and `sso` (arXiv 2601.08393) need the
+weight on the owner and return per-unit coefficients, like `aus`. Their step
+size s is `eta`: the group's `lr` (`"lr"`, the papers' setting), or an
+`EtaSchedule` dict as for `aus`.
+- `hyperball` and `elr` are AUS in the Frobenius geometry: s is the ELR, the
+  step relative to `||W||_F`.
+  - `exact_angle: true` solves s in closed form so that the angle between W
+    and W+ is exactly `eta` (arXiv 2607.22444).
+  - `tangent: true` (MuonH-T) removes the momentum's component along W before
+    the orthogonaliser.
+  - `N()` cancels any scale, so their `scale` applies only to a row compute:
+    an embedding group that inherits the rule keeps its own.
+- `sso` is steepest descent on the spectral sphere of radius `scale(m, n)`,
+  which is `sqrt(d_out / d_in)` by default; the spectral angle of its step is
+  about s.
+  - It needs the top singular pair of W (a warm power iteration) and the root
+    of `h(lambda) = <u v^T, orth(M^ + lambda u v^T)>`.
+  - The root is bracketed by steps growing 4x from `lambda0`, then found by
+    Illinois false position (a secant that keeps the bracket), in
+    `solve_steps` orthogonaliser calls after the one at 0. The count is the
+    same for every unit, so there is no host sync.
+  - The default 12 resolve |lambda*| up to 0.57 to 2e-5. Plain bisection
+    after doubling, the paper's scheme, reached only 6e-2 there. Real hidden
+    matrices measured <= 0.03.
+  - It costs `1 + solve_steps` orthogonalisations per unit, against Muon's 1.
+- `hyperball` and `sso` hold each unit's norm, which undoes weight decay
+  exactly, so their groups must set `weight_decay: 0` (checked at build).
+  `elr` keeps weight decay.
+- A radius-relative step never moves a zero-norm unit under `hyperball` or
+  `elr`; the first step warns if one exists.
+- Like `aus`, they are meant for the hidden matrices. A row group (embedding,
+  head, routers) that inherits a sphere rule stays that row rule.
+  - With an `eta` schedule, the schedule touches only the sphere groups.
+  - With `eta: "lr"` (the default), the default group's `lr` is the ELR, and
+    a row group without its own `lr` inherits it. `moe_template_config()`'s
+    row groups set none, so give them one.
+  - With `eta: "lr"`, the ELR post's minus-square-root schedule is the
+    trainer's `lr_scheduler` with `decay_type: "sqrt"` and
+    `decay_ratio: 1.0`.
+- **Measured** on 1 node, 200 steps, mis-8b-proxy (MoE) and
+  M1-dense-600M-full_rope-proxy, with `eta` a schedule on the hidden
+  matrices, as the median of the step's angle / eta over the hidden units:
+  - `hyperball` and `elr` hold the Frobenius angle at 0.98-1.00, and with
+    `exact_angle` at 1.0000 on every unit and step.
+  - `sso` and `aus` aim at the spectral angle. It starts at ~1.6x at step 1
+    and falls to 1.03-1.08x (`sso`) or 1.05-1.14x (`aus`) by step 200.
+  - That early excess is the weights, not the rule. An orthogonal init has a
+    flat spectrum, where the spectral norm moves at first order in every
+    direction: a synthetic step at a flat spectrum gives 1.8x, with a 1%
+    top gap 1.2x, with a decaying spectrum 1.0x. `aus` on the exact svd
+    polar logs the same numbers.
+- **Step time**, plain step, 4 GPUs, `gram_polar_express` 6:
+
+  | rule | mis-8b-proxy | mis-8b |
+  |---|---|---|
+  | muon | 23 ms | 86 ms |
+  | aus | 75 ms | 170 ms |
+  | hyperball | 49 ms | 138 ms |
+  | elr | 44 ms | 137 ms |
+  | sso | 299 ms | 1120 ms |
 
 Every normalisation divides by `norm + presets.EPS` (1e-30, a constant). Where a
 row's or unit's sum of squares is below fp32's smallest normal (1.2e-38, a
@@ -272,8 +344,10 @@ Saved per parameter: `momentum_buffer`, `radial_state` (the radial metrics'
 accumulators, one row per unit for a fused parameter) and, for a stateful rule,
 `rule_state` (one row per unit). Units live on their owner, so `state_dict()`
 all-reduces those rows from the owners first. `t` (the step count) is saved
-with the param groups; `rule` and `args` are not: a resumed run follows its own
-config, and the container supplies them to upstream's flat loader. Each expert
+with the param groups; `rule`, `args`, `weight_decay` and `decoupled_wd` are
+not: a resumed run follows its own config (a differing value in an older
+checkpoint is logged and replaced), and the container supplies them to
+upstream's flat loader. Each expert
 block's moments are views of one buffer; `state_dict()` hands out copies (DCP's
 save staging cannot deep-copy a DTensor over an offset view) and a load copies
 them back. A resume is bitwise with the uninterrupted run, AUS included.

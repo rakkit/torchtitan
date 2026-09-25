@@ -12,7 +12,7 @@ projection (`models/common/param_layout.py`).
 
     momentum rows ----> pre ----> compute ----> post ----> x scale(m, n) ----> U
     (where FSDP                                                    apply:
-     keeps them)                                   w <- (1 - lr wd) w - lr U
+     keeps them)                                     w <- decay w - lr U
 
     pre      Phases on the momentum rows. A phase works row by row, or declares
              `reduce` and gives a statistic the optimizer sums over every rank
@@ -23,9 +23,11 @@ projection (`models/common/param_layout.py`).
                gram   those rows plus the [n, n] Gram         one all-reduce
                unit   the whole unit on one owner rank        all-to-all out, back
              It may declare `needs_weight` (the owner receives W), `has_state`
-             (kept per unit on the owner) and its `output`: an update, per-unit
-             coefficients `w <- alpha w - beta U`, or the new weight. A `Chain`
-             is a main compute followed by row maps (`gram_polar+row-l2`).
+             (kept per unit on the owner), `keeps_radius` (it holds each
+             unit's norm, which cancels weight decay) and its `output`: an
+             update, a per-unit coefficient `w <- alpha w - U`, or the new
+             weight. A `Chain` is a main compute followed by row maps
+             (`gram_polar+row-l2`).
     post     Phases a preset needs after the compute (the head's re-centring).
     scale    The unit's step size relative to lr, a factor of its shape: a
              constant, the last multiply in the compiled compute.
@@ -37,7 +39,8 @@ How the optimizer runs them each step (`optimizer.py`), per unit:
     gram  : partial X^T X -> one packed all-reduce -> finish on those rows
     unit  : rows --all-to-all--> owner: compute, post, scale --all-to-all--> rows
             (an expert batch is already whole on its rank: one batched call)
-    apply : w <- (1 - lr wd) w - lr U  |  w <- alpha w - beta U  |  w <- W_next
+    apply : w <- decay w - lr U  |  w <- alpha w - U  |  w <- W_next
+            (decay = 1 - lr wd, or 1 - wd with `decoupled_wd`)
 
 A preset is a function registered by name whose keyword arguments are its
 args; `optimizer.groups.<g>.rule` picks it, `.args` fills them. The built-in
@@ -109,18 +112,24 @@ class StepCtx(NamedTuple):
     lr: float
     wd: float
     t: int  # 1-based optimizer step
+    decoupled: bool = False  # weight decay independent of lr
+
+    @property
+    def decay(self) -> float:
+        """What weight decay scales W by this step: `1 - wd` when decoupled,
+        else `1 - lr wd`."""
+        return 1.0 - self.wd if self.decoupled else 1.0 - self.lr * self.wd
 
 
 @dataclass
 class Result:
     """What a compute returns for a stack of `B` units. `update` alone: the
-    plain step. `alpha` (and optionally `beta`), per unit: `w <- alpha w - beta
-    update` (beta defaults to 1). `weight`: the new weight. `state`: what the
+    plain step. `alpha`, per unit: `w <- alpha w - update`, the step's size
+    folded into the update. `weight`: the new weight. `state`: what the
     compute gets back next step for the same units, stacked on dim 0."""
 
     update: torch.Tensor | None = None
     alpha: torch.Tensor | None = None
-    beta: torch.Tensor | None = None
     weight: torch.Tensor | None = None
     state: torch.Tensor | None = None
 
@@ -130,7 +139,8 @@ class Compute:
     "gram", "unit"). `needs_weight`: the computing rank also receives the
     unit's pre-update weight. `has_state`: `run` takes and returns per-unit
     state of shape `state_shape(m, n)`, kept on the computing rank between
-    steps and checkpointed; the first step sees zeros.
+    steps and checkpointed; the first step sees zeros. `keeps_radius`: the
+    step holds each unit's norm, so weight decay would be undone by it.
     `output`: "update", "update_coeffs" or "weight" -- see `Result`.
 
     Rows and unit kinds with output "update" implement `core`, which the rule
@@ -141,6 +151,7 @@ class Compute:
     kind = "unit"
     needs_weight = False
     has_state = False
+    keeps_radius = False
     output = "update"
 
     def core(self, x: torch.Tensor) -> torch.Tensor:
@@ -321,10 +332,7 @@ class Rule:
     def call_fused(self, x: torch.Tensor, m: int) -> torch.Tensor:
         if x.ndim == 3 and x.shape[0] == 0:
             return x
-        if torch._dynamo.config.recompile_limit >= _COMPILE_LIMIT:
-            return self.fused(x, m)  # inside `compile_limits()` (a DiSCO step)
-        with compile_limits():
-            return self.fused(x, m)
+        return call_compiled(self.fused, x, m)
 
     def run_whole(self, x, w=None, ctx: StepCtx | None = None, state=None) -> Result:
         """compute and tail on units that are whole here: `x` one unit
@@ -359,6 +367,14 @@ def compile_limits():
     return torch._dynamo.config.patch(
         recompile_limit=_COMPILE_LIMIT, cache_size_limit=_COMPILE_LIMIT
     )
+
+
+def call_compiled(fn: Callable, *args):
+    """A compiled rule function, within the rules' recompile budget."""
+    if torch._dynamo.config.recompile_limit >= _COMPILE_LIMIT:
+        return fn(*args)  # inside `compile_limits()` (a DiSCO step)
+    with compile_limits():
+        return fn(*args)
 
 
 # ------------------------------------------------------------------ registry
@@ -437,6 +453,7 @@ def lmo(g, compute, scale, steps):
 
 
 __all__ = [
+    "call_compiled",
     "Chain",
     "Compute",
     "lmo",

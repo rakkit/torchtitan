@@ -32,8 +32,8 @@ from ..helpers.radial_helper import (
 )
 
 
-def pseudo_post_update_weight(w, u, lr, wd):
-    pseudo_w = w * (1.0 - wd * lr) if wd != 0.0 else w
+def pseudo_post_update_weight(w, u, lr, decay):
+    pseudo_w = w * decay if decay != 1.0 else w
     return pseudo_w - lr * u
 
 

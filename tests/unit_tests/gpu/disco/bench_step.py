@@ -239,6 +239,8 @@ def main() -> None:
         communication_dtype=args.comm_dtype,
     )
     cfg.optimizer.groups["default"]["rule"] = args.rule
+    if args.rule in ("hyperball", "elr"):  # they normalise the update: no scale
+        cfg.optimizer.groups["default"]["args"].pop("scale")
     with tempfile.TemporaryDirectory() as tmp:
         model, container = harness.build_model_and_optimizer(cfg, pd, device, tmp)
     container.log_metrics_locally = args.local_logging

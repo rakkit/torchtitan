@@ -137,7 +137,9 @@ class DiSCO(torch.optim.Optimizer):
     _CONFIG_ONLY_GROUP_KEYS = (
         "rule",
         "args",
-    )  # the run's config, never the checkpoint's
+        "weight_decay",
+        "decoupled_wd",
+    )  # the run's config, never the checkpoint's: the decay pair stays together
 
     def __init__(
         self,
@@ -146,6 +148,7 @@ class DiSCO(torch.optim.Optimizer):
         parallel_dims,
         lr,
         weight_decay=0.0,
+        decoupled_wd=False,
         momentum=0.95,
         nesterov=False,
         rule="muon",
@@ -154,11 +157,13 @@ class DiSCO(torch.optim.Optimizer):
         enable_step_tracing=False,
         param_layouts=None,
     ):
-        """`lr, weight_decay, momentum, nesterov, rule, args` are the defaults a
-        param group inherits (torch semantics); a group's own `args` merge over
-        the default `args` its rule inherits. `rule` names a preset in
-        `rules.RULES`. `momentum` is the weight of the NEW gradient:
-        `buf <- (1 - momentum) buf + momentum g`."""
+        """`lr, weight_decay, decoupled_wd, momentum, nesterov, rule, args` are
+        the defaults a param group inherits (torch semantics); a group's own
+        `args` merge over the default `args` its rule inherits. `rule` names a
+        preset in `rules.RULES`. `momentum` is the weight of the NEW gradient:
+        `buf <- (1 - momentum) buf + momentum g`. Weight decay scales W by
+        `1 - lr weight_decay` per step, or by `1 - weight_decay` with
+        `decoupled_wd`."""
         self._span = sl.log_trace_span if enable_step_tracing else nullcontext
         self._trace_scalar = sl.log_trace_scalar if enable_step_tracing else _ignore
         self.communication_dtype = communication_dtype
@@ -183,6 +188,7 @@ class DiSCO(torch.optim.Optimizer):
             dict(
                 lr=lr,
                 weight_decay=weight_decay,
+                decoupled_wd=bool(decoupled_wd),
                 momentum=momentum,
                 nesterov=nesterov,
                 rule=rule,
@@ -378,6 +384,11 @@ class DiSCO(torch.optim.Optimizer):
         entries: list[_Entry] = []
         for gi, group in enumerate(self.param_groups):
             rule = rule_of(group)
+            if rule.compute.keeps_radius and float(group["weight_decay"]) != 0.0:
+                raise ValueError(
+                    f"group {gi} ({group.get('rule')}): the rule holds each unit's "
+                    "norm, which undoes weight decay exactly; set weight_decay: 0"
+                )
             for name, p in zip(group["param_names"], group["params"]):
                 if not p.requires_grad:
                     continue
@@ -568,6 +579,7 @@ class DiSCO(torch.optim.Optimizer):
         self._big: dict[int, torch.Tensor] = {}
         self._u_sh: dict[int, torch.Tensor] = {}
         self._u_rep: dict[int, torch.Tensor] = {}
+        self._row_units: dict[int, torch.Tensor] = {}  # coefficient entries
         # (entry, unit position) -> what the compute returned last step; on the
         # computing rank, not checkpointed.
         self._split_full: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -724,7 +736,7 @@ class DiSCO(torch.optim.Optimizer):
             eff = self._effective_grads()
             self._phase_pass(eff, "pre")
         u: dict[int, torch.Tensor] = {}
-        self._coef: dict[int, dict] = {}  # entry -> {unit position: (alpha, beta)}
+        self._coef: dict[int, torch.Tensor] = {}  # entry -> [alpha; beta] per unit
         # The sharded units' exchanges run while the other families compute
         # and apply: out before the local and expert work, back before theirs.
         sent = self._send_sharded(eff, values)
@@ -753,11 +765,16 @@ class DiSCO(torch.optim.Optimizer):
 
     def _ctx(self, e: _Entry) -> StepCtx:
         g = self.param_groups[e.group_idx]
-        return StepCtx(float(g["lr"]), float(g["weight_decay"]), int(g["t"]) + 1)
+        return StepCtx(
+            float(g["lr"]),
+            float(g["weight_decay"]),
+            int(g["t"]) + 1,
+            bool(g["decoupled_wd"]),
+        )
 
-    def _lr_wd(self, e: _Entry) -> tuple[float, float]:
-        g = self.param_groups[e.group_idx]
-        return float(g["lr"]), float(g["weight_decay"])
+    def _lr_decay(self, e: _Entry) -> tuple[float, float]:
+        ctx = self._ctx(e)
+        return ctx.lr, ctx.decay
 
     def _effective_grads(self) -> dict[int, torch.Tensor]:
         """Momentum pass (one call per momentum value, all groups together),
@@ -868,32 +885,52 @@ class DiSCO(torch.optim.Optimizer):
         """`rule` on the stack `st` of the units `pairs` [(entry, unit)], all
         whole here. The result's `update` is what the holders apply: the
         update, the coefficient update, or the step `W - W_next`. Keeps the
-        coefficients in `self._coef` and the state in each unit's row of
-        `state[p]["rule_state"]`."""
+        coefficients in `self._coef` and the state in `state[p]["rule_state"]`,
+        one copy per run of consecutive units of a parameter."""
+        runs = _unit_runs(pairs)
         state = None
         if rule.has_state:
-            state = torch.stack([self._rule_row(ee, un) for ee, un in pairs])
+            state = torch.cat([self._state_rows(ee, p0, n) for ee, _, p0, n in runs])
         if lone_2d and rule.output == "update" and len(pairs) == 1:
             res = rule.run_whole(st[0], None, self._ctx(e))
             res.update = res.update.unsqueeze(0)
         else:
             res = rule.run_whole(st, w, self._ctx(e), state)
-        if rule.has_state:
-            for j, (ee, un) in enumerate(pairs):
-                self._rule_row(ee, un).copy_(res.state[j])
-        if rule.output == "update_coeffs":
-            for j, (ee, un) in enumerate(pairs):
-                self._coef.setdefault(ee.i, {})[un.pos] = _coefs_of(res, j)
-        elif rule.output == "weight":
+        for ee, j0, p0, n in runs:
+            if rule.has_state:
+                self._state_rows(ee, p0, n).copy_(res.state[j0 : j0 + n])
+            if rule.output == "update_coeffs":
+                self._coef_of(ee)[p0 : p0 + n].copy_(res.alpha[j0 : j0 + n])
+        if rule.output == "weight":
             res.update = w.float() - res.weight.float()  # rides the update's slot
         return res
 
-    def _rule_row(self, e: _Entry, un: Unit) -> torch.Tensor:
-        """`un`'s row of `e`'s rule state, as a view."""
+    def _state_rows(self, e: _Entry, p0: int, n: int) -> torch.Tensor:
+        """Units `p0 .. p0 + n` of `e`'s rule state, as a view."""
         t = self.state[e.param]["rule_state"]
         if isinstance(t, DTensor):  # experts: the rows of the local experts
-            return t.to_local()[e.local_units.index(un.pos)]
-        return t[un.pos]
+            l0 = e.local_units.index(p0)
+            return t.to_local()[l0 : l0 + n]
+        return t[p0 : p0 + n]
+
+    def _coef_of(self, e: _Entry) -> torch.Tensor:
+        """`e`'s alpha per unit this step; zero until its owner writes."""
+        c = self._coef.get(e.i)
+        if c is None:
+            c = self._coef[e.i] = torch.zeros(len(e.units), device=e.local.device)
+        return c
+
+    def _row_unit(self, e: _Entry) -> torch.Tensor:
+        """The unit position of each of `e`'s local rows."""
+        t = self._row_units.get(e.i)
+        if t is None:
+            idx = torch.full((e.rows2d(e.local).shape[0],), -1, dtype=torch.long)
+            for pos, runs in enumerate(e.unit_local):
+                for st, n in runs.runs:
+                    idx[st : st + n] = pos
+            assert bool((idx >= 0).all()), f"{e.name}: rows outside every unit"
+            t = self._row_units[e.i] = idx.to(e.local.device)
+        return t
 
     # ---- families
     def _step_local(self, eff, u) -> None:
@@ -983,17 +1020,14 @@ class DiSCO(torch.optim.Optimizer):
             for j, e in enumerate(block):
                 u[e.i] = out[j]
                 if values is not None:
-                    a, b = (
-                        None if x is None else x.view(k, n_local)[j]
-                        for x in (res.alpha, res.beta)
-                    )
+                    a = None if res.alpha is None else res.alpha.view(k, n_local)[j]
                     metric.append(
                         ExpertUnits(
                             e.i,
                             e.local,
                             big.view(k, n_local, m, n)[j],
                             out[j],
-                            functools.partial(self._terms, e, e.local, out[j], a, b),
+                            functools.partial(self._terms, e, e.local, out[j], a),
                             self._exact(e),
                             self._radial(e),
                         )
@@ -1065,7 +1099,7 @@ class DiSCO(torch.optim.Optimizer):
                 for j, (ee, un) in enumerate(pairs):
                     W = wsw["full"][un.index]
                     self._unit_metrics(
-                        values, ee, un, W, st[j], res.update[j], *_coefs_of(res, j)
+                        values, ee, un, W, st[j], res.update[j], _alpha_of(res, j)
                     )
             st.copy_(res.update)
         if not self._u_sh:
@@ -1119,7 +1153,7 @@ class DiSCO(torch.optim.Optimizer):
             if values is not None:
                 for j, (ee, un) in enumerate(pairs):
                     self._unit_metrics(
-                        values, ee, un, w[j], st[j], res.update[j], *_coefs_of(res, j)
+                        values, ee, un, w[j], st[j], res.update[j], _alpha_of(res, j)
                     )
             st.copy_(res.update)
         # A whole single-unit param reads its update straight from the gathered
@@ -1141,27 +1175,25 @@ class DiSCO(torch.optim.Optimizer):
         self._share_coefs(es, rep.units, rep.group)
 
     def _share_coefs(self, es, units, group) -> None:
-        """Owners computed each coefficient unit's alpha and beta; every holder
-        of its rows needs them: one all-reduce, zeros from the other ranks."""
-        cu = [un for un in units if es[un.param_index].rule.output == "update_coeffs"]
-        if not cu:
+        """Owners computed each coefficient unit's alpha; every holder of its
+        rows needs it: one all-reduce, zeros from the other ranks."""
+        ents = {
+            es[un.param_index].i: es[un.param_index]
+            for un in units
+            if es[un.param_index].rule.output == "update_coeffs"
+        }
+        if not ents:
             return
-        buf = torch.zeros(2, len(cu), device=es[0].param.device)
-        for i, un in enumerate(cu):
-            got = self._coef.get(es[un.param_index].i, {}).get(un.pos)
-            if got is not None:
-                buf[0, i] = got[0]
-                buf[1, i] = 1.0 if got[1] is None else got[1]
+        packed = torch.cat([self._coef_of(e).reshape(-1) for e in ents.values()])
         if group is not None and dist.get_world_size(group) > 1:
-            dist.all_reduce(buf, group=group)
-        for i, un in enumerate(cu):
-            self._coef.setdefault(es[un.param_index].i, {})[un.pos] = (
-                buf[0, i],
-                buf[1, i],
-            )
+            dist.all_reduce(packed, group=group)
+        off = 0
+        for e in ents.values():
+            self._coef[e.i] = packed[off : off + len(e.units)]
+            off += len(e.units)
 
     def _apply(self, u: dict[int, torch.Tensor], *, sharded: bool) -> None:
-        """`w <- (1 - lr wd) w - lr U`; per unit `w <- alpha w - beta U` for
+        """`w <- decay w - lr U`; per unit `w <- alpha w - U` for
         coefficient rules; `w <- w - (W - W_next)` for rules returning weights.
         For the sharded family, or for every other one."""
         for gi, es, _ in self._groups:
@@ -1171,24 +1203,21 @@ class DiSCO(torch.optim.Optimizer):
             if not es:
                 continue
             g = self.param_groups[gi]
-            lr, wd = float(g["lr"]), float(g["weight_decay"])
+            lr, decay = self._lr_decay(es[0])
             plain = [e for e in es if e.rule.output == "update"]
             if plain:
                 locals_ = [e.local for e in plain]
-                if wd != 0.0:
-                    torch._foreach_mul_(locals_, 1.0 - wd * lr)
+                if decay != 1.0:
+                    torch._foreach_mul_(locals_, decay)
                 torch._foreach_add_(
                     locals_, [u[e.i].view_as(e.local) for e in plain], alpha=-lr
                 )
             for e in es:
                 if e.rule.output != "update_coeffs":
                     continue
-                rows, urows = e.rows2d(e.local), e.rows2d(u[e.i])
-                for pos, (a, b) in self._coef.get(e.i, {}).items():
-                    for st, n in e.unit_local[pos].runs:
-                        rows[st : st + n].mul_(a)
-                        step = urows[st : st + n]
-                        rows[st : st + n].sub_(step if b is None else b * step)
+                rows = e.rows2d(e.local)
+                rows.mul_(self._coef[e.i][self._row_unit(e)].unsqueeze(-1))
+                rows.sub_(e.rows2d(u[e.i]))
             delta = [e for e in es if e.rule.output == "weight"]
             if delta:
                 torch._foreach_sub_(
@@ -1204,28 +1233,27 @@ class DiSCO(torch.optim.Optimizer):
             return st
         return {n: t[un.pos] for n, t in st.items()}
 
-    def _terms(self, e: _Entry, W, U, alpha=None, beta=None):
+    def _terms(self, e: _Entry, W, U, alpha=None):
         """For units `W` (one `[m, n]` or a stack) and what the holders apply,
         `U`: the step logged as the update, the weight the apply writes, and
         whether their difference is exactly that step."""
-        lr, wd = self._lr_wd(e)
+        lr, decay = self._lr_decay(e)
         out, exact = e.rule.output, self._exact(e)
         if out == "update":
-            return -lr * U, pseudo_post_update_weight(W, U, lr, wd), exact
+            return -lr * U, pseudo_post_update_weight(W, U, lr, decay), exact
         U = U.float()
         if out == "weight":  # U is W - W_next
             return -U, W.float() - U, exact
-        b = 1.0 if beta is None else _per_unit(beta, U)
-        return -b * U, _per_unit(alpha, U) * W.float() - b * U, exact
+        return -U, _per_unit(alpha, U) * W.float() - U, exact
 
     def _exact(self, e: _Entry) -> bool:
         """Whether the weight the apply writes minus `W` is the logged step."""
         out = e.rule.output
-        return self._lr_wd(e)[1] == 0.0 if out == "update" else out == "weight"
+        return self._lr_decay(e)[1] == 1.0 if out == "update" else out == "weight"
 
-    def _unit_metrics(self, values, e: _Entry, un: Unit, W, G, U, alpha, beta) -> None:
+    def _unit_metrics(self, values, e: _Entry, un: Unit, W, G, U, alpha) -> None:
         """One unit's metrics on the rank that has it whole, after its post phases."""
-        upd, w_after, exact = self._terms(e, W, U, alpha, beta)
+        upd, w_after, exact = self._terms(e, W, U, alpha)
         values[_key(e, un)] = self._sink.unit_values(
             W,
             G,
@@ -1264,7 +1292,6 @@ class DiSCO(torch.optim.Optimizer):
                     gs["full"][un.index],
                     us_["full"][un.index],
                     None,
-                    None,
                 )
         for vx in self._ex_vocab:
             e = self._sh_entries[vx.units[0].param_index]
@@ -1280,7 +1307,6 @@ class DiSCO(torch.optim.Optimizer):
                     w["full"][un.index],
                     g["full"][un.index],
                     u_["full"][un.index],
-                    None,
                     None,
                 )
             vx.release("w", torch.float32)
@@ -1312,7 +1338,6 @@ class DiSCO(torch.optim.Optimizer):
                         unit_rows_local(eff[e.i], runs),
                         unit_rows_local(u[e.i], runs),
                         None,
-                        None,
                     )
 
     def _head_geometry(self, e: _Entry, un: Unit, W, U) -> None:
@@ -1330,7 +1355,7 @@ class DiSCO(torch.optim.Optimizer):
             self.head_probe_h,
             U,
             W,
-            self._lr_wd(e)[0],
+            self._lr_decay(e)[0],
             diameter_iters=self.head_diag_diameter_iters,
         )
 
@@ -1434,12 +1459,21 @@ class DiSCO(torch.optim.Optimizer):
             self.norms_at_current_step.update(final)
 
 
-def _coefs_of(res: Result, j: int):
-    """Unit `j`'s (alpha, beta) from a coefficient result, else (None, None)."""
-    return (
-        None if res.alpha is None else res.alpha[j],
-        None if res.beta is None else res.beta[j],
-    )
+def _unit_runs(pairs) -> list[list]:
+    """`pairs` [(entry, unit)] as runs of consecutive units of one entry:
+    [entry, first index in pairs, first unit position, length]."""
+    runs: list[list] = []
+    for j, (e, un) in enumerate(pairs):
+        if runs and runs[-1][0] is e and runs[-1][2] + runs[-1][3] == un.pos:
+            runs[-1][3] += 1
+        else:
+            runs.append([e, j, un.pos, 1])
+    return runs
+
+
+def _alpha_of(res: Result, j: int):
+    """Unit `j`'s alpha from a coefficient result, else None."""
+    return None if res.alpha is None else res.alpha[j]
 
 
 def _key(e: _Entry, u: Unit) -> str:

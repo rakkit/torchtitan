@@ -4,468 +4,128 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import logging
-import math
-from numbers import Real
+"""HF configuration of torchtitan's opt_moe (`torchtitan/models/opt_moe`).
 
-from transformers.configuration_utils import PretrainedConfig
+Written by `setup_hf.py` from the native config; every field is a value the
+native model computes with, resolved at export (no native-only flags)."""
 
+from huggingface_hub.dataclasses import strict
 
-logger = logging.getLogger(__name__)
+from transformers.configuration_utils import PreTrainedConfig
+from transformers.modeling_rope_utils import RopeParameters
 
-
-def _normalize_gated_attention_type(value):
-    if value is None:
-        return None
-    normalized = value.strip().lower()
-    if normalized in {"", "none", "null"}:
-        return None
-    return value
+_LAYER_TYPES = ("full_attention", "sliding_attention")
 
 
-def _normalize_mid_norm_position(value):
-    normalized = value.strip().lower()
-    if normalized not in {"after", "before"}:
-        raise ValueError(
-            "mid_norm_position must be either 'after' or 'before', " f"got {value!r}"
-        )
-    return normalized
+@strict
+class OptMoEConfig(PreTrainedConfig):
+    r"""
+    head_dim (`int`): Attention head width.
+    qk_norm / v_norm (`bool`): Parameter-free RMSNorm on each q/k (v) head.
+    attention_mid_norm (`bool`): Parameter-free RMSNorm on the attention output,
+        per head if `head_wise_mid_norm`, else over all heads; applied before the
+        gate if `mid_norm_position == "before"`.
+    gated_attention (`str`, *optional*): `"head-wise"` or `"element-wise"`
+        sigmoid gate on the attention output, from `gate_proj(hidden_states)`.
+    rotary_dim (`int`): Leading head dims rotated by RoPE (partial RoPE).
+    use_rope_layers (`list[bool]`): Per layer, whether it applies RoPE.
+    layer_types (`list[str]`): Per layer, `"full_attention"` or `"sliding_attention"`.
+    rope_parameters_sliding (`dict`, *optional*): RoPE of the sliding layers,
+        when they use their own theta.
+    mlp_mid_norm / moe_mid_norm (`bool`): RMSNorm on the SwiGLU output of the
+        dense MLP / of every expert.
+    first_k_dense_replace (`int`): The first k layers use a dense MLP.
+    n_routed_experts, num_experts_per_tok, moe_intermediate_size, n_shared_experts:
+        MoE shape; the shared expert is `n_shared_experts * moe_intermediate_size` wide.
+    scoring_func (`str`): `"sigmoid"`, `"softmax"` or `"sqrtsoftplus"`.
+    norm_topk_prob (`bool`): Renormalise the top-k scores to sum to 1.
+    routed_scaling_factor (`float`): Multiplies the top-k scores.
+    embeddings_norm (`bool`): RMSNorm right after the embedding.
+    residual_identity_scale / residual_block_scale (`float`):
+        `h = identity_scale * h + block_scale * block(h)` for every sub-block.
+    """
 
-
-class OptMoEConfig(PretrainedConfig):
     model_type = "OptMoE"
     keys_to_ignore_at_inference = ["past_key_values"]
-    # Default tensor parallel plan for base model
-    base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
-    }
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
         "norm": (["hidden_states"], ["hidden_states"]),
     }
 
-    def __init__(
-        self,
-        vocab_size=32000,
-        hidden_size=4096,
-        intermediate_size=11008,
-        moe_intermediate_size=11008,
-        n_shared_experts=1,
-        n_active_experts=8,
-        n_total_experts=64,
-        moe_scaling_factor=2.8232,
-        n_dense_layers=0,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=None,
-        hidden_act="silu",
-        max_position_embeddings=4096,
-        initializer_range=0.02,
-        rms_norm_eps=1e-30,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=1,
-        eos_token_id=2,
-        pretraining_tp=1,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_parameters=None,
-        attention_bias=False,
-        attention_dropout=0.0,
-        mlp_bias=False,
-        head_dim=None,
-        qk_norm=False,
-        mid_norm=False,
-        norm_everywhere=False,
-        attention_norm_everywhere=None,
-        ffn_norm_everywhere=None,
-        moe_norm_everywhere=None,
-        gated_attention_type=None,
-        gate_only=False,
-        mid_norm_position="after",
-        head_wise_mid_norm=False,
-        use_rope=True,
-        sliding_window_size=-1,
-        qk_rope_dim=None,
-        partial_rotary_factor=None,
-        rope_pattern=None,
-        swa_pattern=None,
-        rope_theta_swa=None,
-        rope_parameters_swa=None,
-        residual_scale="identity",
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
+    vocab_size: int = 201088
+    hidden_size: int = 2048
+    num_hidden_layers: int = 24
+    num_attention_heads: int = 32
+    num_key_value_heads: int = 4
+    head_dim: int = 128
+    hidden_act: str = "silu"
+    max_position_embeddings: int = 4096
+    initializer_range: float = 0.02
+    rms_norm_eps: float = 1e-30
+    use_cache: bool = True
+    tie_word_embeddings: bool = False
+    attention_bias: bool = False
+    attention_dropout: float | int = 0.0
+    qk_norm: bool = True
+    v_norm: bool = False
+    attention_mid_norm: bool = False
+    head_wise_mid_norm: bool = False
+    mid_norm_position: str = "after"
+    gated_attention: str | None = None
+    rope_parameters: RopeParameters | dict | None = None
+    rope_parameters_sliding: RopeParameters | dict | None = None
+    rotary_dim: int | None = None
+    use_rope_layers: list[bool] | None = None
+    layer_types: list[str] | None = None
+    sliding_window: int | None = None
+    intermediate_size: int = 5120
+    mlp_mid_norm: bool = False
+    first_k_dense_replace: int = 0
+    n_routed_experts: int = 64
+    num_experts_per_tok: int = 8
+    moe_intermediate_size: int = 640
+    n_shared_experts: int = 1
+    scoring_func: str = "sigmoid"
+    norm_topk_prob: bool = True
+    routed_scaling_factor: float = 1.0
+    moe_mid_norm: bool = False
+    embeddings_norm: bool = False
+    residual_identity_scale: float = 1.0
+    residual_block_scale: float = 1.0
+    pad_token_id: int | None = None
+    bos_token_id: int | None = None
+    eos_token_id: int | list[int] | None = None
 
-        # for backward compatibility
-        if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
+    def __post_init__(self, **kwargs):
+        n = self.num_hidden_layers
+        if self.rotary_dim is None:
+            self.rotary_dim = self.head_dim
+        if self.use_rope_layers is None:
+            self.use_rope_layers = [True] * n
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * n
+        super().__post_init__(**kwargs)
 
-        self.num_key_value_heads = num_key_value_heads
-        self.hidden_act = hidden_act
-        self.initializer_range = initializer_range
-        self.moe_intermediate_size = moe_intermediate_size
-        self.n_shared_experts = n_shared_experts
-        self.n_active_experts = n_active_experts
-        self.n_total_experts = n_total_experts
-        self.moe_scaling_factor = moe_scaling_factor
-        self.n_dense_layers = n_dense_layers
-        self.rms_norm_eps = rms_norm_eps
-        self.pretraining_tp = pretraining_tp
-        self.use_cache = use_cache
-        self.attention_bias = attention_bias
-        self.attention_dropout = attention_dropout
-        self.mlp_bias = mlp_bias
-        self.head_dim = (
-            head_dim
-            if head_dim is not None
-            else self.hidden_size // self.num_attention_heads
-        )
-        self.norm_everywhere = norm_everywhere
-        # None means inherit the global flag.
-        self.attention_norm_everywhere = (
-            norm_everywhere
-            if attention_norm_everywhere is None
-            else bool(attention_norm_everywhere)
-        )
-        self.ffn_norm_everywhere = (
-            norm_everywhere
-            if ffn_norm_everywhere is None
-            else bool(ffn_norm_everywhere)
-        )
-        self.moe_norm_everywhere = (
-            self.ffn_norm_everywhere
-            if moe_norm_everywhere is None
-            else bool(moe_norm_everywhere)
-        )
-        self.qk_norm = qk_norm
-        self.mid_norm = bool(mid_norm)
-        self.gated_attention_type = _normalize_gated_attention_type(
-            gated_attention_type
-        )
-        self.gate_only = bool(gate_only)
-        self.mid_norm_position = _normalize_mid_norm_position(mid_norm_position)
-        self.head_wise_mid_norm = bool(head_wise_mid_norm)
-        self.use_rope = use_rope
-        self.sliding_window_size = sliding_window_size
-
-        if qk_rope_dim is None:
-            if partial_rotary_factor is None:
-                qk_rope_dim = self.head_dim
-            else:
-                qk_rope_dim = int(self.head_dim * partial_rotary_factor)
-                if not math.isclose(
-                    qk_rope_dim / self.head_dim,
-                    partial_rotary_factor,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                ):
-                    raise ValueError(
-                        "partial_rotary_factor must map to an integer qk_rope_dim. "
-                        f"Got head_dim={self.head_dim}, "
-                        f"partial_rotary_factor={partial_rotary_factor}."
-                    )
-        self.qk_rope_dim = int(qk_rope_dim)
-        if not (0 < self.qk_rope_dim <= self.head_dim):
-            raise ValueError(
-                f"qk_rope_dim must be in (0, head_dim], got {self.qk_rope_dim} "
-                f"for head_dim={self.head_dim}."
-            )
-
-        derived_partial_rotary_factor = self.qk_rope_dim / self.head_dim
-        if partial_rotary_factor is not None and not math.isclose(
-            partial_rotary_factor,
-            derived_partial_rotary_factor,
-            rel_tol=0.0,
-            abs_tol=1e-6,
-        ):
-            raise ValueError(
-                "qk_rope_dim and partial_rotary_factor disagree. "
-                f"Got qk_rope_dim={self.qk_rope_dim}, head_dim={self.head_dim}, "
-                f"partial_rotary_factor={partial_rotary_factor}."
-            )
-        self.partial_rotary_factor = derived_partial_rotary_factor
-
-        if residual_scale not in ("identity", "depth_scale"):
-            raise ValueError(
-                f"residual_scale must be 'identity' or 'depth_scale', got {residual_scale!r}"
-            )
-        self.residual_scale = residual_scale
-
-        self.rope_pattern = rope_pattern
-        self.swa_pattern = swa_pattern
-        self.rope_theta = rope_theta
-        self.rope_theta_swa = rope_theta_swa
-        self.rope_parameters = rope_parameters
-        self.rope_parameters_swa = rope_parameters_swa
-        self.standardize_rope_params()
-        self.validate_rope()
-
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
-
-    @staticmethod
-    def _check_received_keys(
-        rope_type, received_keys, required_keys, optional_keys=None, ignore_keys=None
-    ):
-        received_keys = set(received_keys)
-        required_keys = set(required_keys)
-        optional_keys = set(optional_keys or ())
-
-        if "type" in received_keys:
-            received_keys.discard("type")
-            required_keys.add("rope_type")
-
-        optional_keys.add("partial_rotary_factor")
-
-        if ignore_keys is not None:
-            received_keys -= set(ignore_keys)
-
-        missing_keys = required_keys - received_keys
-        if missing_keys:
-            raise KeyError(
-                "Missing required keys in `rope_parameters` for "
-                f"`rope_type`={rope_type!r}: {missing_keys}"
-            )
-
-        unused_keys = received_keys - required_keys - optional_keys
-        if unused_keys:
-            logger.warning_once(
-                "Unrecognized keys in `rope_parameters` for "
-                f"`rope_type`={rope_type!r}: {unused_keys}"
-            )
-
-    def _validate_default_rope_parameters(self, rope_parameters, ignore_keys=None):
-        self._check_received_keys(
-            rope_parameters["rope_type"],
-            rope_parameters.keys(),
-            {"rope_type", "rope_theta"},
-            ignore_keys=ignore_keys,
-        )
-
-    def _validate_linear_rope_parameters(self, rope_parameters, ignore_keys=None):
-        self._check_received_keys(
-            rope_parameters["rope_type"],
-            rope_parameters.keys(),
-            {"rope_type", "factor", "rope_theta"},
-            ignore_keys=ignore_keys,
-        )
-        factor = rope_parameters["factor"]
-        if factor is None or not isinstance(factor, Real) or factor < 1.0:
-            logger.warning_once(
-                "`rope_parameters['factor']` must be a real number >= 1, "
-                f"got {factor!r}"
-            )
-
-    def _validate_dynamic_rope_parameters(self, rope_parameters, ignore_keys=None):
-        self._check_received_keys(
-            rope_parameters["rope_type"],
-            rope_parameters.keys(),
-            {"rope_type", "factor"},
-            ignore_keys=ignore_keys,
-        )
-        factor = rope_parameters["factor"]
-        if factor is None or not isinstance(factor, Real) or factor < 1.0:
-            logger.warning_once(
-                "`rope_parameters['factor']` must be a real number >= 1, "
-                f"got {factor!r}"
-            )
-
-    def _validate_yarn_rope_parameters(self, rope_parameters, ignore_keys=None):
-        self._check_received_keys(
-            rope_parameters["rope_type"],
-            rope_parameters.keys(),
-            {
-                "rope_type",
-                "factor",
-                "rope_theta",
-                "original_max_position_embeddings",
-            },
-            {
-                "attention_factor",
-                "beta_fast",
-                "beta_slow",
-                "mscale",
-                "mscale_all_dim",
-                "truncate",
-            },
-            ignore_keys=ignore_keys,
-        )
-        factor = rope_parameters["factor"]
-        if factor is None or not isinstance(factor, Real) or factor < 1.0:
-            logger.warning_once(
-                "`rope_parameters['factor']` must be a real number >= 1, "
-                f"got {factor!r}"
-            )
-
-        attention_factor = rope_parameters.get("attention_factor")
-        if attention_factor is not None and (
-            not isinstance(attention_factor, Real) or attention_factor < 0.0
-        ):
-            logger.warning_once(
-                "`rope_parameters['attention_factor']` must be a real number > 0, "
-                f"got {attention_factor!r}"
-            )
-
-        beta_fast = rope_parameters.get("beta_fast")
-        if beta_fast is not None and not isinstance(beta_fast, Real):
-            logger.warning_once(
-                "`rope_parameters['beta_fast']` must be a real number, "
-                f"got {beta_fast!r}"
-            )
-
-        beta_slow = rope_parameters.get("beta_slow")
-        if beta_slow is not None and not isinstance(beta_slow, Real):
-            logger.warning_once(
-                "`rope_parameters['beta_slow']` must be a real number, "
-                f"got {beta_slow!r}"
-            )
-
-        if (beta_fast or 32) < (beta_slow or 1):
-            logger.warning_once(
-                "`rope_parameters['beta_fast']` must be >= `beta_slow`; "
-                f"got beta_fast={beta_fast!r}, beta_slow={beta_slow!r}"
-            )
-
-    def _validate_longrope_rope_parameters(self, rope_parameters, ignore_keys=None):
-        self._check_received_keys(
-            rope_parameters["rope_type"],
-            rope_parameters.keys(),
-            {
-                "rope_type",
-                "short_factor",
-                "long_factor",
-                "rope_theta",
-                "original_max_position_embeddings",
-            },
-            {"attention_factor", "factor"},
-            ignore_keys=ignore_keys,
-        )
-
-        partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
-        head_dim = self.head_dim
-        dim = int(head_dim * partial_rotary_factor)
-
-        short_factor = rope_parameters.get("short_factor")
-        if not (
-            isinstance(short_factor, list)
-            and all(isinstance(x, Real) for x in short_factor)
-        ):
-            logger.warning_once(
-                "`rope_parameters['short_factor']` must be a list of real numbers, "
-                f"got {short_factor!r}"
-            )
-        elif len(short_factor) != dim // 2:
-            logger.warning_once(
-                "`rope_parameters['short_factor']` must have length "
-                f"{dim // 2}, got {len(short_factor)}"
-            )
-
-        long_factor = rope_parameters.get("long_factor")
-        if not (
-            isinstance(long_factor, list)
-            and all(isinstance(x, Real) for x in long_factor)
-        ):
-            logger.warning_once(
-                "`rope_parameters['long_factor']` must be a list of real numbers, "
-                f"got {long_factor!r}"
-            )
-        elif len(long_factor) != dim // 2:
-            logger.warning_once(
-                "`rope_parameters['long_factor']` must have length "
-                f"{dim // 2}, got {len(long_factor)}"
-            )
-
-        factor = rope_parameters.get("factor")
-        if factor is not None and (not isinstance(factor, Real) or factor < 1.0):
-            logger.warning_once(
-                "`rope_parameters['factor']` must be a real number >= 1, "
-                f"got {factor!r}"
-            )
-
-        attention_factor = rope_parameters.get("attention_factor")
-        if attention_factor is not None and (
-            not isinstance(attention_factor, Real) or attention_factor < 0.0
-        ):
-            logger.warning_once(
-                "`rope_parameters['attention_factor']` must be a real number > 0, "
-                f"got {attention_factor!r}"
-            )
-
-    def _validate_llama3_rope_parameters(self, rope_parameters, ignore_keys=None):
-        self._check_received_keys(
-            rope_parameters["rope_type"],
-            rope_parameters.keys(),
-            {
-                "rope_type",
-                "factor",
-                "original_max_position_embeddings",
-                "low_freq_factor",
-                "high_freq_factor",
-                "rope_theta",
-            },
-            ignore_keys=ignore_keys,
-        )
-
-        factor = rope_parameters["factor"]
-        if factor is None or not isinstance(factor, Real) or factor < 1.0:
-            logger.warning_once(
-                "`rope_parameters['factor']` must be a real number >= 1, "
-                f"got {factor!r}"
-            )
-
-        low_freq_factor = rope_parameters["low_freq_factor"]
-        if low_freq_factor is None or not isinstance(low_freq_factor, Real):
-            logger.warning_once(
-                "`rope_parameters['low_freq_factor']` must be a real number, "
-                f"got {low_freq_factor!r}"
-            )
-
-        high_freq_factor = rope_parameters["high_freq_factor"]
-        if high_freq_factor is None or not isinstance(high_freq_factor, Real):
-            logger.warning_once(
-                "`rope_parameters['high_freq_factor']` must be a real number, "
-                f"got {high_freq_factor!r}"
-            )
-        elif high_freq_factor <= low_freq_factor:
-            logger.warning_once(
-                "`rope_parameters['high_freq_factor']` must be greater than "
-                f"`low_freq_factor`; got high={high_freq_factor!r}, low={low_freq_factor!r}"
-            )
-
-        original_max_position_embeddings = rope_parameters[
-            "original_max_position_embeddings"
-        ]
-        if original_max_position_embeddings is None or not isinstance(
-            original_max_position_embeddings, int
-        ):
-            logger.warning_once(
-                "`rope_parameters['original_max_position_embeddings']` must be "
-                f"an integer, got {original_max_position_embeddings!r}"
-            )
-        elif original_max_position_embeddings >= self.max_position_embeddings:
-            logger.warning_once(
-                "`rope_parameters['original_max_position_embeddings']` must be less "
-                "than `max_position_embeddings`; got "
-                f"{original_max_position_embeddings} vs {self.max_position_embeddings}"
-            )
+    def validate_architecture(self):
+        super().validate_architecture()
+        n = self.num_hidden_layers
+        if len(self.use_rope_layers) != n or len(self.layer_types) != n:
+            raise ValueError("use_rope_layers and layer_types need one entry per layer")
+        if any(t not in _LAYER_TYPES for t in self.layer_types):
+            raise ValueError(f"layer_types entries must be in {_LAYER_TYPES}")
+        if "sliding_attention" in self.layer_types and not self.sliding_window:
+            raise ValueError("sliding layers need a sliding_window")
+        if not 0 < self.rotary_dim <= self.head_dim or self.rotary_dim % 2:
+            raise ValueError(f"rotary_dim {self.rotary_dim} must be even and in (0, head_dim]")
+        if self.gated_attention not in (None, "head-wise", "element-wise"):
+            raise ValueError(f"unknown gated_attention {self.gated_attention!r}")
+        if self.mid_norm_position not in ("after", "before"):
+            raise ValueError(f"unknown mid_norm_position {self.mid_norm_position!r}")
+        if self.scoring_func not in ("sigmoid", "softmax", "sqrtsoftplus"):
+            raise ValueError(f"unknown scoring_func {self.scoring_func!r}")
+        if self.hidden_act != "silu":
+            raise ValueError("opt_moe's MLPs are SwiGLU: hidden_act must be 'silu'")
 
 
 __all__ = ["OptMoEConfig"]

@@ -39,7 +39,6 @@ from convert_to_hf import (  # noqa: E402
     _copy_hf_assets,
     _export_hf_weights,
     _resolve_model_config_for_conversion,
-    _validate_exported_hf_config,
     ParallelFileSystemReader,
     set_init_fn_type,
 )
@@ -199,11 +198,6 @@ def convert_ema_to_hf(
     hf_assets_setup_fn = getattr(type(actual_model), "hf_assets_setup_fn", None)
     if hf_assets_setup_fn is not None:
         hf_assets_setup_fn(actual_model, model_config, str(output_dir))
-        _validate_exported_hf_config(
-            model_name=model_name,
-            model_config=model_config,
-            output_dir=output_dir,
-        )
     else:
         print(
             f"[WARNING] No hf_assets_setup_fn registered for "
@@ -256,9 +250,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--export_dtype",
         type=str,
-        default="float32",
+        default="bfloat16",
         choices=["float16", "bfloat16", "float32"],
-        help="Export dtype for HF checkpoint (default: float32).",
+        help="Export dtype for HF checkpoint (default: bfloat16).",
     )
     parser.add_argument(
         "--read_threads",

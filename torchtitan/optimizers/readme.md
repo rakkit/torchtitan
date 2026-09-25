@@ -226,7 +226,10 @@ build). Head-wise attention is two groups:
   by 8, and the Triton ones need at least 16. They are refused at build, so use
   `polar_express`, `newtonschulz5` or `svd`.
 - **Sinks:** under the production default, the `[1, n_heads]` unit is refused
-  too. Give the sinks a row rule; `sign` moves each head's sink by lr.
+  too (one row). Give them a group: `sign` moves each head's sink by lr;
+  `row-l2` normalises the whole vector; muon on a pure-PyTorch backend is the
+  `[1, H]` polar, i.e. `row-l2` times `sqrt(1/H)`. None was clearly better
+  (below).
 - **Not yet trained with:** `right_polar` (the polar factor through the
   `[K, K]` Gram) orthogonalises `[C, 4]` exactly at 8 steps, with a 4x4
   all-reduce and no gather. NS5 and polar express leave singular values in
@@ -241,6 +244,20 @@ build). Head-wise attention is two groups:
   | row-norm conv + sign sinks, lr 0.01 | 6.570 |
   | orthogonal conv + sign sinks, lr 0.1 | 6.632 |
   | orthogonal conv + sign sinks, lr 0.01 | 6.644 |
+
+  Sink rule, with row-norm conv at lr 0.1 (H = 8; train over steps 251-300 /
+  val at 300):
+
+  | sink rule | step per head (RMS) | train | val |
+  |---|---|---|---|
+  | `sign`, `one` (two runs) | lr | 6.555 / 6.569 | 6.774 / 6.771 |
+  | `row-l2`, `one` | lr / sqrt(H) | 6.578 | 6.779 |
+  | `row-l2`, `sqrt_n` | lr | 6.577 | 6.772 |
+  | muon, `polar_express`, `spectral` | lr / H | 6.555 | 6.764 |
+
+  The runs are not deterministic: the same `sign` config twice differs by
+  0.014 (train) and 0.003 (val). The four rules span 0.023 and 0.015, so no
+  sink rule stands out at this scale; all beat no conv / sinks.
 
 **Sphere rules.** `hyperball` (MuonH, arXiv 2606.16899), `elr` (Tencent's ELR,
 hy.tencent.ai/research/elr, their Eq. 2) and `sso` (arXiv 2601.08393) need the

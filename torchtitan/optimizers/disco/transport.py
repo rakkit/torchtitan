@@ -57,6 +57,17 @@ def unit_rows(rows2d: torch.Tensor, u: Unit) -> torch.Tensor:
     return torch.cat([rows2d[a : a + n] for a, n in runs], dim=0)
 
 
+def deal(units: list[Unit], world: int) -> dict[int, int]:
+    """Owner per unit index: the largest orthogonalisation cost `m n min(m, n)`
+    first, dealt in a snake so each rank gets big and small units. Units, not
+    parameters: a fused parameter's units are dealt apart."""
+    order = sorted(units, key=lambda u: -u.shape[0] * u.shape[1] * min(u.shape))
+    return {
+        u.index: world - 1 - k % world if k // world % 2 else k % world
+        for k, u in enumerate(order)
+    }
+
+
 def batches_of(owned: list[Unit]) -> list[list[Unit]]:
     """Owned units grouped by (shape, batch key), in first-seen order."""
     groups: dict[tuple, list[Unit]] = {}
@@ -306,7 +317,7 @@ class Exchange:
 
 class Replicated:
     """Every rank holds every unit whole: owners compute, one all-gather of
-    the updates. Owner = `unit.index % world`."""
+    the updates. Owners from `deal`."""
 
     def __init__(self, units, *, group, rank, world, dtype):
         self.units, self.group, self.rank, self.world, self.dtype = (
@@ -316,7 +327,8 @@ class Replicated:
             world,
             dtype,
         )
-        self.owner = [u.index % world for u in units]
+        owner = deal(units, world)
+        self.owner = [owner[u.index] for u in units]
         self.owned = [u for u in units if self.owner[u.index] == rank]
         self.batches = batches_of(self.owned)
         per_rank, self.offset = [0] * world, {}

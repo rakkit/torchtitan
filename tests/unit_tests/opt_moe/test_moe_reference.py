@@ -21,10 +21,10 @@ import torch
 from torchtitan.models.opt_moe.norm_moe import make_norm_moe_config
 
 
-def reference_moe(moe, x_TD):
+def reference_moe(moe, x_TD, *, mid_norm: bool):
     """Naive MoE: for each token, apply each of its top-k experts directly."""
     router = moe.router
-    experts = moe.routed_experts.inner_experts
+    experts = moe.routed_experts
 
     scores_TE = torch.sigmoid(router.gate(x_TD))
     bias = moe.expert_bias_E
@@ -37,7 +37,9 @@ def reference_moe(moe, x_TD):
     topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-20)
     topk_scores = topk_scores * router.route_scale
 
-    w1, w2, w3 = experts.w1_EFD, experts.w2_EDF, experts.w3_EFD
+    # w13 is [E, 2, F, D]: the gate (w1) and up (w3) projections, stacked.
+    w1, w3 = experts.w13.weight.unbind(1)
+    w2 = experts.w2.weight
     out = torch.zeros_like(x_TD, dtype=torch.float32)
     for t in range(x_TD.shape[0]):
         xt = x_TD[t].bfloat16()
@@ -45,9 +47,12 @@ def reference_moe(moe, x_TD):
             e = int(topk_ids[t, k])
             # Same casts as the grouped GEMM, so any difference is routing or
             # accumulation, not precision.
-            h = experts.act_fn(xt @ w1[e].bfloat16().t())
+            h = torch.nn.functional.silu(xt @ w1[e].bfloat16().t())
             h = h * (xt @ w3[e].bfloat16().t())
-            y = experts.mid_norm(h) @ w2[e].bfloat16().t()
+            if mid_norm:  # parameter-free RMS norm over the hidden dim
+                hf = h.float()
+                h = (hf * torch.rsqrt(hf.pow(2).mean() + 1e-30)).to(h.dtype)
+            y = h @ w2[e].bfloat16().t()
             out[t] += y.float() * topk_scores[t, k].float()
 
     if moe.shared_experts is not None:
@@ -74,7 +79,7 @@ def run_case(*, norm_everywhere, num_shared_experts, top_k, label):
     x = torch.randn(48, 64, device="cuda")
     with torch.no_grad():
         fast = moe(x)
-        ref = reference_moe(moe, x)
+        ref = reference_moe(moe, x, mid_norm=norm_everywhere)
 
     d = (fast.float() - ref).abs().max().item()
     scale = ref.abs().max().item()

@@ -8,7 +8,7 @@
 
     presets   sgd, muon, right_polar, lm_head, left_polar, aus, hyperball,
               elr, sso
-    computes  RowL2, Sign (rows), Orthogonalise (unit), GramPolar (gram),
+    computes  RowL2, Sign (rows), Orthogonalise, Blocks (unit), GramPolar (gram),
               AUSMap, FrobeniusAUS, SpectralSphere
     phases    RowNorm, ColNorm, UnitNorm, Centre: the `pre` table
 
@@ -46,6 +46,7 @@ from .rules import (
     Result,
     RowsIdentity,
     Rule,
+    Scale,
     SCALES,
     StepCtx,
 )
@@ -157,6 +158,41 @@ class Orthogonalise(Compute):
 
     def core(self, x):
         return zeropower_backends[self.backend](x, steps=self.steps, eps=EPS)
+
+
+@dataclass(frozen=True)
+class Blocks(Compute):
+    """`inner` on equal blocks of the unit, each times `scale` of its own
+    shape: blocks of `rows` rows (the heads of a q, k or v unit) or of `cols`
+    columns (the heads feeding `wo`). Head-wise Muon."""
+
+    inner: Compute
+    rows: int = 0
+    cols: int = 0
+    scale: str = "one"
+
+    def __post_init__(self):
+        if (self.rows > 0) == (self.cols > 0):
+            raise ValueError("set exactly one of block_rows, block_cols")
+        if self.inner.kind != "unit" or self.inner.output != "update":
+            raise ValueError(f"blocks need a whole-unit orthogonaliser, not {self.inner}")
+        Scale(self.scale)
+
+    def check_unit(self, m, n):
+        size, dim = (self.rows, m) if self.rows else (self.cols, n)
+        if dim % size:
+            raise ValueError(f"blocks of {size} do not divide the [{m}, {n}] unit")
+
+    def core(self, x):
+        *b, m, n = x.shape
+        if self.rows:
+            y = self.inner.core(x.reshape(-1, self.rows, n))
+            return (y * SCALES[self.scale](self.rows, n)).reshape(x.shape)
+        k = n // self.cols
+        blocks = x.reshape(*b, m, k, self.cols).movedim(-2, -3)
+        y = self.inner.core(blocks.reshape(-1, m, self.cols))
+        y = y.reshape(blocks.shape) * SCALES[self.scale](m, self.cols)
+        return y.movedim(-3, -2).reshape(x.shape)
 
 
 @dataclass(frozen=True)
@@ -528,9 +564,21 @@ def sgd(pre="identity", compute="identity", steps=0, scale="one") -> Rule:
 
 
 @register("muon")
-def muon(pre="identity", compute="newtonschulz5", steps=5, scale="spectral") -> Rule:
-    """Muon / Scion: an orthogonalising compute and the spectral scale."""
-    return plain(pre, compute, steps, scale)
+def muon(
+    pre="identity",
+    compute="newtonschulz5",
+    steps=5,
+    scale="spectral",
+    block_rows=0,
+    block_cols=0,
+) -> Rule:
+    """Muon / Scion: an orthogonalising compute and the spectral scale.
+    `block_rows` / `block_cols` (e.g. head_dim): orthogonalise and scale each
+    block of that many rows / columns on its own -- head-wise Muon."""
+    if not (block_rows or block_cols):
+        return plain(pre, compute, steps, scale)
+    blocks = Blocks(compute_of(compute, steps), int(block_rows), int(block_cols), scale)
+    return Rule(pick(PRE, pre, "pre"), blocks)
 
 
 @register("right_polar", own={"compute"})

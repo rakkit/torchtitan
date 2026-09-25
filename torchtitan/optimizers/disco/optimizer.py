@@ -61,7 +61,7 @@ from .layout import (
 from .metrics import ExpertUnits, MetricSink, pseudo_post_update_weight, UnitValues
 from .presets import Sign
 from .rules import compile_limits, Result, Rule, rule_of, RULES, StepCtx
-from .transport import Exchange, Replicated, Unit, unit_rows
+from .transport import deal, Exchange, Replicated, Unit, unit_rows
 
 logger = logging.getLogger(__name__)
 
@@ -344,18 +344,19 @@ class DiSCO(torch.optim.Optimizer):
                 st["momentum_buffer"] = torch.zeros_like(p)
             if "radial_state" not in st:
                 if e.family is Family.EXPERT and isinstance(p, DTensor):
+                    # One slot per unit: [E] or, fused, [E, 2]; sharded as p.
                     st["radial_state"] = {
                         n: distribute_tensor(
-                            torch.zeros(p.shape[0], device=p.device),
+                            torch.zeros(p.shape[:-2], device=p.device),
                             p.device_mesh,
                             p.placements,
                         )
                         for n in RADIAL_ACCUMULATOR_NAMES
                     }
                 else:
-                    # Experts: one slot per expert; fused params: per unit.
+                    # One slot per unit (experts, fused params).
                     if e.family is Family.EXPERT:
-                        shape = (p.shape[0],)
+                        shape = (len(e.units),)
                     else:
                         shape = (len(e.units),) if len(e.units) > 1 else ()
                     st["radial_state"] = new_radial_state(p.device, shape=shape)
@@ -370,7 +371,7 @@ class DiSCO(torch.optim.Optimizer):
                 shape = e.rule.compute.state_shape(*e.units[0].shape)
                 if e.family is Family.EXPERT and isinstance(p, DTensor):
                     st["rule_state"] = distribute_tensor(
-                        torch.zeros(p.shape[0], *shape, device=p.device),
+                        torch.zeros(*p.shape[:-2], *shape, device=p.device),
                         p.device_mesh,
                         p.placements,
                     )
@@ -448,6 +449,11 @@ class DiSCO(torch.optim.Optimizer):
                         "a wide unit's [n, n] Gram is rank-deficient. Use muon or "
                         "left_polar for it."
                     )
+                for u in e.units:
+                    try:
+                        rule.compute.check_unit(u.shape[0], u.shape[-1])
+                    except ValueError as err:
+                        raise ValueError(f"{name}, unit {u.name!r}: {err}") from None
                 entries.append(e)
         self.entries = entries
         self._init_state()
@@ -498,7 +504,14 @@ class DiSCO(torch.optim.Optimizer):
                 raise ValueError(
                     f"sharded axis size {world} != fsdp mesh size {mesh.size()}"
                 )
-            owner = [u.index % world for u in units]
+            step_units = [u for u in units if self._is_matrix(u)]
+            step_idx = {u.index for u in step_units}
+            # The step's units are dealt on their own: the logging-only rest
+            # must not shift them.
+            owner_of = deal(step_units, world) | deal(
+                [u for u in units if u.index not in step_idx], world
+            )
+            owner = [owner_of[u.index] for u in units]
             kw = dict(
                 axis=axis,
                 group=self._shard_group,
@@ -507,8 +520,6 @@ class DiSCO(torch.optim.Optimizer):
                 dtype=cd,
                 owner=owner,
             )
-            step_units = [u for u in units if self._is_matrix(u)]
-            step_idx = {u.index for u in step_units}
             vocab = {
                 u.index
                 for u in units
@@ -541,12 +552,6 @@ class DiSCO(torch.optim.Optimizer):
         rep = fam[Family.REPLICATED]
         mesh = metrics_shard_mesh(pd)  # owners live in the metric sink's rank space
         w = mesh.size() if mesh is not None else 1
-        if w > 1:  # snake over owner blocks: each rank gets big and small units
-            blocks = [rep[i : i + w] for i in range(0, len(rep), w)]
-            rep = [
-                e for b, blk in enumerate(blocks) for e in (blk[::-1] if b % 2 else blk)
-            ]
-            fam[Family.REPLICATED] = rep
         units = []
         for i, e in enumerate(rep):
             e.rep = i
@@ -908,9 +913,9 @@ class DiSCO(torch.optim.Optimizer):
     def _state_rows(self, e: _Entry, p0: int, n: int) -> torch.Tensor:
         """Units `p0 .. p0 + n` of `e`'s rule state, as a view."""
         t = self.state[e.param]["rule_state"]
-        if isinstance(t, DTensor):  # experts: the rows of the local experts
+        if isinstance(t, DTensor):  # experts: the rows of the local units
             l0 = e.local_units.index(p0)
-            return t.to_local()[l0 : l0 + n]
+            return _unit_rows(e, t.to_local())[l0 : l0 + n]
         return t[p0 : p0 + n]
 
     def _coef_of(self, e: _Entry) -> torch.Tensor:
@@ -1006,28 +1011,34 @@ class DiSCO(torch.optim.Optimizer):
             if n_local == 0:
                 continue
             r = e0.rule
-            k, m, n = len(block), e0.local.shape[1], e0.local.shape[2]
-            big = self._big[bi]  # the block's moments
+            m, n = e0.units[0].shape
+            k, nu = len(block), len(e0.local_units)  # units per rank per entry
+            big = self._big[bi].view(k * nu, m, n)  # the block's moments
             if any(
-                eff[e.i].data_ptr() != big[j * n_local].data_ptr()
+                eff[e.i].data_ptr() != big[j * nu].data_ptr()
                 for j, e in enumerate(block)
             ):  # pre phases or nesterov made new tensors
-                big = torch.cat([eff[e.i].view(n_local, m, n) for e in block])
-            w = torch.cat([e.local for e in block]) if r.needs_weight else None
+                big = torch.cat([eff[e.i].view(nu, m, n) for e in block])
+            w = (
+                torch.cat([e.local.view(nu, m, n) for e in block])
+                if r.needs_weight
+                else None
+            )
             pairs = [(e, e.units[pos]) for e in block for pos in e.local_units]
             res = self._run(r, big, w, e0, pairs, lone_2d=False)
-            out = res.update.view(k, n_local, m, n)
+            out = res.update.view(k, nu, m, n)
             for j, e in enumerate(block):
                 u[e.i] = out[j]
                 if values is not None:
-                    a = None if res.alpha is None else res.alpha.view(k, n_local)[j]
+                    a = None if res.alpha is None else res.alpha.view(k, nu)[j]
+                    w_units = e.local.view(nu, m, n)
                     metric.append(
                         ExpertUnits(
                             e.i,
-                            e.local,
-                            big.view(k, n_local, m, n)[j],
+                            w_units,
+                            big.view(k, nu, m, n)[j],
                             out[j],
-                            functools.partial(self._terms, e, e.local, out[j], a),
+                            functools.partial(self._terms, e, w_units, out[j], a),
                             self._exact(e),
                             self._radial(e),
                         )
@@ -1036,8 +1047,8 @@ class DiSCO(torch.optim.Optimizer):
             per = self._sink.expert_block_values(metric)
             for x in metric:
                 e = self.entries[x.key]
-                for local_e, global_e in enumerate(self._expert_indices(e)):
-                    values[f"ep_{global_e}/{e.clean}"] = per[x.key][local_e]
+                for local_e, g in enumerate(self._expert_indices(e)):
+                    values[_expert_key(e, g)] = per[x.key][local_e]
 
     def _send_sharded(self, eff, values):
         """Issue the sharded units' exchanges to their owners without waiting:
@@ -1391,7 +1402,8 @@ class DiSCO(torch.optim.Optimizer):
                 final[f"head_{m}/{k}"] = buf[i * n + j]
 
     def _expert_indices(self, e: _Entry) -> list[int]:
-        m = int(e.param.shape[1])
+        """The global unit index of each unit this rank holds of `e`."""
+        m = e.units[0].shape[0]
         return [
             s // m + i
             for s, n in local_rows(e.param, e.view).runs
@@ -1435,13 +1447,13 @@ class DiSCO(torch.optim.Optimizer):
             for r, g in enumerate(ranks):
                 coord = [int(c) for c in (mesh.mesh == g).nonzero()[0].tolist()]
                 for e in es:
-                    m = int(e.param.shape[1])
+                    m = e.units[0].shape[0]
                     for s0, n in rows_of_coordinate(
                         e.param.shape, e.view, e.param, coord
                     ).runs:
                         for i in range(n // m):
                             sink.add(
-                                f"ep_{s0 // m + i}/{e.clean}", tuple(e.param.shape), r
+                                _expert_key(e, s0 // m + i), tuple(e.param.shape), r
                             )
         sink.finalize()
         self._sink_ready = True
@@ -1479,10 +1491,26 @@ def _alpha_of(res: Result, j: int):
 def _key(e: _Entry, u: Unit) -> str:
     """A named unit logs under the name a split parameter would have had:
     `...qkv_linear.wqkv` + `wq` -> `...qkv_linear.wq`, `...w13` + `w1` -> `...w1`."""
-    if not u.name:
-        return e.clean
-    head = e.clean.rsplit(".", 1)[0]
-    return f"{head}.{u.name}" if head != e.clean else u.name
+    return _split_name(e.clean, u.name)
+
+
+def _split_name(clean: str, name: str) -> str:
+    if not name:
+        return clean
+    head = clean.rsplit(".", 1)[0]
+    return f"{head}.{name}" if head != clean else name
+
+
+def _expert_key(e: _Entry, g: int) -> str:
+    """Expert unit `g`: `ep_{expert}/` and the name its split weight would have."""
+    expert, _, name = e.units[g].name.partition(".")
+    return f"ep_{expert}/{_split_name(e.clean, name)}"
+
+
+def _unit_rows(e: _Entry, t: torch.Tensor) -> torch.Tensor:
+    """An expert tensor `[E_local, ..., rest]` as one row per unit: its leading
+    dims up to the unit's matrix flattened (`[E, 2, F, D]` -> `[2E, F, D]`)."""
+    return t.flatten(0, e.param.ndim - 3)
 
 
 def unit_rows_local(rows2d: torch.Tensor, runs: RunList) -> torch.Tensor:

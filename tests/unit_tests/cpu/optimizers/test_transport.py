@@ -9,7 +9,13 @@
 import torch
 
 from torchtitan.optimizers.disco.layout import RunList
-from torchtitan.optimizers.disco.transport import batches_of, Exchange, Replicated, Unit
+from torchtitan.optimizers.disco.transport import (
+    batches_of,
+    deal,
+    Exchange,
+    Replicated,
+    Unit,
+)
 
 
 def _unit(index, param_index, shape, batch, rows=None):
@@ -65,6 +71,23 @@ def test_replicated_fused_units_take_their_rows_and_write_them_back():
     want[4:6] *= 2
     want[2:4] *= 3
     assert torch.equal(out[0], want)
+
+
+def test_fused_units_are_dealt_apart():
+    # Three layers of a fused [q; k; v], q four times the rows of k or v. In
+    # parameter order (q k v q k v q k v), `index % 3` put every q on rank 0.
+    us = [
+        _unit(3 * layer + i, layer, shape, 0)
+        for layer in range(3)
+        for i, shape in enumerate(((8, 4), (2, 4), (2, 4)))
+    ]
+    owner = deal(us, 3)
+    assert sorted(owner[u.index] for u in us if u.shape == (8, 4)) == [0, 1, 2]
+    loads = [0] * 3
+    for u in us:
+        m, n = u.shape
+        loads[owner[u.index]] += m * n * min(m, n)
+    assert len(set(loads)) == 1, loads
 
 
 def test_packed_row_views_are_kept_only_for_memory_that_persists():

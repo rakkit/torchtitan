@@ -134,6 +134,7 @@ class EvaluationRuntime:
             pp=1,
             ep=1,
             world_size=world_size,
+            enable_sequence_parallel=False,
         )
         parallel_dims.build_mesh()
 

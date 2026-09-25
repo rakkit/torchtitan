@@ -25,7 +25,6 @@ from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.rope import CosSinRoPE
 from torchtitan.models.opt_moe.gated_norm_swattention import GatedNormSWAttention
 from torchtitan.models.opt_moe.model import OPTMoEModel
-from torchtitan.models.opt_moe.norm_moe import NormGroupedExperts
 from torchtitan.models.opt_moe.utils.norms import (
     ALL_NORM_PARAM_NAMES,
     build_norm_config,
@@ -87,7 +86,6 @@ def main():
     for name, cls in (
         ("OPTMoEModel", OPTMoEModel.Config),
         ("GatedNormSWAttention", GatedNormSWAttention.Config),
-        ("NormGroupedExperts", NormGroupedExperts.Config),
     ):
         names = [f.name for f in dataclasses.fields(cls)]
         check(
@@ -128,9 +126,8 @@ def main():
         )
 
     # WHOLE-MODEL walk. The per-attention check above cannot see
-    # `embeddings_norm` (model.py) or `NormGroupedExperts.mid_norm`
-    # (norm_moe.py) -- dropping the threading at either site left the suite
-    # green. Build the real model and assert EVERY parameter of EVERY norm has
+    # `embeddings_norm` (model.py) -- dropping the threading there left the
+    # suite green. Build the real model and assert EVERY parameter of EVERY norm has
     # a declared placement, which is the property the sharding actually needs.
     print("whole-model walk: every norm parameter has a declared placement")
     import copy
@@ -141,7 +138,7 @@ def main():
 
     for flavor, norm_type in (
         ("gauge-d16-w512-embeddings-norm", "rmsnorm"),  # exercises embeddings_norm
-        ("bsc-1B-7B-opt-g-proxy-8layers", "rmsnorm"),  # exercises MoE mid_norm
+        ("bsc-1B-7B-opt-g-proxy-8layers", "rmsnorm"),  # an MoE model
     ):
         if flavor not in moe_opt_moe_configs:
             check(f"{flavor}: present in registry", False, "flavor missing")
@@ -153,9 +150,6 @@ def main():
         spec.layer.attention.qk_norm = True
         spec.layer.attention.v_norm = True
         spec.layer.attention.mid_norm = True
-        if spec.layer.moe is not None:
-            spec.layer.moe.norm_type = norm_type
-            spec.layer.moe.norm_everywhere = True
         # `update_from_config` populates tok_embeddings/layers, which
         # set_opt_moe_sharding_config walks.
         job = moe_template_config()

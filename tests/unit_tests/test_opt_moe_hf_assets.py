@@ -148,7 +148,6 @@ def _build_native_moe_model_config() -> OPTMoEModel.Config:
             feed_forward=FeedForward.Config(
                 hidden_dim=18,
                 norm_everywhere=False,
-                activation_type="silu",
             ),
             moe=MoE.Config(
                 hidden_dim=24,
@@ -157,7 +156,6 @@ def _build_native_moe_model_config() -> OPTMoEModel.Config:
                 top_k=4,
                 scaling_factor=1.0,
                 norm_everywhere=True,
-                activation_type="silu",
             ),
         ),
         rope=CosSinRoPE.Config(
@@ -183,12 +181,22 @@ class _ConfigOnlyModel:
 def _copy_attention_weights(
     native_attention: GatedNormSWAttention,
     hf_attention: OptMoEAttention,
+    *,
+    head_dim: int,
 ) -> None:
     with torch.no_grad():
-        qkv = native_attention.qkv_linear
-        hf_attention.q_proj.weight.copy_(qkv.wq.weight)
-        hf_attention.k_proj.weight.copy_(qkv.wk.weight)
-        hf_attention.v_proj.weight.copy_(qkv.wv.weight)
+        q, k, v = (
+            hf_attention.q_proj.weight,
+            hf_attention.k_proj.weight,
+            hf_attention.v_proj.weight,
+        )
+        # wqkv is [n_kv, heads_per_kv + 2, head_dim, D]: the q heads, k, v.
+        packed = native_attention.qkv_linear.wqkv.weight.view(
+            k.shape[0] // head_dim, -1, head_dim, q.shape[1]
+        )
+        q.copy_(packed[:, :-2].reshape_as(q))
+        k.copy_(packed[:, -2].reshape_as(k))
+        v.copy_(packed[:, -1].reshape_as(v))
         hf_attention.o_proj.weight.copy_(native_attention.wo.weight)
         hf_attention.gate_proj.weight.copy_(native_attention.gate_proj.weight)
 
@@ -264,7 +272,9 @@ class TestOptMoEHFAssets(unittest.TestCase):
                     self.assertIsInstance(native_attention.v_norm, torch.nn.Identity)
                     self.assertIsInstance(hf_attention.v_norm, torch.nn.Identity)
 
-                _copy_attention_weights(native_attention, hf_attention)
+                _copy_attention_weights(
+                    native_attention, hf_attention, head_dim=16
+                )
                 native_attention.to("cuda")
                 hf_attention.to("cuda")
 

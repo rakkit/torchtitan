@@ -4,55 +4,57 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 import torch
+import torch.nn.functional as F
+
+from torchtitan.models.common.activation import BinaryActivationFn, SwiGLU
 
 
-def squared_relu(x: torch.Tensor) -> torch.Tensor:
-    return torch.square(torch.nn.functional.relu(x))
+class MidNormActivation(BinaryActivationFn):
+    """`inner(gate, up)`, then a parameter-free norm over the hidden dim: the
+    FFN / expert mid-norm, kept for testing it. An activation holds no
+    parameters, so only the `np_*` norms are available."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BinaryActivationFn.Config):
+        inner: BinaryActivationFn.Config = field(default_factory=SwiGLU.Config)
+        norm_type: str = "np_rmsnorm"
+        eps: float = 1e-30
+
+        def __post_init__(self) -> None:
+            if self.norm_type not in ("np_rmsnorm", "np_layernorm"):
+                raise ValueError(
+                    "the mid-norm needs a parameter-free norm (np_rmsnorm or "
+                    f"np_layernorm), got {self.norm_type!r}"
+                )
+
+    def __init__(self, config: Config) -> None:
+        self.inner = config.inner.build()
+        self.norm_type, self.eps = config.norm_type, config.eps
+
+    def __call__(
+        self, gate: torch.Tensor, up: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
+        h = self.inner(gate, up, **kwargs)
+        if self.norm_type == "np_rmsnorm":
+            return F.rms_norm(h, (h.shape[-1],), eps=self.eps)
+        return F.layer_norm(h, (h.shape[-1],), eps=self.eps)
 
 
-def approx_gelu(x: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.gelu(x, approximate="tanh")
-
-
-def quick_gelu(x: torch.Tensor) -> torch.Tensor:
-    return x * torch.nn.functional.sigmoid(1.702 * x)
-
-
-ACTIVATION_FUNCTIONS = {
-    "silu": torch.nn.functional.silu,
-    "squared_relu": squared_relu,
-    "elu": torch.nn.functional.elu,
-    "relu": torch.nn.functional.relu,
-    "selu": torch.nn.functional.selu,
-    "gelu": torch.nn.functional.gelu,
-    "approx_gelu": approx_gelu,
-    "quick_gelu": quick_gelu,
-    "sigmoid": torch.nn.functional.sigmoid,
-}
-
-
-def build_activation(activation_type: str) -> Callable:
-    """
-    Builds the specified activation function based on the
-    activation_type.
-
-    Args:
-        activation_type (str): The type of activation layer to build.
-
-    Returns:
-        The built activation function.
-
-    Raises:
-        NotImplementedError: If an unknown `activation_type` is
-            provided.
-    """
-    activation_type = activation_type.lower()  # Normalize to lowercase
-
-    activation_fn = ACTIVATION_FUNCTIONS.get(activation_type)
-    if activation_fn is not None:
+def ffn_activation(
+    activation_fn: BinaryActivationFn.Config,
+    *,
+    mid_norm: bool,
+    norm_type: str,
+    norm_eps: float,
+) -> BinaryActivationFn.Config:
+    """What an FFN or expert block applies between `w13` and `w2`:
+    `activation_fn`, wrapped in the mid-norm when it is on."""
+    if not mid_norm:
         return activation_fn
-    else:
-        raise NotImplementedError(f"Unknown activation_type: '{activation_type}'")
+    return MidNormActivation.Config(
+        inner=activation_fn, norm_type=norm_type, eps=norm_eps
+    )

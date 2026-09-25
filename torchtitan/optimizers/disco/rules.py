@@ -169,6 +169,9 @@ class Compute:
     def state_shape(self, m: int, n: int) -> tuple[int, ...]:
         return ()
 
+    def check_unit(self, m: int, n: int) -> None:
+        """Raise ValueError if the compute cannot run on an `[m, n]` unit."""
+
 
 @dataclass(frozen=True)
 class RowsIdentity(Compute):

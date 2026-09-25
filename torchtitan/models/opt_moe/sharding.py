@@ -184,16 +184,12 @@ def set_opt_moe_sharding_config(
         layer_cfg.attention.norm_sharding_config = _replicated_norm
         if getattr(layer_cfg, "feed_forward", None) is not None:
             layer_cfg.feed_forward.linear_sharding_config = _replicated_linear
-            layer_cfg.feed_forward.norm_sharding_config = _replicated_norm
 
-        # MoE layers: fully_shard rejects the grouped expert weights outright
-        # ("Got plain tensor for parameter 'w1_EFD'") because they are raw 3-D
-        # nn.Parameters on NormGroupedExperts rather than Linear submodules, so
-        # nothing else stamps them. The router gate and shared experts need the
-        # same treatment. NOTE: the config goes on `inner_experts`, NOT on
-        # NormMoE itself, which owns extra buffers (load_balance_loss,
-        # router_entropy, ...) that `_distribute_states` would then demand
-        # placements for.
+        # MoE layers: the routed experts' grouped linears, the router gate and
+        # the shared experts each need a weight placement before fully_shard.
+        # NOTE: nothing goes on NormMoE itself, which owns extra buffers
+        # (load_balance_loss, router_entropy, ...) that `_distribute_states`
+        # would then demand placements for.
         # KNOWN GAP (CP): `rope.cache` stays a PLAIN tensor while everything
         # around it becomes a DTensor. llama3/qwen3 get its placement from
         # `set_gqa_attention_sharding`, which cannot be used here (it asserts
@@ -206,43 +202,28 @@ def set_opt_moe_sharding_config(
         # unverified and needs a real multi-GPU CP run to settle.
         moe_cfg = getattr(layer_cfg, "moe", None)
         if moe_cfg is not None:
-            inner = moe_cfg.routed_experts.inner_experts
-            inner.sharding_config = ShardingConfig(
-                state_shardings={
-                    name: dense_param_placement(tp=spmd.I)
-                    for name in ("w1_EFD", "w2_EDF", "w3_EFD")
-                }
+            routed = moe_cfg.routed_experts
+            routed.w13.sharding_config = routed.w2.sharding_config = ShardingConfig(
+                state_shardings={"weight": dense_param_placement(tp=spmd.I)}
             )
-            inner.norm_sharding_config = _replicated_norm
             moe_cfg.router.gate.sharding_config = _replicated_linear
             if getattr(moe_cfg, "shared_experts", None) is not None:
                 moe_cfg.shared_experts.linear_sharding_config = _replicated_linear
-                moe_cfg.shared_experts.norm_sharding_config = _replicated_norm
 
             if enable_ep:
-                # EXPERT PARALLEL. Take the routed-expert plan from upstream's
-                # own helpers rather than re-deriving it: `w1_EFD/w2_EDF/w3_EFD`
-                # are the same parameter names upstream's GroupedExperts uses.
-                #
-                # Only the ROUTED-expert pieces come from upstream. Two parts of
-                # `set_moe_sharding_config` are deliberately not used:
-                #   * `shared_experts.w1/.w2/.w3` -- norm_moe's shared_experts
-                #     config is FLAT (it builds its Linears internally), so it
-                #     has no `.w1`; it goes through `linear_sharding_config`
-                #     above instead. Calling upstream's helper raises
-                #     AttributeError: 'Config' object has no attribute 'w1'.
-                #   * `moe_cfg.sharding_config` -- NormMoE owns buffers upstream's
-                #     MoE does not (load_balance_loss, router_entropy,
-                #     tokens_per_expert_E, expert_bias_E, acc_fwd_times,
-                #     tokens_per_expert_cumul). Declaring a plan on the wrapper
-                #     makes `_distribute_states` demand a placement for each of
-                #     them.
-                routed_cfg, inner_cfg = _routed_experts_sharding_configs(
+                # EXPERT PARALLEL: the routed experts are upstream's, so their
+                # plan comes from upstream's helper. Not `set_moe_sharding_config`
+                # as a whole: the shared experts' config is flat (its Linears
+                # are built inside, planned through `linear_sharding_config`),
+                # and NormMoE owns buffers upstream's MoE does not, for which a
+                # plan on the wrapper would demand placements.
+                routed_cfg, w13_cfg, w2_cfg = _routed_experts_sharding_configs(
                     enable_ep=True,
                     enable_sp=enable_sp,
                 )
-                moe_cfg.routed_experts.sharding_config = routed_cfg
-                inner.sharding_config = inner_cfg
+                routed.sharding_config = routed_cfg
+                routed.w13.sharding_config = w13_cfg
+                routed.w2.sharding_config = w2_cfg
                 # The router MODULE gets the token redistribution plan; the gate
                 # keeps the replicated-weight plan set above (upstream's
                 # `_router_gate_sharding_config` at tp=1).

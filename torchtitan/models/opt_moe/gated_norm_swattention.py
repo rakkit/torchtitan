@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-from torch.distributed.tensor import distribute_tensor, DTensor
 
 from torchtitan.models.common.attention import (
     AttentionMasksType,
@@ -19,51 +18,16 @@ from torchtitan.models.common.attention import (
     InnerAttention,
     QKVLinear,
 )
-from torchtitan.models.common.config_utils import get_attention_config
+from torchtitan.models.common.config_utils import (
+    fused_qkv_param_init,
+    get_attention_config,
+)
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
-from .split_qkv import SplitQKVLinear
 from .utils.inits import make_param_init
 from .utils.norms import build_norm_config
-
-
-def _fused_qkv_init(wq_init, wk_init, wv_init, *, n_heads, n_kv_heads, head_dim):
-    """Init a fused wqkv as the three split projections would be.
-
-    Rows are interleaved per KV group, and `scaled_orthogonal` scales by the
-    shape it is given, so each projection is drawn at its own split shape.
-    """
-    heads_per_kv = n_heads // n_kv_heads
-
-    def _init(weight):
-        in_features = weight.shape[-1]
-        full = torch.empty(
-            tuple(weight.shape), dtype=weight.dtype, device=weight.device
-        )
-        view = full.view(n_kv_heads, heads_per_kv + 2, head_dim, in_features)
-        for init_fn, rows, slot in (
-            (wq_init, n_heads, slice(0, heads_per_kv)),
-            (wk_init, n_kv_heads, slice(heads_per_kv, heads_per_kv + 1)),
-            (wv_init, n_kv_heads, slice(heads_per_kv + 1, heads_per_kv + 2)),
-        ):
-            buffer = torch.empty(
-                rows * head_dim, in_features, dtype=weight.dtype, device=weight.device
-            )
-            init_fn(buffer)
-            view[:, slot] = buffer.view(n_kv_heads, -1, head_dim, in_features)
-        _copy_full(weight, full)
-
-    return _init
-
-
-def _copy_full(weight, full):
-    """Write a full-shape plain tensor into a parameter, sharded or not."""
-    if isinstance(weight, DTensor):
-        weight.copy_(distribute_tensor(full, weight.device_mesh, weight.placements))
-    else:
-        weight.copy_(full)
 
 
 class GatedNormSWAttention(GQAttention):
@@ -100,8 +64,6 @@ class GatedNormSWAttention(GQAttention):
         norm_everywhere: bool = False
         gated_attention_type: str | None = None  # "none", "head-wise", "element-wise"
         gate_only: bool = False
-        fuse_qkv: bool = False
-        """One fused wqkv projection instead of split wq/wkv."""
         norm_eps: float = 1e-30
         norm_type: str = "np_rmsnorm"
         mid_norm_position: str = "after"  # "after" or "before"
@@ -177,61 +139,34 @@ class GatedNormSWAttention(GQAttention):
             head_dim = (
                 self.head_dim if self.head_dim is not None else self.dim // self.n_heads
             )
-            wq_init = {
-                "weight": make_param_init(self.wq_init_fn_type, self.wq_init_std)
-            }
-            wkv_init = {
-                "weight": make_param_init(self.wk_init_fn_type, self.wk_init_std)
-            }
-            if self.fuse_qkv:
-                wv_init = {
-                    "weight": make_param_init(self.wv_init_fn_type, self.wv_init_std)
-                }
-                qkv = QKVLinear.Config(
-                    head_dim=head_dim,
-                    n_heads=self.n_heads,
-                    n_kv_heads=n_kv,
-                    wqkv=Linear.Config(
-                        in_features=self.dim,
-                        out_features=(self.n_heads + 2 * n_kv) * head_dim,
-                        param_init={
-                            "weight": _fused_qkv_init(
-                                wq_init["weight"],
-                                wkv_init["weight"],
-                                wv_init["weight"],
-                                n_heads=self.n_heads,
-                                n_kv_heads=n_kv,
-                                head_dim=head_dim,
+            if {
+                (self.wk_init_fn_type, self.wk_init_std),
+                (self.wv_init_fn_type, self.wv_init_std),
+            } != {(self.wq_init_fn_type, self.wq_init_std)}:
+                raise ValueError(
+                    "wq, wk and wv initializers must match: the fused wqkv draws "
+                    "q, k and v with one initializer (fused_qkv_param_init)"
+                )
+            qkv = QKVLinear.Config(
+                head_dim=head_dim,
+                n_heads=self.n_heads,
+                n_kv_heads=n_kv,
+                wqkv=Linear.Config(
+                    in_features=self.dim,
+                    out_features=(self.n_heads + 2 * n_kv) * head_dim,
+                    param_init=fused_qkv_param_init(
+                        {
+                            "weight": make_param_init(
+                                self.wq_init_fn_type, self.wq_init_std
                             )
                         },
+                        n_heads=self.n_heads,
+                        n_kv_heads=n_kv,
+                        head_dim=head_dim,
                     ),
-                )
-            else:
-                if (self.wk_init_fn_type, self.wk_init_std) != (
-                    self.wv_init_fn_type,
-                    self.wv_init_std,
-                ):
-                    # SplitQKVLinear shares one config for wk and wv; fuse_qkv
-                    # does not, hence split-path only.
-                    raise ValueError(
-                        "wk and wv initializers must match "
-                        f"(got wk={self.wk_init_fn_type}/{self.wk_init_std}, "
-                        f"wv={self.wv_init_fn_type}/{self.wv_init_std}): "
-                        "SplitQKVLinear shares one config between them."
-                    )
-                qkv = SplitQKVLinear.Config(
-                    head_dim=head_dim,
-                    wq=Linear.Config(
-                        in_features=self.dim,
-                        out_features=self.n_heads * head_dim,
-                        param_init=wq_init,
-                    ),
-                    wkv=Linear.Config(
-                        in_features=self.dim,
-                        out_features=n_kv * head_dim,
-                        param_init=wkv_init,
-                    ),
-                )
+                    sharding_config=self.linear_sharding_config,
+                ),
+            )
 
             qk_norm = None
             if self.qk_norm or self.norm_everywhere:
@@ -241,13 +176,6 @@ class GatedNormSWAttention(GQAttention):
                     self.norm_eps,
                     sharding_config=self.norm_sharding_config,
                 )
-
-            if self.linear_sharding_config is not None:
-                if self.fuse_qkv:
-                    qkv.wqkv.sharding_config = self.linear_sharding_config
-                else:
-                    qkv.wq.sharding_config = self.linear_sharding_config
-                    qkv.wkv.sharding_config = self.linear_sharding_config
 
             return GQAttention.Config(
                 n_heads=self.n_heads,
@@ -408,12 +336,9 @@ class GatedNormSWAttention(GQAttention):
 
     def param_layouts(self) -> dict:
         """The fused wqkv is three units (q / k / v rows interleaved per KV group)."""
-        wqkv = getattr(self.qkv_linear, "wqkv", None)
-        if wqkv is None:
-            return {}
         from torchtitan.models.common.param_layout import named, ParamLayout, qkv_units
 
-        w = wqkv.weight
+        w = self.qkv_linear.wqkv.weight
         units = qkv_units(self.n_heads, self.n_kv_heads, self.head_dim, w.shape[-1])
         return {named(self, w): ParamLayout("matrix", units=units)}
 
@@ -424,9 +349,7 @@ class GatedNormSWAttention(GQAttention):
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = x_TD.shape[0]
-        # Q/K/V projection comes from GQAttention's pluggable qkv_linear, so
-        # fused and split projections are both available.
-        xq, xk, xv = self.qkv_linear(x_TD)
+        xq, xk, xv = self.qkv_linear(x_TD)  # upstream's fused QKVLinear
 
         # QK norm before RoPE (per Qwen3); V norm has no upstream equivalent.
         if self.q_norm is not None:

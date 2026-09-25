@@ -8,6 +8,8 @@ import json
 import os
 import shutil
 
+from torchtitan.models.common.activation import SwiGLU
+
 from ..utils.moe_utils import calc_gate_scaling_factor
 
 
@@ -90,6 +92,20 @@ def _qk_rope_dim_from_model_config(model_config, *, head_dim: int) -> int:
     return getattr(attn_cfg, "qk_rope_dim", None) or head_dim
 
 
+def _hidden_act_of(activation_fn) -> str:
+    if isinstance(activation_fn, SwiGLU.Config):
+        return "silu"
+    # The override's config is the same function.
+    from torchtitan.overrides.fused_swiglu import FusedSwiGLU
+
+    if isinstance(activation_fn, FusedSwiGLU.Config):
+        return "silu"
+    raise ValueError(
+        "opt_moe HF export has no hidden_act for "
+        f"{type(activation_fn).__qualname__}; only SwiGLU is exported."
+    )
+
+
 def _hidden_act_from_layer_configs(
     feed_forward_cfg,
     moe_cfg,
@@ -97,9 +113,9 @@ def _hidden_act_from_layer_configs(
     default_hidden_act: str | None = None,
 ) -> str | None:
     activation_types = {
-        cfg.activation_type
+        _hidden_act_of(cfg.activation_fn)
         for cfg in (feed_forward_cfg, moe_cfg)
-        if cfg is not None and getattr(cfg, "activation_type", None) is not None
+        if cfg is not None
     }
     if len(activation_types) > 1:
         raise ValueError(

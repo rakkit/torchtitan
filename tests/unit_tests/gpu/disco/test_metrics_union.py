@@ -59,17 +59,38 @@ def aus_reference(wb: torch.Tensor, wa: torch.Tensor) -> tuple[float, float]:
     return float(fro), float(spec(wb / spec(wb) - wa / spec(wa)))
 
 
-def expected_keys(model, norms: list[str]) -> set[str]:
+def unit_keys(clean: str, units) -> list[str]:
+    """The key of each unit: a fused param logs under the names its split
+    params would have had (`...wqkv` -> `...wq`, `...w13` -> `...w1`), an
+    expert unit (`3`, or `3.w1` when fused) under `ep_3/`."""
+    head = clean.rsplit(".", 1)[0]
+    keys = []
+    for u in units:
+        expert, _, name = u.name.rpartition(".")
+        if not expert and name.isdigit():
+            expert, name = name, ""
+        key = f"{head}.{name}" if name else clean
+        keys.append(f"ep_{expert}/{key}" if expert else key)
+    return keys
+
+
+def unit_matrix(t: torch.Tensor, u) -> torch.Tensor:
+    rows = t.reshape(-1, t.shape[-1])
+    return torch.cat([rows[a : a + n] for a, n in u.rows.runs]).reshape(u.shape)
+
+
+def units_by_param(container) -> dict[int, tuple]:
+    return {id(e.param): e.units for opt in container.optimizers for e in opt.entries}
+
+
+def expected_keys(model, units: dict[int, tuple], norms: list[str]) -> set[str]:
     keys = set()
     for name, p in harness.trainable(model):
         clean = remove_orig_mod_and_weight_for_p_name(name)
         if p.numel() == 1:
             keys.add(f"scalar_param_supremum/{clean}")
             continue
-        prefixes = (
-            [f"ep_{e}/{clean}" for e in range(p.shape[0])] if p.ndim == 3 else [clean]
-        )
-        for pre in prefixes:
+        for pre in unit_keys(clean, units[id(p)]):
             for n in norms:
                 keys.add(f"track_update_{n}/{pre}")
                 keys.add(f"track_param_{n}/{pre}")
@@ -144,8 +165,9 @@ class TestMetricsUnion(DTensorTestBase):
 
         gathered: list = [None] * self.world_size
         dist.all_gather_object(gathered, mine)
+        units = units_by_param(container)
         expected = expected_keys(
-            model, get_norms_to_log(list(cfg.optimizer.norms_to_log))
+            model, units, get_norms_to_log(list(cfg.optimizer.norms_to_log))
         )
 
         union = set().union(*gathered)
@@ -172,15 +194,11 @@ class TestMetricsUnion(DTensorTestBase):
             clean = remove_orig_mod_and_weight_for_p_name(name)
             if p.numel() == 1:
                 continue
-            u = ref.last_update[name]
-            w = ref.params[name]
-            wb = before[name]
-            if p.ndim == 3:
-                items = [
-                    (f"ep_{e}/{clean}", u[e], w[e], wb[e]) for e in range(p.shape[0])
-                ]
-            else:
-                items = [(clean, u, w, wb)]
+            u, w, wb = ref.last_update[name], ref.params[name], before[name]
+            items = [
+                (key, *(unit_matrix(t, unit) for t in (u, w, wb)))
+                for key, unit in zip(unit_keys(clean, units[id(p)]), units[id(p)])
+            ]
             for pre, u_e, w_e, wb_e in items:
                 fro, r2r = aus_reference(wb_e, w_e)
                 for key, want, tol in (
@@ -211,17 +229,18 @@ class TestMetricsUnion(DTensorTestBase):
             print("\n".join(problems[:20]))
         self.assertTrue(ok, f"rank {self.rank}: {problems[:3]}")
 
-    def _check_radial_checkpoint(self, topo: dict, *, fused: bool = False):
+    def _check_radial_checkpoint(self, topo: dict):
         """A unit's radial accumulators advance on its metric owner only, and
         DCP saves one copy of a plain tensor. After a save, a wipe and a load,
         every rank must hold the owner's values -- the owner is the rank whose
-        accumulators moved (replicas agree)."""
+        accumulators moved (replicas agree). The fused wqkv / w13 units have
+        different owners, so each slot must come back from its own."""
         device = self._device()
         pd = harness.parallel_dims(
             world_size=self.world_size, device_type=device.type, **topo
         )
         cfg = harness.trainer_config(
-            harness.tiny_model_config(moe=True, fuse_qkv=fused, fuse_w13=fused),
+            harness.tiny_model_config(moe=True),
             compute="svd",
             log_norm_freq=1,
             norms_to_log=("all",),
@@ -276,14 +295,6 @@ class TestMetricsUnion(DTensorTestBase):
     @with_comms
     def test_fsdp4_radial_survives_a_checkpoint(self):
         self._check_radial_checkpoint(dict(dp_replicate=1, dp_shard=4, cp=1, ep=1))
-
-    @with_comms
-    def test_fsdp4_fused_radial_survives_a_checkpoint(self):
-        """A fused param's units have different owners: each slot must come
-        back from its own owner, not the sum over them."""
-        self._check_radial_checkpoint(
-            dict(dp_replicate=1, dp_shard=4, cp=1, ep=1), fused=True
-        )
 
     @with_comms
     def test_hsdp22_radial_survives_a_checkpoint(self):

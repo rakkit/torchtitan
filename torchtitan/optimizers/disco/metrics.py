@@ -302,8 +302,8 @@ class MetricSink:
                 spectral = SpectralInputs(
                     *b_spec[:3], _stack_if_all(w_sig), *b_spec[3:]
                 )
-            state_local = {
-                name: (t.to_local() if isinstance(t, DTensor) else t)[:n_ep]
+            state_local = {  # one slot per unit: [E] or, fused, [E, 2] -> flat
+                name: (t.to_local() if isinstance(t, DTensor) else t).flatten()[:n_ep]
                 for name, t in radial_state.items()
             }
             radial = calculate_radial_metrics(

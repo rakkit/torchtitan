@@ -125,7 +125,9 @@ class TestRuleExtension(DTensorTestBase):
             float(v)
             for st in opt.state.values()
             if "rule_state" in st
-            for v in getattr(st["rule_state"], "_local_tensor", st["rule_state"])
+            for v in getattr(
+                st["rule_state"], "_local_tensor", st["rule_state"]
+            ).flatten()  # one slot per unit: [E, 2] for a fused expert w13
             if float(v) != 0.0
         ]
         if not states or any(s != STEPS for s in states):

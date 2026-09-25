@@ -26,12 +26,9 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
         super().__init__(model_config, hf_assets_path)
         # self.model_config and self.hf_assets_path already set by MoEStateDictAdapter
 
-        # NOTE: these native FQNs must track the model. The 0.5.0 port
-        # ("Rebuild OPT MoE attention on upstream's GQAttention") moved q/k/v
-        # under `qkv_linear`, renamed `output` -> `lm_head`, and moved experts
-        # under `routed_experts.inner_experts` with shape-suffixed names -- the
-        # map was not updated and to_hf silently dropped every one of them
-        # (21 tensors in, 10 out) behind a root-logger warning.
+        # NOTE: these native FQNs must track the model. The fused projections
+        # (`wqkv`, `w13`) are mapped through their logical names: `to_hf`
+        # splits them first (`_unfuse`), `from_hf` packs them last (`_fuse`).
         self.from_hf_map = {
             "model.embed_tokens.weight": "tok_embeddings.weight",
             "model.norm.weight": "norm.weight",
@@ -48,9 +45,9 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
             "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
             "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
             # MoE
-            "model.layers.{}.mlp.experts.{}.gate_proj.weight": "layers.{}.moe.routed_experts.inner_experts.w1_EFD",
-            "model.layers.{}.mlp.experts.{}.up_proj.weight": "layers.{}.moe.routed_experts.inner_experts.w3_EFD",
-            "model.layers.{}.mlp.experts.{}.down_proj.weight": "layers.{}.moe.routed_experts.inner_experts.w2_EDF",
+            "model.layers.{}.mlp.experts.{}.gate_proj.weight": "layers.{}.moe.routed_experts.w1_EFD",
+            "model.layers.{}.mlp.experts.{}.up_proj.weight": "layers.{}.moe.routed_experts.w3_EFD",
+            "model.layers.{}.mlp.experts.{}.down_proj.weight": "layers.{}.moe.routed_experts.w2.weight",
             "model.layers.{}.mlp.router.gate.weight": "layers.{}.moe.router.gate.weight",
             "model.layers.{}.mlp.expert_bias": "layers.{}.moe.expert_bias_E",
             "model.layers.{}.mlp.shared_experts.gate_proj.weight": "layers.{}.moe.shared_experts.w1.weight",
@@ -62,15 +59,65 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
     def _is_unsupported_norm_key(key: str) -> bool:
         return bool(
             re.match(
-                r"layers\.\d+\.(attention\.(q_norm|k_norm|v_norm|mid_norm)"
-                r"|feed_forward\.mid_norm"
-                r"|moe\.routed_experts\.inner_experts\.mid_norm"
-                r"|moe\.shared_experts\.mid_norm)\.",
+                r"layers\.\d+\.attention\.(q_norm|k_norm|v_norm|mid_norm)\.",
                 key,
             )
         )
 
+    @staticmethod
+    def _prefixes(keys, suffix: str) -> list[str]:
+        return sorted({k[: -len(suffix)] for k in keys if k.endswith(suffix)})
+
+    def _qkv_args(self) -> dict[str, int]:
+        attn = self.model_config.layer.attention
+        n_kv = attn.n_kv_heads or attn.n_heads
+        return {
+            "head_dim": attn.head_dim or attn.dim // attn.n_heads,
+            "heads_per_kv": attn.n_heads // n_kv,
+        }
+
+    def _unfuse(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """The fused projections as the logical weights the HF map names."""
+        sd = dict(state_dict)
+        for prefix in self._prefixes(sd, "wqkv.weight"):
+            self._split_qkv_linear(sd, prefix=prefix, **self._qkv_args())
+        for prefix in self._prefixes(sd, "w13.weight"):
+            experts = prefix.endswith("routed_experts.")
+            self._split_stacked_linear(
+                sd,
+                fused_key=f"{prefix}w13.weight",
+                logical_keys=(
+                    (f"{prefix}w1_EFD", f"{prefix}w3_EFD")
+                    if experts
+                    else (f"{prefix}w1.weight", f"{prefix}w3.weight")
+                ),
+                dim=1 if experts else 0,
+            )
+        return sd
+
+    def _fuse(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """The inverse of `_unfuse`."""
+        sd = dict(state_dict)
+        for prefix in self._prefixes(sd, "wq.weight"):
+            self._merge_qkv_linear(sd, prefix=prefix, **self._qkv_args())
+        for prefix in self._prefixes(sd, "w1.weight"):
+            self._stack_logical_linears(
+                sd,
+                fused_key=f"{prefix}w13.weight",
+                logical_keys=(f"{prefix}w1.weight", f"{prefix}w3.weight"),
+                dim=0,
+            )
+        for prefix in self._prefixes(sd, "w1_EFD"):
+            self._stack_logical_linears(
+                sd,
+                fused_key=f"{prefix}w13.weight",
+                logical_keys=(f"{prefix}w1_EFD", f"{prefix}w3_EFD"),
+                dim=1,
+            )
+        return sd
+
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        state_dict = self._unfuse(state_dict)
         # Both native (apply_rotary_emb_cos_sin / rotate_half) and HF use the
         # "consecutive halves" RoPE convention, so wq/wk weights are copied verbatim.
         to_hf_map = {v: k for k, v in self.from_hf_map.items()}
@@ -110,7 +157,7 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
 
                 new_key = to_hf_map[abstract_key]
 
-                if "routed_experts.inner_experts" in key:
+                if "moe.routed_experts." in key:
                     # Store the GroupedExperts Weight metadata for from_hf()
                     if isinstance(value, DTensor):
                         self.grouped_expert_weight_placements[
@@ -235,4 +282,4 @@ class OPTMoEStateDictAdapter(MoEStateDictAdapter):
                     continue
                 state_dict[new_key] = value
 
-        return state_dict
+        return self._fuse(state_dict)

@@ -83,7 +83,7 @@ def main() -> int:
     # so the inverse map is keyed only by real native names.
     to_hf_map = {v: k for k, v in adapter.from_hf_map.items() if v is not None}
     unmapped = []
-    for key in exportable:
+    for key in adapter._unfuse(exportable):
         abstract = re.sub(r"(\d+)", "{}", key, count=1) if "layers" in key else key
         if abstract not in to_hf_map:
             unmapped.append(key)
@@ -116,11 +116,20 @@ def main() -> int:
     for abstract_name in (
         "layers.{}.attention.qkv_linear.wq.weight",  # was layers.{}.attention.wq.weight
         "lm_head.weight",  # was output.weight
-        "layers.{}.moe.routed_experts.inner_experts.w1_EFD",  # was layers.{}.moe.experts.w1
+        "layers.{}.moe.routed_experts.w1_EFD",  # the gate half of the fused w13
         "layers.{}.moe.expert_bias_E",  # was layers.{}.moe.expert_bias
     ):
         if abstract_name not in to_hf_map:
             failures.append(f"0.5.0 rename missing from from_hf_map: {abstract_name}")
+
+    # 6. Values survive the round trip: the fused wqkv / w13 are split into
+    #    HF's projections and packed back, so a wrong interleave shows here.
+    torch.manual_seed(0)
+    real = {k: torch.randn(v.shape) for k, v in exportable.items()}
+    real_back = adapter.from_hf(adapter.to_hf(real))
+    changed = [k for k in real if not torch.equal(real[k], real_back[k])]
+    if changed:
+        failures.append(f"round trip CHANGED values of {sorted(changed)[:6]}")
 
     print(
         f"  round trip: {len(hf)} HF -> {len(back)} native "

@@ -13,12 +13,12 @@ conversion for the expert weights, FP32 router gradients (not just FP32 forward)
 expert counts derived from the routing map instead of a second ``torch.histc``,
 and dispatchers for expert parallelism (all-to-all, DeepEP, HybridEP).
 
-So the fork now subclasses upstream instead of duplicating it. What remains
-here is only what upstream has no equivalent for:
+So the fork now subclasses upstream instead of duplicating it. The routed
+experts are upstream's ``RoutedExperts`` (fused ``w13`` ``[E, 2, F, D]``, one
+grouped GEMM). What remains here is only what upstream has no equivalent for:
 
-  * ``norm_everywhere`` -- a norm between the gated activation and the down
-    projection, inside the grouped expert GEMM.
-  * a configurable activation (upstream hardcodes SiLU).
+  * the mid-norm (``norm_everywhere``), an activation wrapper
+    (``MidNormActivation``) kept for testing it.
   * the sequence-wise / batch-wise auxiliary load-balance loss, whose gradient
     is injected at the layer via ``LoadBalanceLoss`` rather than returned.
     Upstream's MoE is aux-loss-free and steers balance purely through the
@@ -42,29 +42,27 @@ TENSOR parallelism.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple
 
-import spmd_types as spmd
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor
 
-from torchtitan.distributed.spmd_types import spmd_mesh_size
 from torchtitan.models.common.aux_loss import AuxLoss
-from torchtitan.models.common.config_utils import make_token_dispatcher_config
-from torchtitan.models.common.linear import RouterGateLinear
+from torchtitan.models.common.activation import BinaryActivationFn, SwiGLU
+from torchtitan.models.common.config_utils import (
+    fused_grouped_gate_up_param_init,
+    make_token_dispatcher_config,
+)
+from torchtitan.models.common.linear import GroupedLinear, RouterGateLinear
 from torchtitan.models.common.moe import QuantileBalancer, RoutedExperts
-from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.common.param_layout import named, ParamLayout
 from torchtitan.protocols.module import Module
 
 from .norm_ffn import FeedForward
-from .utils.activations import build_activation
+from .utils.activations import ffn_activation
 from .utils.inits import build_init_fn, make_param_init
 from .utils.moe_utils import calc_gate_scaling_factor
-from .utils.norms import build_norm_config
 
 
 logger = logging.getLogger(__name__)
@@ -104,6 +102,12 @@ def init_all_experts_different(init_fn, w, init_std, slot, layer_id):
     # No copy back: `local_tensor` aliases `w`'s storage in both branches
     # above (`w.to_local()` shares it; the dense branch binds `w` itself), and
     # `init_fn` wrote through that alias in place. The copy was `w.copy_(w)`.
+
+
+def _expert_init(fn_type: str, std: float, slot: int, layer_id: int):
+    """An initializer drawing every expert with its own seed."""
+    init_fn = build_init_fn(fn_type)
+    return lambda w: init_all_experts_different(init_fn, w, std, slot, layer_id)
 
 
 def saint_check_scaling_factor(
@@ -361,148 +365,6 @@ def batch_wise_aux_loss(
     loss = (f_i * P_i).sum()
 
     return loss
-
-
-class NormGroupedExperts(Module):
-    """Grouped experts with a mid-norm and a configurable activation.
-
-    Upstream's ``forward`` is mirrored -- including the DTensor-to-local
-    conversion, which expert parallelism needs, since EP feeds dynamic shapes
-    that cannot be expressed as DTensors. The only changes are the activation
-    and the norm applied between the gated activation and the down projection.
-
-    NOT a subclass of ``common.moe.GroupedExperts``, deliberately. Subclassing
-    would remove real duplication (``_grouped_mm`` is identical bar its
-    docstring, and ``silu(gate) * up`` is bitwise equal to upstream's
-    ``SwiGLU``), but ``Config.traverse`` matches by ``isinstance``, so deriving
-    the Config would silently enrol these experts in the three quantization
-    transforms that traverse ``GroupedExperts.Config``. Those swap in a
-    quantized class chosen from ``type(config)._owner``, which knows nothing
-    about ``mid_norm``. opt_moe never enables quantization today, so it would be
-    a latent trap rather than a visible break -- which is the worse kind.
-    Revisit if the Config hierarchy stops driving transform matching.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        dim: int
-        hidden_dim: int
-        num_experts: int
-        norm_everywhere: bool = False
-        norm_type: str = "np_rmsnorm"
-        norm_eps: float = 1e-30
-        norm_sharding_config: Any | None = None
-        """Sharding plan for `mid_norm`, which this config builds internally.
-        See GatedNormSWAttention.Config.norm_sharding_config."""
-        activation_type: str = "silu"
-        layer_id: int = 0
-        # Per-expert initialization; see init_all_experts_different.
-        w1_init_fn_type: str = "scaled_orthogonal"
-        w2_init_fn_type: str = "scaled_orthogonal"
-        w3_init_fn_type: str = "scaled_orthogonal"
-        w1_init_std: float = 1.0
-        w2_init_std: float = 1.0
-        w3_init_std: float = 1.0
-        residual_div: float = 1.0
-        init_gate_as_residual: bool = False
-
-    def param_layouts(self) -> dict:
-        """Dim 0 of every expert weight is the batch of experts."""
-        return {
-            n: ParamLayout("expert_batch")
-            for n, _ in self.named_parameters(recurse=False)
-        }
-
-    def __init__(self, config: Config):
-        super().__init__()
-        self.config = config
-        self.num_experts = config.num_experts
-        self.w1_EFD = nn.Parameter(
-            torch.empty(config.num_experts, config.hidden_dim, config.dim)
-        )
-        self.w2_EDF = nn.Parameter(
-            torch.empty(config.num_experts, config.dim, config.hidden_dim)
-        )
-        self.w3_EFD = nn.Parameter(
-            torch.empty(config.num_experts, config.hidden_dim, config.dim)
-        )
-        self.act_fn = build_activation(config.activation_type)
-        if config.norm_everywhere:
-            self.mid_norm = build_norm_config(
-                config.norm_type,
-                config.hidden_dim,
-                config.norm_eps,
-                sharding_config=config.norm_sharding_config,
-            ).build()
-        else:
-            self.mid_norm = Identity.Config().build()
-
-    def forward(
-        self, x_RD: torch.Tensor, num_tokens_per_expert_E: torch.Tensor
-    ) -> torch.Tensor:
-        if isinstance(self.w1_EFD, DTensor):
-            # EP feeds dynamic shapes that cannot be expressed as DTensors, so
-            # drop to local tensors first. Mirrors upstream.
-            w1_EFD = self.w1_EFD.to_local()
-            assert isinstance(self.w2_EDF, DTensor)
-            w2_EDF = self.w2_EDF.to_local()
-            assert isinstance(self.w3_EFD, DTensor)
-            w3_EFD = self.w3_EFD.to_local()
-        else:
-            w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
-
-        offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
-        if spmd.is_type_checking() and spmd_mesh_size("ep") == 1:
-            for axis in ("dp", "cp"):
-                # if no EP, convert to V for grouped_mm, which would otherwise see
-                # x:R, w1:V, offsets:P in local SPMD typechecking.
-                # spmd.P is not currently allowed to mix with spmd.V.
-                # Verbatim from upstream `models/common/moe.py:85-96`.
-                spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
-
-        h_RF = self.act_fn(
-            self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E)
-        )
-        h_RF = h_RF * self._grouped_mm(
-            A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E
-        )
-        return self._grouped_mm(
-            A=self.mid_norm(h_RF), weight_EOI=w2_EDF, offs=offsets_E
-        ).type_as(x_RD)
-
-    def _init_self_parameters(self) -> None:
-        """Draw every expert's weights independently.
-
-        A single initializer over the ``(E, ...)`` parameter would work, but
-        seeding per (layer, slot, expert) keeps each expert's draw reproducible
-        and independent of the expert count.
-        """
-        cfg = self.config
-        w3_div = cfg.residual_div if cfg.init_gate_as_residual else 1.0
-        for slot, (w, fn_type, std) in enumerate(
-            (
-                (self.w1_EFD, cfg.w1_init_fn_type, cfg.w1_init_std),
-                (self.w2_EDF, cfg.w2_init_fn_type, cfg.w2_init_std / cfg.residual_div),
-                (self.w3_EFD, cfg.w3_init_fn_type, cfg.w3_init_std / w3_div),
-            )
-        ):
-            init_all_experts_different(
-                build_init_fn(fn_type), w.data, std, slot=slot, layer_id=cfg.layer_id
-            )
-
-    def _grouped_mm(
-        self, *, A: torch.Tensor, weight_EOI: torch.Tensor, offs: torch.Tensor
-    ) -> torch.Tensor:
-        """Grouped matmul of ``A @ weight_EOI.transpose(-2, -1)``.
-
-        Vendored from ``models/common/moe.py``. ``weight_EOI`` is the stored
-        ``(experts, out_features, in_features)`` orientation; the transpose to
-        the grouped-GEMM right operand happens here. Overridable seam for
-        low-precision variants (the MXFP8 converter swaps this for a scaled
-        grouped GEMM), which is why the weight rather than its transpose is
-        passed: a quantized representation is keyed off the stored orientation.
-        """
-        return torch._grouped_mm(A, weight_EOI.bfloat16().transpose(-2, -1), offs=offs)
 
 
 class RouterOutput(NamedTuple):
@@ -829,6 +691,7 @@ class NormMoE(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
+        self.num_experts = config.num_experts
         self.routed_experts = config.routed_experts.build()
         self.router = config.router.build()
         self.shared_experts = (
@@ -1049,7 +912,7 @@ def make_norm_moe_config(
     norm_everywhere: bool = False,
     norm_type: str = "np_rmsnorm",
     norm_eps: float = 1e-30,
-    activation_type: str = "silu",
+    activation_fn: BinaryActivationFn.Config | None = None,
     residual_div: float = 1.0,
     init_gate_as_residual: bool = False,
     bias_update_norm_factor: str = "sign",
@@ -1079,6 +942,8 @@ def make_norm_moe_config(
         activate_experts=top_k,
         scaling_factor=scaling_factor,
     )
+    activation_fn = activation_fn or SwiGLU.Config()
+    w3_div = residual_div if init_gate_as_residual else 1.0
 
     return NormMoE.Config(
         num_experts=num_experts,
@@ -1110,23 +975,35 @@ def make_norm_moe_config(
             _debug_force_load_balance=_debug_force_load_balance,
         ),
         routed_experts=RoutedExperts.Config(
-            inner_experts=NormGroupedExperts.Config(
-                dim=dim,
-                hidden_dim=hidden_dim,
-                num_experts=num_experts,
-                norm_everywhere=norm_everywhere,
+            w13=GroupedLinear.Config(
+                group_size=num_experts,
+                in_features=dim,
+                out_features=hidden_dim,
+                num_linears=2,
+                param_init=fused_grouped_gate_up_param_init(
+                    {
+                        "w1_EFD": _expert_init(w1_init_fn_type, w1_init_std, 0, layer_id),
+                        "w3_EFD": _expert_init(
+                            w3_init_fn_type, w3_init_std / w3_div, 2, layer_id
+                        ),
+                    }
+                ),
+            ),
+            w2=GroupedLinear.Config(
+                group_size=num_experts,
+                in_features=hidden_dim,
+                out_features=dim,
+                param_init={
+                    "weight": _expert_init(
+                        w2_init_fn_type, w2_init_std / residual_div, 1, layer_id
+                    )
+                },
+            ),
+            activation_fn=ffn_activation(
+                activation_fn,
+                mid_norm=norm_everywhere,
                 norm_type=norm_type,
                 norm_eps=norm_eps,
-                activation_type=activation_type,
-                layer_id=layer_id,
-                w1_init_fn_type=w1_init_fn_type,
-                w2_init_fn_type=w2_init_fn_type,
-                w3_init_fn_type=w3_init_fn_type,
-                w1_init_std=w1_init_std,
-                w2_init_std=w2_init_std,
-                w3_init_std=w3_init_std,
-                residual_div=residual_div,
-                init_gate_as_residual=init_gate_as_residual,
             ),
             # Upstream's factory, not a hardcoded LocalTokenDispatcher: that
             # class only ever does local dispatch, so EP>1 could never work
@@ -1152,7 +1029,7 @@ def make_norm_moe_config(
             FeedForward.Config(
                 dim=dim,
                 hidden_dim=hidden_dim * num_shared_experts,
-                activation_type=activation_type,
+                activation_fn=activation_fn,
                 norm_everywhere=norm_everywhere,
                 norm_type=norm_type,
                 norm_eps=norm_eps,
@@ -1209,7 +1086,9 @@ class MoE:
         norm_everywhere: bool = False
         norm_type: str = "np_rmsnorm"
         norm_eps: float = 1e-30
-        activation_type: str = "silu"
+        activation_fn: BinaryActivationFn.Config = field(
+            default_factory=SwiGLU.Config
+        )
         # NOTE there is deliberately no `force_router_on_fp32`. 0.4.0 needed it to wrap
         # the router gate in autocast(float32); upstream's RouterGateLinear
         # (models/common/linear.py) now yields FP32 logits unconditionally -- CUDA bf16
@@ -1255,7 +1134,7 @@ class MoE:
                 norm_everywhere=self.norm_everywhere,
                 norm_type=self.norm_type,
                 norm_eps=self.norm_eps,
-                activation_type=self.activation_type,
+                activation_fn=self.activation_fn,
                 residual_div=self.residual_div,
                 init_gate_as_residual=self.init_gate_as_residual,
                 track_router_metrics=self.track_router_metrics,

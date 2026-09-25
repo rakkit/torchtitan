@@ -123,22 +123,25 @@ declares every parameter (`param_layouts() -> {fqn: ParamLayout}`, types in
 | kind | what it is |
 |---|---|
 | `matrix` | a weight matrix; a fused projection lists its units (q/k/v, w1/w3) as row runs |
-| `expert_batch` | dim 0 is a batch of independent matrices, one unit each |
+| `expert_batch` | dim 0 is a batch of experts: one unit each, or the declared units of each (w1, w3 of a fused `[E, 2, F, D]` w13) |
 | `embedding`, `unembedding` | the vocabulary matrices, rows are tokens |
 | `router` | an MoE router's gate, rows are experts |
 | `vector`, `scalar` | a one-row unit `[1, d]` / `[1, 1]` |
 
-opt_moe's modules declare what only they know (expert batches, fused q/k/v and
-w1/w3, the router gate), finding each parameter by identity (`named`); the
+opt_moe's projections are fused, as upstream's (`wqkv`, `w13`, and the
+experts' `w13` `[E, 2, F, D]`). Its modules declare what only they know (expert
+batches, the q/k/v and w1/w3 units, the router gate), finding each parameter by
+identity (`named`); the
 model adds the two vocabulary matrices and states the rest by rank (`by_rank`,
 which refuses rank 3+: a depthwise Conv1d `[C, 1, K]` and an expert batch
 `[E, F, D]` look alike). A fused parameter's units are unions of contiguous
 row runs, so they get unfused math and log under the split names
-(`...wqkv` + `wq` logs as `...wq`).
+(`...wqkv` + `wq` logs as `...wq`; an expert's `ep_3/...w1`).
 
 Checked at build: an undeclared parameter; a vocabulary matrix under a rule
 that would gather all its rows on one rank; a Gram compute on a wide unit
-(rank-deficient Gram); and the ranks of a model part compare a hash of their
+(rank-deficient Gram); a unit a compute cannot take (`check_unit`: head-wise
+blocks that do not divide it); and the ranks of a model part compare a hash of their
 plans, so a divergent plan raises instead of hanging the first exchange.
 
 ## Rules: pre -> compute -> post -> scale
@@ -174,7 +177,7 @@ keyword arguments are its args and defaults:
 | `rule` | pipeline | defaults | `own` |
 |---|---|---|---|
 | `sgd` | `pre` -> `compute` -> scale | identity, identity, steps 0, `one` | |
-| `muon` | `pre` -> orthogonaliser -> scale | identity, `newtonschulz5`, 5, `spectral` | |
+| `muon` | `pre` -> orthogonaliser -> scale; per block with `block_rows` / `block_cols` | identity, `newtonschulz5`, 5, `spectral`, blocks 0 | |
 | `right_polar` | `pre` -> `gram_polar` -> scale; no all-to-all | 5 steps, `spectral`, work dtype fp16 | `compute` |
 | `lm_head` | centre -> `gram_polar+row-l2` (`spectral: false`: `row-l2`) -> centre -> scale | 5 steps, `inv_sqrt_n` | `scale` |
 | `left_polar` | centre -> orthogonaliser -> centre -> scale (routers) | `newtonschulz5`, 5, `spectral` | |
@@ -192,6 +195,17 @@ its compute and scale), the SwiGLU hybrid `{"rule": "muon", "args": {"pre":
 it is a build error. The production row rules are
 `compute: row-l2` with `scale: sqrt_n` (embedding) or `inv_sqrt_n` (head,
 routers). `lm_head` and `left_polar` take no `pre`: the centring is the rule.
+
+**Head-wise Muon.** `muon` with `block_rows: head_dim` orthogonalises each head
+of a q, k or v unit on its own, `block_cols: head_dim` each head's columns of
+`wo`; each block is scaled by its own shape (`spectral`: sqrt(rows / cols) of
+the block). The block size must divide every unit of the group (checked at
+build). Head-wise attention is two groups:
+
+```python
+"qkv": {"match": r"\.wqkv\.", "args": {"block_rows": 128}},
+"wo": {"match": r"attention\.wo\.", "args": {"block_cols": 128}},
+```
 
 **Sphere rules.** `hyperball` (MuonH, arXiv 2606.16899), `elr` (Tencent's ELR,
 hy.tencent.ai/research/elr, their Eq. 2) and `sso` (arXiv 2601.08393) need the
@@ -282,8 +296,10 @@ and the placement:
 | `sharded` | a `unit` compute, rows split over the FSDP axis | one packed all-to-all pair: momentum rows to the owners, updates back |
 | `replicated` | whole on every rank (pure DDP) | owners compute, one all-gather of the updates |
 
-Owners are `unit.index % world` after a big-to-small sort (snaked over owner
-blocks for the replicated family). Per-peer row tables come from DTensor's own
+Owners are dealt per unit, largest orthogonalisation cost `m n min(m, n)`
+first, in a snake over the ranks (`transport.deal`), so a fused parameter's
+units land on different ranks; the step's matrix units are dealt apart from
+the units that travel on logging steps only. Per-peer row tables come from DTensor's own
 chunking, which also covers the nested `_StridedShard` FSDP-over-EP puts on
 experts.
 
@@ -351,8 +367,6 @@ upstream's flat loader. Each expert
 block's moments are views of one buffer; `state_dict()` hands out copies (DCP's
 save staging cannot deep-copy a DTensor over an offset view) and a load copies
 them back. A resume is bitwise with the uninterrupted run, AUS included.
-Flipping `fuse_qkv` / `fuse_w13` changes the unit count, so such a checkpoint
-does not resume.
 
 ## Metrics
 

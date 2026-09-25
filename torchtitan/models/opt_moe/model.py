@@ -28,7 +28,13 @@ from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Identity
-from torchtitan.models.common.param_layout import by_rank, named, ParamLayout
+from torchtitan.models.common.moe import RoutedExperts
+from torchtitan.models.common.param_layout import (
+    by_rank,
+    named,
+    ParamLayout,
+    stacked_units,
+)
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import (
     get_nparams_and_active_nparams,
@@ -327,6 +333,12 @@ class OPTMoEModel(Decoder):
                 layouts[
                     f"{module_name}.{param_name}" if module_name else param_name
                 ] = layout
+        for module in self.modules():
+            if isinstance(module, RoutedExperts):  # upstream's: declared here
+                w13 = module.w13.weight
+                slots = stacked_units(("w1", "w3"), w13.shape[-2], w13.shape[-1])
+                layouts[named(self, w13)] = ParamLayout("expert_batch", units=slots)
+                layouts[named(self, module.w2.weight)] = ParamLayout("expert_batch")
         for module, kind in (
             (self.tok_embeddings, "embedding"),
             (self.lm_head, "unembedding"),

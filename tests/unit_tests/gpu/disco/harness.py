@@ -48,8 +48,6 @@ def tiny_model_config(
     num_experts: int = 4,
     ffn_hidden_dim: int = 128,
     moe_hidden_dim: int = 32,
-    fuse_qkv: bool = False,
-    fuse_w13: bool = False,
     flavor: str = "mis-8b-proxy",
 ):
     """mis-8b-proxy's architecture shrunk until a 4-rank test runs in seconds."""
@@ -72,8 +70,6 @@ def tiny_model_config(
     attn.n_heads = 2
     attn.n_kv_heads = 1
     attn.head_dim = 32
-    attn.fuse_qkv = fuse_qkv
-    layer.feed_forward.fuse_w13 = fuse_w13
     attn.sliding_window_size = 16
     return cfg
 
@@ -172,6 +168,7 @@ def parallel_dims(
         pp=1,
         ep=ep,
         world_size=world_size,
+        enable_sequence_parallel=False,
     )
     pd.build_mesh()
     return pd

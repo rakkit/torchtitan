@@ -49,37 +49,52 @@ def matrix_view(shape: torch.Size) -> tuple[int, int]:
     return (int(prod(shape[:-1])), int(shape[-1]))
 
 
+def _checked_units(fqn: str, units, r: int, c: int) -> tuple[UnitSpec, ...]:
+    """Declared units must tile the `[r, c]` matrix exactly."""
+    covered = RunList.merged([run for u in units for run in u.rows.runs])
+    if covered.runs != ((0, r),):
+        raise ValueError(
+            f"{fqn}: declared units must tile all {r} rows, cover {covered.runs}"
+        )
+    if sum(u.rows.n_rows for u in units) != r:
+        raise ValueError(f"{fqn}: declared units overlap")
+    for u in units:
+        if tuple(u.shape) != (u.rows.n_rows, c):
+            raise ValueError(
+                f"{fqn}: unit {u.name!r} has {u.rows.n_rows} rows of {c} "
+                f"but declares shape {tuple(u.shape)}"
+            )
+    return tuple(units)
+
+
 def resolve_units(
     fqn: str, shape: torch.Size, layout: ParamLayout
 ) -> tuple[UnitSpec, ...]:
     """Fill in the default single unit when the layout declares none."""
-    if layout.units:
-        r, c = matrix_view(shape)
-        covered = RunList.merged([run for u in layout.units for run in u.rows.runs])
-        if covered.runs != ((0, r),):
-            raise ValueError(
-                f"{fqn}: declared units must tile all {r} rows, cover {covered.runs}"
+    if layout.kind == "expert_batch":
+        # Dim 0 is the batch: one [m, n] unit per expert, named by index, or
+        # the declared per-expert units (a fused [E, 2, F, D]) named `i.name`.
+        e, m, n = shape[0], prod(shape[1:-1]), shape[-1]
+        per = (
+            _checked_units(fqn, layout.units, m, n)
+            if layout.units
+            else (UnitSpec("", RunList.contiguous(0, m), (m, n)),)
+        )
+        return tuple(
+            UnitSpec(
+                f"{i}.{u.name}" if u.name else str(i),
+                RunList(tuple((i * m + s, k) for s, k in u.rows.runs)),
+                u.shape,
             )
-        if sum(u.rows.n_rows for u in layout.units) != r:
-            raise ValueError(f"{fqn}: declared units overlap")
-        for u in layout.units:
-            if tuple(u.shape) != (u.rows.n_rows, c):
-                raise ValueError(
-                    f"{fqn}: unit {u.name!r} has {u.rows.n_rows} rows of {c} "
-                    f"but declares shape {tuple(u.shape)}"
-                )
-        return layout.units
+            for i in range(e)
+            for u in per
+        )
+    if layout.units:
+        return _checked_units(fqn, layout.units, *matrix_view(shape))
     if layout.kind == "scalar":
         return (UnitSpec("", RunList.contiguous(0, 1), (1, 1)),)
     if layout.kind == "vector":
         return (UnitSpec("", RunList.contiguous(0, 1), (1, int(shape[0]))),)
-    if layout.kind == "expert_batch":
-        # Dim 0 is the batch: one [m, n] unit per expert, named by index.
-        e, m = shape[0], prod(shape[1:-1])
-        return tuple(
-            UnitSpec(str(i), RunList.contiguous(i * m, m), (m, shape[-1]))
-            for i in range(e)
-        )
     r, c = matrix_view(shape)
     return (UnitSpec("", RunList.contiguous(0, r), (r, c)),)
 

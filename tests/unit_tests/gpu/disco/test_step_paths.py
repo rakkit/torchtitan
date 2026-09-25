@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness  # noqa: E402
 from reference import ReferenceDiSCO, rules_from_container  # noqa: E402
 
+from torchtitan.optimizers.disco.presets import Blocks  # noqa: E402
 from torchtitan.optimizers.disco.rules import lmo, StepCtx  # noqa: E402
 
 pytestmark = pytest.mark.multi_gpu
@@ -61,15 +62,11 @@ def _same_lmo(g, r):
     rule = r.get("rule_obj")
     if rule is not None and (rule.kind == "gram" or rule.pre or rule.rest_tail):
         return rule.reference(g).update  # a rule with its own phases, whole
-    if g.ndim == 3:
-        return torch.stack(
-            [lmo(g[e], r["compute"], r["scale"], r["steps"]) for e in range(g.shape[0])]
-        )
     return lmo(g, r["compute"], r["scale"], r["steps"])
 
 
 class _SameLMOReference(ReferenceDiSCO):
-    def lmo(self, g, r):
+    def matrix_lmo(self, g, r):
         return _same_lmo(g, r)
 
 
@@ -151,6 +148,7 @@ class TestDiSCOStepPaths(DTensorTestBase):
         one_per_owner: bool = False,
         num_experts: int = 4,
         restart_after: int = 0,
+        on_build=None,
     ):
         device = self._device()
         pd = harness.parallel_dims(
@@ -174,6 +172,8 @@ class TestDiSCOStepPaths(DTensorTestBase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             model, container = harness.build_model_and_optimizer(cfg, pd, device, tmp)
+        if on_build is not None:
+            on_build(container)
         if one_per_owner:  # the step exchange lands in place on those owners
             ex = container.optimizers[0]._ex_step
             single = len(ex.owned) == 1
@@ -242,6 +242,30 @@ class TestDiSCOStepPaths(DTensorTestBase):
     @with_comms
     def test_fsdp4_fp32(self):
         self._check_topology(TOPOLOGIES["fsdp4"], comm_dtype=torch.float32)
+
+    @with_comms
+    def test_fsdp4_headwise_fp32(self):
+        """Head-wise Muon: q, k, v blocked by head rows, wo by head columns."""
+        head_dim = harness.tiny_model_config(moe=True).layer.attention.head_dim
+        groups = {
+            "qkv": {"match": r"\.wqkv\.", "args": {"block_rows": head_dim}},
+            "wo": {"match": r"attention\.wo\.", "args": {"block_cols": head_dim}},
+        }
+
+        def blocked(container):
+            names = {
+                e.clean.rsplit(".", 1)[-1]
+                for e in container.optimizers[0].entries
+                if isinstance(e.rule.compute, Blocks)
+            }
+            self.assertEqual(names, {"wqkv", "wo"})
+
+        self._check_topology(
+            TOPOLOGIES["fsdp4"],
+            comm_dtype=torch.float32,
+            extra_groups=groups,
+            on_build=blocked,
+        )
 
     @with_comms
     def test_fsdp4_one_matrix_per_owner_fp32(self):

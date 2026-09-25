@@ -62,7 +62,7 @@ def test_every_tensor_has_an_hf_mapping(flavor: str):
     to_hf_map = {v: k for k, v in adapter.from_hf_map.items()}
 
     unmapped = []
-    for key in model.state_dict():
+    for key in adapter._unfuse(model.state_dict()):
         if any(s in key for s in DELIBERATE_SKIPS):
             continue
         abstract = re.sub(r"(\d+)", "{}", key, count=1) if "layers" in key else key
@@ -92,7 +92,7 @@ def test_the_map_has_no_entry_that_no_flavor_owns():
     for flavor in FLAVORS:
         model, model_config = _build(flavor)
         adapter = OPTMoEStateDictAdapter(model_config, None)
-        for key in model.state_dict():
+        for key in adapter._unfuse(model.state_dict()):
             native.add(re.sub(r"(\d+)", "{}", key, count=1) if "layers" in key else key)
 
     # Norm weights exist only under a PARAMETRIC `norm_type`. Every flavor

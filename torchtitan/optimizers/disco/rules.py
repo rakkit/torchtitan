@@ -217,6 +217,9 @@ class Chain(Compute):
     def kind(self) -> str:
         return self.main.kind
 
+    def check_unit(self, m: int, n: int) -> None:
+        self.main.check_unit(m, n)
+
     def core(self, x):
         y = self.main.core(x)
         for c in self.after:

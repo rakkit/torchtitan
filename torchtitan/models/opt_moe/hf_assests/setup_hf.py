@@ -51,6 +51,13 @@ def _rope_parameters(rope) -> dict:
     return {"rope_type": "default", "rope_theta": float(rope.theta)}
 
 
+def _layer_type(sliding: bool, conv: bool) -> str:
+    """HF's cache type: a layer with a short conv also caches conv states."""
+    if conv:
+        return "hybrid_sliding" if sliding else "hybrid"
+    return "sliding_attention" if sliding else "full_attention"
+
+
 def _route_scale(model, moe) -> float:
     """What the routers multiply by. Taken from a built router when there is
     one: without a table entry the native value is a random estimate."""
@@ -98,11 +105,13 @@ def hf_config(model, model_config=None) -> OptMoEConfig:
         gated_attention=(
             None if attn.gated_attention_type in (None, "none") else attn.gated_attention_type
         ),
+        conv_kernel_size=attn.conv_kernel_size,
+        attention_sinks=attn.attention_sinks,
         rope_parameters=rope,
         rope_parameters_sliding=rope_sliding,
         rotary_dim=rotary_dim,
         use_rope_layers=[a.use_rope for a in per_layer],
-        layer_types=["sliding_attention" if s else "full_attention" for s in sliding],
+        layer_types=[_layer_type(s, attn.conv_kernel_size > 0) for s in sliding],
         sliding_window=attn.sliding_window_size if any(sliding) else None,
         embeddings_norm=m.use_embeddings_norm,
         residual_identity_scale=identity_scale,

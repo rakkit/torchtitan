@@ -17,6 +17,7 @@ kept as contiguous runs. `kind` says what the parameter is to the network:
     embedding     the input embedding table: rows are the vocabulary
     unembedding   the output projection: rows are the vocabulary
     router        an MoE router's gate: rows are the experts
+    conv          a depthwise Conv1d `[C, 1, K]`: one `[C, K]` unit
     vector        a 1-D parameter: one row
     scalar        one number
 
@@ -38,6 +39,7 @@ KINDS = (
     "embedding",
     "unembedding",
     "router",
+    "conv",
     "vector",
     "scalar",
 )

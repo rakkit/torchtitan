@@ -126,6 +126,7 @@ declares every parameter (`param_layouts() -> {fqn: ParamLayout}`, types in
 | `expert_batch` | dim 0 is a batch of experts: one unit each, or the declared units of each (w1, w3 of a fused `[E, 2, F, D]` w13) |
 | `embedding`, `unembedding` | the vocabulary matrices, rows are tokens |
 | `router` | an MoE router's gate, rows are experts |
+| `conv` | a depthwise Conv1d `[C, 1, K]` (the attention's short conv): one `[C, K]` unit, rows are channels |
 | `vector`, `scalar` | a one-row unit `[1, d]` / `[1, 1]` |
 
 opt_moe's projections are fused, as upstream's (`wqkv`, `w13`, and the
@@ -206,6 +207,40 @@ build). Head-wise attention is two groups:
 "qkv": {"match": r"\.wqkv\.", "args": {"block_rows": 128}},
 "wo": {"match": r"attention\.wo\.", "args": {"block_cols": 128}},
 ```
+
+**The attention's short conv and sinks** (opt_moe `conv_kernel_size`,
+`attention_sinks`). A conv weight `[C, 1, K]` is one `[C, K]` unit (kind
+`conv`, rows are channels); the sinks are one `[1, n_heads]` row (kind
+`vector`). Select them with groups:
+
+```python
+"conv": {"kind": "conv", "args": {"compute": "row-l2", "scale": "one"}},        # row-norm
+"conv": {"kind": "conv", "args": {"compute": "polar_express", "steps": 5}},     # orthogonal
+"sinks": {"match": r"\.sinks$", "args": {"compute": "sign", "scale": "one"}},
+```
+
+- **Row-norm** normalises each channel's K taps. It runs on the channels a
+  rank holds, so it needs no communication.
+- **Orthogonal** is muon on `[C, K]`, gathered to an owner. With K = 4 the
+  tiled orthogonalisers cannot run: `gram_polar_express` needs dims divisible
+  by 8, and the Triton ones need at least 16. They are refused at build, so use
+  `polar_express`, `newtonschulz5` or `svd`.
+- **Sinks:** under the production default, the `[1, n_heads]` unit is refused
+  too. Give the sinks a row rule; `sign` moves each head's sink by lr.
+- **Not yet trained with:** `right_polar` (the polar factor through the
+  `[K, K]` Gram) orthogonalises `[C, 4]` exactly at 8 steps, with a 4x4
+  all-reduce and no gather. NS5 and polar express leave singular values in
+  0.68-1.10.
+- **Measured** (mis-8b-proxy, 300 steps, one seed; train loss over steps
+  251-300):
+
+  | setting | train loss |
+  |---|---|
+  | no conv / sinks | 6.596 |
+  | row-norm conv + sign sinks, default lr 0.1 (recommended) | 6.556 |
+  | row-norm conv + sign sinks, lr 0.01 | 6.570 |
+  | orthogonal conv + sign sinks, lr 0.1 | 6.632 |
+  | orthogonal conv + sign sinks, lr 0.01 | 6.644 |
 
 **Sphere rules.** `hyperball` (MuonH, arXiv 2606.16899), `elr` (Tencent's ELR,
 hy.tencent.ai/research/elr, their Eq. 2) and `sso` (arXiv 2601.08393) need the

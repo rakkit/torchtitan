@@ -640,6 +640,13 @@ class OPTMoEModel(Decoder):
                 )
             if uses_swa and base_attn.attn_backend == "varlen":
                 raise ValueError("SWA is not supported with varlen attention.")
+            if (base_attn.conv_kernel_size > 0 or base_attn.attention_sinks) and (
+                parallelism.tensor_parallel_degree > 1
+                or parallelism.context_parallel_degree > 1
+            ):
+                raise NotImplementedError(
+                    "the attention short conv and sinks support neither TP nor CP"
+                )
 
             # Expand before delegating: Decoder.Config.update_from_config walks
             # self.layers for TP/EP validation and token-dispatcher setup, so the

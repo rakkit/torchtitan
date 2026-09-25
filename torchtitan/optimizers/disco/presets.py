@@ -145,6 +145,13 @@ class Sign(Compute):
         return torch.sign(x)
 
 
+_TILED_BACKENDS = {
+    "gram_polar_express": 8,
+    "newtonschulz5_triton": 16,
+    "polar_express_triton": 16,
+}
+
+
 @dataclass(frozen=True)
 class Orthogonalise(Compute):
     """A zeropower backend on the whole unit (Newton-Schulz, polar express, svd)."""
@@ -155,6 +162,17 @@ class Orthogonalise(Compute):
     def __post_init__(self):
         if self.backend not in zeropower_backends or self.backend == "identity":
             raise ValueError(f"unknown backend {self.backend!r}")
+
+    def check_unit(self, m, n):
+        # Measured: quack's GEMM needs 8-aligned dims; the Triton kernels hang
+        # below 16 (a [1024, 4] conv unit breaks both).
+        need = _TILED_BACKENDS.get(self.backend)
+        if need and (m % 8 or n % 8 or min(m, n) < need):
+            raise ValueError(
+                f"{self.backend} runs tiled kernels needing both dims divisible by 8 "
+                f"and >= {need}, not [{m}, {n}]: use newtonschulz5, polar_express or "
+                "svd, or a row rule (row-l2, sign)"
+            )
 
     def core(self, x):
         return zeropower_backends[self.backend](x, steps=self.steps, eps=EPS)
@@ -182,6 +200,7 @@ class Blocks(Compute):
         size, dim = (self.rows, m) if self.rows else (self.cols, n)
         if dim % size:
             raise ValueError(f"blocks of {size} do not divide the [{m}, {n}] unit")
+        self.inner.check_unit(self.rows or m, self.cols or n)
 
     def core(self, x):
         *b, m, n = x.shape

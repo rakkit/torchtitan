@@ -14,7 +14,8 @@ from huggingface_hub.dataclasses import strict
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
 
-_LAYER_TYPES = ("full_attention", "sliding_attention")
+# `hybrid*`: attention with a short conv, whose cache also holds conv states.
+_LAYER_TYPES = ("full_attention", "sliding_attention", "hybrid", "hybrid_sliding")
 
 
 @strict
@@ -27,9 +28,14 @@ class OptMoEConfig(PreTrainedConfig):
         gate if `mid_norm_position == "before"`.
     gated_attention (`str`, *optional*): `"head-wise"` or `"element-wise"`
         sigmoid gate on the attention output, from `gate_proj(hidden_states)`.
+    conv_kernel_size (`int`): 0, or the width of the short conv (depthwise,
+        causal, then SiLU) on q, k and v after the projection (KDA).
+    attention_sinks (`bool`): A learned logit per head in the softmax
+        denominator (gpt-oss).
     rotary_dim (`int`): Leading head dims rotated by RoPE (partial RoPE).
     use_rope_layers (`list[bool]`): Per layer, whether it applies RoPE.
-    layer_types (`list[str]`): Per layer, `"full_attention"` or `"sliding_attention"`.
+    layer_types (`list[str]`): Per layer, `"full_attention"` or
+        `"sliding_attention"`; `"hybrid"` / `"hybrid_sliding"` with a short conv.
     rope_parameters_sliding (`dict`, *optional*): RoPE of the sliding layers,
         when they use their own theta.
     mlp_mid_norm / moe_mid_norm (`bool`): RMSNorm on the SwiGLU output of the
@@ -73,6 +79,8 @@ class OptMoEConfig(PreTrainedConfig):
     head_wise_mid_norm: bool = False
     mid_norm_position: str = "after"
     gated_attention: str | None = None
+    conv_kernel_size: int = 0
+    attention_sinks: bool = False
     rope_parameters: RopeParameters | dict | None = None
     rope_parameters_sliding: RopeParameters | dict | None = None
     rotary_dim: int | None = None
@@ -114,7 +122,10 @@ class OptMoEConfig(PreTrainedConfig):
             raise ValueError("use_rope_layers and layer_types need one entry per layer")
         if any(t not in _LAYER_TYPES for t in self.layer_types):
             raise ValueError(f"layer_types entries must be in {_LAYER_TYPES}")
-        if "sliding_attention" in self.layer_types and not self.sliding_window:
+        hybrid = [t.startswith("hybrid") for t in self.layer_types]
+        if any(hybrid) != (self.conv_kernel_size > 0) or any(hybrid) != all(hybrid):
+            raise ValueError("every layer is hybrid exactly when conv_kernel_size > 0")
+        if any(t.endswith("sliding") or t == "sliding_attention" for t in self.layer_types) and not self.sliding_window:
             raise ValueError("sliding layers need a sliding_window")
         if not 0 < self.rotary_dim <= self.head_dim or self.rotary_dim % 2:
             raise ValueError(f"rotary_dim {self.rotary_dim} must be even and in (0, head_dim]")
@@ -124,8 +135,15 @@ class OptMoEConfig(PreTrainedConfig):
             raise ValueError(f"unknown mid_norm_position {self.mid_norm_position!r}")
         if self.scoring_func not in ("sigmoid", "softmax", "sqrtsoftplus"):
             raise ValueError(f"unknown scoring_func {self.scoring_func!r}")
+        if self.conv_kernel_size < 0:
+            raise ValueError(f"conv_kernel_size {self.conv_kernel_size} must be >= 0")
         if self.hidden_act != "silu":
             raise ValueError("opt_moe's MLPs are SwiGLU: hidden_act must be 'silu'")
+
+    @property
+    def number_of_conv_states(self) -> int:
+        """The cache's conv states per hybrid layer: q, k and v."""
+        return 3
 
 
 __all__ = ["OptMoEConfig"]

@@ -5,10 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
+from functools import partial
 
 from typing import Any
 
 import torch
+from torch import nn
 
 from torchtitan.models.common.attention import (
     AttentionMasksType,
@@ -23,11 +25,14 @@ from torchtitan.models.common.config_utils import (
     get_attention_config,
 )
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.nn_modules import Identity
+from torchtitan.models.common.nn_modules import Conv1d, Identity
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 from .utils.inits import make_param_init
+from torchtitan.models.gpt_oss.model import apply_attention_sink_rescale
+
 from .utils.norms import build_norm_config
+from .utils.short_conv import causal_short_conv
 
 
 class GatedNormSWAttention(GQAttention):
@@ -86,6 +91,11 @@ class GatedNormSWAttention(GQAttention):
         # head_dim (standard RoPE).  Set to a smaller value for partial RoPE where
         # only the first qk_rope_dim dims are rotated and the rest pass through.
         sliding_window_size: int = -1
+        conv_kernel_size: int = 0
+        """0: none. Else KDA / Gated DeltaNet's short convolution on q, k and v
+        after the projection: a depthwise causal conv of this width, then SiLU."""
+        attention_sinks: bool = False
+        """A learned logit per head in the softmax denominator (gpt-oss)."""
 
         # Filled in by OPTMoEModel.Config expansion from ``attn_backend`` and the
         # model-level rope/rope_of_swa configs. Declared with defaults so the
@@ -309,6 +319,35 @@ class GatedNormSWAttention(GQAttention):
                 sharding_config=config.linear_sharding_config,
             ).build()
 
+        self.q_conv = self.k_conv = self.v_conv = None
+        if config.conv_kernel_size > 0:
+
+            def conv(channels: int) -> Conv1d:
+                return Conv1d.Config(
+                    in_channels=channels,
+                    out_channels=channels,
+                    kernel_size=config.conv_kernel_size,
+                    groups=channels,
+                    bias=False,
+                    param_init={"weight": partial(nn.init.trunc_normal_, std=0.02)},
+                    sharding_config=config.linear_sharding_config,
+                ).build()
+
+            self.q_conv = conv(self.n_heads * self.head_dim)
+            self.k_conv = conv(self.n_kv_heads * self.head_dim)
+            self.v_conv = conv(self.n_kv_heads * self.head_dim)
+        self.sinks = (
+            nn.Parameter(torch.empty(self.n_heads)) if config.attention_sinks else None
+        )
+
+    def _init_self_parameters(self) -> None:
+        if self.sinks is not None:
+            # gpt-oss's std, without its depth scaling
+            nn.init.trunc_normal_(self.sinks, std=0.02)
+
+    def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+        return apply_attention_sink_rescale(out, lse, self.sinks)
+
     def _apply_rope(
         self,
         xq_THK: torch.Tensor,
@@ -340,7 +379,11 @@ class GatedNormSWAttention(GQAttention):
 
         w = self.qkv_linear.wqkv.weight
         units = qkv_units(self.n_heads, self.n_kv_heads, self.head_dim, w.shape[-1])
-        return {named(self, w): ParamLayout("matrix", units=units)}
+        layouts = {named(self, w): ParamLayout("matrix", units=units)}
+        for conv in (self.q_conv, self.k_conv, self.v_conv):
+            if conv is not None:
+                layouts[named(self, conv.weight)] = ParamLayout("conv")
+        return layouts
 
     def forward(
         self,
@@ -350,6 +393,11 @@ class GatedNormSWAttention(GQAttention):
     ) -> torch.Tensor:
         num_tokens = x_TD.shape[0]
         xq, xk, xv = self.qkv_linear(x_TD)  # upstream's fused QKVLinear
+        if self.q_conv is not None:
+            xq, xk, xv = (
+                causal_short_conv(t.flatten(-2), c.weight, positions).view_as(t)
+                for t, c in ((xq, self.q_conv), (xk, self.k_conv), (xv, self.v_conv))
+            )
 
         # QK norm before RoPE (per Qwen3); V norm has no upstream equivalent.
         if self.q_norm is not None:
@@ -374,6 +422,7 @@ class GatedNormSWAttention(GQAttention):
             xv,
             attention_masks=attention_masks,
             enable_gqa=self.enable_gqa,
+            out_transform=self._apply_sinks if self.sinks is not None else None,
             **scale_kwargs,
         )
         output = output.contiguous()

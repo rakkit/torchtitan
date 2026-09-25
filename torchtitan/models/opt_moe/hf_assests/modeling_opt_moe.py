@@ -42,6 +42,9 @@ from transformers.modeling_utils import (
     AttentionInterface,
     PreTrainedModel,
 )
+from transformers.models.gpt_oss.modeling_gpt_oss import (
+    eager_attention_forward as eager_attention_with_sinks,
+)
 from transformers.models.llama.modeling_llama import eager_attention_forward
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple, TransformersKwargs
@@ -69,24 +72,30 @@ def torchtitan_flex_attention(
     value: torch.Tensor,
     attention_mask,
     scaling: float | None = None,
+    s_aux: torch.Tensor | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
     """`[B, H, T, K]` q/k/v and a BlockMask -> `[B, T, H, K]`, as torchtitan's
-    flex call (GQA without repeating k/v)."""
+    flex call (GQA without repeating k/v); `s_aux` (sinks) rescales by
+    `sigmoid(lse - sink)` as torchtitan's out_transform does."""
     global _compiled_flex
     if _compiled_flex is None:
         _compiled_flex = torch.compile(flex_attention, options=_FLEX_OPTIONS)
-    out, _ = _compiled_flex(
+    out, aux = _compiled_flex(
         query,
         key,
         value,
         block_mask=attention_mask,
         scale=scaling,
         enable_gqa=query.shape[1] != key.shape[1],
-        return_aux=AuxRequest(lse=False),
+        return_aux=AuxRequest(lse=s_aux is not None),
         kernel_options={},
     )
-    return out.transpose(1, 2), None
+    out = out.transpose(1, 2)
+    if s_aux is not None:
+        lse = aux.lse.transpose(1, 2)
+        out = out * torch.sigmoid(lse - s_aux.view(1, 1, -1)).unsqueeze(-1).to(out.dtype)
+    return out, None
 
 
 AttentionInterface.register("torchtitan_flex", torchtitan_flex_attention)
@@ -97,6 +106,26 @@ AttentionMaskInterface.register("torchtitan_flex", flex_attention_mask)
 def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
     """opt_moe's parameter-free RMSNorm (`nn.RMSNorm`, no affine)."""
     return F.rms_norm(x, (x.shape[-1],), eps=eps)
+
+
+def causal_short_conv(x, weight, positions):
+    """`[B, T, C]` -> `silu` of a depthwise causal conv (`nn.Conv1d`
+    orientation), accumulated in fp32; tap `j` only where `positions >= j`, so a
+    packed document never sees the previous one (as torchtitan's)."""
+    k = weight.shape[-1]
+    x32 = x.float()
+    w = weight.squeeze(1).float()
+    if positions is None:
+        positions = torch.arange(x.shape[1], device=x.device).expand(x.shape[0], -1)
+    y = x32 * w[:, k - 1]
+    for j in range(1, k):
+        back = F.pad(x32[:, :-j], (0, 0, j, 0))
+        y = y + torch.where((positions >= j).unsqueeze(-1), back, 0.0) * w[:, k - 1 - j]
+    return F.silu(y).to(x.dtype)
+
+
+def _is_sliding(layer_type: str) -> bool:
+    return layer_type in ("sliding_attention", "hybrid_sliding")
 
 
 class OptMoERotaryEmbedding(nn.Module):
@@ -157,9 +186,7 @@ class OptMoEAttention(nn.Module):
         self.eps = config.rms_norm_eps
         self.use_rope = config.use_rope_layers[layer_idx]
         self.sliding_window = (
-            config.sliding_window
-            if config.layer_types[layer_idx] == "sliding_attention"
-            else None
+            config.sliding_window if _is_sliding(config.layer_types[layer_idx]) else None
         )
         bias = config.attention_bias
         d = config.hidden_size
@@ -172,6 +199,31 @@ class OptMoEAttention(nn.Module):
         if self.gated is not None:
             width = self.n_heads if self.gated == "head-wise" else self.n_heads * self.head_dim
             self.gate_proj = nn.Linear(d, width, bias=False)
+        self.convs = None
+        if config.conv_kernel_size > 0:
+            k = config.conv_kernel_size
+            self.q_conv, self.k_conv, self.v_conv = (
+                nn.Conv1d(c, c, k, groups=c, bias=False)
+                for c in (self.n_heads * self.head_dim, kv, kv)
+            )
+            self.convs = (self.q_conv, self.k_conv, self.v_conv)
+        self.sinks = nn.Parameter(torch.empty(self.n_heads)) if config.attention_sinks else None
+
+    def _short_conv(self, x, state_idx, positions, cache):
+        """The q (0), k (1) or v (2) short conv. With a cache, the conv state
+        carries the last `k - 1` inputs into the next call."""
+        conv = self.convs[state_idx]
+        if cache is None:
+            return causal_short_conv(x, conv.weight, positions)
+        width = conv.weight.shape[-1] - 1
+        decoding = cache.layers[self.layer_idx].has_previous_state[state_idx]
+        full = cache.update_conv_state(
+            x.transpose(1, 2), self.layer_idx, state_idx, conv_kernel_size=width
+        ).transpose(1, 2)
+        if not decoding:
+            return causal_short_conv(x, conv.weight, positions)
+        # The cached history (zero-padded after a short prefill) then the new tokens.
+        return causal_short_conv(full, conv.weight, None)[:, -x.shape[1] :]
 
     def _mid_norm(self, out: torch.Tensor, position: str) -> torch.Tensor:
         """`[B, T, H, D]` in; the attention mid-norm at `position`."""
@@ -192,9 +244,14 @@ class OptMoEAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         cfg = self.config
         B, T, _ = hidden_states.shape
-        q = self.q_proj(hidden_states).view(B, T, -1, self.head_dim)
-        k = self.k_proj(hidden_states).view(B, T, -1, self.head_dim)
-        v = self.v_proj(hidden_states).view(B, T, -1, self.head_dim)
+        q, k, v = (proj(hidden_states) for proj in (self.q_proj, self.k_proj, self.v_proj))
+        if self.convs is not None:
+            positions = kwargs.get("position_ids")
+            q, k, v = (
+                self._short_conv(t, i, positions, past_key_values)
+                for i, t in enumerate((q, k, v))
+            )
+        q, k, v = (t.view(B, T, -1, self.head_dim) for t in (q, k, v))
         if cfg.qk_norm:
             q, k = rms_norm(q, self.eps), rms_norm(k, self.eps)
         if cfg.v_norm:
@@ -205,8 +262,16 @@ class OptMoEAttention(nn.Module):
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         if past_key_values is not None:
             k, v = past_key_values.update(k, v, self.layer_idx)
+        eager = eager_attention_forward
+        if self.sinks is not None:
+            if cfg._attn_implementation not in ("torchtitan_flex", "eager"):
+                raise ValueError(
+                    "attention sinks need attn_implementation torchtitan_flex or eager"
+                )
+            kwargs["s_aux"] = self.sinks
+            eager = eager_attention_with_sinks
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            cfg._attn_implementation, eager_attention_forward
+            cfg._attn_implementation, eager
         )
         out, weights = attention_interface(
             self,
@@ -434,6 +499,8 @@ class OptMoEPreTrainedModel(PreTrainedModel):
         elif isinstance(module, OptMoETopKRouter):
             init.normal_(module.weight, mean=0.0, std=std)
             init.zeros_(module.e_score_correction_bias)
+        elif isinstance(module, OptMoEAttention) and module.sinks is not None:
+            init.normal_(module.sinks, mean=0.0, std=std)
 
 
 @auto_docstring
@@ -485,9 +552,12 @@ class OptMoEModel(OptMoEPreTrainedModel):
             "past_key_values": past_key_values,
             "position_ids": position_ids,
         }
-        masks = {"full_attention": create_causal_mask(**mask_kwargs)}
-        if "sliding_attention" in self.config.layer_types:
-            masks["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        full = create_causal_mask(**mask_kwargs)
+        sliding = (
+            create_sliding_window_causal_mask(**mask_kwargs)
+            if any(map(_is_sliding, self.config.layer_types))
+            else None
+        )
 
         h = inputs_embeds
         if self.config.embeddings_norm:
@@ -499,12 +569,13 @@ class OptMoEModel(OptMoEPreTrainedModel):
             else rope
         )
         for layer in self.layers:
-            sliding = layer.attention_type == "sliding_attention"
+            is_sliding = _is_sliding(layer.attention_type)
             h = layer(
                 h,
-                attention_mask=masks[layer.attention_type],
-                position_embeddings=rope_sliding if sliding else rope,
+                attention_mask=sliding if is_sliding else full,
+                position_embeddings=rope_sliding if is_sliding else rope,
                 past_key_values=past_key_values,
+                position_ids=position_ids,
                 **kwargs,
             )
         return MoeModelOutputWithPast(

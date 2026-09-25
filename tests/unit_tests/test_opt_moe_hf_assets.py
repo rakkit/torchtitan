@@ -36,7 +36,7 @@ from torchtitan.models.opt_moe.utils.inits import setup_residual_scale
 T = 256
 
 
-def _native(*, moe=True, norms=True, gate="head-wise", gate_only=False, **model):
+def _native(*, moe=True, norms=True, gate="head-wise", gate_only=False, conv=0, sinks=False, **model):
     """A 4-layer opt_moe: NoPE layer 2, sliding layers 0, 1, 3 with their own
     theta, partial RoPE, a dense first layer."""
     cfg = OPTMoEModel.Config(
@@ -58,6 +58,8 @@ def _native(*, moe=True, norms=True, gate="head-wise", gate_only=False, **model)
                 gate_only=gate_only,
                 qk_rope_dim=8,
                 sliding_window_size=32,
+                conv_kernel_size=conv,
+                attention_sinks=sinks,
             ),
             feed_forward=FeedForward.Config(hidden_dim=96, norm_everywhere=norms),
             moe=(
@@ -139,6 +141,12 @@ class TestHFConfig(unittest.TestCase):
             c.save_pretrained(d)
             self.assertEqual(type(c).from_pretrained(d).to_dict(), c.to_dict())
 
+    def test_conv_layers_cache_conv_states(self):
+        c = hf_config(_config_only(_native(conv=4, sinks=True)))
+        self.assertEqual(c.layer_types, ["hybrid_sliding"] * 2 + ["hybrid", "hybrid_sliding"])
+        self.assertEqual((c.conv_kernel_size, c.attention_sinks), (4, True))
+        self.assertEqual(c.number_of_conv_states, 3)
+
     def test_gate_only_has_no_mid_norm(self):
         c = hf_config(_config_only(_native(gate_only=True)))
         self.assertFalse(c.attention_mid_norm)
@@ -156,9 +164,17 @@ class TestHFConfig(unittest.TestCase):
 
 
 class TestHFStateDict(unittest.TestCase):
-    CASES = ("tiny-moe", "tiny-dense", "mis-8b-proxy", "M1-dense-600M-full_rope-gate")
+    CASES = (
+        "tiny-moe",
+        "tiny-dense",
+        "tiny-conv-sinks",
+        "mis-8b-proxy",
+        "M1-dense-600M-full_rope-gate",
+    )
 
     def _cfg(self, name):
+        if name == "tiny-conv-sinks":
+            return _native(conv=4, sinks=True)
         if name.startswith("tiny"):
             return _native(moe=name == "tiny-moe")
         return _expanded(model_registry(name))
@@ -176,7 +192,7 @@ class TestHFStateDict(unittest.TestCase):
                 self.assertEqual(got, want)
 
     def test_round_trip_is_exact(self):
-        for name in ("tiny-moe", "tiny-dense"):
+        for name in ("tiny-moe", "tiny-dense", "tiny-conv-sinks"):
             with self.subTest(name):
                 cfg = self._cfg(name)
                 with torch.device("meta"):
@@ -234,6 +250,7 @@ class TestHFForwardParity(unittest.TestCase):
             "moe, norms, head-wise gate": _native(),
             "moe, no norms, element-wise gate": _native(norms=False, gate="element-wise"),
             "dense, gate only": _native(moe=False, gate_only=True),
+            "moe, short conv, sinks": _native(conv=4, sinks=True),
         }
         for label, cfg in cases.items():
             with self.subTest(label):
@@ -254,6 +271,22 @@ class TestHFForwardParity(unittest.TestCase):
                     torch.equal(got, want),
                     f"max |d| {(got.float() - want.float()).abs().max().item():.3e}",
                 )
+
+    def test_decoding_with_the_conv_state_matches_one_forward(self):
+        """Prefill, then one token at a time through the cache (conv states and
+        KV): the logits of a single forward over the whole sequence."""
+        cfg = _native(conv=4, sinks=True)
+        _, hf = _pair(cfg, torch.device("cuda"), "eager")
+        torch.manual_seed(2)
+        tokens = torch.randint(0, cfg.vocab_size, (1, 48), device="cuda")
+        with torch.no_grad():
+            want = hf(input_ids=tokens).logits
+            out = hf(input_ids=tokens[:, :40], use_cache=True)
+            got, cache = [out.logits], out.past_key_values
+            for t in range(40, 48):
+                out = hf(input_ids=tokens[:, t : t + 1], past_key_values=cache, use_cache=True)
+                got.append(out.logits)
+        torch.testing.assert_close(torch.cat(got, dim=1), want, rtol=1e-4, atol=1e-4)
 
     def test_transformers_expert_backends_stay_selectable(self):
         cfg = _native()

@@ -49,8 +49,11 @@ def tiny_model_config(
     ffn_hidden_dim: int = 128,
     moe_hidden_dim: int = 32,
     flavor: str = "mis-8b-proxy",
+    conv: int = 0,
+    sinks: bool = False,
 ):
-    """mis-8b-proxy's architecture shrunk until a 4-rank test runs in seconds."""
+    """mis-8b-proxy's architecture shrunk until a 4-rank test runs in seconds;
+    `conv` / `sinks`: the attention's short conv width and sinks."""
     cfg = model_registry(flavor)
     cfg.dim = dim
     cfg.n_layers = n_layers
@@ -71,6 +74,8 @@ def tiny_model_config(
     attn.n_kv_heads = 1
     attn.head_dim = 32
     attn.sliding_window_size = 16
+    attn.conv_kernel_size = conv
+    attn.attention_sinks = sinks
     return cfg
 
 

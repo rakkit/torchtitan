@@ -254,3 +254,27 @@ def test_register_refuses_a_taken_name_and_unknown_own_args():
     with pytest.raises(TypeError, match="own"):
         register("test_own_typo", own={"computee"})(lambda compute="svd": Rule())
     assert "test_own_typo" not in RULES
+
+
+def test_tiled_orthogonalisers_refuse_units_their_kernels_cannot_take():
+    """A short conv's [C, 4] unit crashes quack's GEMM and hangs the Triton
+    kernels; the rule refuses it at build instead, chained or not."""
+    from torchtitan.optimizers.disco.presets import Orthogonalise
+    from torchtitan.optimizers.disco.rules import rule_of
+
+    for backend, bad, good in (
+        ("gram_polar_express", (1024, 4), (1024, 8)),
+        ("polar_express_triton", (1024, 8), (1024, 16)),
+        ("newtonschulz5_triton", (1024, 8), (1024, 16)),
+    ):
+        with pytest.raises(ValueError, match="tiled kernels"):
+            Orthogonalise(backend, 5).check_unit(*bad)
+        Orthogonalise(backend, 5).check_unit(*good)
+    for backend in ("newtonschulz5", "polar_express", "svd"):
+        Orthogonalise(backend, 5).check_unit(1024, 4)
+    for group in (
+        {"rule": "muon", "args": {"compute": "gram_polar_express", "steps": 5}},
+        {"rule": "muon", "args": {"compute": "gram_polar_express+row-l2", "steps": 5}},
+    ):
+        with pytest.raises(ValueError, match="tiled kernels"):
+            rule_of(group).compute.check_unit(1024, 4)

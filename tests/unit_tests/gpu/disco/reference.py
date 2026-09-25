@@ -98,8 +98,9 @@ class ReferenceDiSCO:
                 g_eff = buf if not r["nesterov"] else torch.lerp(buf, g, m)
             else:
                 g_eff = g
-            if w.ndim < 2:  # scalars and vectors: the whole tensor
-                u = self.lmo(g_eff, r)
+            if w.ndim < 2:  # scalars as they are, a vector as one [1, d] row
+                u = self.lmo(g_eff if g_eff.numel() == 1 else g_eff.view(1, -1), r)
+                u = u.view_as(g_eff)
                 self.last_update[name] = u
                 if r["weight_decay"] != 0.0:
                     w.mul_(decay_of(r))

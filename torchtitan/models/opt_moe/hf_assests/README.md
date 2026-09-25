@@ -64,6 +64,18 @@ Expert backends: unset means this model's forward. `experts_implementation=`
 `"grouped_mm"`, `"batched_mm"`, ... select transformers' own; they are
 equivalent up to rounding.
 
+## Attention short conv and sinks
+
+Both are optional on the native attention and exported as-is:
+- **Short conv** (`conv_kernel_size > 0`) is KDA's: a depthwise causal conv on
+  q, k and v, then SiLU, in `self_attn.{q,k,v}_conv.weight`. It is gated by
+  `position_ids`, so packed documents and left padding never leak. Layers are
+  `"hybrid"` / `"hybrid_sliding"`, whose cache also carries the last `K - 1`
+  inputs of q, k and v, so generation decodes token by token.
+- **Sinks** (`attention_sinks`) are gpt-oss's per-head logit
+  (`self_attn.sinks`). They need `attn_implementation` `"torchtitan_flex"` or
+  `"eager"`; other backends raise.
+
 ## Not exported
 
 `setup_hf.hf_config` raises on anything the template does not compute:

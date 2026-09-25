@@ -149,6 +149,7 @@ class TestDiSCOStepPaths(DTensorTestBase):
         num_experts: int = 4,
         restart_after: int = 0,
         on_build=None,
+        model: dict | None = None,
     ):
         device = self._device()
         pd = harness.parallel_dims(
@@ -161,7 +162,7 @@ class TestDiSCOStepPaths(DTensorTestBase):
         backend = "svd" if comm_dtype == torch.float32 else "newtonschulz5"
         cfg = harness.trainer_config(
             harness.tiny_model_config(
-                moe=moe, n_layers=n_layers, num_experts=num_experts
+                moe=moe, n_layers=n_layers, num_experts=num_experts, **(model or {})
             ),
             compute=backend,
             communication_dtype=str(comm_dtype).removeprefix("torch."),
@@ -266,6 +267,54 @@ class TestDiSCOStepPaths(DTensorTestBase):
             extra_groups=groups,
             on_build=blocked,
         )
+
+    # ---- the attention's short conv (kind "conv", [C, K] units) and sinks ----
+    @with_comms
+    def test_fsdp4_conv_sinks_fp32(self):
+        """Conv units under the default rule: gathered to their owners."""
+        self._check_topology(
+            TOPOLOGIES["fsdp4"],
+            comm_dtype=torch.float32,
+            model={"conv": 4, "sinks": True},
+            on_build=self._assert_conv_family("sharded"),
+        )
+
+    @with_comms
+    def test_fsdp4_conv_row_rule_fp32(self):
+        """A row rule on the conv's channels: no gather."""
+        self._check_topology(
+            TOPOLOGIES["fsdp4"],
+            comm_dtype=torch.float32,
+            model={"conv": 4, "sinks": True},
+            extra_groups={"conv": {"kind": "conv", "args": {"compute": "row-l2", "scale": "one"}}},
+            on_build=self._assert_conv_family("local"),
+        )
+
+    @with_comms
+    def test_hsdp22_conv_sinks_fp32(self):
+        self._check_topology(
+            TOPOLOGIES["hsdp22"], comm_dtype=torch.float32, model={"conv": 4, "sinks": True}
+        )
+
+    @with_comms
+    def test_ddp4_dense_conv_sinks_fp32(self):
+        self._check_topology(
+            TOPOLOGIES["ddp4"],
+            comm_dtype=torch.float32,
+            moe=False,
+            model={"conv": 4, "sinks": True},
+        )
+
+    def _assert_conv_family(self, family: str):
+        def check(container):
+            fams = {
+                e.family.value
+                for e in container.optimizers[0].entries
+                if e.kind == "conv"
+            }
+            self.assertEqual(fams, {family})
+
+        return check
 
     @with_comms
     def test_fsdp4_one_matrix_per_owner_fp32(self):

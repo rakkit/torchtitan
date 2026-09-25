@@ -182,6 +182,10 @@ def set_opt_moe_sharding_config(
         # fields), so the plan is threaded in via `linear_sharding_config`.
         layer_cfg.attention.linear_sharding_config = _replicated_linear
         layer_cfg.attention.norm_sharding_config = _replicated_norm
+        if layer_cfg.attention.attention_sinks:
+            layer_cfg.attention.sharding_config = ShardingConfig(
+                state_shardings={"sinks": dense_param_placement(tp=spmd.I)}
+            )
         if getattr(layer_cfg, "feed_forward", None) is not None:
             layer_cfg.feed_forward.linear_sharding_config = _replicated_linear
 

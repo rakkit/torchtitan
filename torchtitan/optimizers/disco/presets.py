@@ -142,6 +142,21 @@ class RowL2(Compute):
 
 
 @dataclass(frozen=True)
+class RowL2Deflate(Compute):
+    """RowL2 after removing M's top right singular direction v from every row:
+    v by `iters` power iterations from normalise(1^T M). Needs the whole unit."""
+
+    iters: int = 2
+
+    def core(self, x):
+        x32 = x.float()
+        v = _norm(x32.sum(dim=-2, keepdim=True), -1, EPS)  # [.., 1, n]
+        for _ in range(self.iters):
+            v = _norm((x32 @ v.mT).mT @ x32, -1, EPS)  # (M v)^T M
+        return _norm(x32 - (x32 @ v.mT) @ v, -1, EPS).to(x.dtype)
+
+
+@dataclass(frozen=True)
 class Sign(Compute):
     """The elementwise sign (scalars; signSGD-like rows)."""
 
@@ -1331,8 +1346,12 @@ ROW_COMPUTES: dict[str, Callable[[], Compute]] = {  # need no whole unit
 def _one_compute(name: str, steps: int, work_dtype: str) -> Compute:
     if name in ROW_COMPUTES:
         return ROW_COMPUTES[name]()
+    if name == "row-l2-deflate":
+        return RowL2Deflate()
     if name != "gram_polar" and (name not in zeropower_backends or name == "identity"):
-        known = sorted({*ROW_COMPUTES, "gram_polar", *zeropower_backends})
+        known = sorted(
+            {*ROW_COMPUTES, "gram_polar", "row-l2-deflate", *zeropower_backends}
+        )
         raise ValueError(f"unknown compute {name!r}; known: {known}")
     if name != "svd" and int(steps) < 1:
         raise ValueError(f"compute {name!r} iterates: it needs steps >= 1")
@@ -1477,6 +1496,16 @@ def aus(
     return Rule(inner.pre, AUSMap(direction, int(sigma_iters), eta_of("aus", eta)))
 
 
+def _row_rule(name: str, inner: Rule, compute: str, row_direction: bool) -> bool:
+    """A row compute is the group's whole rule (an embedding group that inherits
+    the preset), unless `row_direction` makes it the sphere rule's direction."""
+    if row_direction and inner.kind != "rows":
+        raise ValueError(
+            f"{name} row_direction needs a row compute (row-l2), got {compute!r}"
+        )
+    return inner.kind == "rows" and not row_direction
+
+
 def _whole_unit(name: str, pre: str, compute: str, steps: int, scale: str) -> Rule:
     """A sphere preset's direction; a row compute (an embedding group that
     inherits the preset) is returned as that row rule, with its scale."""
@@ -1489,10 +1518,20 @@ def _whole_unit(name: str, pre: str, compute: str, steps: int, scale: str) -> Ru
 
 
 def _frobenius(
-    name, radius, pre, compute, steps, scale, tangent, exact_angle, eta, radius_ratio=()
+    name,
+    radius,
+    pre,
+    compute,
+    steps,
+    scale,
+    tangent,
+    exact_angle,
+    eta,
+    radius_ratio=(),
+    row_direction=False,
 ):
     inner = _whole_unit(name, pre, compute, steps, scale)
-    if inner.kind == "rows":
+    if _row_rule(name, inner, compute, row_direction):
         return inner
     if scale != "one":
         raise ValueError(
@@ -1523,12 +1562,14 @@ def hyperball(
     exact_angle=False,
     eta=None,
     radius_ratio=(),
+    row_direction=False,
 ) -> Rule:
     """Hyperball (MuonH): each unit stays on its Frobenius sphere and turns by
     the ELR: lr (the paper), times the `EtaSchedule` dict `eta` if set.
     `tangent`: MuonH-T. `exact_angle`: the angle is the ELR exactly. Weight
     decay must be 0. `scale` only applies to a row compute. `radius_ratio`:
-    a prescribed radius path instead of a fixed radius (see `FrobeniusAUS`)."""
+    a prescribed radius path instead of a fixed radius (see `FrobeniusAUS`).
+    `row_direction`: a row compute (row-l2) is the direction, not the rule."""
     return _frobenius(
         "hyperball",
         "keep",
@@ -1540,6 +1581,7 @@ def hyperball(
         exact_angle,
         eta,
         radius_ratio,
+        row_direction,
     )
 
 
@@ -1552,12 +1594,23 @@ def elr(
     tangent=False,
     exact_angle=False,
     eta=None,
+    row_direction=False,
 ) -> Rule:
     """The ELR rule: a step of `ELR ||W||_F` along the normalised direction,
-    weight decay as usual, the radius free. `tangent`, `exact_angle`, `eta`
-    and `scale` as for `hyperball`."""
+    weight decay as usual, the radius free. `tangent`, `exact_angle`, `eta`,
+    `scale` and `row_direction` as for `hyperball`."""
     return _frobenius(
-        "elr", "free", pre, compute, steps, scale, tangent, exact_angle, eta
+        "elr",
+        "free",
+        pre,
+        compute,
+        steps,
+        scale,
+        tangent,
+        exact_angle,
+        eta,
+        (),
+        row_direction,
     )
 
 
@@ -1657,6 +1710,7 @@ def angular_muown(
     col_gain_lr_mult=None,
     col_gauge=False,
     col_units=(),
+    row_direction=False,
 ) -> Rule:
     """AngularMuown (arXiv 2606.23637): each unit W = Diag(g) U turns its
     unit-norm rows by the orthogonalised momentum under the angular schedule
@@ -1672,7 +1726,8 @@ def angular_muown(
     relative step without the exp, "induced" log|g| by the operator-norm step of
     the turn's size, "polar" / "polar_t" / "v3b" both from one Orth and "cosine" /
     "cosine_raw" by a cosine, on F's row sphere (see AngularMuownMap). A
-    row compute (an embedding group that inherits the preset) stays that row rule.
+    row compute (an embedding group that inherits the preset) stays that row rule,
+    unless `row_direction` makes it the direction (RMNP's row-l2).
     `sphere`, `tangent`, `magnitude_shape` "none", `native_norm`, `radius`,
     `turn_norm`, `frozen_units`, `col_scale`, `gain_param`, `gain_lr`, `gain_lr_mult`,
     `col_gain_param`, `col_gain_lr_mult`, `col_gauge` and `col_units`: see
@@ -1682,7 +1737,7 @@ def angular_muown(
     on the group's momentum (momentum 0.05, nesterov: true)."""
     schedule = eta_of("angular_muown", eta)
     inner = _whole_unit("angular_muown", "identity", compute, steps, scale)
-    if inner.kind == "rows":
+    if _row_rule("angular_muown", inner, compute, row_direction):
         return inner
     if (
         not native_norm
@@ -1719,7 +1774,13 @@ def angular_muown(
                 "must be at their hyperball values (warmup 0, c 0, scale one, the rest default)"
             )
         ratio = [[0, 1.0], [1, float(radius)]] if float(radius) != 1.0 else ()
-        return hyperball(compute=compute, steps=steps, eta=eta, radius_ratio=ratio)
+        return hyperball(
+            compute=compute,
+            steps=steps,
+            eta=eta,
+            radius_ratio=ratio,
+            row_direction=row_direction,
+        )
     b1, b2 = betas
     return Rule(
         (),
@@ -1782,6 +1843,7 @@ __all__ = [
     "right_polar",
     "ROW_COMPUTES",
     "RowL2",
+    "RowL2Deflate",
     "RowNorm",
     "sgd",
     "Sign",

@@ -88,6 +88,9 @@ SCALES: dict[str, Callable[[int, int], float]] = {
     "one": lambda m, n: 1.0,
     "spectral": lambda m, n: (m / n) ** 0.5,  # sqrt(d_out / d_in)
     "image_spectral": lambda m, n: max((m / n) ** 0.5, 1.0),  # at least 1
+    "rms_parity": lambda m, n: min(
+        (m / n) ** 0.5, 1.0
+    ),  # unit rows at polar x spectral's ||.||_F
     "n": lambda m, n: n,  # d_in; per row of a table: dim
     "sqrt_n": lambda m, n: n**0.5,  # sqrt(d_in); embedding rows: sqrt(dim)
     "inv_n": lambda m, n: 1 / n,  # 1 / d_in

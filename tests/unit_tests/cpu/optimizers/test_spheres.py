@@ -11,7 +11,11 @@ import math
 import pytest
 import torch
 
-from torchtitan.optimizers.disco.presets import FrobeniusAUS, SpectralSphere
+from torchtitan.optimizers.disco.presets import (
+    EtaSchedule,
+    FrobeniusAUS,
+    SpectralSphere,
+)
 from torchtitan.optimizers.disco.rules import rule_of, StepCtx
 
 
@@ -244,28 +248,110 @@ def test_elr_decoupled_decay():
     torch.testing.assert_close(_apply(res, W).double(), want, rtol=0, atol=2e-6)
 
 
+# eta(t) = (1 + 0.1 (t - 10))^-1 after step 10: 1 at t = 5, 1/2 at t = 20
+SCHED = {"shape": "inverse_poly", "start": 10, "c": 0.1, "p": 1.0}
+
+
 @pytest.mark.parametrize("name", ["hyperball", "elr"])
-def test_eta_schedule_sets_the_angle(name):
-    """With `eta` a schedule, the exact angle is eta(t), whatever lr is; the
-    warmup scales it linearly."""
+def test_eta_schedule_multiplies_the_angle(name):
+    """With `eta` a schedule, the exact angle is lr eta(t)."""
     W, M = _pair(3, 24, 16, 9, align=1.0)
-    sched = {"kappa": 0.03, "alpha": 0.0, "warmup": 10}
-    rule = _rule(name, exact_angle=True, eta=sched)
-    for t, want in ((5, 0.015), (20, 0.03)):
-        res = rule.run_whole(M, W, StepCtx(0.5, 0.0, t))
+    rule = _rule(name, exact_angle=True, eta=SCHED)
+    lr = 0.03
+    for t, want in ((5, lr), (20, lr / 2)):
+        res = rule.run_whole(M, W, StepCtx(lr, 0.0, t))
         got = _angle(W.double(), _apply(res, W).double())
         torch.testing.assert_close(got, torch.full_like(got, want), rtol=0, atol=1e-6)
 
 
-def test_sso_eta_schedule_sets_the_step():
-    """SSO's step is eta(t) R orth(...): spectral norm eta R, not lr R."""
+def test_sso_eta_schedule_multiplies_the_step():
+    """SSO's step is lr eta(t) R orth(...): spectral norm lr eta(t) R."""
     W, M = _pair(2, 24, 16, 11)
-    rule = _rule("sso", eta={"kappa": 0.004, "alpha": 0.0})
-    res = rule.run_whole(M, W, StepCtx(0.5, 0.0, 3))
+    rule = _rule("sso", eta=SCHED)
+    res = rule.run_whole(M, W, StepCtx(0.008, 0.0, 20))
     R = math.sqrt(24 / 16)
     step = torch.linalg.matrix_norm(res.update.double(), ord=2)
     torch.testing.assert_close(
         step, torch.full_like(step, 0.004 * R), rtol=1e-3, atol=0
     )
-    with pytest.raises(ValueError, match="eta"):
-        _rule("sso", eta=0.1)
+    for bad in (0.1, "lr", {"kappa": 0.1}, {"shape": "inverse_poly", "total": 50}):
+        with pytest.raises(ValueError, match="eta"):
+            _rule("sso", eta=bad)
+
+
+@pytest.mark.parametrize("wd", [0.0, 0.01])
+def test_muon_eta_schedule_is_its_equation(wd):
+    """muon with `eta` a schedule: W+ = (1 - lr wd) W - lr eta(t) sqrt(m/n) polar(M):
+    the schedule scales the step, not the decay; with none it is the plain lr step."""
+    W, M = _pair(3, 24, 16, 12)
+    rule = _rule("muon", eta=SCHED)
+    assert (rule.kind, rule.output, rule.needs_weight) == (
+        "unit",
+        "update_coeffs",
+        False,
+    )
+    lr = 0.5
+    for t, eta in ((5, 1.0), (20, 0.5), (30, 1 / 3)):
+        res = rule.run_whole(M, W, StepCtx(lr, wd, t))
+        want = (1 - lr * wd) * W.double() - lr * eta * math.sqrt(24 / 16) * _polar(M)
+        torch.testing.assert_close(_apply(res, W).double(), want, rtol=0, atol=2e-6)
+    plain = _rule("muon").run_whole(M).update.double()
+    res = rule.run_whole(M, W, StepCtx(lr, 0.0, 20))
+    torch.testing.assert_close(res.update.double(), lr * 0.5 * plain, rtol=0, atol=1e-7)
+    res = rule.run_whole(M, W, StepCtx(lr, 0.01, 20, True))  # decoupled: 1 - wd
+    torch.testing.assert_close(res.alpha, torch.full_like(res.alpha, 0.99))
+    with pytest.raises(ValueError, match="whole-unit"):
+        _rule("muon", eta=SCHED, block_rows=8)
+    # Groups of another rule never inherit it; a row group under it keeps its lr.
+    from torchtitan.optimizers.disco.rules import RULES
+
+    assert "eta" not in RULES["muon"].inherits
+    row = _rule("muon", compute="row-l2", scale="sqrt_n", eta=SCHED)
+    assert row.kind == "rows" and row.output == "update" and row.scale == "sqrt_n"
+
+
+def test_eta_schedule_shapes():
+    """The two shapes from their definitions: 1 up to start, then
+    (1 + c x)^-p, or 1 - sqrt(x / (total - start)), x = t - start."""
+    inv = EtaSchedule("inverse_poly", start=100, c=1e-3, p=1.0)
+    assert inv(1) == inv(100) == 1.0
+    assert math.isclose(inv(1100), 0.5) and math.isclose(inv(3100), 0.25)
+    sq = EtaSchedule("sqrt_decay", start=100, total=500)
+    assert (
+        sq(100) == 1.0
+        and math.isclose(sq(200), 0.5)
+        and sq(500) == 0.0
+        and sq(900) == 0.0
+    )
+    with pytest.raises(ValueError):
+        EtaSchedule("sqrt_decay", start=100, total=100)
+    with pytest.raises(ValueError):
+        EtaSchedule("cosine")
+
+
+def test_eta_schedule_linear_and_hold():
+    """linear: 1 - x / (total - start); hold freezes eta at its step-`hold`
+    value; hold = 0 leaves every shape exactly as defined."""
+    lin = EtaSchedule("linear", start=100, total=500)
+    assert lin(100) == 1.0 and lin(300) == 0.5 and lin(500) == 0.0 and lin(900) == 0.0
+    with pytest.raises(ValueError):
+        EtaSchedule("linear", start=100, total=100)
+    held = EtaSchedule("inverse_poly", start=100, c=1e-3, p=1.0, hold=1100)
+    assert (
+        math.isclose(held(1100), 0.5)
+        and held(5000) == held(1100)
+        and held(600) == held(600)
+    )
+    with pytest.raises(ValueError):
+        EtaSchedule("inverse_poly", hold=100)
+    c, p, T = 0.01995, 0.5148, 25600
+    for t in (1, 100, 101, 2000, 20480, 25600):
+        x = t - 100
+        want_inv = 1.0 if x <= 0 else (1.0 + c * x) ** -p
+        want_sq = 1.0 if x <= 0 else 1.0 - math.sqrt(min(1.0, x / (T - 100)))
+        assert EtaSchedule("inverse_poly", c=c, p=p)(t) == want_inv
+        assert EtaSchedule("sqrt_decay", total=T)(t) == want_sq
+        hx = min(t, 20480) - 100
+        assert EtaSchedule("inverse_poly", c=c, p=p, hold=20480)(t) == (
+            1.0 if hx <= 0 else (1.0 + c * hx) ** -p
+        )

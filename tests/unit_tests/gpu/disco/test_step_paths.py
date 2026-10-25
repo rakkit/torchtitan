@@ -286,14 +286,18 @@ class TestDiSCOStepPaths(DTensorTestBase):
             TOPOLOGIES["fsdp4"],
             comm_dtype=torch.float32,
             model={"conv": 4, "sinks": True},
-            extra_groups={"conv": {"kind": "conv", "args": {"compute": "row-l2", "scale": "one"}}},
+            extra_groups={
+                "conv": {"kind": "conv", "args": {"compute": "row-l2", "scale": "one"}}
+            },
             on_build=self._assert_conv_family("local"),
         )
 
     @with_comms
     def test_hsdp22_conv_sinks_fp32(self):
         self._check_topology(
-            TOPOLOGIES["hsdp22"], comm_dtype=torch.float32, model={"conv": 4, "sinks": True}
+            TOPOLOGIES["hsdp22"],
+            comm_dtype=torch.float32,
+            model={"conv": 4, "sinks": True},
         )
 
     @with_comms
@@ -557,8 +561,10 @@ class TestDiSCOStepPaths(DTensorTestBase):
 
     @with_comms
     def test_fsdp4_elr_scheduled_decoupled_fp32(self):
-        """An eta schedule sets the angle, and decoupled weight decay the decay."""
-        args = {"scale": None, "exact_angle": True, "eta": {"kappa": 0.05, "warmup": 2}}
+        """An eta schedule multiplies the angle, and decoupled weight decay sets
+        the decay."""
+        eta = {"shape": "inverse_poly", "start": 1, "c": 0.5}
+        args = {"scale": None, "exact_angle": True, "eta": eta}
         self._check_sphere(
             TOPOLOGIES["fsdp4"], "elr", args, weight_decay=0.01, decoupled_wd=True
         )

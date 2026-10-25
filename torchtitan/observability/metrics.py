@@ -223,7 +223,9 @@ class WandBLogger(BaseLogger):
             (k if self.tag is None else f"{self.tag}/{k}"): v
             for k, v in metrics.items()
         }
-        self.wandb.log(wandb_metrics, step=step, commit=True)
+        # No commit: the row stays open for later writes at this step (validation
+        # logs after training); the next step or `close` commits it.
+        self.wandb.log(wandb_metrics, step=step)
 
     def close(self) -> None:
         if self.wandb.run is not None:
@@ -337,6 +339,10 @@ class MetricsProcessor(Configurable):
         log_freq: int = 10
         """How often to log metrics to TensorBoard, in iterations"""
 
+        dense_log_steps: int = 0
+        """Also log every step up to this one (early dynamics at full
+        resolution); 0 disables."""
+
         enable_tensorboard: bool = False
         """Whether to log metrics to TensorBoard"""
 
@@ -385,6 +391,8 @@ class MetricsProcessor(Configurable):
         def __post_init__(self) -> None:
             if self.log_freq <= 0:
                 raise ValueError("metrics.log_freq must be greater than 0.")
+            if self.dense_log_steps < 0:
+                raise ValueError("metrics.dense_log_steps must be >= 0.")
 
     config: Config
     logger: BaseLogger
@@ -452,7 +460,11 @@ class MetricsProcessor(Configurable):
     def should_log(self, step: int) -> bool:
         if self.step_last_log is None:
             self.step_last_log = step - 1
-        return step == 1 or step % self.config.log_freq == 0
+        return (
+            step == 1
+            or step <= self.config.dense_log_steps
+            or step % self.config.log_freq == 0
+        )
 
     def _build_metric_logger(
         self,
@@ -670,8 +682,20 @@ class MetricsProcessor(Configurable):
         self.device_memory_monitor.reset_peak_stats()
 
     def log_validation(
-        self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
+        self,
+        loss: float,
+        step: int,
+        extra_metrics: dict[str, Any] | None = None,
+        tag: str | None = None,
     ):
+        if tag is not None:  # another weight set scored at this step: its loss only
+            self.logger.log({f"validation_metrics/{tag}/loss": loss}, step)
+            logger.info(
+                f"{self.color.yellow}validate step: {step:2}  [{tag}]  {self.color.green}loss: {loss:7.4f}{self.color.reset}"
+            )
+            self.ntokens_since_last_log = 0
+            self.time_last_log = time.perf_counter()
+            return
         time_delta = time.perf_counter() - self.time_last_log
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()

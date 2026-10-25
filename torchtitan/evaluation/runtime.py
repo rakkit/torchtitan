@@ -7,10 +7,11 @@
 """Model loading, dense loss evaluation, and durable CSV output."""
 
 from __future__ import annotations
-import logging
 
+import contextlib
 import csv
 import fcntl
+import logging
 import math
 import os
 import tempfile
@@ -98,7 +99,9 @@ class EvaluationRuntime:
     @classmethod
     def build(cls, config: Trainer.Config, *, base_folder: str) -> "EvaluationRuntime":
         if config.model is None:
-            raise EvaluationConfigError("saved job config did not produce a model config")
+            raise EvaluationConfigError(
+                "saved job config did not produce a model config"
+            )
 
         device_module, device_type = utils.device_module, utils.device_type
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -143,22 +146,13 @@ class EvaluationRuntime:
         tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
 
         model_config = config.model
-        model_config.update_from_config(trainer_config=config)
+        model_config.update_from_config(config=config)
         with (
             torch.device("meta"),
             utils.set_default_dtype(TORCH_DTYPE_MAP[config.training.dtype]),
         ):
             model = model_config.build()
 
-        # Snapshot serialization does not retain the concrete converter config
-        # types, and config loading already rejected non-empty converter lists.
-        model_converters = config.model_converters.build(
-            parallel_dims=parallel_dims,
-            model_compile_enabled=(
-                config.compile is not None and "model" in config.compile.components
-            ),
-        )
-        model_converters.convert(model)
         model = model.parallelize(
             parallel_dims=parallel_dims,
             training=config.training,
@@ -171,9 +165,7 @@ class EvaluationRuntime:
         with torch.no_grad():
             cast(BaseModel, model).init_weights(buffer_device=None, skip_init=True)
 
-        amp_context = dist_utils.maybe_enable_amp(
-            parallel_dims, config.training.mixed_precision_param, device_type
-        )
+        amp_context = contextlib.nullcontext()
         return cls(
             config=config,
             device=device,
@@ -194,7 +186,7 @@ class EvaluationRuntime:
         wrapper.load_state_dict(state_dict)
         logger.info("Loaded model checkpoint in %.2fs", time.monotonic() - begin)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def evaluate(
         self, dataset: EvaluationDatasetConfig
     ) -> tuple[EvaluationTotals, float]:
@@ -268,7 +260,7 @@ class EvaluationRuntime:
             extra_kwargs["positions"] = positions
 
             try:
-                with dist_utils.get_train_context(False)():
+                with dist_utils.get_spmd_context(parallel_dims=self.parallel_dims):
                     with self.amp_context:
                         raw_output = self.model(inputs, **extra_kwargs)
                         logits = _unwrap_model_output(raw_output)

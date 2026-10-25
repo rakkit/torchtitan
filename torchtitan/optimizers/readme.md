@@ -101,6 +101,8 @@ Container fields (`--optimizer.<field>`):
 | `communication_dtype` | `float32` | dtype of the momentum and updates that travel; `bfloat16` selectable, `float16` refused |
 | `log_norm_freq` | 0 | per-parameter metrics every N steps (and at step 1 and the last step); 0 = off |
 | `norms_to_log` | `["default"]` | norm names, `"default"` or `"all"` (see Metrics) |
+| `effective_rank_freq` | 0 | N > 0: `effective_rank` (the whole spectrum) only on the norm-logging steps divisible by N, step 1 and the last step; 0 = every norm-logging step |
+| `spectral_norm_freq` | 0 | N > 0 (a multiple of `log_norm_freq`): every SVD-based metric (`rms_to_rms`, `stable_rank`, `condition_number`, `effective_rank*`, the spectra, the six spectral radial metrics) only on the norm-logging steps divisible by N, step 1 and the last step; the SVD-free norms and the other radial metrics keep `log_norm_freq` (dense phase included). 0 = every norm-logging step |
 | `gram_level` | 0 | Gram metrics, 0 = off, 1-3 cumulative |
 | `head_diag_probes`, `head_diag_diameter_iters` | 512, 10 | LM-head geometry: tokens of the last microbatch whose head input it uses (0 = off), diameter iterations |
 | `enable_spectrum_export`, `enable_gram_export` | False | Parquet export of the singular-value spectra / Gram vectors, one `step_N_rankR.parquet` per writing rank |
@@ -182,10 +184,10 @@ keyword arguments are its args and defaults:
 | `right_polar` | `pre` -> `gram_polar` -> scale; no all-to-all | 5 steps, `spectral`, work dtype fp16 | `compute` |
 | `lm_head` | centre -> `gram_polar+row-l2` (`spectral: false`: `row-l2`) -> centre -> scale | 5 steps, `inv_sqrt_n` | `scale` |
 | `left_polar` | centre -> orthogonaliser -> centre -> scale (routers) | `newtonschulz5`, 5, `spectral` | |
-| `aus` | `AUSMap` around a muon direction: needs the weight, keeps a per-unit vector, returns `beta U` and `alpha` (beta folded into the update) | as `muon`, `sigma_iters` 8, `eta`: an `EtaSchedule` dict (`kappa`, `tau`, `alpha`, `min`, `anneal_*`, `warmup`; default `0.1 / sqrt(t)`) or `"lr"` | |
-| `hyperball` | `FrobeniusAUS`, radius kept: `W+ = r N(W - s r N(U))`, r = `\|\|W\|\|_F` | as `muon` without a scale; `tangent` false, `exact_angle` false, `eta` `"lr"` | `scale` |
+| `aus` | `AUSMap` around a muon direction: needs the weight, keeps a per-unit vector, returns `beta U` and `alpha` (beta folded into the update) | as `muon`, `sigma_iters` 8, `eta` none | |
+| `hyperball` | `FrobeniusAUS`, radius kept: `W+ = r N(W - s r N(U))`, r = `\|\|W\|\|_F` | as `muon` without a scale; `tangent` false, `exact_angle` false, `eta` none | `scale` |
 | `elr` | `FrobeniusAUS`, radius free: `W+ = d W - s r N(U)`, d the decay | as `hyperball` | `scale` |
-| `sso` | `SpectralSphere`: `W+ = (R / sigma) W - s R orth(M^ + lambda* u v^T)`, `R = scale(m, n)` | as `muon`; `sigma_iters` 8, `solve_steps` 12, `lambda0` 1e-3, `eta` `"lr"` | |
+| `sso` | `SpectralSphere`: `W+ = (R / sigma) W - s R orth(M^ + lambda* u v^T)`, `R = scale(m, n)` | as `muon`; `sigma_iters` 8, `solve_steps` 12, `lambda0` 1e-3, `eta` none | |
 
 `right_polar`, `lm_head` and `left_polar` are the symmetry-compatible rules of
 Lau & Su (arXiv 2605.18106); the paper's other two are configs: row-norm only
@@ -262,12 +264,12 @@ build). Head-wise attention is two groups:
 **Sphere rules.** `hyperball` (MuonH, arXiv 2606.16899), `elr` (Tencent's ELR,
 hy.tencent.ai/research/elr, their Eq. 2) and `sso` (arXiv 2601.08393) need the
 weight on the owner and return per-unit coefficients, like `aus`. Their step
-size s is `eta`: the group's `lr` (`"lr"`, the papers' setting), or an
-`EtaSchedule` dict as for `aus`.
+size s is the group's `lr` (the papers' setting), times `eta(t)` when `eta`
+is an `EtaSchedule` dict (see "Angular schedule" below).
 - `hyperball` and `elr` are AUS in the Frobenius geometry: s is the ELR, the
   step relative to `||W||_F`.
   - `exact_angle: true` solves s in closed form so that the angle between W
-    and W+ is exactly `eta` (arXiv 2607.22444).
+    and W+ is exactly s (arXiv 2607.22444).
   - `tangent: true` (MuonH-T) removes the momentum's component along W before
     the orthogonaliser.
   - `N()` cancels any scale, so their `scale` applies only to a row compute:
@@ -292,16 +294,39 @@ size s is `eta`: the group's `lr` (`"lr"`, the papers' setting), or an
   `elr`; the first step warns if one exists.
 - Like `aus`, they are meant for the hidden matrices. A row group (embedding,
   head, routers) that inherits a sphere rule stays that row rule.
-  - With an `eta` schedule, the schedule touches only the sphere groups.
-  - With `eta: "lr"` (the default), the default group's `lr` is the ELR, and
-    a row group without its own `lr` inherits it. `moe_template_config()`'s
-    row groups set none, so give them one.
-  - With `eta: "lr"`, the ELR post's minus-square-root schedule is the
-    trainer's `lr_scheduler` with `decay_type: "sqrt"` and
-    `decay_ratio: 1.0`.
+  - The default group's `lr` is the ELR, and a row group without its own
+    `lr` inherits it. `moe_template_config()`'s row groups set none, so give
+    them one.
+  - The ELR post's minus-square-root schedule is the trainer's
+    `lr_scheduler` with `decay_type: "sqrt"` and `decay_ratio: 1.0`, or an
+    `eta` of shape `sqrt_decay` on top of a WSD.
+
+**Angular schedule.** Every matrix rule (`muon`, `aus`, `hyperball`, `elr`,
+`sso`, `angular_muown`) takes `eta`, an `EtaSchedule` dict that multiplies
+the group's lr for the direction step only: the step is `lr_t eta(t)`, lr_t
+the trainer's schedule. Weight decay keeps `1 - lr_t wd`, and angular-muown's
+magnitudes keep lr_t. `eta(t)` is 1 up to `start`; after it, with
+`x = t - start`, `inverse_poly` is `(1 + c x)^-p` (angular-muown's kappa) and
+`sqrt_decay` is `1 - sqrt(x / (total - start))` (the ELR post's msqrt). A
+shape takes only its own keys; `table` takes `points`, `((step, value), ...)` with increasing steps: eta is linear between them and the first / last value outside. A row group under a default with `eta` keeps
+its lr (`muon` does not pass `eta` on; the sphere rules return the row rule).
+The value used is logged as `eta_schedule/DiSCO/<group>` and
+`eta_used/DiSCO/<group>` (lr_t eta(t)).
+
+**Column scales (`angular_muown` `col_scale: true`, off by default).** W =
+Diag(g) U Diag(c) (MuonMD, arXiv 2606.25971 Eq. 1): c starts at 1 and is moved
+by the row scales' rule (Adam or sign, same betas, eps and rate lr_t x
+`magnitude_lr`) on dL/dc_j = sum_i G_ij g_i U_ij; U's gradient is Diag(g) G
+Diag(c) and the row gradient rowdot(G Diag(c), U). c lives in three extra rows
+of the rule state ([c; m_c; v_c], state (m + 3, n + 3)), so it is checkpointed
+with it and sharded as the rule state (whole units on their owner). Needs
+`magnitude_shape: row`, `magnitude_rule: adam | sign` and no `frozen_units`.
+The parameter is the effective W, so every logged norm and radial metric is
+W's; U, g and c are not logged.
 - **Measured** on 1 node, 200 steps, mis-8b-proxy (MoE) and
-  M1-dense-600M-full_rope-proxy, with `eta` a schedule on the hidden
-  matrices, as the median of the step's angle / eta over the hidden units:
+  M1-dense-600M-full_rope-proxy, with the step size set on the hidden
+  matrices, as the median of the step's angle / that size over the hidden
+  units:
   - `hyperball` and `elr` hold the Frobenius angle at 0.98-1.00, and with
     `exact_angle` at 1.0000 on every unit and step.
   - `sso` and `aus` aim at the spectral angle. It starts at ~1.6x at step 1
@@ -587,3 +612,95 @@ CPU test on an explicit CPU mesh.
 - **W&B resume / fork** (`WANDB_RESUME_FROM`, `WANDB_FORK_FROM`) get no rank
   suffix under per-rank logging.
 - The metrics gather sends to every rank; only the logging rank reads it.
+
+## Gradient-noise logging (`optimizer.gnoise`, off by default)
+
+`optimizers/gnoise.py` (E1), `gnoise_research.py` (research mode), `gnoise_math.py` (the
+estimators). Off by default; when off nothing is installed and nothing runs.
+
+**When.** E1 runs on DiSCO's norm-logging steps: by default every one (step 1, every step
+<= `dense_norm_steps`, every `log_norm_freq`-th step, the last step). `e1_freq` N (a multiple
+of `log_norm_freq`) keeps the steps divisible by N; `e1_dense_phase` false drops step 1, the
+dense phase and the last step. `research_freq` and the curvature frequencies must be multiples
+of the E1 interval (`e1_freq`, or `log_norm_freq` when 0). The finalisation is vectorised over
+all units, rows, heads and types (static index maps); metrics are kept as vector families and
+gathered by owner with one sync.
+
+**Small batch.** One (rank, microbatch): torchtitan reduces the gradient after every
+microbatch, so that is the smallest gradient that exists. For a routed expert it is one
+(expert copy, microbatch): EP 1, the rank; EP > 1, its EP group. K = dp ranks x accumulation;
+K_e = (efsdp x dp_replicate) x accumulation. K < 2 is refused at set-up.
+
+**Where it reads.** A per-instance wrapper on every `FSDPParamGroup.post_backward`, at its
+entry: the group still holds the unsharded weight the forward used and this small batch's
+gradient, before FSDP reshards and reduces (torch `_fsdp_param_group.py`, pinned by a test).
+The reduced gradient G is read before the clip. One small batch per (param, microbatch),
+counted exactly once; a group still sharded at the entry, or a skipped reduce outside the
+chunked loss's chunks, raises.
+
+**Estimators.** With n_b valid tokens, g_b the gradient of sum(loss) / N_den, ghat_b =
+(N_den / n_b) g_b, N = sum n_b, Ghat = (N_den / N) sum_b g_b, for a projection P fixed with
+respect to the batch: A = mean_b ||P ghat_b||^2, F = ||P Ghat||^2, H = mean_b 1 / n_b,
+tr = (A - F) / (H - 1/N), S = (F H - A / N) / (H - 1/N). Small batches with no token are left
+out; a component with fewer than two is not estimable (NaN). P is built from the compute
+copy of W (the fp32 master cast to FSDP's param_dtype on the F side, bitwise the same values).
+A basis from G_t or M_t is not offered: the unbiasedness needs P independent of the batch.
+
+**Caveats.**
+- Sampling: the loader packs documents (concat_then_split, no shuffle), so the estimate is
+  the noise per rank-microbatch. It scales to tokens only as far as microbatches are
+  independent draws; the accumulation test (mb 32 vs 16 x 2) measures the gap.
+- Experts: unbiased conditional on the routing, treating the tokens routed to an expert as
+  draws from its routed-token distribution; n_b,e is the routed count (every routed token, a
+  masked label included), N_e = sum_b n_b,e, Ghat_e = (N_den / N_e) G_e. B_simple is in routed
+  tokens and, x N / N_e, in total tokens. Small batches with fewer routed tokens than min(m, n) are rank-deficient
+  (counted per step: `gnoise_ex_lowtok`).
+- Per-step SE: the delete-one jackknife needs <P ghat_b, P Ghat> per b. E1 has it for rank-1
+  components (Frobenius / spectral radial); research mode for every component.
+- Router: covered with no aux loss or the sequence-wise one; left out under the batch-wise one
+  (its gradient is no per-token sum). The expert bias is a buffer, not covered.
+
+**Research mode** (`research_freq` > 0). Every rank copies its small batch's gradient of the
+covered units (bf16) into a send buffer laid out by owner; one all-to-all over the dp world
+moves them (a dense matrix whole to one owner, a vocabulary matrix by row blocks, an expert
+unit only among the ranks holding that expert). The owner then has all K small batches and W:
+exact jackknife SEs, the spectral radial (u1 v1^T of W_t), top-k shares (W_t's top-k on the
+smaller side; A1 predicts k / min(m, n)), and the LMO agreement a_s = mean over disjoint pairs
+of <O_S, O_S'> / min(m, n) at every s dividing K with s <= K / 2 (one partition per size from a
+private generator seeded by the step, three at the half, all three pairings at K = 4).
+- Exact polar = the eigendecomposition of the fp64 Gram; singular values below 1e-6 sigma_max
+  map to 0 (resolvable to about 1e-8 sigma_max). It is the exact polar, not the training
+  backend's Polar-Express LMO, and it is the same for every training rule: research reads no
+  optimizer state (vectors: sign, embedding / head / router rows: row-l2, matrices: polar).
+- E a_s = kappa(s n_b)^2 under the linear-drift model (two independent halves); reading the
+  momentum step's kappa from it assumes the noise-dominated law kappa ~ sqrt(P B).
+- Memory on a research step: about 4 B x (P_dense + P_experts / EP) x accumulation per rank
+  (snapshot + received), freed after the step.
+
+**Curvature** (`curvature_model_freq`, `curvature_matrix_freq`; research runs): same-batch,
+after the optimizer step: c = 2 (L(W_{t+1}) - L(W_t) - <G_t, Delta>) / ||Delta||^2 from one
+forward, and per unit <Delta_k, G'_k - G_k> / ||Delta_k||^2 from a second forward and backward.
+All model buffers (MoE counts, aux-loss accumulators) and the RNG are restored and the
+gradients cleared.
+
+**Update metrics** (hidden matrices: layout kind `matrix`, no experts). DiSCO calls
+`update_observer` at the end of `step()` with the update u it applied (W <- decay W -
+lr u, alpha W - u, or W - u for rules that return weights); O_t = u. On every E1 step
+`gnoise_psi/<unit>` = <O_t, G_t> / (|O_t| |G_t|), G_t the reduced gradient (read after
+the clip, a common scalar). On the E1 steps divisible by L, the smallest multiple of the
+E1 interval >= 8, `gnoise_lag<h>/<unit>` = <O_t, O_{t-h}> / (|O_t| |O_{t-h}|) for h = 1,
+2, 4, 8; the local rows of O are copied only on the steps L - h before (at most four
+copies per parameter, dropped once read; NaN after a resume until refilled). Research
+steps add `gnoise_psi_half` / `gnoise_psi_quarter` (G from the subset sums of the groups
+{b : b mod g = a}, g = 2 / 4, b the rank-major small-batch index; mean over a; the
+small-batch gradients are kept on their owner through the optimizer step and O is
+gathered whole), and per matrix unit `gnoise_ntop<k>` (k = 1, 2, 3, k <= K - 1: the
+top-k eigenvalue share of the K x K Gram of sqrt(n_b) d_b, d_b = ghat_b - Ghat, i.e. of
+the per-token noise covariance; an isotropic noise gives about k / (K - 1)) and, when K
+>= 8 (else one startup line), `gnoise_bs1` = `gnoise_bs1_noise` / `gnoise_bs1_grad` =
+||C_row^(1/2)||_S1^2 / ||Ghat||_S1^2, C_row = sum_b n_b d_b d_b^T / (K - 1) over the
+unit's rows (Naganuma et al. 2602.03001 Eq. 17; ||Ghat||_S1 includes the noise's
+upward bias).
+
+**Refused (raise at config time, only when enabled):** TP, CP or PP > 1; CUDA graphs;
+CPU offload; compiled autograd.

@@ -19,6 +19,8 @@ from torch.distributed.pipelining.schedules import (
     PipelineScheduleMulti,
 )
 
+from torchtitan import nanprobe
+
 from torchtitan.components.checkpointer import BaseCheckpointManager, CheckpointManager
 from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.components.data.types import TrainingMicrobatch
@@ -28,6 +30,7 @@ from torchtitan.components.optimizer import (
     LRSchedulersContainer,
     OptimizersContainer,
 )
+from torchtitan.components.optimizer.averages import WeightAverages
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
 from torchtitan.config.configs import (
     CommConfig,
@@ -99,6 +102,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         ema: EMA.Config | None = None
         """Online EMA of model weights, e.g. for cheap mid-WSD-training eval
         without a full LR decay. Unset (None) means EMA is disabled."""
+        averages: WeightAverages.Config | None = None
+        """Online power averages, snapshots and scoring of weight files.
+        Unset (None) means none."""
         training: TrainingConfig = field(default_factory=TrainingConfig)
         parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
         checkpointer: Annotated[
@@ -192,6 +198,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     optimizers: OptimizersContainer
     lr_schedulers: LRSchedulersContainer
     ema: EMA | None
+    averages: WeightAverages | None
     checkpointer: BaseCheckpointManager
     pp_has_last_stage: bool
     max_num_documents: int | None
@@ -424,6 +431,13 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             if self.config.ema is not None
             else None
         )
+        self.averages = (
+            self.config.averages.build(
+                model_parts=self.model_parts, output_dir=self.output_dir
+            )
+            if self.config.averages is not None
+            else None
+        )
 
     def _initialize_checkpointer(
         self,
@@ -441,7 +455,10 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             ema=self.ema,
-            states={"train_state": self},
+            states={
+                "train_state": self,
+                **({"averages": self.averages} if self.averages is not None else {}),
+            },
             sd_adapter=sd_adapter,
             base_folder=self.output_dir,
         )
@@ -675,6 +692,10 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             loss = forward_backward()
         detached_loss = loss.detach()
         self.loss_is_finite.logical_and_(torch.isfinite(detached_loss).all())
+        if nanprobe.on() and not self.parallel_dims.pp_enabled:
+            nanprobe.on_microbatch(
+                self, microbatch_group[0], detached_loss, accumulation_index
+            )
         return detached_loss
 
     def _non_pp_forward_backward_body(
@@ -685,6 +706,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         model_kwargs: dict[str, Any],
         loss_kwargs: dict[str, Any],
     ) -> torch.Tensor:
+        if nanprobe.on():
+            nanprobe.capture(inputs, labels, model_kwargs, loss_kwargs)
         with dist_utils.get_spmd_context(
             parallel_dims=self.parallel_dims,
             spmd_typechecking=self.config.debug.spmd_typechecking,
@@ -740,6 +763,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         # max_norm <= 0 disables clipping in this fork's configs; clip_grad_norm_
         # has no such sentinel, so translate it to the no-op value.
         max_norm = self.config.training.max_norm
+        gnoise = getattr(self.optimizers, "gnoise", None)
+        if gnoise is not None:  # reads G before the clip on its armed steps
+            gnoise.before_clip()
         grad_norm = dist_utils.clip_grad_norm_(
             [p for model in self.model_parts for p in model.parameters()],
             max_norm if max_norm > 0 else float("inf"),
@@ -765,6 +791,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         step_is_finite = self.loss_is_finite.logical_and(
             torch.isfinite(grad_norm).all()
         )
+        if nanprobe.on():
+            nanprobe.after_backward(self, grad_norm)
         torch._assert_async(
             step_is_finite,
             "Loss or gradient norm is not finite on at least one rank at "
@@ -773,6 +801,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         if hasattr(self, "checkpointer"):
             self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
+        if nanprobe.on():
+            nanprobe.after_update(self)
         self.lr_schedulers.step()
         # getattr, not attribute access: `ema` is only assigned in
         # _initialize_optimizer, and optimizer_step is reachable without it
@@ -783,6 +813,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             # current_step is the step just optimized, which is what the EMA
             # schedule's start_step/update_every_n_steps are defined against.
             ema.step(current_step)
+        averages = getattr(self, "averages", None)
+        if averages is not None:
+            averages.step(current_step)
         self.num_completed_steps = current_step
         self._num_optimizer_steps_since_cuda_graph_init += 1
         return grad_norm

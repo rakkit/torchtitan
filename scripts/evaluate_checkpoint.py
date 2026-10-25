@@ -13,9 +13,9 @@ Trainer, optimizer, scheduler, or training dataloader.
 """
 
 from __future__ import annotations
-import logging
 
 import argparse
+import logging
 from pathlib import Path
 
 import torch
@@ -29,6 +29,8 @@ from torchtitan.evaluation.config import (
 )
 from torchtitan.evaluation.runtime import EvaluationRuntime, result_row, upsert_result
 from torchtitan.observability.logging import init_logger
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -184,5 +186,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-logger = logging.getLogger(__name__)

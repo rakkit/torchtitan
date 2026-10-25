@@ -56,11 +56,33 @@ from torch import Tensor
 logger = logging.getLogger(__name__)
 
 from .floors import NORM_FLOOR, SUMSQ_FLOOR
-from .zeropower import polar_express_coefficients, zeropower_backends
+from .zeropower import (
+    _POLAR_EXPRESS_BASE,
+    polar_express_coefficients,
+    zeropower_backends,
+)
 
 # Restarting the accumulated polynomial partway through keeps the Gram
 # iteration stable; upstream restarts once, before iteration 2.
 _RESET_ITERATIONS = frozenset({2})
+
+# The polar-express triples are evaluated at x / safety. 1.01: this repo's
+# X-iteration value (bitwise today's kernel); upstream Gram-NS uses 1.05.
+GRAM_SAFETY_DEFAULT = 1.01
+
+
+def gram_coefficients(
+    steps: int, safety: float = GRAM_SAFETY_DEFAULT
+) -> list[tuple[float, float, float]]:
+    """First `steps` triples as p(x / safety): (a / f, b / f^3, c / f^5), the
+    limit triple unscaled and repeated."""
+    if safety == GRAM_SAFETY_DEFAULT:
+        return polar_express_coefficients(steps)
+    f = safety
+    table = [(a / f, b / f**3, c / f**5) for a, b, c in _POLAR_EXPRESS_BASE[:-1]]
+    table.append(_POLAR_EXPRESS_BASE[-1])
+    return (table + [table[-1]] * max(0, steps - len(table)))[:steps]
+
 
 _QUACK = None
 
@@ -113,6 +135,7 @@ def gram_polar_express(
     eps: float = 1e-7,
     use_kernels: bool = True,
     work_dtype: torch.dtype = torch.float16,
+    safety: float = GRAM_SAFETY_DEFAULT,
 ) -> Tensor:
     """Drop-in for `zeropower_via_polar_express` with the Gram iteration.
 
@@ -143,7 +166,7 @@ def gram_polar_express(
             lambda A, B: A @ B,
         )
     )
-    coeffs = polar_express_coefficients(steps)
+    coeffs = gram_coefficients(steps, safety)
 
     is_2d = G.dim() == 2
     if is_2d:

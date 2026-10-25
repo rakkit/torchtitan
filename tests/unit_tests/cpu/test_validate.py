@@ -68,6 +68,7 @@ def _generic_validator(loader):
     validator.tokenizer = mock.Mock()
     validator.seq_len = 4
     validator.num_tokens_per_microbatch = 4
+    validator.plan = None  # no fixed slice: each rank reads its own shard
     validator.metrics_processor = SimpleNamespace(
         ntokens_since_last_log=0,
         log_validation=mock.Mock(),
@@ -126,6 +127,7 @@ def _flux_validator(loader):
     validator.tokenizer = mock.Mock()
     validator.seq_len = 4
     validator.num_tokens_per_microbatch = 4
+    validator.plan = None  # no fixed slice: each rank reads its own shard
     validator.metrics_processor = SimpleNamespace(
         ntokens_since_last_log=0,
         log_validation=mock.Mock(),
@@ -317,3 +319,144 @@ def test_validator_rejects_steps_neg1_when_dp_gt_1():
 def test_validator_accepts_finite_pass_or_positive_steps():
     _validator_from_init(steps=-1, dp_world_size=1)
     _validator_from_init(steps=10, dp_world_size=8)
+
+
+def test_validation_seq_len_defaults_to_the_training_context_and_can_be_fixed():
+    """K1: validator.fixed_seq_len (None = the training max_context_length, so every config that does not set it is unchanged)."""
+    from torchtitan.components.validate import validation_seq_len
+
+    assert validation_seq_len(Validator.Config(), 2048) == 2048
+    assert validation_seq_len(Validator.Config(), 4096) == 4096
+    assert validation_seq_len(Validator.Config(fixed_seq_len=4096), 2048) == 4096
+    assert validation_seq_len(Validator.Config(fixed_seq_len=4096), 32768) == 4096
+    assert (
+        validation_seq_len(SimpleNamespace(), 8192) == 8192
+    )  # another validator's config without the field
+    with pytest.raises(ValueError, match="fixed_seq_len must be positive"):
+        Validator.Config(fixed_seq_len=0)
+
+
+def test_trainer_builds_the_validator_at_the_validation_seq_len():
+    """K1: trainer.py passes validation_seq_len(config.validator, config.training.max_context_length), not the training context length alone."""  # noqa: B950
+    from pathlib import Path
+
+    from torchtitan import trainer as trainer_module
+
+    src = Path(trainer_module.__file__).read_text()
+    assert (
+        "validation_seq_len(" in src
+        and "seq_len=config.training.max_context_length" not in src
+    )
+
+
+def test_fixed_slice_reads_sequences_of_the_validator_seq_len_whatever_the_training_context():
+    """K1: a (256, 2048) config with validator.fixed_seq_len 4096 reads the fixed validation slice as 4,096-token sequences: dataloader max_context_length 4096 and slice_microbatch x 4096 tokens per microbatch."""  # noqa: B950
+    from torchtitan.components.validate import validation_seq_len
+
+    cfg = Validator.Config(
+        slice_shards=4, slice_sequences=8, slice_microbatch=2, fixed_seq_len=4096
+    )
+    training_context = 2048
+    validator = _validator_from_init(steps=10, dp_world_size=4)
+    validator.config = cfg
+    validator.seq_len = validation_seq_len(cfg, training_context)
+    validator.plan = [(0, 0, 1)]
+    calls = []
+
+    def build(**kw):
+        calls.append(kw)
+        return _ClosableLoader([object()])
+
+    validator.dl_config = SimpleNamespace(build=build)
+    validator.dp_world_size = 4
+    validator.tokenizer = mock.Mock()
+    list(validator._slice_microbatches())
+    assert validator.seq_len == 4096
+    assert (
+        calls[0]["max_context_length"] == 4096
+        and calls[0]["num_tokens_per_microbatch"] == 2 * 4096
+    )
+
+
+def test_rope_cache_covers_a_validator_seq_len_longer_than_the_training_context():
+    """K1: a (256, 2048) config validated at 4,096 needs RoPE positions up to 4,095: the model's RoPE caches (global and SWA) cover max(training context, validator.fixed_seq_len); without validator.fixed_seq_len they are the training context, as before."""  # noqa: B950
+    from torchtitan.config import ParallelismConfig
+    from torchtitan.config.configs import TrainingConfig
+    from torchtitan.models.opt_moe import model_registry
+
+    def rope_lengths(training_ctx, validator):
+        cfg = model_registry("mis-8b-proxy")
+        cfg.n_layers, cfg.swa_pattern, cfg.rope_pattern = 2, "SF", None
+        ns = SimpleNamespace(
+            parallelism=ParallelismConfig(),
+            training=TrainingConfig(max_context_length=training_ctx),
+        )
+        if validator is not None:
+            ns.validator = validator
+        cfg.update_from_config(config=ns)
+        swa = (
+            cfg.rope_of_swa.max_context_length
+            if cfg.rope_of_swa is not None
+            else cfg.rope.max_context_length
+        )
+        return cfg.rope.max_context_length, swa, cfg.max_context_length
+
+    assert rope_lengths(2048, SimpleNamespace(fixed_seq_len=4096)) == (4096, 4096, 2048)
+    assert rope_lengths(2048, SimpleNamespace(fixed_seq_len=None)) == (2048, 2048, 2048)
+    assert rope_lengths(2048, None) == (2048, 2048, 2048)
+    assert rope_lengths(8192, SimpleNamespace(fixed_seq_len=4096)) == (8192, 8192, 8192)
+
+
+def _trainer_build_calls():
+    """every `config.<attr>.build(<keywords>)` call in Trainer.__init__ (ast): [(attr, [keyword names], the Call node)]"""
+    import ast
+    from pathlib import Path
+
+    from torchtitan import trainer as trainer_module
+
+    out = []
+    for node in ast.walk(ast.parse(Path(trainer_module.__file__).read_text())):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "build"
+        ):
+            v = node.func.value
+            if (
+                isinstance(v, ast.Attribute)
+                and isinstance(v.value, ast.Name)
+                and v.value.id == "config"
+                and node.keywords
+                and all(k.arg for k in node.keywords)
+            ):
+                out.append((v.attr, [k.arg for k in node.keywords], node))
+    return out
+
+
+def test_the_trainer_builds_the_validator_with_kwargs_that_do_not_overlap_the_config_fields():
+    """K1 regression: Configurable.Config.build refuses a kwarg that is also a config field (ValueError 'build() kwargs {...} overlap with config fields'); trainer.py's config.validator.build(...) call is replayed here with the SAME keyword names (parsed from the source) on a Validator.Config with the K1 field set."""  # noqa: B950
+    from dataclasses import fields
+
+    calls = [c for c in _trainer_build_calls() if c[0] == "validator"]
+    assert len(calls) == 1
+    names = calls[0][1]
+    cfg = Validator.Config(slice_shards=4, slice_sequences=8, slice_microbatch=2)
+    kw = {n: mock.Mock() for n in names}
+    kw.update(
+        dp_world_size=4,
+        dp_rank=0,
+        num_tokens_per_microbatch=4096,
+        **{n: None for n in names if n.startswith("pp_")}
+    )
+    kw["seq_len"] = validate_module.validation_seq_len(cfg, 2048)
+    assert {f.name for f in fields(cfg)}.isdisjoint(names), sorted(
+        {f.name for f in fields(cfg)} & set(names)
+    )
+    v = cfg.build(**kw)  # the real Validator.__init__ through Config.build
+    assert v.seq_len == kw["seq_len"]
+    # with the K1 field set the build goes through, and the validator is built at the field's length
+    cfg2 = Validator.Config(
+        slice_shards=4, slice_sequences=8, slice_microbatch=2, fixed_seq_len=4096
+    )
+    kw["seq_len"] = validate_module.validation_seq_len(cfg2, 2048)
+    assert cfg2.build(**kw).seq_len == 4096

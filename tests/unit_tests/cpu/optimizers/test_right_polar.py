@@ -82,19 +82,62 @@ def test_centring_and_the_lm_head_rule_agree_on_split_rows():
     parts = torch.cat(_phases_on_parts(mu.pre, [x[:30], x[30:]], 80))
     torch.testing.assert_close(parts, whole, rtol=1e-6, atol=1e-6)
     assert torch.allclose(whole.mean(0), torch.zeros(16), atol=1e-6)
-    # the LM-head rule: centre -> right polar (or none) -> scale -> centre
-    for spectral in (True, False):
-        rule = rule_of(
-            dict(
-                rule="lm_head",
-                args={"steps": 8, "spectral": spectral, "work_dtype": "float32"},
-            )
-        )
+    # the LM-head rule, every order: centred in, centred out
+    for spectral, order in (
+        (True, "row_then_polar"),
+        (True, "polar_then_row"),
+        (False, "row_then_polar"),
+    ):
+        args = {
+            "steps": 8,
+            "spectral": spectral,
+            "order": order,
+            "work_dtype": "float32",
+        }
+        rule = rule_of(dict(rule="lm_head", args=args))
         assert rule.kind == ("gram" if spectral else "rows")
-        assert rule.pre == (Centre(),) and rule.post[-1] == Centre()
+        assert rule.pre[0] == Centre() and rule.pre[-1] == Centre()
+        assert rule.post[-1] == Centre()
         whole = rule.reference(x).update
         assert torch.allclose(whole.mean(0), torch.zeros(16), atol=1e-5)  # re-projected
         torch.testing.assert_close(_split_run(rule, x, 30), whole, rtol=1e-4, atol=1e-5)
+
+
+def _their_row_then_polar(g, alpha=1.0):
+    """Lau & Su's LM-head hybrid, from their optim/hybrid.py (`row_then_polar`,
+    `center_rows=True`), in float64 with an exact inverse square root."""
+    x = g.double()
+    x = x - x.mean(0)
+    x = x / x.norm(dim=1, keepdim=True)
+    x = x - x.mean(0)
+    evals, evecs = torch.linalg.eigh(x.mT @ x)
+    u = x @ (evecs * evals.rsqrt()) @ evecs.mT
+    u = (x * u).sum() ** alpha * u
+    return u - u.mean(0)
+
+
+def test_lm_head_row_then_polar_is_their_hybrid():
+    """A head-like moment: a shared row, and row norms over three decades."""
+    gen = torch.Generator().manual_seed(7)
+    g = torch.randn(200, 16, generator=gen) + 0.5 * torch.randn(1, 16, generator=gen)
+    g = g * torch.logspace(-3, 0, 200)[:, None]
+    for alpha in (1.0, 0.0):
+        args = {"steps": 8, "alpha": alpha, "scale": "one", "work_dtype": "float32"}
+        got = rule_of(dict(rule="lm_head", args=args)).reference(g).update
+        want = _their_row_then_polar(g, alpha).float()
+        torch.testing.assert_close(
+            got, want, rtol=2e-3, atol=2e-3 * want.abs().max().item()
+        )
+    # the other order is a different map, so the reference can tell them apart
+    args = {
+        "steps": 8,
+        "order": "polar_then_row",
+        "scale": "one",
+        "work_dtype": "float32",
+    }
+    other = rule_of(dict(rule="lm_head", args=args)).reference(g).update
+    want = _their_row_then_polar(g, 0.0).float()
+    assert (other - want).abs().max() > 0.1 * want.abs().max()
 
 
 def test_an_all_zero_unit_gives_a_zero_update_not_nan():

@@ -18,6 +18,8 @@ import torch
 import tyro
 from torch.distributed.elastic.multiprocessing.errors import record
 
+from torchtitan import nanprobe
+
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.observability.data_consumption import (
@@ -39,7 +41,7 @@ def _disco_container(optimizers: Any) -> DiSCOOptimizersContainer | None:
 
 
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
-from torchtitan.components.validate import BaseValidator, Validator
+from torchtitan.components.validate import BaseValidator, validation_seq_len, Validator
 from torchtitan.config import Configurable
 from torchtitan.config.configs import CompileConfig
 from torchtitan.config.override import apply_overrides
@@ -179,6 +181,19 @@ class Trainer(Configurable):
                     "metric-logging steps, so otherwise norms land on "
                     "lcm(log_freq, log_norm_freq) instead of the cadence you "
                     "asked for."
+                )
+            gnoise = getattr(self.optimizer, "gnoise", None)
+            if gnoise is not None and gnoise.enable:
+                from torchtitan.optimizers.gnoise import refuse_unsupported
+
+                gnoise.validate(log_norm_freq=log_norm_freq)
+                refuse_unsupported(parallelism=self.parallelism, training=self.training)
+            dense = getattr(self.optimizer, "dense_norm_steps", 0)
+            if dense > self.metrics.dense_log_steps:
+                raise ValueError(
+                    f"optimizer.dense_norm_steps ({dense}) needs "
+                    f"metrics.dense_log_steps >= it ({self.metrics.dense_log_steps}): "
+                    "norms are only computed on metric-logging steps."
                 )
             if (
                 self.metrics.save_all_shard_ranks
@@ -340,6 +355,8 @@ class Trainer(Configurable):
         disco = _disco_container(engine.optimizers)
         if disco is not None:
             disco.log_metrics_locally = logs_metrics_locally(config.metrics)
+            if disco.gnoise is not None:
+                disco.gnoise.validate_layout(accum=self.gradient_accumulation_steps)
         self._check_per_rank_metric_logging()
 
         self.data_mix_metrics = build_data_mix_metrics(self.dataloader)
@@ -377,7 +394,9 @@ class Trainer(Configurable):
                 parallel_dims=parallel_dims,
                 loss_fn=engine.loss_fn,
                 metrics_processor=self.metrics_processor,
-                seq_len=config.training.max_context_length,
+                seq_len=validation_seq_len(
+                    config.validator, config.training.max_context_length
+                ),
                 num_tokens_per_microbatch=num_tokens_per_microbatch,
                 pp_schedule=pp_schedule,
                 pp_has_first_stage=pp_has_first_stage,
@@ -478,6 +497,7 @@ class Trainer(Configurable):
     def train_step(self, data_iterator: Iterator[TrainingMicrobatch]):
         engine = self.engine
         current_step = engine.num_completed_steps + 1
+        nanprobe.set_step(current_step)
         # Always log the final step even when it does not land on a log_freq
         # boundary, so a run ends with a metrics point. This has to be decided
         # here, not at the log site: the loss is only accumulated when
@@ -534,10 +554,17 @@ class Trainer(Configurable):
             global_valid_tokens,
             num_accumulation_steps=self.gradient_accumulation_steps,
         )
+        gnoise = disco.gnoise if disco is not None else None
+        if gnoise is not None:
+            gnoise.set_tokens(global_valid_tokens)
 
         # Process each gradient accumulation step, then free its inputs.
         accumulated_loss: torch.Tensor | None = None
         for fwd_bwd_index, microbatch_group in enumerate(microbatch_groups):
+            if gnoise is not None:
+                gnoise.begin_microbatch(
+                    sum(mb.num_valid_tokens for mb in microbatch_group)
+                )
             detached_loss = engine.forward_backward_microbatch(
                 microbatch_group=microbatch_group,
                 global_valid_tokens=global_valid_tokens,
@@ -555,6 +582,11 @@ class Trainer(Configurable):
         # scheduler advances in engine.optimizer_step().
         lr_metrics = engine.lr_schedulers.get_metrics() if should_log else {}
         grad_norm = engine.optimizer_step()
+        if gnoise is not None and gnoise.curvature_due:
+            assert accumulated_loss is not None  # curvature steps are logging steps
+            gnoise.curvature(
+                engine, microbatch_groups, global_valid_tokens, accumulated_loss
+            )
 
         # log metrics
         if not should_log:
@@ -631,6 +663,14 @@ class Trainer(Configurable):
         # After checkpoint load, this is the restored number of completed updates.
         loaded_step = engine.num_completed_steps
 
+        averages = getattr(engine, "averages", None)
+        if averages is not None and averages.config.score_files:
+            if self.config.validator is None:
+                raise ValueError("averages.score_files needs the validator")
+            averages.score(self.validator, engine.num_completed_steps)
+            logger.info("averages: scored the score_files; no training")
+            return
+
         logger.info(f"Training starts at step {engine.num_completed_steps + 1}")
 
         engine.start_profiler()
@@ -662,6 +702,10 @@ class Trainer(Configurable):
                         self.validator.validate(
                             engine.model_parts, engine.num_completed_steps
                         )
+                        if getattr(engine, "averages", None) is not None:
+                            engine.averages.validate(
+                                self.validator, engine.num_completed_steps
+                            )
 
                     engine.step_profiler()
 
@@ -688,6 +732,8 @@ class Trainer(Configurable):
         logger.info("Training completed")
 
     def should_continue_training(self) -> bool:
+        if nanprobe.should_stop(self.engine.num_completed_steps):
+            return False
         return self.engine.num_completed_steps < self.config.training.steps
 
     def close(self) -> None:

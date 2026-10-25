@@ -27,8 +27,8 @@ from torchtitan.models.common.attention import (
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.common.moe import RoutedExperts
+from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.common.param_layout import (
     by_rank,
     named,
@@ -122,6 +122,10 @@ class OPTMoETransformerBlock(TransformerBlock):
         # from ``norm_type``/``norm_eps`` instead, so they stay unset.
         attention_norm: Any = None
         ffn_norm: Any = None
+        # Sandwich norm on each branch output before the residual add, stamped
+        # from ``post_norm_type`` ("none" = plain pre-norm block).
+        post_attention_norm: Any = None
+        post_ffn_norm: Any = None
 
         n_dense_layers: int = 0
         init_gate_as_residual: bool = False
@@ -129,6 +133,7 @@ class OPTMoETransformerBlock(TransformerBlock):
         residual_scale: str = "identity"
         norm_eps: float = 1e-30
         norm_type: str = "np_rmsnorm"
+        post_norm_type: str = "none"
 
         # Stamped per layer by OPTMoEModel.Config._expand_layers(). Upstream
         # builds each layer with a bare build(), so these can no longer be
@@ -225,6 +230,16 @@ class OPTMoETransformerBlock(TransformerBlock):
         self._skip_identity_mul = self.identity_scale == 1.0
         self._skip_block_mul = self.block_scale == 1.0
 
+        # Registered last: module order is init-RNG order.
+        self.post_attention_norm = (
+            None
+            if config.post_attention_norm is None
+            else config.post_attention_norm.build()
+        )
+        self.post_ffn_norm = (
+            None if config.post_ffn_norm is None else config.post_ffn_norm.build()
+        )
+
     def extra_repr(self) -> str:
         return (
             f"layer_id={self.layer_id}, "
@@ -286,6 +301,8 @@ class OPTMoETransformerBlock(TransformerBlock):
         # restores AC. Non-unit scales still hit the torch bug -- see the
         # migration doc.
         _attn_out = self.attention(self.attention_norm(x), layer_mask, positions)
+        if self.post_attention_norm is not None:
+            _attn_out = self.post_attention_norm(_attn_out)
         _lhs = x if self._skip_identity_mul else self.identity_scale * x
         _rhs = _attn_out if self._skip_block_mul else self.block_scale * _attn_out
         h = _lhs + _rhs
@@ -296,6 +313,8 @@ class OPTMoETransformerBlock(TransformerBlock):
             )
         else:
             mlp_output = self.feed_forward(self.ffn_norm(h))
+        if self.post_ffn_norm is not None:
+            mlp_output = self.post_ffn_norm(mlp_output)
 
         _lhs = h if self._skip_identity_mul else self.identity_scale * h
         _rhs = mlp_output if self._skip_block_mul else self.block_scale * mlp_output
@@ -454,6 +473,13 @@ class OPTMoEModel(Decoder):
             base_attn = self.layer.attention
             assert isinstance(base_attn, GatedNormSWAttention.Config)
 
+            def post_norm():
+                if self.layer.post_norm_type == "none":
+                    return None
+                return build_norm_config(
+                    self.layer.post_norm_type, self.dim, self.layer.norm_eps
+                )
+
             use_rope = _parse_layer_pattern(
                 self.rope_pattern, n_layers, "R", "N", default_true=base_attn.use_rope
             )
@@ -535,6 +561,8 @@ class OPTMoEModel(Decoder):
                         ffn_norm=build_norm_config(
                             self.layer.norm_type, self.dim, self.layer.norm_eps
                         ),
+                        post_attention_norm=post_norm(),
+                        post_ffn_norm=post_norm(),
                         dim=self.dim,
                         layer_id=layer_id,
                         n_layers=n_layers,
@@ -614,12 +642,18 @@ class OPTMoEModel(Decoder):
                     f"maximum {self.rope.max_context_length}."
                 )
 
-            # Sync rope length (both global and SWA-local caches)
+            # Sync rope length (both global and SWA-local caches). The caches also
+            # cover the validation sequences: validator.fixed_seq_len may be longer than
+            # the training context, and positions index the cache (K1).
             self.max_context_length = max_context_length
-            self.rope = _dc.replace(self.rope, max_context_length=max_context_length)
+            rope_length = max(
+                max_context_length,
+                getattr(getattr(config, "validator", None), "fixed_seq_len", None) or 0,
+            )
+            self.rope = _dc.replace(self.rope, max_context_length=rope_length)
             if self.rope_of_swa is not None:
                 self.rope_of_swa = _dc.replace(
-                    self.rope_of_swa, max_context_length=max_context_length
+                    self.rope_of_swa, max_context_length=rope_length
                 )
 
             # Direct: TrainingConfig is a slots dataclass that always has the
@@ -716,6 +750,9 @@ class OPTMoEModel(Decoder):
             ).build()
         else:
             self.embeddings_norm = Identity.Config().build()
+        # Set to [] by the optimizer container on logging steps (log_residual_stats);
+        # _trunk then appends each forward's residual statistics. Not a buffer.
+        self.residual_capture: list[torch.Tensor] | None = None
 
     def forward(
         self,
@@ -772,8 +809,28 @@ class OPTMoEModel(Decoder):
         # The load-balance loss is no longer returned: NormMoE injects its
         # gradient at the layer (see LoadBalanceLoss), so nothing has to be
         # threaded through the blocks or carried across pipeline stages.
+        # The residual statistics are taken here, in the eager loop between the
+        # compiled blocks, so the blocks and their graphs are the same either way.
+        rows = [] if self.residual_capture is not None else None
         for layer in self.layers.values():
-            h = layer(h, attention_masks, positions, loss_mask, doc_id)
+            out = layer(h, attention_masks, positions, loss_mask, doc_id)
+            if rows is not None:
+                with torch.no_grad():
+                    hf = h.float()
+                    rows.append(
+                        torch.stack(
+                            [hf.square().mean(), (out.float() - hf).square().mean()]
+                        )
+                    )
+            h = out
+        if rows is not None:
+            with torch.no_grad():
+                # [ms(input), ms(write) per block..., ms(final norm input)]
+                self.residual_capture.append(
+                    torch.cat(
+                        [torch.stack(rows).flatten(), h.float().square().mean()[None]]
+                    )
+                )
 
         return self.norm(h) if self.norm is not None else h
 

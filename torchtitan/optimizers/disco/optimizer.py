@@ -30,6 +30,8 @@ apply writes -- see `metrics.py`.
 import functools
 import hashlib
 import logging
+import math
+import re
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 
@@ -39,13 +41,20 @@ from torch.distributed.tensor import distribute_tensor, DTensor
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from torch.profiler import record_function
 
+from torchtitan import nanprobe
+
 from torchtitan.distributed.utils import fsdp_shard_mesh, metrics_shard_mesh
 from torchtitan.observability import structured_logger as sl
+from torchtitan.optimizers.disco import gram_input_stats
 
 from ..helpers import gram_helper
 from ..helpers.head_geometry import head_geometry, HEAD_METRIC_NAMES
 from ..helpers.norm_helper import NORM_FUNCTIONS
-from ..helpers.radial_helper import new_radial_state, RADIAL_ACCUMULATOR_NAMES
+from ..helpers.radial_helper import (
+    new_radial_state,
+    RADIAL_ACCUMULATOR_NAMES,
+    radial_names,
+)
 from ..utils import remove_orig_mod_and_weight_for_p_name
 from .layout import (
     _sharded_axes,
@@ -196,8 +205,19 @@ class DiSCO(torch.optim.Optimizer):
                 t=0,  # optimizer steps taken; rules with a schedule read it
             ),
         )
+        # The lr scheduler's per-group keys (lr_scheduler._group_lambdas).
+        scheduler_keys = {
+            "warmup_steps",
+            "decay_ratio",
+            "decay_type",
+            "min_lr_factor",
+            "lr_table",
+            "momentum_k",
+        }
         for g in self.param_groups:
-            unknown = sorted(set(g) - set(self.defaults) - {"params", "param_names"})
+            unknown = sorted(
+                set(g) - set(self.defaults) - {"params", "param_names"} - scheduler_keys
+            )
             if unknown:
                 raise ValueError(
                     f"DiSCO group {g.get('param_names', [])[:2]}: unknown keys "
@@ -212,6 +232,11 @@ class DiSCO(torch.optim.Optimizer):
                 known = RULES[g["rule"]].inherits if g["rule"] in RULES else ()
                 base = {k: v for k, v in self._default_args.items() if k in known}
             g["args"] = {**base, **(g["args"] or {})}
+            k = g.get("momentum_k")
+            if k is not None and not (math.isfinite(float(k)) and float(k) > 0.0):
+                raise ValueError(
+                    f"DiSCO group {g.get('param_names', [])[:2]}: momentum_k must be finite and > 0, got {k!r}"
+                )
         # Metric arming, set per logging step by the container.
         self.need_to_calculate_norm = False
         self.norms_to_log: list[str] = list(NORM_FUNCTIONS.keys())
@@ -220,7 +245,23 @@ class DiSCO(torch.optim.Optimizer):
         self.gram_vector_names: list[str] = []
         self.track_spectrum = True
         self.log_metrics_locally = False
+        # The SVD-based metrics this step (rms_to_rms, spectra, spectral radial).
+        self.spectral_metrics = True
+        # sigma_1 / ||X||_F of each gram_polar_express input on spectral logging steps (container's log_gram_input)
+        self.log_gram_input = False
+        self._gram_final: dict[str, float] = {}
+        self._gram_keys: list[str] | None = None
+        self.radial_names: list[str] = radial_names(True)
+        # Called as update_observer(self, u) at the end of `step()`, u the
+        # applied per-entry updates; set by optimizers/gnoise.py when enabled.
+        self.update_observer = None
         self.norms_at_current_step: dict[str, torch.Tensor] = {}
+        # group -> (eta(t), lr eta(t)) of the last step, for groups whose
+        # rule has an eta schedule
+        self.eta_used: dict[int, tuple[float, float]] = {}
+        # group -> the momentum field m_t = min(1, k / t) applied at the last
+        # step, for groups with `momentum_k` (the scheduled momentum)
+        self.momentum_used: dict[int, float] = {}
         # LM-head geometry. `head_probe_h` is the head's input for a few probe
         # tokens; the container sets it for one norm step, step() drops it.
         self.head_probe_h: torch.Tensor | None = None
@@ -241,8 +282,11 @@ class DiSCO(torch.optim.Optimizer):
         gram_level=None,
         track_spectrum=None,
         log_metrics_locally=None,
+        spectral=True,
     ):
         self.need_to_calculate_norm = True
+        self.spectral_metrics = bool(spectral)
+        self.radial_names = radial_names(self.spectral_metrics)
         if norms_to_log is not None:
             self.norms_to_log = norms_to_log
         if gram_level is not None:
@@ -259,6 +303,66 @@ class DiSCO(torch.optim.Optimizer):
         """Hands the logging step's metrics over; nothing is kept after."""
         norms, self.norms_at_current_step = self.norms_at_current_step, {}
         return norms
+
+    # ---- column gains (angular_muown col_scale): read-only statistics for log_gain_stats
+    def _col_entries(self) -> list:
+        return [
+            e
+            for e in self.entries
+            if getattr(e.rule.compute, "col_scale", False)
+            and e.family is not Family.EXPERT
+            and "rule_state" in self.state[e.param]
+        ]
+
+    def _col_c(self, e: _Entry) -> torch.Tensor:
+        """c of `e`'s units, [units, n]: the state's third row from the bottom; zeros (a unit not stepped yet) read as 1."""
+        c = self.state[e.param]["rule_state"][:, -3, :-3].detach().float()
+        return torch.where(c == 0, torch.ones_like(c), c).clone()
+
+    def col_gain_snapshot(self):
+        """c of every col_scale unit before the step (the base of the logged relative update); None without col_scale."""
+        es = self._col_entries()
+        return [self._col_c(e) for e in es] if es else None
+
+    def col_gain_metrics(self, before) -> dict[str, float]:
+        """Per col_scale unit, after the step: rms of c, mean log|c|, q10 / q50 / q90 of c and ||c - c_before|| / ||c_before||.
+        Read from the rule state; the unit's owner (the rank that advances it) supplies the values, one all-reduce over the metric mesh."""  # noqa: B950
+        es = self._col_entries()
+        if not es or before is None:
+            return {}
+        rows, keys = [], []
+        for e, c0 in zip(es, before, strict=True):
+            c = self._col_c(e)
+            mine = torch.tensor(
+                [(e.i, un.pos) in self._radial_mine for un in e.units], device=c.device
+            )
+            q = torch.quantile(
+                c, torch.tensor([0.1, 0.5, 0.9], device=c.device), dim=-1
+            )
+            stats = torch.stack(
+                [
+                    c.square().mean(-1).sqrt(),
+                    c.abs().clamp_min(1e-30).log().mean(-1),
+                    q[0],
+                    q[1],
+                    q[2],
+                    (c - c0).norm(dim=-1) / c0.norm(dim=-1),
+                ],
+                dim=-1,
+            )
+            rows.append(stats * mine[:, None])
+            keys.extend(_key(e, un) for un in e.units)
+        packed = torch.cat(rows)
+        mesh = self._sink.mesh
+        if mesh is not None and mesh.size() > 1:
+            dist.all_reduce(packed, group=mesh.get_group())
+        out: dict[str, float] = {}
+        for k, v in zip(keys, packed.tolist(), strict=True):
+            for name, x in zip(
+                ("rms", "mean_log", "q10", "q50", "q90", "rel_update"), v, strict=True
+            ):
+                out[f"col_gain_{name}/{k}"] = x
+        return out
 
     def _get_cached_zero_scalar(self, device):
         z = self._zeros.get(device)
@@ -383,12 +487,36 @@ class DiSCO(torch.optim.Optimizer):
     def _build(self) -> None:
         pd = self.parallel_dims
         entries: list[_Entry] = []
+        self._eta = []  # per group: its rule's eta schedule, or None
+        self._unit_eta: dict[tuple[int, int], float] = {}  # (entry, unit pos) -> factor
+        self._frozen: dict[
+            tuple[int, int], bool
+        ] = {}  # (entry, unit pos) -> in frozen_units
+        self._frozen_masks: dict[
+            tuple, torch.Tensor
+        ] = {}  # a stack's units -> its mask
+        self._col_on: dict[
+            tuple[int, int], bool
+        ] = {}  # (entry, unit pos) -> in col_units (learns column gains)
+        self._col_masks: dict[tuple, torch.Tensor] = {}  # a stack's units -> its mask
         for gi, group in enumerate(self.param_groups):
             rule = rule_of(group)
+            self._eta.append(getattr(rule.compute, "eta", None))
             if rule.compute.keeps_radius and float(group["weight_decay"]) != 0.0:
                 raise ValueError(
                     f"group {gi} ({group.get('rule')}): the rule holds each unit's "
                     "norm, which undoes weight decay exactly; set weight_decay: 0"
+                )
+            if rule.compute.owns_momentum and (
+                float(group["momentum"]) != 1.0
+                or bool(group["nesterov"])
+                or float(group["weight_decay"]) != 0.0
+            ):
+                raise ValueError(
+                    f"group {gi} ({group.get('rule')}): the rule keeps its own "
+                    "momentum and returns the new weight, so the group passes the "
+                    "raw gradient and decays nothing: set momentum: 1.0, "
+                    "nesterov: false, weight_decay: 0"
                 )
             for name, p in zip(group["param_names"], group["params"]):
                 if not p.requires_grad:
@@ -455,6 +583,18 @@ class DiSCO(torch.optim.Optimizer):
                     except ValueError as err:
                         raise ValueError(f"{name}, unit {u.name!r}: {err}") from None
                 entries.append(e)
+            if getattr(rule.compute, "unit_eta", ()):
+                self._check_unit_eta(
+                    gi, group, rule, [e for e in entries if e.group_idx == gi]
+                )
+            if getattr(rule.compute, "frozen_units", ()):
+                self._check_frozen_units(
+                    gi, rule, [e for e in entries if e.group_idx == gi]
+                )
+            if getattr(rule.compute, "col_units", ()):
+                self._check_col_units(
+                    gi, rule, [e for e in entries if e.group_idx == gi]
+                )
         self.entries = entries
         self._init_state()
         fam = {f: [e for e in entries if e.family is f] for f in Family}
@@ -666,7 +806,8 @@ class DiSCO(torch.optim.Optimizer):
         # The travelling rows are the momentum itself (no pre phase, no
         # nesterov): the exchange may keep its views of them across steps.
         self._eff_is_moment = all(
-            0.0 < self.param_groups[e.group_idx]["momentum"] < 1.0
+            self.param_groups[e.group_idx].get("momentum_k") is None
+            and 0.0 < self.param_groups[e.group_idx]["momentum"] < 1.0
             and not self.param_groups[e.group_idx]["nesterov"]
             and not e.rule.pre
             for e in self.fam[Family.SHARDED]
@@ -738,10 +879,16 @@ class DiSCO(torch.optim.Optimizer):
         if logging_step and not self._sink_ready:
             self._register_metric_units()
         with self._span("disco_prepare_grads"):
+            self._scheduled_momentum()
             eff = self._effective_grads()
             self._phase_pass(eff, "pre")
+        if nanprobe.on():
+            nanprobe.disco_tensors(self, "eff", eff)
         u: dict[int, torch.Tensor] = {}
         self._coef: dict[int, torch.Tensor] = {}  # entry -> [alpha; beta] per unit
+        gram_log = self.log_gram_input and logging_step and self.spectral_metrics
+        if gram_log:
+            gram_input_stats.arm()
         # The sharded units' exchanges run while the other families compute
         # and apply: out before the local and expert work, back before theirs.
         sent = self._send_sharded(eff, values)
@@ -753,7 +900,12 @@ class DiSCO(torch.optim.Optimizer):
             back = self._step_sharded(eff, u, values, sent)
         with self._span("disco_replicated"):
             self._step_replicated(eff, u, values)
+        if gram_log:
+            self._gram_final = self._gram_input_metrics(gram_input_stats.disarm())
         self._phase_pass(u, "post")
+        if nanprobe.on():
+            nanprobe.disco_tensors(self, "update", u)
+            nanprobe.disco_flush()
         if values is not None:
             self._local_metrics(eff, u, values)
             self._flush_metrics(values)
@@ -762,10 +914,15 @@ class DiSCO(torch.optim.Optimizer):
         if back is not None:
             back()
         self._apply(u, sharded=True)
-        for g in self.param_groups:
+        for gi, g in enumerate(self.param_groups):
             g["t"] = int(g["t"]) + 1
+            if self._eta[gi] is not None:
+                s = self._eta[gi](g["t"])
+                self.eta_used[gi] = (s, float(g["lr"]) * s)
         self.need_to_calculate_norm = False
         self.head_probe_h = None
+        if self.update_observer is not None:
+            self.update_observer(self, u)
         return loss
 
     def _ctx(self, e: _Entry) -> StepCtx:
@@ -781,24 +938,43 @@ class DiSCO(torch.optim.Optimizer):
         ctx = self._ctx(e)
         return ctx.lr, ctx.decay
 
+    def _scheduled_momentum(self) -> None:
+        """A group with `momentum_k` takes the momentum field m_t = min(1, k / t)
+        at its step t = 1, 2, ... (the weight of the NEW gradient: 1 = no
+        momentum, buf = g; then beta_t = 1 - k / t)."""
+        for gi, g in enumerate(self.param_groups):
+            k = g.get("momentum_k")
+            if k is not None:
+                g["momentum"] = self.momentum_used[gi] = min(
+                    1.0, float(k) / (int(g["t"]) + 1)
+                )
+
     def _effective_grads(self) -> dict[int, torch.Tensor]:
         """Momentum pass (one call per momentum value, all groups together),
         then each entry's effective gradient as fp32 rows `[nl, C]`."""
         groups, moments = [], {}
+        scheduled = []
         for gi, es, _ in self._groups:
             g = self.param_groups[gi]
             m, nesterov = float(g["momentum"]), bool(g["nesterov"])
+            sched = g.get("momentum_k") is not None
             grads = []
             for e in es:
                 gr = e.param.grad
                 if gr is None:
                     raise RuntimeError(f"[DiSCO] {e.name} has no gradient")
                 grads.append(gr.to_local() if isinstance(gr, DTensor) else gr)
-            groups.append((es, grads, m, nesterov))
-            if 0.0 < m < 1.0:
+            groups.append((es, grads, m, nesterov, sched))
+            if (
+                sched
+            ):  # a new value every step: the eager pass (no compile specialisation per value), also at m = 1 (buf = g)
+                scheduled.append(([self._bufs_local[e.i] for e in es], grads, m))
+            elif 0.0 < m < 1.0:
                 bufs, gs = moments.setdefault(m, ([], []))
                 bufs += [self._bufs_local[e.i] for e in es]
                 gs += grads
+        for bufs, gs, m in scheduled:
+            _momentum(bufs, gs, m)
         for m, (bufs, gs) in moments.items():
             if bufs[0].is_cuda:
                 with torch._dynamo.config.patch(
@@ -808,9 +984,9 @@ class DiSCO(torch.optim.Optimizer):
             else:
                 _momentum(bufs, gs, m)
         eff = {}
-        for es, grads, m, nesterov in groups:
+        for es, grads, m, nesterov, sched in groups:
             out = grads
-            if 0.0 < m < 1.0:
+            if 0.0 < m < 1.0 or sched:
                 out = [self._bufs_local[e.i] for e in es]
                 if nesterov:
                     out = torch._foreach_lerp(out, grads, m)
@@ -886,6 +1062,90 @@ class DiSCO(torch.optim.Optimizer):
                         )
             todo = [(e, phases) for e, phases in todo if phases]
 
+    def _check_unit_eta(self, gi: int, group: dict, rule: Rule, es: list) -> None:
+        """A group's per-unit-type step factors, checked and logged once: only a
+        compute whose update is linear in eta with an eta-free alpha (sso) may
+        be scaled per unit; every unit needs a factor, every factor a unit."""
+        c, ue = rule.compute, dict(rule.compute.unit_eta)
+        if not (getattr(c, "eta_linear", False) and rule.output == "update_coeffs"):
+            raise ValueError(
+                f"group {gi} ({group.get('rule')}): unit_eta needs a compute whose "
+                "update is linear in eta with an eta-free alpha (sso); "
+                f"{type(c).__name__} is not"
+            )
+        used, lines = set(), []
+        for e in es:
+            for un in e.units:
+                t = _unit_type(e, un)
+                if t not in ue:
+                    raise ValueError(
+                        f"group {gi}: {_key(e, un)} (type {t!r}) has no unit_eta factor"
+                    )
+                used.add(t)
+                self._unit_eta[(e.i, un.pos)] = ue[t]
+                lines.append(f"{_key(e, un)} x{ue[t]!r}")
+        if set(ue) - used:
+            raise ValueError(
+                f"group {gi}: unit_eta {sorted(set(ue) - used)} matches no unit of the group"
+            )
+        logger.info(
+            f"[DiSCO] group {gi} unit_eta, {len(lines)} units: {', '.join(lines)}"
+        )
+
+    def _check_frozen_units(self, gi: int, rule: Rule, es: list) -> None:
+        """A group's frozen unit types, mapped to its units once; every type must name a unit."""
+        fu, used, lines = set(rule.compute.frozen_units), set(), []
+        for e in es:
+            for un in e.units:
+                t = _unit_type(e, un)
+                self._frozen[(e.i, un.pos)] = t in fu
+                if t in fu:
+                    used.add(t)
+                    lines.append(_key(e, un))
+        if fu - used:
+            raise ValueError(
+                f"group {gi}: frozen_units {sorted(fu - used)} match no unit of the group"
+            )
+        logger.info(
+            f"[DiSCO] group {gi} frozen lengths, {len(lines)} units: {', '.join(lines)}"
+        )
+
+    def _check_col_units(self, gi: int, rule: Rule, es: list) -> None:
+        """A group's col_units (the unit types that learn column gains), mapped to its units once; every type must name a unit."""
+        cu, used, lines = set(rule.compute.col_units), set(), []
+        for e in es:
+            for un in e.units:
+                t = _unit_type(e, un)
+                self._col_on[(e.i, un.pos)] = t in cu
+                if t in cu:
+                    used.add(t)
+                    lines.append(_key(e, un))
+        if cu - used:
+            raise ValueError(
+                f"group {gi}: col_units {sorted(cu - used)} match no unit of the group"
+            )
+        logger.info(
+            f"[DiSCO] group {gi} column gains, {len(lines)} units: {', '.join(lines)}"
+        )
+
+    def _col_mask(self, pairs, device) -> torch.Tensor:
+        """The stack's per-unit column-gain flags, built once per stack."""
+        key = tuple((ee.i, un.pos) for ee, un in pairs)
+        m = self._col_masks.get(key)
+        if m is None:
+            m = torch.tensor([self._col_on[k] for k in key], device=device)
+            self._col_masks[key] = m
+        return m
+
+    def _frozen_mask(self, pairs, device) -> torch.Tensor:
+        """The stack's per-unit freeze flags, built once per stack."""
+        key = tuple((ee.i, un.pos) for ee, un in pairs)
+        m = self._frozen_masks.get(key)
+        if m is None:
+            m = torch.tensor([self._frozen[k] for k in key], device=device)
+            self._frozen_masks[key] = m
+        return m
+
     def _run(self, rule: Rule, st, w, e: _Entry, pairs, *, lone_2d: bool) -> Result:
         """`rule` on the stack `st` of the units `pairs` [(entry, unit)], all
         whole here. The result's `update` is what the holders apply: the
@@ -896,11 +1156,28 @@ class DiSCO(torch.optim.Optimizer):
         state = None
         if rule.has_state:
             state = torch.cat([self._state_rows(ee, p0, n) for ee, _, p0, n in runs])
-        if lone_2d and rule.output == "update" and len(pairs) == 1:
-            res = rule.run_whole(st[0], None, self._ctx(e))
-            res.update = res.update.unsqueeze(0)
-        else:
-            res = rule.run_whole(st, w, self._ctx(e), state)
+        ctx = self._ctx(e)
+        if getattr(rule.compute, "frozen_units", ()):
+            ctx = ctx._replace(frozen=self._frozen_mask(pairs, st.device))
+        if getattr(rule.compute, "col_units", ()):
+            ctx = ctx._replace(colmask=self._col_mask(pairs, st.device))
+        with gram_input_stats.units([_key(ee, un) for ee, un in pairs]):
+            if lone_2d and rule.output == "update" and len(pairs) == 1:
+                res = rule.run_whole(st[0], None, ctx)
+                res.update = res.update.unsqueeze(0)
+            else:
+                res = rule.run_whole(st, w, ctx, state)
+        if nanprobe.on():
+            nanprobe.disco_run(self, rule, st, w, state, res, pairs)
+        if getattr(
+            rule.compute, "unit_eta", ()
+        ):  # linear in eta: scale each unit's step
+            f = torch.tensor(
+                [self._unit_eta[(ee.i, un.pos)] for ee, un in pairs],
+                dtype=res.update.dtype,
+                device=res.update.device,
+            )
+            res.update = res.update * f.view(-1, *(1,) * (res.update.ndim - 1))
         for ee, j0, p0, n in runs:
             if rule.has_state:
                 self._state_rows(ee, p0, n).copy_(res.state[j0 : j0 + n])
@@ -909,6 +1186,49 @@ class DiSCO(torch.optim.Optimizer):
         if rule.output == "weight":
             res.update = w.float() - res.weight.float()  # rides the update's slot
         return res
+
+    @staticmethod
+    def _fused_named(r: Rule, e: _Entry, k: int, x, m):
+        with gram_input_stats.units([_key(e, e.units[k])]):
+            return r.call_fused(x, m)
+
+    def _gram_input_metrics(self, rec: dict) -> dict[str, float]:
+        """Every rank's recorded values over all gram units: per unit the first
+        call's sigma_1 / ||X||_F and the max over its calls (SSO: all its msign
+        inputs), and how many units sit in the 1.01 failure band."""
+        if self._gram_keys is None:
+            self._gram_keys = [
+                _key(e, un)
+                for e in self.entries
+                if e.family is not Family.EXPERT and gram_input_stats.has_gram(e.rule)
+                for un in e.units
+            ]
+        keys = self._gram_keys
+        if not keys:
+            return {}
+        dev = self.entries[0].param.device
+        buf = torch.zeros(len(keys), 3, dtype=torch.float32, device=dev)
+        for i, k in enumerate(keys):
+            vs = rec.get(k)
+            if vs:
+                buf[i] = torch.stack(
+                    [vs[0], torch.stack(vs).max(), torch.ones((), device=vs[0].device)]
+                )
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(buf)
+        vals = buf.tolist()
+        out, lo, hi, n_in, n_seen, top = {}, *gram_input_stats.BAND, 0, 0, 0.0
+        for k, (first, mx, n) in zip(keys, vals):
+            if n == 0:
+                continue
+            first, mx = first / n, mx / n
+            out[f"gram_input_s1f/{k}"] = first
+            out[f"gram_input_s1f_max/{k}"] = mx
+            n_seen, n_in, top = n_seen + 1, n_in + (lo <= mx <= hi), max(top, mx)
+        out["gram_input_band/count"] = float(n_in)
+        out["gram_input_band/units"] = float(n_seen)
+        out["gram_input_band/max_s1f"] = top
+        return out
 
     def _state_rows(self, e: _Entry, p0: int, n: int) -> torch.Tensor:
         """Units `p0 .. p0 + n` of `e`'s rule state, as a view."""
@@ -968,7 +1288,9 @@ class DiSCO(torch.optim.Optimizer):
                 u[e.i] = r.run_whole(eff[e.i]).update
             else:
                 u[e.i] = self._map_units(
-                    e, eff[e.i], lambda x, k, m, r=r: r.call_fused(x, m)
+                    e,
+                    eff[e.i],
+                    lambda x, k, m, r=r, e=e: self._fused_named(r, e, k, x, m),
                 )
 
     def _step_gram(self, eff, u) -> None:
@@ -1462,6 +1784,9 @@ class DiSCO(torch.optim.Optimizer):
         sink = self._sink
         device = self.entries[0].param.device if self.entries else torch.device("cpu")
         final = sink.flush(values, device)
+        if self._gram_final and sink.stores_replicated_norms:
+            final.update(self._gram_final)
+        self._gram_final = {}
         if sink.stores_replicated_norms:
             for e in self.fam[Family.LOCAL]:
                 if e.param.numel() == 1:
@@ -1492,6 +1817,11 @@ def _key(e: _Entry, u: Unit) -> str:
     """A named unit logs under the name a split parameter would have had:
     `...qkv_linear.wqkv` + `wq` -> `...qkv_linear.wq`, `...w13` + `w1` -> `...w1`."""
     return _split_name(e.clean, u.name)
+
+
+def _unit_type(e: _Entry, u: Unit) -> str:
+    """A unit's type: its log name without the block prefix (`attention.qkv_linear.wq`)."""
+    return re.sub(r"^(.*\.)?layers\.\d+\.", "", _key(e, u))
 
 
 def _split_name(clean: str, name: str) -> str:

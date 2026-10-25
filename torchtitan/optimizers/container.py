@@ -34,19 +34,22 @@ from torchtitan.components.optimizer.optimizer import (
     ParamGroupConfig,
 )
 from torchtitan.distributed import ParallelDims
-from torchtitan.optimizers import DiSCO, disco_factory_kwargs
+from torchtitan.optimizers import DiSCO, disco_factory_kwargs, model_stats
 from torchtitan.optimizers.export import spectrum_logging
 from torchtitan.optimizers.export.gram_vector_logging import (
     GramVectorLoggingConfig,
     process_gram_vectors_for_logging,
 )
 from torchtitan.optimizers.export.spectrum_logging import process_norms_for_logging
+from torchtitan.optimizers.gnoise import GradNoise, GradNoiseConfig
 from torchtitan.optimizers.helpers import norm_helper
 
 __all__ = ["DiSCOOptimizersContainer"]
 logger = logging.getLogger(__name__)
 
-_DISCO_ONLY_KEYS = frozenset({"rule", "args", "momentum", "nesterov", "decoupled_wd"})
+_DISCO_ONLY_KEYS = frozenset(
+    {"rule", "args", "momentum", "nesterov", "decoupled_wd", "momentum_k"}
+)
 _KIND = "\x00kind:"  # a group pattern resolved per model part from its declarations
 
 
@@ -62,6 +65,12 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
     ``begin_step`` arms it, ``collect_metrics`` reads back. Also accepts
     Adam/AdamW.
     """
+
+    effective_rank_freq: int = 0  # Config.effective_rank_freq; the class default for a container built without it
+    spectral_norm_freq: int = 0  # Config.spectral_norm_freq; likewise
+    gnoise: "GradNoise | None" = (
+        None  # built in __init__ only when optimizer.gnoise.enable
+    )
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseOptimizersContainer.Config):
@@ -120,9 +129,25 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         arrive on lcm(log_freq, log_norm_freq) instead of the cadence asked for.
         """
 
+        dense_norm_steps: int = 0
+        """Also log the norms every step up to this one; 0 disables. Needs
+        metrics.dense_log_steps at least as large, which the trainer checks."""
+
         norms_to_log: list[str] = field(default_factory=lambda: ["default"])
         """Which norm families to log. "default" is the curated set; see
         torchtitan.optimizers.helpers.norm_helper.get_norms_to_log."""
+
+        effective_rank_freq: int = 0
+        """0: every norm in `norms_to_log` on every norm-logging step. N > 0:
+        `effective_rank`, the one norm that needs the whole spectrum, only on the
+        norm-logging steps divisible by N, on step 1 and on the final step."""
+
+        spectral_norm_freq: int = 0
+        """0: the SVD-based metrics on every norm-logging step (as log_norm_freq).
+        N > 0, a multiple of log_norm_freq: `rms_to_rms`, `stable_rank`,
+        `condition_number`, `effective_rank*`, the spectra and the spectral radial
+        metrics only on the norm-logging steps divisible by N, step 1 and the final
+        step; the SVD-free norms keep log_norm_freq (dense phase included)."""
 
         gram_level: int = 0
         """Gram-matrix metric depth, on the same cadence as log_norm_freq.
@@ -135,10 +160,30 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         under the chunked loss), so they cost no extra forward. Only mean/RMS
         over probes are reported, so a few hundred suffice."""
 
+        log_residual_stats: bool = False
+        """Log the RMS of every block's input and total residual write and of
+        the final norm's input on the log_norm_freq cadence, taken in the
+        model's eager layer loop (optimizers/model_stats.py; OPTMoEModel)."""
+
+        log_gain_stats: bool = False
+        """Log each RMSNorm gain's mean, RMS and ||dg|| / ||g|| on the
+        log_norm_freq cadence (optimizers/model_stats.py). With angular_muown
+        col_scale it also logs each unit's column gains c (col_gain_*: rms,
+        mean log|c|, q10 / q50 / q90, relative update; DiSCO.col_gain_metrics)."""
+
         head_diag_diameter_iters: int = 10
         """Power-iteration count and farthest-point restarts for the row
         diameter behind gamma_H. Fixed, not convergence-tested, so the sweep
         stays fullgraph-safe. Recovers ~98%; past ~20 does not help."""
+
+        log_gram_input: bool = False
+        """On the spectral norm-logging steps, log sigma_1 / ||X||_F of the
+        tensor each gram_polar_express call receives, per unit
+        (gram_input_s1f/<unit>, its max over the unit's calls, and the count
+        of units in the 1.01 failure band [0.94, 0.955])."""
+
+        gnoise: GradNoiseConfig = field(default_factory=GradNoiseConfig)
+        """Gradient-noise statistics (optimizers/gnoise.py); off by default."""
 
         enable_spectrum_export: bool = False
         """
@@ -185,6 +230,12 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
     def _validate(config: Config) -> None:
         if not 0 <= config.gram_level <= 3:
             raise ValueError(f"optimizer.gram_level {config.gram_level}: use 0-3")
+        n, every = config.spectral_norm_freq, config.log_norm_freq
+        if n < 0 or (n and (every <= 0 or n % every)):
+            raise ValueError(
+                f"optimizer.spectral_norm_freq ({n}) must be 0 or a multiple of "
+                f"optimizer.log_norm_freq ({every})"
+            )
 
     @staticmethod
     def _param_group_configs(config: Config) -> list[ParamGroupConfig]:
@@ -301,10 +352,19 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         self.norms_to_log: list[str] | None = norm_helper.get_norms_to_log(
             config.norms_to_log
         )
+        self.effective_rank_freq: int = config.effective_rank_freq
+        self.spectral_norm_freq: int = config.spectral_norm_freq
         self.gram_level: int = config.gram_level
         self.log_norm_freq: int = config.log_norm_freq
+        self.dense_norm_steps: int = config.dense_norm_steps
         self.head_diag_probes: int = config.head_diag_probes
         self.head_diag_diameter_iters: int = config.head_diag_diameter_iters
+        self.parallel_dims = parallel_dims
+        self.log_residual_stats: bool = config.log_residual_stats
+        self.log_gain_stats: bool = config.log_gain_stats
+        self._model_stats_armed: bool = False
+        self._gains_before: list[torch.Tensor] | None = None
+        self._col_before: list | None = None  # per optimizer: c of the col_scale units before the step (log_gain_stats)
         self._moe_publish_armed: bool = False
         self._norms_armed: bool = False
         self._head_input: Callable[[], torch.Tensor | None] | None = None
@@ -348,6 +408,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                 optimizer = cls(groups, **kwargs)
                 if isinstance(optimizer, DiSCO):
                     optimizer.head_diag_diameter_iters = config.head_diag_diameter_iters
+                    optimizer.log_gram_input = config.log_gram_input
                 self.optimizers.append(optimizer)
                 self._log_optimizer(optimizer, part_idx, patterns[opt_name])
                 for g in groups:
@@ -363,6 +424,18 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         if config.implementation == "fused_opt_states_bf16":
             self._register_bf16_optimizer_state_hook()
         self._post_init(all_params)
+        config.gnoise.validate(log_norm_freq=config.log_norm_freq)
+        self.gnoise: GradNoise | None = (
+            GradNoise(
+                config.gnoise,
+                model_parts=self.model_parts,
+                parallel_dims=parallel_dims,
+                container=self,
+            )
+            if config.gnoise.enable
+            else None
+        )
+        self._gnoise_research_freq = config.gnoise.research_freq
 
     def __iter__(self) -> Iterator[T]:
         return iter(self.optimizers)
@@ -384,6 +457,19 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         for optimizer in self.optimizers:
             optimizer.zero_grad(*args, **kwargs)
 
+    # The lr scheduler reads a group's lr_table from the config; checkpoints
+    # leave it out, so a branch may run another table than its source run.
+    _CONFIG_ONLY_SCHEDULER_KEYS = ("lr_table", "momentum_k")
+
+    def state_dict(self) -> dict[str, Any]:
+        sd = super().state_dict()
+        drop = tuple(f".{k}" for k in self._CONFIG_ONLY_SCHEDULER_KEYS)
+        return {
+            k: v
+            for k, v in sd.items()
+            if not (k.startswith("param_groups.") and k.endswith(drop))
+        }
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Load optimizer state, optionally keeping the current learning rates.
 
@@ -399,6 +485,10 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                 for key in getattr(optimizer, "_CONFIG_ONLY_GROUP_KEYS", ()):
                     for fqn in group.get("param_names", ()):
                         state_dict.setdefault(f"param_groups.{fqn}.{key}", group[key])
+                for key in self._CONFIG_ONLY_SCHEDULER_KEYS:
+                    if key in group:
+                        for fqn in group.get("param_names", ()):
+                            state_dict[f"param_groups.{fqn}.{key}"] = group[key]
         if not self.preserve_lrs_when_loading:
             super().load_state_dict(state_dict)
             return
@@ -429,7 +519,9 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
             return False
         if is_final_step:
             return True
-        return should_log and (step == 1 or step % self.log_norm_freq == 0)
+        return should_log and (
+            step == 1 or step <= self.dense_norm_steps or step % self.log_norm_freq == 0
+        )
 
     def begin_step(
         self,
@@ -445,39 +537,114 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         takes from `head_input` and hands to DiSCO for that step only.
         """
         self._head_input = None
+        if self.gnoise is not None:
+            self.gnoise.note_step(step)
         if should_log:
             self.arm_moe_publish()
+        self._arm_model_stats(step, should_log=should_log, is_final_step=is_final_step)
         if not self.wants_norms_at(
             step, should_log=should_log, is_final_step=is_final_step
         ):
             return 0
-        self.arm_norm_computation()
+        self.arm_norm_computation(
+            self._norms_at(step, is_final_step),
+            spectral=self._spectral_at(step, is_final_step),
+        )
+        if self.gnoise is not None and self.gnoise.due(
+            step, dense=step == 1 or step <= self.dense_norm_steps or is_final_step
+        ):
+            freq = self._gnoise_research_freq
+            self.gnoise.arm(step, research=freq > 0 and step % freq == 0)
         discos = [o for o in self.optimizers if isinstance(o, DiSCO)]
         if head_input is None or not any(o.has_head_geometry for o in discos):
             return 0
         self._head_input = head_input
         return self.head_diag_probes
 
-    def arm_norm_computation(self):
-        """Tell DiSCO to produce norms during the next `step()`."""
+    def _norms_at(self, step: int, is_final_step: bool) -> list[str]:
+        """The norms for a norm-logging step: all of `norms_to_log`, less
+        `effective_rank` off its `effective_rank_freq` cadence and every
+        SVD-based norm off the `spectral_norm_freq` cadence."""
+        if not self._spectral_at(step, is_final_step):
+            return [x for x in self.norms_to_log if x in norm_helper._SVD_FREE_NORMS]
+        n = self.effective_rank_freq
+        if n > 0 and "effective_rank" in self.norms_to_log:
+            if not (is_final_step or step == 1 or step % n == 0):
+                return [x for x in self.norms_to_log if x != "effective_rank"]
+        return self.norms_to_log
+
+    def _spectral_at(self, step: int, is_final_step: bool) -> bool:
+        """Whether a norm-logging step computes the SVD-based metrics."""
+        n = self.spectral_norm_freq
+        return n <= 0 or is_final_step or step == 1 or step % n == 0
+
+    def arm_norm_computation(
+        self, norms: list[str] | None = None, spectral: bool = True
+    ):
+        """Tell DiSCO to produce norms (`norms`, default `norms_to_log`)
+        during the next `step()`; `spectral` False skips the SVD-based ones."""
         self._norms_armed = True
+        norms = self.norms_to_log if norms is None else norms
         # Every DiSCO instance, not `optimizers[part_index]`: a config that
         # sends some parameters to AdamW builds one optimizer per (part, name),
         # so the indices stopped lining up with the parts.
         for optimizer in self.optimizers:
             if isinstance(optimizer, DiSCO):
                 optimizer.calculate_norm_at_next_step(
-                    self.norms_to_log,
+                    norms,
                     self.gram_level,
                     # Dropped by process_norms_for_logging unless the parquet
                     # export is on, so let the optimizer skip computing,
                     # packing and all-gathering them.
-                    track_spectrum=self.spectrum_logging_config.enable_export,
+                    track_spectrum=self.spectrum_logging_config.enable_export
+                    and spectral,
                     # Single source of truth with the logger: the optimizer must
                     # only skip the gather on ranks that actually have a logger,
                     # otherwise their metrics are computed and silently dropped.
                     log_metrics_locally=self.log_metrics_locally,
+                    spectral=spectral,
                 )
+
+    def _arm_model_stats(
+        self, step: int, *, should_log: bool, is_final_step: bool
+    ) -> None:
+        """On the per-unit cadence, before the forward: arm the residual
+        capture and snapshot the gains for `_collect_model_stats`."""
+        self._gains_before = None
+        self._col_before = None
+        self._model_stats_armed = self.wants_norms_at(
+            step, should_log=should_log, is_final_step=is_final_step
+        )
+        if not self._model_stats_armed:
+            return
+        if self.log_residual_stats:
+            model_stats.arm_residual_capture(self.model_parts)
+        if self.log_gain_stats:
+            self._gains_before = model_stats.snapshot_gains(self.model_parts)
+            self._col_before = [
+                o.col_gain_snapshot() if isinstance(o, DiSCO) else None
+                for o in self.optimizers
+            ]
+
+    def _collect_model_stats(self) -> dict[str, Any]:
+        """The armed step's residual and gain statistics, read once."""
+        if not self._model_stats_armed:
+            return {}
+        self._model_stats_armed = False
+        metrics = model_stats.residual_metrics(self.model_parts, self.parallel_dims)
+        if self._gains_before is not None:
+            metrics.update(
+                model_stats.gain_metrics(
+                    self.model_parts, self._gains_before, self.parallel_dims
+                )
+            )
+            self._gains_before = None
+        if self._col_before is not None:
+            for o, before in zip(self.optimizers, self._col_before, strict=True):
+                if before is not None:
+                    metrics.update(o.col_gain_metrics(before))
+            self._col_before = None
+        return metrics
 
     def arm_moe_publish(self) -> None:
         """Tell the MoE hook to publish router metrics during the next `step()`.
@@ -500,7 +667,17 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         armed, self._norms_armed = self._norms_armed, False
         if armed:
             metrics.update(self.get_parameter_norms(step=step))
+        for optimizer in self.optimizers:
+            if isinstance(optimizer, DiSCO):
+                for gi, (s, eta) in optimizer.eta_used.items():
+                    metrics[f"eta_schedule/DiSCO/{gi}"] = s
+                    metrics[f"eta_used/DiSCO/{gi}"] = eta
+                for gi, m in optimizer.momentum_used.items():
+                    metrics[f"momentum_used/DiSCO/{gi}"] = m
+        if self.gnoise is not None:
+            metrics.update(self.gnoise.collect())
         metrics.update(self.collect_moe_metrics())
+        metrics.update(self._collect_model_stats())
         return metrics
 
     def collect_moe_metrics(self) -> dict[str, Any]:
@@ -543,4 +720,10 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
     def close(self):
         """Forget any armed publish and the cached MoE metrics. Idempotent."""
         self._moe_publish_armed = False
+        self._model_stats_armed = False
+        self._gains_before = None
+        self._col_before = None
+        for part in self.model_parts:
+            if getattr(part, "residual_capture", None) is not None:
+                part.residual_capture = None
         self._drop_moe_metrics()

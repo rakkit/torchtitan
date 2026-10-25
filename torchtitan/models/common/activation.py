@@ -125,6 +125,29 @@ class SwiGLU(BinaryActivationFn):
         return F.silu(gate) * up
 
 
+class ReGLU(BinaryActivationFn):
+    """ReGLU activation: relu(gate) * up. Homogeneous in the gate's scale: a
+    positive factor on the gate input is an exact gauge (it moves into the
+    up branch)."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BinaryActivationFn.Config):
+        kind: str = "reglu"
+        """A tag only: a config with no field dumps as `{}`, so the job config could not tell ReGLU from SwiGLU."""
+
+    def __init__(self, config: Config) -> None:
+        pass
+
+    def __call__(
+        self,
+        gate: torch.Tensor,
+        up: torch.Tensor,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del kwargs
+        return F.relu(gate) * up
+
+
 class SiTUGLU(BinaryActivationFn):
     """Kimi's SiTU-GLU activation, evaluated in FP32."""
 

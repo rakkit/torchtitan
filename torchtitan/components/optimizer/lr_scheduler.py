@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import bisect
 import functools
 import logging
 import math
@@ -23,6 +24,135 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "LRSchedulersContainer",
 ]
+
+
+def _with_group_warmup(
+    lr_lambda: Callable, warmup_steps: int, current_step: int
+) -> float:
+    """The shared schedule times a param group's own linear warmup: the
+    optimizer's step t (LambdaLR's current_step t - 1) runs at
+    min(1, t / warmup_steps) of it."""
+    return lr_lambda(current_step) * min(1.0, (current_step + 1) / warmup_steps)
+
+
+_DECAY_TYPES = ("linear", "sqrt", "cosine")
+
+
+def _with_group_decay(
+    lr_lambda: functools.partial,
+    warmup_steps: int,
+    decay_ratio: float | None,
+    decay_type: str | None = None,
+    min_lr_factor: float | None = None,
+) -> functools.partial:
+    """The shared schedule with a param group's own `decay_ratio` (the decay
+    covers that share of the total steps, at most every step after the
+    group's warmup), `decay_type` and `min_lr_factor` (the floor of its decay).
+    A key left None keeps the shared schedule's."""
+    kw = dict(lr_lambda.keywords)
+    if decay_ratio is not None:
+        total = kw["warmup_steps"] + kw["stable_steps"] + kw["decay_steps"] - 1
+        decay = min(
+            round(total * decay_ratio), total - max(warmup_steps, kw["warmup_steps"])
+        )
+        kw.update(
+            stable_steps=total + 1 - kw["warmup_steps"] - decay, decay_steps=decay
+        )
+    if decay_type is not None:
+        kw["lr_decay_type"] = decay_type
+    if min_lr_factor is not None:
+        kw["min_lr_factor"] = min_lr_factor
+    return functools.partial(lr_lambda.func, **kw)
+
+
+def _check_table(table) -> tuple[tuple[int, float], ...]:
+    try:
+        knots = tuple((int(s), float(v)) for s, v in table)
+    except (TypeError, ValueError) as ex:
+        raise ValueError(f"group lr_table needs (step, factor) knots: {ex}") from ex
+    if len(knots) < 2:
+        raise ValueError("group lr_table needs at least two knots")
+    if any(b[0] <= a[0] for a, b in zip(knots, knots[1:])):
+        raise ValueError("group lr_table steps must increase")
+    if not all(math.isfinite(v) and v >= 0 for _, v in knots):
+        raise ValueError("group lr_table factors must be finite and >= 0")
+    return knots
+
+
+def _table_factor(knots: tuple[tuple[int, float], ...], current_step: int) -> float:
+    """The table at the optimizer's step t = current_step + 1: linear between
+    knots, the end values outside them."""
+    t = current_step + 1
+    i = bisect.bisect_right(knots, (t, math.inf))
+    if i == 0:
+        return knots[0][1]
+    if i == len(knots):
+        return knots[-1][1]
+    (s0, v0), (s1, v1) = knots[i - 1], knots[i]
+    return v0 if s0 == t else v0 + (v1 - v0) * (t - s0) / (s1 - s0)
+
+
+def _group_lambdas(optimizer, lr_lambda: Callable) -> Callable | list[Callable]:
+    """The shared schedule, or one per param group when a group sets its own
+    `warmup_steps`, `decay_ratio`, `decay_type` or `min_lr_factor` (extra keys
+    in its optimizer kwargs), or its own `lr_table` (knots (step, factor) that
+    replace the schedule for that group; not with the other keys)."""
+    tables = [g.get("lr_table") for g in optimizer.param_groups]
+    for g, table in zip(optimizer.param_groups, tables):
+        if table is not None:
+            mixed = [
+                k
+                for k in ("warmup_steps", "decay_ratio", "decay_type", "min_lr_factor")
+                if g.get(k) is not None
+            ]
+            if mixed:
+                raise ValueError(
+                    f"group lr_table replaces the schedule: not with {mixed}"
+                )
+    knots = [None if t is None else _check_table(t) for t in tables]
+    if any(k is not None for k in knots):
+        rest = _group_lambdas_no_table(optimizer, lr_lambda)
+        rest = rest if isinstance(rest, list) else [rest] * len(knots)
+        return [
+            lam if k is None else functools.partial(_table_factor, k)
+            for lam, k in zip(rest, knots)
+        ]
+    return _group_lambdas_no_table(optimizer, lr_lambda)
+
+
+def _group_lambdas_no_table(
+    optimizer, lr_lambda: Callable
+) -> Callable | list[Callable]:
+    own = [
+        (
+            int(g.get("warmup_steps", 0)),
+            g.get("decay_ratio"),
+            g.get("decay_type"),
+            g.get("min_lr_factor"),
+        )
+        for g in optimizer.param_groups
+    ]
+    for _, _, t, _ in own:
+        if t is not None and t not in _DECAY_TYPES:
+            raise ValueError(f"group decay_type {t!r}: one of {_DECAY_TYPES}")
+    if not any(
+        w or d is not None or t is not None or m is not None for w, d, t, m in own
+    ):
+        return lr_lambda
+    out = []
+    for w, d, t, m in own:
+        if d is None and t is None and m is None:
+            lam = lr_lambda
+        else:
+            lam = _with_group_decay(
+                lr_lambda,
+                w,
+                None if d is None else float(d),
+                t,
+                None if m is None else float(m),
+            )
+        out.append(functools.partial(_with_group_warmup, lam, w) if w else lam)
+    return out
 
 
 class LRSchedulersContainer(Stateful, Configurable):
@@ -203,7 +333,10 @@ class LRSchedulersContainer(Stateful, Configurable):
             len(optimizers) > 0
         ), "Must have at least one optimizer to create LRScheduler"
 
-        self.schedulers = [LambdaLR(optimizer, lr_lambda) for optimizer in optimizers]
+        self.schedulers = [
+            LambdaLR(optimizer, _group_lambdas(optimizer, lr_lambda))
+            for optimizer in optimizers
+        ]
 
     def __iter__(self) -> Iterator[LRScheduler]:
         return iter(self.schedulers)
@@ -248,3 +381,7 @@ class LRSchedulersContainer(Stateful, Configurable):
             scheduler.last_epoch = last_epoch
             scheduler._step_count = last_epoch + 1
             scheduler._last_lr = scheduler.get_lr()
+            # The next step runs this run's schedule, not the lr the checkpoint
+            # holds (a branch's own table); on a plain resume they are equal.
+            for group, lr in zip(scheduler.optimizer.param_groups, scheduler._last_lr):
+                group["lr"] = lr

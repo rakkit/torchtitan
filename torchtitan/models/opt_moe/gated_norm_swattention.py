@@ -27,9 +27,9 @@ from torchtitan.models.common.config_utils import (
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Conv1d, Identity
 from torchtitan.models.common.rope import RoPE
+from torchtitan.models.gpt_oss.model import apply_attention_sink_rescale
 from torchtitan.protocols.module import Module
 from .utils.inits import make_param_init
-from torchtitan.models.gpt_oss.model import apply_attention_sink_rescale
 
 from .utils.norms import build_norm_config
 from .utils.short_conv import causal_short_conv
@@ -96,6 +96,15 @@ class GatedNormSWAttention(GQAttention):
         after the projection: a depthwise causal conv of this width, then SiLU."""
         attention_sinks: bool = False
         """A learned logit per head in the softmax denominator (gpt-oss)."""
+        row_multipliers: tuple[str, ...] = ()
+        """Learned per-row output multipliers (init 1), y = m * (W x), i.e.
+        W_eff = Diag(m) W (arXiv 2601.04890), on the named projections: "q", "k",
+        "v" (those rows of wqkv) and/or "o" (wo, the block's residual write). On
+        q/k the qk-norm removes a head's overall scale, so only the profile of
+        its rows acts."""
+        scalar_multipliers: bool = False
+        """Make each of `row_multipliers` a single learned scalar per projection
+        (shape [1], W_eff = m W) instead of one per row."""
 
         # Filled in by OPTMoEModel.Config expansion from ``attn_backend`` and the
         # model-level rope/rope_of_swa configs. Declared with defaults so the
@@ -339,11 +348,42 @@ class GatedNormSWAttention(GQAttention):
         self.sinks = (
             nn.Parameter(torch.empty(self.n_heads)) if config.attention_sinks else None
         )
+        unknown = set(config.row_multipliers) - {"q", "k", "v", "o"}
+        if unknown:
+            raise ValueError(
+                "attention row_multipliers takes 'q', 'k', 'v' and/or 'o', got "
+                f"{sorted(unknown)}"
+            )
+        if config.scalar_multipliers and not config.row_multipliers:
+            raise ValueError("attention scalar_multipliers needs row_multipliers")
+        if config.scalar_multipliers and {"q", "k"} & set(config.row_multipliers):
+            raise ValueError(
+                "attention scalar_multipliers on q/k would be removed by the qk-norm"
+            )
+        self.scalar_multipliers = config.scalar_multipliers
+
+        def multiplier(name: str, size: int) -> nn.Parameter | None:
+            if name not in config.row_multipliers:
+                return None
+            return nn.Parameter(torch.empty(1 if config.scalar_multipliers else size))
+
+        self.v_multiplier = multiplier("v", self.n_kv_heads * self.head_dim)
+        self.o_multiplier = multiplier("o", dim)
+        self.q_multiplier = multiplier("q", self.n_heads * self.head_dim)
+        self.k_multiplier = multiplier("k", self.n_kv_heads * self.head_dim)
 
     def _init_self_parameters(self) -> None:
         if self.sinks is not None:
             # gpt-oss's std, without its depth scaling
             nn.init.trunc_normal_(self.sinks, std=0.02)
+        for m in (
+            self.v_multiplier,
+            self.o_multiplier,
+            self.q_multiplier,
+            self.k_multiplier,
+        ):
+            if m is not None:
+                nn.init.ones_(m)
 
     def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
         return apply_attention_sink_rescale(out, lse, self.sinks)
@@ -393,6 +433,15 @@ class GatedNormSWAttention(GQAttention):
     ) -> torch.Tensor:
         num_tokens = x_TD.shape[0]
         xq, xk, xv = self.qkv_linear(x_TD)  # upstream's fused QKVLinear
+        if self.v_multiplier is not None:
+            m = self.v_multiplier
+            xv = xv * (
+                m if self.scalar_multipliers else m.view(self.n_kv_heads, self.head_dim)
+            )
+        if self.q_multiplier is not None:
+            xq = xq * self.q_multiplier.view(self.n_heads, self.head_dim)
+        if self.k_multiplier is not None:
+            xk = xk * self.k_multiplier.view(self.n_kv_heads, self.head_dim)
         if self.q_conv is not None:
             xq, xk, xv = (
                 causal_short_conv(t.flatten(-2), c.weight, positions).view_as(t)
@@ -464,4 +513,6 @@ class GatedNormSWAttention(GQAttention):
                 output = self.mid_norm(output)
         else:
             output = output.reshape(num_tokens, -1)
+        if self.o_multiplier is not None:
+            return self.wo(output) * self.o_multiplier
         return self.wo(output)

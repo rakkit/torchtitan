@@ -25,11 +25,31 @@ from torchtitan.distributed.utils import (
 from ..helpers import gram_helper, norm_helper, power_iteration
 from ..helpers.gram_helper import calculate_gram_metrics
 from ..helpers.norm_helper import calculate_norm, calculate_norm_batched
-from ..helpers.radial_helper import (
-    calculate_radial_metrics,
-    RADIAL_METRIC_NAMES,
-    SpectralInputs,
-)
+from ..helpers.radial_helper import calculate_radial_metrics, SpectralInputs
+
+
+ROW_QUANTILES = (0.1, 0.5, 0.9)
+ROW_METRIC_NAMES = [
+    f"{what}_q{int(q * 100)}" for what in ("norm", "angle") for q in ROW_QUANTILES
+]
+
+
+def row_metrics(W_before, W_after) -> list[torch.Tensor]:
+    """Quantiles over a unit's stored rows (a Linear's output channels, a
+    table's tokens) of the row norms after the step and of each row's angle,
+    in chord form `2 asin(|w/|w| - w'/|w'|| / 2)` (fp32 `acos` cannot resolve
+    the ~1e-3 rad of one step). Zeros for a vector."""
+    if W_before.ndim != 2:
+        return [W_before.new_zeros((), dtype=torch.float32)] * len(ROW_METRIC_NAMES)
+    tiny = torch.finfo(torch.float32).tiny
+    a, b = W_before.float(), W_after.float()
+    nb = b.norm(dim=-1)
+    chord = (a / a.norm(dim=-1, keepdim=True).clamp_min(tiny)) - (
+        b / nb[:, None].clamp_min(tiny)
+    )
+    angle = 2 * torch.asin((chord.norm(dim=-1) / 2).clamp(max=1.0))
+    q = torch.tensor(ROW_QUANTILES, device=a.device)
+    return list(torch.quantile(nb, q)) + list(torch.quantile(angle, q))
 
 
 def pseudo_post_update_weight(w, u, lr, decay):
@@ -153,6 +173,7 @@ class UnitValues:
     w: list = field(default_factory=list)
     gram: list = field(default_factory=list)
     radial: list = field(default_factory=list)
+    rows: list = field(default_factory=list)
     gram_vecs: list = field(default_factory=list)
     upd_spec: torch.Tensor | None = None
     w_spec: torch.Tensor | None = None
@@ -172,7 +193,8 @@ class _Layout:
             [(f"track_update_{n}/", False) for n in opt.norms_to_log]
             + [(f"track_param_{n}/", False) for n in opt.norms_to_log]
             + [(f"track_gram_{n}/", True) for n in opt.gram_scalar_names]
-            + [(f"track_radial_{n}/", False) for n in RADIAL_METRIC_NAMES]
+            + [(f"track_radial_{n}/", False) for n in opt.radial_names]
+            + [(f"track_rows_{n}/", False) for n in ROW_METRIC_NAMES]
         )
         self.per_unit = len(self.row_names)
         scalars = sink.max_slots * self.per_unit
@@ -254,11 +276,16 @@ class MetricSink:
         upd_norms = calculate_norm(update, opt.norms_to_log, **norm_kw)
         w_norms = calculate_norm(w_after, opt.norms_to_log, **norm_kw)
         w_sigma, upd_sigma = _split_norms(out, upd_norms, w_norms)
-        spectral = radial_spectral_inputs(W, w_after, w_sigma, upd_sigma, exact)
+        spectral = (
+            radial_spectral_inputs(W, w_after, w_sigma, upd_sigma, exact)
+            if opt.spectral_metrics
+            else None
+        )
         radial = calculate_radial_metrics(
             W, w_after, radial_state, spectral=spectral, transpose=transpose
         )
-        out.radial = [radial[n] for n in RADIAL_METRIC_NAMES]
+        out.radial = [radial[n] for n in opt.radial_names]
+        out.rows = row_metrics(W, w_after)
         if gram and opt.gram_level > 0:
             self._fill_gram(out, W, G_raw, w_after)
         elif gram:
@@ -291,7 +318,9 @@ class MetricSink:
                 _split_norms(vals[e], dict(b_upd[e]), dict(b_w[e])) for e in range(n_ep)
             ]
             w_sig, u_sig = [s[0] for s in sigmas], [s[1] for s in sigmas]
-            if b_spec is None:
+            if not opt.spectral_metrics:
+                spectral = None
+            elif b_spec is None:
                 spectral = _stack_spectral(
                     [
                         radial_spectral_inputs(p, q, ws, us, exact)
@@ -310,7 +339,8 @@ class MetricSink:
                 p_local, pw_all, state_local, spectral=spectral, batch_ndim=1
             )
             for e, out in enumerate(vals):
-                out.radial = [radial[n][e] for n in RADIAL_METRIC_NAMES]
+                out.radial = [radial[n][e] for n in opt.radial_names]
+                out.rows = row_metrics(p_local[e], pw_all[e])
                 if opt.gram_level > 0:
                     self._fill_gram(out, p_local[e], g_raw[e], pw_all[e])
             results[key] = vals
@@ -344,6 +374,18 @@ class MetricSink:
             pw = torch.cat([w for _, w in pieces], dim=0)
             del pieces
             un, wn = _norms(upd), _norms(pw)
+            if not opt.spectral_metrics:  # no spectral radial metrics this step
+                del upd, pw
+                off = 0
+                for x in group:
+                    k, e = x.key, x.U.shape[0]
+                    batched[k] = (
+                        [{n: un[n][off + i] for n in un} for i in range(e)],
+                        [{n: wn[n][off + i] for n in wn} for i in range(e)],
+                        (None,) * 5,
+                    )
+                    off += e
+                return
             wb = torch.cat([x.W for x in group], dim=0)
             sig_b, u1_b, v1_b = norm_helper.gram_top_singular_pair(wb)
             sig_u_b = norm_helper.gram_top_singular_pair(pw.float() - wb.float())[0]
@@ -404,7 +446,13 @@ class MetricSink:
             v = values.get(mu.key)
             if v is None:
                 continue
-            row = v.upd + v.w + (v.gram if v.gram else [zero] * lay.n_gram) + v.radial
+            row = (
+                v.upd
+                + v.w
+                + (v.gram if v.gram else [zero] * lay.n_gram)
+                + v.radial
+                + v.rows
+            )
             _write(buf, mu.slot * lay.per_unit, torch.stack([x.float() for x in row]))
             if lay.want_gvec and v.gram_vecs:
                 off = lay.gvec_at(0, self.rank, mu.key)

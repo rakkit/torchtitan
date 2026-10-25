@@ -118,6 +118,14 @@ _ACCUMULATOR_NAMES: tuple[str, ...] = ("raw_A2", "angular_A1", "angular_A2", "R1
 # so it needs the names without reaching for a private symbol.
 RADIAL_ACCUMULATOR_NAMES = _ACCUMULATOR_NAMES
 
+
+def radial_names(spectral: bool) -> list[str]:
+    """The radial metrics a step logs: all, or without the spectral ones."""
+    if spectral:
+        return list(RADIAL_METRIC_NAMES)
+    return [n for n in RADIAL_METRIC_NAMES if n not in _SPECTRAL_METRIC_NAMES]
+
+
 # a_t below this fraction of r_t is treated as a degenerate (no real update)
 # step -- see the valid_wu comment in calculate_radial_metrics for why a
 # relative floor is needed instead of a bare a_t > 0 check.

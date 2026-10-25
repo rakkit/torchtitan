@@ -36,7 +36,11 @@ import harness  # noqa: E402
 from reference import rules_from_container  # noqa: E402
 from test_step_paths import _SameLMOReference  # noqa: E402
 
-from torchtitan.optimizers.helpers.norm_helper import get_norms_to_log  # noqa: E402
+from torchtitan.optimizers.disco.metrics import ROW_METRIC_NAMES  # noqa: E402
+from torchtitan.optimizers.helpers.norm_helper import (  # noqa: E402
+    _SVD_FREE_NORMS,
+    get_norms_to_log,
+)
 from torchtitan.optimizers.helpers.radial_helper import (  # noqa: E402
     RADIAL_METRIC_NAMES,
 )
@@ -83,7 +87,19 @@ def units_by_param(container) -> dict[int, tuple]:
     return {id(e.param): e.units for opt in container.optimizers for e in opt.entries}
 
 
-def expected_keys(model, units: dict[int, tuple], norms: list[str]) -> set[str]:
+_SPECTRAL_RADIAL = {
+    "spectral_radius",
+    "spectral_radius_next",
+    "spectral_growth",
+    "spectral_relative_step",
+    "radiality_rms_to_rms",
+    "aus_rms_to_rms",
+}
+
+
+def expected_keys(
+    model, units: dict[int, tuple], norms: list[str], radial=RADIAL_METRIC_NAMES
+) -> set[str]:
     keys = set()
     for name, p in harness.trainable(model):
         clean = remove_orig_mod_and_weight_for_p_name(name)
@@ -94,8 +110,10 @@ def expected_keys(model, units: dict[int, tuple], norms: list[str]) -> set[str]:
             for n in norms:
                 keys.add(f"track_update_{n}/{pre}")
                 keys.add(f"track_param_{n}/{pre}")
-            for r in RADIAL_METRIC_NAMES:
+            for r in radial:
                 keys.add(f"track_radial_{r}/{pre}")
+            for r in ROW_METRIC_NAMES:
+                keys.add(f"track_rows_{r}/{pre}")
     return keys
 
 
@@ -109,7 +127,9 @@ class TestMetricsUnion(DTensorTestBase):
             return torch.device("cpu")
         return torch.device(self.device_type, self.rank)
 
-    def _check(self, topo: dict, *, local: bool, moe: bool = True):
+    def _check(
+        self, topo: dict, *, local: bool, moe: bool = True, spectral: bool = True
+    ):
         device = self._device()
         pd = harness.parallel_dims(
             world_size=self.world_size, device_type=device.type, **topo
@@ -133,7 +153,14 @@ class TestMetricsUnion(DTensorTestBase):
         ref = _SameLMOReference(params, rules_from_container(container, model))
 
         grads = harness.set_synthetic_grads(model, 1, device)
-        container.arm_norm_computation()
+        norms = get_norms_to_log(list(cfg.optimizer.norms_to_log))
+        radial = RADIAL_METRIC_NAMES
+        if spectral:
+            container.arm_norm_computation()
+        else:  # spectral_norm_freq off-cadence: the SVD-free norms, no spectral radial metrics
+            norms = [n for n in norms if n in _SVD_FREE_NORMS]
+            radial = [r for r in RADIAL_METRIC_NAMES if r not in _SPECTRAL_RADIAL]
+            container.arm_norm_computation(norms, spectral=False)
         container.step()
         container.zero_grad()
         ref.step(grads)
@@ -166,9 +193,7 @@ class TestMetricsUnion(DTensorTestBase):
         gathered: list = [None] * self.world_size
         dist.all_gather_object(gathered, mine)
         units = units_by_param(container)
-        expected = expected_keys(
-            model, units, get_norms_to_log(list(cfg.optimizer.norms_to_log))
-        )
+        expected = expected_keys(model, units, norms, radial)
 
         union = set().union(*gathered)
         total = sum(len(s) for s in gathered)
@@ -311,6 +336,13 @@ class TestMetricsUnion(DTensorTestBase):
     @with_comms
     def test_hsdp22_local(self):
         self._check(dict(dp_replicate=2, dp_shard=2, cp=1, ep=1), local=True)
+
+    @with_comms
+    def test_fsdp4_local_spectral_off(self):
+        """spectral_norm_freq's off-cadence step, MoE included (the batched expert path)."""
+        self._check(
+            dict(dp_replicate=1, dp_shard=4, cp=1, ep=1), local=True, spectral=False
+        )
 
     @with_comms
     def test_ddp4_dense_local(self):

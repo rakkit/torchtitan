@@ -15,7 +15,7 @@ import torch.distributed as dist
 from torchtitan.models.common.param_layout import ParamLayout
 
 from torchtitan.optimizers.disco.optimizer import DiSCO
-from torchtitan.optimizers.disco.presets import AUSMap
+from torchtitan.optimizers.disco.presets import AUSMap, EtaSchedule
 from torchtitan.optimizers.disco.rules import rule_of
 
 
@@ -52,7 +52,10 @@ def _groups():
             "param_names": ["c.weight"],
             "lr": 0.5,
             "rule": "aus",
-            "args": {"compute": "svd", "eta": "lr"},
+            "args": {
+                "compute": "svd",
+                "eta": {"shape": "inverse_poly", "start": 10, "c": 0.1},
+            },
         },
     ]
 
@@ -99,11 +102,15 @@ def test_groups_inherit_the_defaults_and_merge_args():
     assert (g0["lr"], g0["momentum"], g0["rule"]) == (0.1, 0.95, "muon")
     assert g0["args"] == {"steps": 3}
     assert (g1["lr"], g1["rule"]) == (0.5, "aus")
-    assert g1["args"] == {"steps": 3, "compute": "svd", "eta": "lr"}
+    assert g1["args"] == {
+        "steps": 3,
+        "compute": "svd",
+        "eta": {"shape": "inverse_poly", "start": 10, "c": 0.1},
+    }
     rules = {e.name: e.rule for e in opt.entries}
     assert rules["a.weight"] == rule_of({"rule": "muon", "args": {"steps": 3}})
     aus = rules["c.weight"].compute
-    assert isinstance(aus, AUSMap) and aus.eta == "lr"
+    assert isinstance(aus, AUSMap) and aus.eta == EtaSchedule("inverse_poly", 10, 0.1)
 
 
 def test_rule_config_is_not_checkpoint_state():
@@ -382,3 +389,57 @@ def test_the_weight_decay_pair_comes_from_the_config():
     new.load_state_dict(sd)
     g = new.optimizers[0].param_groups[0]
     assert (g["weight_decay"], g["decoupled_wd"]) == (1e-4, True)
+
+
+def _table_container(table):
+    """Two DiSCO groups; the second (not the default: its keys are DiSCO's
+    defaults) carries the table."""
+    from torchtitan.optimizers.container import DiSCOOptimizersContainer
+
+    second = {
+        "match": r"^1\.weight$",
+        "lr": 0.2,
+        "rule": "muon",
+        "args": {"compute": "svd"},
+    }
+    if table is not None:
+        second["lr_table"] = table
+    cfg = DiSCOOptimizersContainer.Config(
+        groups={
+            "second": second,
+            "default": {"lr": 0.1, "rule": "muon", "args": {"compute": "svd"}},
+        }
+    )
+    model = torch.nn.Sequential(
+        torch.nn.Linear(4, 8, bias=False), torch.nn.Linear(8, 4, bias=False)
+    )
+    model.param_layouts = lambda: {
+        "0.weight": ParamLayout("matrix"),
+        "1.weight": ParamLayout("matrix"),
+    }
+    return model, DiSCOOptimizersContainer(
+        cfg, model_parts=[model], parallel_dims=_NoParallel()
+    )
+
+
+def test_an_lr_table_is_config_not_checkpoint_state():
+    """A group's lr_table stays out of checkpoints; a run with a table loads a
+    checkpoint saved with another table or with none (a branch), and keeps its own."""
+    a, b = [[0, 1.0], [10, 0.5]], [[0, 1.0], [10, 0.0]]
+    for saved_table, live_table in ((a, b), (None, b), (a, None)):
+        model, container = _table_container(saved_table)
+        for m in model:
+            m.weight.grad = torch.ones_like(m.weight)
+        container.step()
+        sd = container.state_dict()
+        assert not any(k.endswith(".lr_table") for k in sd)
+        model, container = _table_container(live_table)
+        container.load_state_dict(
+            {k: v.clone() if torch.is_tensor(v) else v for k, v in sd.items()}
+        )
+        (g,) = [
+            g
+            for g in container.optimizers[0].param_groups
+            if g["param_names"] == ["1.weight"]
+        ]
+        assert g.get("lr_table") == live_table

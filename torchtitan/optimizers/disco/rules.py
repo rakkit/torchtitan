@@ -50,12 +50,15 @@ and aus.
 """
 
 import inspect
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import NamedTuple
 
 import torch
+
+from . import gram_input_stats
 
 
 # ------------------------------------------------------------------ phases
@@ -113,6 +116,10 @@ class StepCtx(NamedTuple):
     wd: float
     t: int  # 1-based optimizer step
     decoupled: bool = False  # weight decay independent of lr
+    frozen: torch.Tensor | None = (
+        None  # per stacked unit: in the compute's frozen_units (DiSCO sets it)
+    )
+    colmask: torch.Tensor | None = None  # per stacked unit: in the compute's col_units, i.e. learns column gains (DiSCO sets it)
 
     @property
     def decay(self) -> float:
@@ -141,6 +148,8 @@ class Compute:
     state of shape `state_shape(m, n)`, kept on the computing rank between
     steps and checkpointed; the first step sees zeros. `keeps_radius`: the
     step holds each unit's norm, so weight decay would be undone by it.
+    `owns_momentum`: the compute keeps its own moments in its state, so its
+    group passes the raw gradient (momentum 1, no nesterov) and decays nothing.
     `output`: "update", "update_coeffs" or "weight" -- see `Result`.
 
     Rows and unit kinds with output "update" implement `core`, which the rule
@@ -152,6 +161,7 @@ class Compute:
     needs_weight = False
     has_state = False
     keeps_radius = False
+    owns_momentum = False
     output = "update"
 
     def core(self, x: torch.Tensor) -> torch.Tensor:
@@ -338,6 +348,8 @@ class Rule:
     def call_fused(self, x: torch.Tensor, m: int) -> torch.Tensor:
         if x.ndim == 3 and x.shape[0] == 0:
             return x
+        if gram_input_stats.is_armed():
+            gram_input_stats.record(self.compute, x)
         return call_compiled(self.fused, x, m)
 
     def run_whole(self, x, w=None, ctx: StepCtx | None = None, state=None) -> Result:
@@ -444,12 +456,50 @@ def rule_of(group: dict) -> Rule:
             + " (a row normalisation such as embed_sqrt is now compute: row-l2"
             " with scale: sqrt_n; see CONFIG_MIGRATION section 69)"
         )
+    safety = args.pop("safety", None)
     unknown = set(args) - set(preset.args)
     if unknown:
         raise ValueError(
             f"{name}: unknown args {sorted(unknown)}; allowed {sorted(preset.args)}"
         )
-    return preset.build(**args)
+    rule = preset.build(**args)
+    if safety is None:
+        return rule
+    if not (math.isfinite(float(safety)) and float(safety) >= 1.0):
+        raise ValueError(f"{name}: safety must be finite and >= 1, got {safety!r}")
+    rule, n = _with_gram_safety(rule, float(safety))
+    if not n and rule.kind != "rows":  # a row rule inherits the default group's args
+        raise ValueError(
+            f"{name}: safety needs a gram_polar_express compute in the rule"
+        )
+    return rule
+
+
+def _with_gram_safety(obj, safety: float):
+    """`obj` (a rule or compute tree) with every gram_polar_express Orthogonalise
+    at `safety`, and how many were set."""
+    import dataclasses
+
+    from .presets import Orthogonalise
+
+    if isinstance(obj, Orthogonalise):
+        if obj.backend != "gram_polar_express":
+            return obj, 0
+        return dataclasses.replace(obj, safety=safety), 1
+    if isinstance(obj, tuple):
+        out = [_with_gram_safety(o, safety) for o in obj]
+        return tuple(o for o, _ in out), sum(n for _, n in out)
+    if not dataclasses.is_dataclass(obj) or isinstance(obj, type):
+        return obj, 0
+    changes, total = {}, 0
+    for f in dataclasses.fields(obj):
+        if not f.init:
+            continue
+        v = getattr(obj, f.name)
+        nv, n = _with_gram_safety(v, safety)
+        if n:
+            changes[f.name], total = nv, total + n
+    return (dataclasses.replace(obj, **changes) if changes else obj), total
 
 
 def lmo(g, compute, scale, steps):

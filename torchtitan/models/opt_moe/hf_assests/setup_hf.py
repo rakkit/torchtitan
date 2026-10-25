@@ -73,7 +73,16 @@ def hf_config(model, model_config=None) -> OptMoEConfig:
     m = getattr(model, "config", None) or model_config
     if not getattr(m, "layers", None):
         raise ValueError("HF export needs the expanded config (update_from_config)")
-    layer, attn, ffn, moe = m.layer, m.layer.attention, m.layer.feed_forward, m.layer.moe
+    layer, attn, ffn, moe = (
+        m.layer,
+        m.layer.attention,
+        m.layer.feed_forward,
+        m.layer.moe,
+    )
+    if layer.post_norm_type != "none":
+        raise ValueError(
+            f"HF export has no sandwich norm, got post_norm_type={layer.post_norm_type!r}"
+        )
     head_dim = attn.head_dim or m.dim // attn.n_heads
     per_layer = [lc.attention for lc in m.layers]
     sliding = [a.sliding_window_size > 0 for a in per_layer]
@@ -83,10 +92,15 @@ def hf_config(model, model_config=None) -> OptMoEConfig:
         a.rope.theta for a, s in zip(per_layer, sliding) if s and a.use_rope
     }
     if len(sliding_ropes) > 1:
-        raise ValueError(f"sliding layers disagree on their RoPE: {sorted(sliding_ropes)}")
+        raise ValueError(
+            f"sliding layers disagree on their RoPE: {sorted(sliding_ropes)}"
+        )
     rope_sliding = None
     if sliding_ropes and sliding_ropes != {rope["rope_theta"]}:
-        rope_sliding = {"rope_type": "default", "rope_theta": float(sliding_ropes.pop())}
+        rope_sliding = {
+            "rope_type": "default",
+            "rope_theta": float(sliding_ropes.pop()),
+        }
     block_scale, identity_scale = setup_residual_scale(layer.residual_scale, m.n_layers)
     fields = dict(
         vocab_size=m.vocab_size,
@@ -99,11 +113,14 @@ def hf_config(model, model_config=None) -> OptMoEConfig:
         rms_norm_eps=_rms_eps(m),
         qk_norm=attn.qk_norm or attn.norm_everywhere,
         v_norm=attn.v_norm or attn.norm_everywhere,
-        attention_mid_norm=(attn.mid_norm or attn.norm_everywhere) and not attn.gate_only,
+        attention_mid_norm=(attn.mid_norm or attn.norm_everywhere)
+        and not attn.gate_only,
         head_wise_mid_norm=attn.head_wise_mid_norm,
         mid_norm_position=attn.mid_norm_position,
         gated_attention=(
-            None if attn.gated_attention_type in (None, "none") else attn.gated_attention_type
+            None
+            if attn.gated_attention_type in (None, "none")
+            else attn.gated_attention_type
         ),
         conv_kernel_size=attn.conv_kernel_size,
         attention_sinks=attn.attention_sinks,
@@ -120,7 +137,9 @@ def hf_config(model, model_config=None) -> OptMoEConfig:
     )
     if ffn is not None:
         _swiglu(ffn.activation_fn)
-        fields.update(intermediate_size=ffn.hidden_dim, mlp_mid_norm=ffn.norm_everywhere)
+        fields.update(
+            intermediate_size=ffn.hidden_dim, mlp_mid_norm=ffn.norm_everywhere
+        )
     if moe is None:
         fields.update(first_k_dense_replace=m.n_layers)
     else:

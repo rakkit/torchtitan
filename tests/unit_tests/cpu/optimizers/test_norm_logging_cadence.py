@@ -43,6 +43,7 @@ def test_cadence_matches_the_expression_it_replaced(
 ):
     container = MagicMock(spec=DiSCOOptimizersContainer)
     container.log_norm_freq = log_norm_freq
+    container.dense_norm_steps = 0
 
     got = DiSCOOptimizersContainer.wants_norms_at(
         container, step, should_log=should_log, is_final_step=is_final_step
@@ -50,6 +51,21 @@ def test_cadence_matches_the_expression_it_replaced(
 
     assert got == _reference_wants_norms(
         log_norm_freq, step, should_log=should_log, is_final_step=is_final_step
+    )
+
+
+@pytest.mark.parametrize("step", [1, 2, 499, 500, 501, 505, 510])
+def test_dense_window_arms_every_logged_step(step):
+    """Every logged step up to dense_norm_steps arms, then the cadence again."""
+    container = MagicMock(spec=DiSCOOptimizersContainer)
+    container.log_norm_freq = 10
+    container.dense_norm_steps = 500
+    got = DiSCOOptimizersContainer.wants_norms_at(
+        container, step, should_log=True, is_final_step=False
+    )
+    assert got == (step <= 500 or step % 10 == 0)
+    assert not DiSCOOptimizersContainer.wants_norms_at(
+        container, step, should_log=False, is_final_step=False
     )
 
 
@@ -78,6 +94,8 @@ class _FakeDiSCO:
         self.arm_kwargs: dict | None = None
         self.steps_that_computed: list[int] = []
         self._step_index = 0
+        self.eta_used: dict[int, tuple[float, float]] = {}
+        self.momentum_used: dict[int, float] = {}
 
     def calculate_norm_at_next_step(self, norms_to_log=None, gram_level=None, **kw):
         self.need_to_calculate_norm = True
@@ -185,6 +203,7 @@ def _live_container(fake, monkeypatch, *, log_norm_freq: int = 5):
     container.optimizers = [fake]
     container.model_parts = []
     container.log_norm_freq = log_norm_freq
+    container.dense_norm_steps = 0
     container.norms_to_log = ["all"]
     container.gram_level = 0
     container.log_metrics_locally = False
@@ -192,6 +211,11 @@ def _live_container(fake, monkeypatch, *, log_norm_freq: int = 5):
     container._moe_publish_armed = False
     container._norms_armed = False
     container._head_input = None
+    container.parallel_dims = None
+    container.log_residual_stats = False
+    container.log_gain_stats = False
+    container._model_stats_armed = False
+    container._gains_before = None
     container.head_diag_probes = 512
     container.get_parameter_norms = lambda step: dict(fake.norms_at_current_step)
     return container

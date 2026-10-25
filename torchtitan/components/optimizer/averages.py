@@ -181,6 +181,13 @@ class WeightAverages(OptimizersContainer):
         """Score these weight files (canonical FQN -> full tensor, e.g. a
         mixture of snapshots) with the validator at start, then stop."""
 
+        start_from_gamma: float | None = None
+        """Angular WSD: right after the run's FIRST load of `initial_load_path`
+        (not after a restart from its own checkpoint), replace the model
+        weights by this gamma's renormalised average (what the validation
+        scores as avg_g<gamma>) and stop averaging. The optimizer state is the
+        checkpoint's. The gamma must be one of `gammas`."""
+
         def __post_init__(self) -> None:
             if self.every < 1 or self.start_step < 0:
                 raise ValueError("averages: every >= 1 and start_step >= 0")
@@ -200,6 +207,12 @@ class WeightAverages(OptimizersContainer):
                 raise ValueError("averages.snapshot_steps must be >= 1")
             if self.export_steps and not self.gammas:
                 raise ValueError("averages.export_steps needs gammas")
+            if self.start_from_gamma is not None and float(
+                self.start_from_gamma
+            ) not in [float(g) for g in self.gammas]:
+                raise ValueError(
+                    f"averages.start_from_gamma {self.start_from_gamma} must be one of gammas {self.gammas}"
+                )
 
     def __init__(
         self, config: Config, *, model_parts: list[nn.Module], output_dir: str = ""
@@ -309,6 +322,19 @@ class WeightAverages(OptimizersContainer):
                     current_step,
                     f"avg_g{g:g}-step-{current_step}.pt",
                 )
+
+    @torch.no_grad()
+    def start_from_average(self) -> None:
+        """The weights become the renormalised average of `config.start_from_gamma`,
+        bitwise what the validation scores as that average (the live weights of the
+        loaded checkpoint are the reference of the renormalisation); the averages
+        stop updating."""
+        i = [float(g) for g in self.gammas].index(float(self.config.start_from_gamma))
+        locs = self._materialize(i)
+        self._reshard()
+        self._load_locals(locs)
+        self._reshard()
+        self.gammas = []
 
     # ---- the renormalised average as each rank's local tensors
     def _materialize(self, i: int) -> list[list[torch.Tensor]]:

@@ -338,6 +338,10 @@ class BaseCheckpointManager(Configurable, ABC):
                     )
 
             logger.info("Loading the checkpoint from %s.", checkpoint_id)
+            # a first start from initial_load_path, not a restart from the folder
+            self.loaded_from_initial_path = load_step == -1 and bool(
+                self.initial_load_path
+            )
             begin = time.monotonic()
             self._load_checkpoint(
                 self._states_to_load(model_only),

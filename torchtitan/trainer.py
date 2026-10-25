@@ -664,6 +664,22 @@ class Trainer(Configurable):
         loaded_step = engine.num_completed_steps
 
         averages = getattr(engine, "averages", None)
+        if (
+            averages is not None
+            and averages.config.start_from_gamma is not None
+            and getattr(engine.checkpointer, "loaded_from_initial_path", False)
+        ):
+            # angular WSD: the branch starts from the renormalised average of the
+            # loaded checkpoint, with its raw optimizer state
+            averages.start_from_average()
+            logger.info(
+                f"averages: the weights are the gamma {averages.config.start_from_gamma:g} "
+                f"average at step {engine.num_completed_steps}"
+            )
+            if self.config.validator is not None:
+                self.validator.validate(
+                    engine.model_parts, engine.num_completed_steps, tag="avgstart"
+                )
         if averages is not None and averages.config.score_files:
             if self.config.validator is None:
                 raise ValueError("averages.score_files needs the validator")

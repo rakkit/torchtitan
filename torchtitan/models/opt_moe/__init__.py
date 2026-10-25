@@ -2468,6 +2468,32 @@ moe_opt_moe_configs = {
             theta=10000.0,
         ),
     ),
+    "gauge-d16-w1024-vnorm": OPTMoEModel.Config(
+        n_layers=16,
+        dim=1024,
+        layer=OPTMoETransformerBlock.Config(
+            n_dense_layers=16,
+            feed_forward=FeedForward.Config(
+                hidden_dim=4096,
+                norm_everywhere=False,
+                norm_eps=1e-30,
+            ),
+            attention=GatedNormSWAttention.Config(
+                n_heads=16,
+                n_kv_heads=16,
+                head_dim=128,
+                qk_norm=True,
+                v_norm=True,
+                norm_everywhere=False,
+                norm_eps=1e-30,
+            ),
+        ),
+        rope=CosSinRoPE.Config(
+            dim=128,
+            max_context_length=4096,
+            theta=10000.0,
+        ),
+    ),
     "gauge-d32-w1024": OPTMoEModel.Config(
         n_layers=32,
         dim=1024,

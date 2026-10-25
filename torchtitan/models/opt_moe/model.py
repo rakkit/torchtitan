@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses as _dc
+import functools
 import logging
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
@@ -134,6 +135,9 @@ class OPTMoETransformerBlock(TransformerBlock):
         norm_eps: float = 1e-30
         norm_type: str = "np_rmsnorm"
         post_norm_type: str = "none"
+        prenorm_gain_init: float = 1.0
+        """Constant init of the attention_norm / ffn_norm gains (``norm_type="rmsnorm"``
+        only). 1.0 leaves the norms on their stock ``reset_parameters`` (ones)."""
 
         # Stamped per layer by OPTMoEModel.Config._expand_layers(). Upstream
         # builds each layer with a bare build(), so these can no longer be
@@ -493,6 +497,23 @@ class OPTMoEModel(Decoder):
             swa_window = base_attn.sliding_window_size
             depth_init = parse_depth_init(self.layer.depth_init)
 
+            def pre_norm():
+                cfg = build_norm_config(
+                    self.layer.norm_type, self.dim, self.layer.norm_eps
+                )
+                if self.layer.prenorm_gain_init != 1.0:
+                    if self.layer.norm_type != "rmsnorm":
+                        raise ValueError(
+                            "prenorm_gain_init != 1 needs norm_type='rmsnorm' "
+                            f"(got {self.layer.norm_type!r}): no gain to initialise"
+                        )
+                    cfg.param_init = {
+                        "weight": functools.partial(
+                            nn.init.constant_, val=self.layer.prenorm_gain_init
+                        )
+                    }
+                return cfg
+
             layers: list = []
             for layer_id in range(n_layers):
                 residual_div_attn, residual_div_ffn = setup_depth_init(
@@ -555,12 +576,8 @@ class OPTMoEModel(Decoder):
                         attention=attn_cfg,
                         moe=moe_cfg,
                         feed_forward=ff_cfg,
-                        attention_norm=build_norm_config(
-                            self.layer.norm_type, self.dim, self.layer.norm_eps
-                        ),
-                        ffn_norm=build_norm_config(
-                            self.layer.norm_type, self.dim, self.layer.norm_eps
-                        ),
+                        attention_norm=pre_norm(),
+                        ffn_norm=pre_norm(),
                         post_attention_norm=post_norm(),
                         post_ffn_norm=post_norm(),
                         dim=self.dim,

@@ -6,6 +6,7 @@
 
 import functools
 import math
+import re
 
 import torch
 import torch.nn as nn
@@ -319,6 +320,11 @@ def setup_residual_scale(residual_scale: str, n_layers: int):
 
         case "complete_p_N":
             block_scale = 1 / N
+            identity_scale = 1.0
+
+        case _ if re.fullmatch(r"complete_p_base[1-9][0-9]*", residual_scale):
+            # CompleteP alpha=1 (arXiv 2505.01618 Table 1), base depth K: K / L
+            block_scale = int(residual_scale[len("complete_p_base") :]) / N
             identity_scale = 1.0
 
         case _:

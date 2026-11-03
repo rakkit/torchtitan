@@ -806,6 +806,24 @@ CPU test on an explicit CPU mesh.
 - **W&B resume / fork** (`WANDB_RESUME_FROM`, `WANDB_FORK_FROM`) get no rank
   suffix under per-rank logging.
 - The metrics gather sends to every rank; only the logging rank reads it.
+- **Rule state is not sharded under FSDP (to confirm before production).** For every
+  unit outside the experts, a stateful rule's `rule_state` is allocated whole on
+  every rank (`DiSCO._init_state`): one row per unit, of `state_shape(m, n)`. Only
+  the unit's owner writes its rows; the others stay zero, and `state_dict()` sums
+  the rows over the ranks to save them. Numbers and checkpoints are right (resumes
+  are bitwise), but the memory is not split across ranks:
+  - `angular_muown` / `onerate` / `amphione` keep `(m, n + 3)` per unit (the
+    direction's momentum and the row lengths' state), `lie_relative` `(m, n)`: a
+    full fp32 copy of every hidden matrix on every rank. 336M (335M hidden
+    parameters): about 1.35 GB per rank, where 1/8 would be about 0.17 GB; an 8B
+    dense model about 28 GB.
+  - `aus` and `sso` keep a length-n vector per unit: replicated too, but small.
+  - These groups (`momentum: 1.0`) still get the generic `momentum_buffer`
+    (sharded like the parameter), which they never use.
+  - The experts' `rule_state` is a DTensor, sharded like the parameter.
+  The fix: allocate only the rows of the units a rank owns, and no
+  `momentum_buffer` when the rule keeps its own momentum; both change the
+  checkpoint path and need the FSDP resume tests (`gpu/disco/test_step_paths.py`).
 
 ## Gradient-noise logging (`optimizer.gnoise`, off by default)
 

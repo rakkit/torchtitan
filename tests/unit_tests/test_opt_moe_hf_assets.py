@@ -16,7 +16,6 @@ import unittest
 from types import SimpleNamespace
 
 import torch
-from safetensors.torch import save_file
 
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.models.common.rope import CosSinRoPE
@@ -36,7 +35,16 @@ from torchtitan.models.opt_moe.utils.inits import setup_residual_scale
 T = 256
 
 
-def _native(*, moe=True, norms=True, gate="head-wise", gate_only=False, conv=0, sinks=False, **model):
+def _native(
+    *,
+    moe=True,
+    norms=True,
+    gate="head-wise",
+    gate_only=False,
+    conv=0,
+    sinks=False,
+    **model,
+):
     """A 4-layer opt_moe: NoPE layer 2, sliding layers 0, 1, 3 with their own
     theta, partial RoPE, a dense first layer."""
     cfg = OPTMoEModel.Config(
@@ -147,7 +155,9 @@ class TestHFConfig(unittest.TestCase):
 
     def test_conv_layers_cache_conv_states(self):
         c = hf_config(_config_only(_native(conv=4, sinks=True)))
-        self.assertEqual(c.layer_types, ["hybrid_sliding"] * 2 + ["hybrid", "hybrid_sliding"])
+        self.assertEqual(
+            c.layer_types, ["hybrid_sliding"] * 2 + ["hybrid", "hybrid_sliding"]
+        )
         self.assertEqual((c.conv_kernel_size, c.attention_sinks), (4, True))
         self.assertEqual(c.number_of_conv_states, 3)
 
@@ -220,17 +230,23 @@ class TestHFExport(unittest.TestCase):
             os.path.dirname(__file__), "../../scripts/checkpoint_conversion"
         )
         sys.path.insert(0, os.path.abspath(scripts))
-        from convert_to_hf import _export_hf_weights
         from pathlib import Path
+
+        from convert_to_hf import _export_hf_weights
 
         cfg = _native()
         native, _ = _pair(cfg, torch.device("cpu"))
         adapter = OPTMoEStateDictAdapter(cfg, None)
         with tempfile.TemporaryDirectory() as d:
             copy_and_overwrite_model_config(native, None, d)
-            _export_hf_weights(dict(native.state_dict()), adapter, torch.bfloat16, Path(d))
+            _export_hf_weights(
+                dict(native.state_dict()), adapter, torch.bfloat16, Path(d)
+            )
             hf, info = AutoModelForCausalLM.from_pretrained(
-                d, trust_remote_code=True, dtype=torch.bfloat16, output_loading_info=True
+                d,
+                trust_remote_code=True,
+                dtype=torch.bfloat16,
+                output_loading_info=True,
             )
         self.assertEqual(type(hf).__name__, "OptMoEForCausalLM")
         self.assertFalse(any(info.values()), info)
@@ -244,7 +260,9 @@ class TestHFExport(unittest.TestCase):
             self.assertTrue(torch.equal(v, sd[k].to(want)), k)
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "flex attention and grouped GEMMs need CUDA")
+@unittest.skipUnless(
+    torch.cuda.is_available(), "flex attention and grouped GEMMs need CUDA"
+)
 class TestHFForwardParity(unittest.TestCase):
     """bf16 parameters (FSDP's mixed precision: buffers stay fp32) and the
     native compiled flex kernel: every logit bitwise."""
@@ -252,7 +270,9 @@ class TestHFForwardParity(unittest.TestCase):
     def test_bf16_prefill_is_bitwise(self):
         cases = {
             "moe, norms, head-wise gate": _native(),
-            "moe, no norms, element-wise gate": _native(norms=False, gate="element-wise"),
+            "moe, no norms, element-wise gate": _native(
+                norms=False, gate="element-wise"
+            ),
             "dense, gate only": _native(moe=False, gate_only=True),
             "moe, short conv, sinks": _native(conv=4, sinks=True),
         }
@@ -288,7 +308,11 @@ class TestHFForwardParity(unittest.TestCase):
             out = hf(input_ids=tokens[:, :40], use_cache=True)
             got, cache = [out.logits], out.past_key_values
             for t in range(40, 48):
-                out = hf(input_ids=tokens[:, t : t + 1], past_key_values=cache, use_cache=True)
+                out = hf(
+                    input_ids=tokens[:, t : t + 1],
+                    past_key_values=cache,
+                    use_cache=True,
+                )
                 got.append(out.logits)
         torch.testing.assert_close(torch.cat(got, dim=1), want, rtol=1e-4, atol=1e-4)
 

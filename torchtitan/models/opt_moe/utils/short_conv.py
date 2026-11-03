@@ -32,6 +32,9 @@ def causal_short_conv(
     y = x * w[:, k - 1]
     for j in range(1, k):
         back = F.pad(x[:-j], (0, 0, j, 0))
-        y = y + torch.where((positions_T >= j).unsqueeze(-1), back, 0.0) * w[:, k - 1 - j]
+        y = (
+            y
+            + torch.where((positions_T >= j).unsqueeze(-1), back, 0.0) * w[:, k - 1 - j]
+        )
     y = F.silu(y) if conv_format == "kda" else y + x
     return y.to(x_TC.dtype)

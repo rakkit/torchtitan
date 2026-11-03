@@ -230,7 +230,11 @@ def test_gain_metrics_match_direct_formulas():
 
 
 def _container(
-    model, *, log_residual_stats: bool, log_gain_stats: bool, log_sink_stats: bool = False
+    model,
+    *,
+    log_residual_stats: bool,
+    log_gain_stats: bool,
+    log_sink_stats: bool = False,
 ):
     c = MagicMock(spec=DiSCOOptimizersContainer)
     c.model_parts = [model]
@@ -313,7 +317,9 @@ def test_container_logs_every_sink_value_on_the_cadence_and_only_when_asked():
             model.layers[str(i)].attention.sinks.copy_(
                 torch.arange(n_heads, dtype=torch.float32) / 8 + i
             )
-    c = _container(model, log_residual_stats=False, log_gain_stats=False, log_sink_stats=True)
+    c = _container(
+        model, log_residual_stats=False, log_gain_stats=False, log_sink_stats=True
+    )
     c.begin_step(1, should_log=True, is_final_step=False)
     got = c.collect_metrics(1)
     sink = {k: v for k, v in got.items() if k.startswith("sink_value/")}
@@ -322,7 +328,9 @@ def test_container_logs_every_sink_value_on_the_cadence_and_only_when_asked():
         for i in range(2)
         for h in range(n_heads)
     }
-    assert not any(k.startswith("sink_value/") for k in c.collect_metrics(1))  # one read per armed step
+    assert not any(
+        k.startswith("sink_value/") for k in c.collect_metrics(1)
+    )  # one read per armed step
     c.begin_step(505, should_log=True, is_final_step=False)  # past dense, off cadence
     assert not any(k.startswith("sink_value/") for k in c.collect_metrics(505))
 
@@ -331,7 +339,10 @@ def test_container_logs_every_sink_value_on_the_cadence_and_only_when_asked():
     assert not any(k.startswith("sink_value/") for k in off.collect_metrics(1))
 
     plain = _container(
-        _tiny(gains=False), log_residual_stats=False, log_gain_stats=False, log_sink_stats=True
+        _tiny(gains=False),
+        log_residual_stats=False,
+        log_gain_stats=False,
+        log_sink_stats=True,
     )
     plain.begin_step(1, should_log=True, is_final_step=False)
     with pytest.raises(ValueError, match="attention sinks"):

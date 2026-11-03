@@ -355,12 +355,18 @@ def _conv_init(tensor: torch.Tensor, kind: str, gain: float) -> torch.Tensor:
     (the same CPU draw as the module itself). The full tensor is drawn on CPU from
     the global generator, so the values do not depend on the sharding."""
     if tensor.ndim != 3 or tensor.shape[1] != 1:
-        raise ValueError(f"conv init needs a depthwise weight [C, 1, K], got {tuple(tensor.shape)}")
+        raise ValueError(
+            f"conv init needs a depthwise weight [C, 1, K], got {tuple(tensor.shape)}"
+        )
     channels, _, k = tensor.shape
     if kind == "torch_default":
         bound = 1.0 / math.sqrt(k)  # fan_in = K for a depthwise weight
-        return _copy_full_into(tensor, torch.empty(channels, 1, k).uniform_(-bound, bound) * gain)
-    if kind == "delay":  # one tap uniform in 0..K-1, sign uniform: |H| = gain at every w
+        return _copy_full_into(
+            tensor, torch.empty(channels, 1, k).uniform_(-bound, bound) * gain
+        )
+    if (
+        kind == "delay"
+    ):  # one tap uniform in 0..K-1, sign uniform: |H| = gain at every w
         tap = torch.randint(0, k, (channels,))
         sign = torch.randint(0, 2, (channels,)) * 2 - 1
         w = torch.zeros(channels, k, dtype=torch.float64)
@@ -377,7 +383,9 @@ def conv_init_fn(kind: str, gain: float) -> "functools.partial":
     kind: "delay" (one +-gain tap per channel), "random_opnorm" (random filter with
     operator norm gain) or "torch_default" (gain x the nn.Conv1d default draw). gain > 0."""
     if kind not in ("delay", "random_opnorm", "torch_default"):
-        raise ValueError(f"conv_init_fn_type must be delay | random_opnorm | torch_default, got {kind!r}")
+        raise ValueError(
+            f"conv_init_fn_type must be delay | random_opnorm | torch_default, got {kind!r}"
+        )
     if not gain > 0:
         raise ValueError(f"conv_init_gain must be > 0, got {gain!r}")
     return functools.partial(_conv_init, kind=kind, gain=float(gain))

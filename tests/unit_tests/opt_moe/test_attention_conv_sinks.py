@@ -50,10 +50,14 @@ def test_short_conv_sees_neither_the_future_nor_the_previous_document():
     base = causal_short_conv(x, w, positions, "kda")
     later = x.clone()
     later[5:] += 1.0  # the future of token 4, and the whole second document
-    torch.testing.assert_close(causal_short_conv(later, w, positions, "kda")[:5], base[:5])
+    torch.testing.assert_close(
+        causal_short_conv(later, w, positions, "kda")[:5], base[:5]
+    )
     earlier = x.clone()
     earlier[:7] += 1.0  # the whole first document
-    torch.testing.assert_close(causal_short_conv(earlier, w, positions, "kda")[7:], base[7:])
+    torch.testing.assert_close(
+        causal_short_conv(earlier, w, positions, "kda")[7:], base[7:]
+    )
 
 
 def test_short_conv_gradients_match_the_reference():
@@ -79,7 +83,8 @@ def _tiny(conv=4, sinks=True, sink_init=None):
     cfg.layer.attention.sink_init = sink_init
     cfg.update_from_config(
         config=SimpleNamespace(
-            parallelism=ParallelismConfig(), training=TrainingConfig(max_context_length=256)
+            parallelism=ParallelismConfig(),
+            training=TrainingConfig(max_context_length=256),
         )
     )
     return cfg
@@ -127,7 +132,10 @@ def test_sink_rescale_is_the_softmax_with_one_more_logit_on_cpu():
     # opt_moe's attention takes this copy, not gpt_oss's
     from torchtitan.models.opt_moe import gated_norm_swattention
 
-    assert gated_norm_swattention.apply_attention_sink_rescale is attention_sinks.apply_attention_sink_rescale
+    assert (
+        gated_norm_swattention.apply_attention_sink_rescale
+        is attention_sinks.apply_attention_sink_rescale
+    )
 
 
 def _init_on_cpu(cfg):
@@ -143,7 +151,10 @@ def _init_on_cpu(cfg):
 def test_sinks_are_zero_at_init_with_sink_init_zero():
     model = _init_on_cpu(_tiny(conv=0, sinks=True, sink_init=0.0))
     sinks = [model.layers[str(i)].attention.sinks for i in range(2)]
-    assert all(s.shape == (model.layers["0"].attention.n_heads,) and (s == 0).all() for s in sinks)
+    assert all(
+        s.shape == (model.layers["0"].attention.n_heads,) and (s == 0).all()
+        for s in sinks
+    )
     assert all(s.requires_grad for s in sinks)  # still learned
 
 
@@ -176,7 +187,10 @@ def test_sink_metrics_log_every_value_of_every_layer():
         def __init__(self):
             super().__init__()
             self.layers = nn.ModuleDict(
-                {"0": nn.ModuleDict({"attention": Attn([0.0, 0.25])}), "1": nn.ModuleDict({"attention": Attn([-1.5, 2.0])})}
+                {
+                    "0": nn.ModuleDict({"attention": Attn([0.0, 0.25])}),
+                    "1": nn.ModuleDict({"attention": Attn([-1.5, 2.0])}),
+                }
             )
 
     got = model_stats.sink_metrics([Part()], parallel_dims=None)
@@ -194,20 +208,29 @@ def test_sinks_are_a_softmax_with_one_more_logit():
     from torch.nn.attention.flex_attention import create_block_mask
 
     from torchtitan.models.common.attention import FlexInnerAttention
-    from torchtitan.models.opt_moe.utils.attention_sinks import apply_attention_sink_rescale
+    from torchtitan.models.opt_moe.utils.attention_sinks import (
+        apply_attention_sink_rescale,
+    )
 
     torch.manual_seed(0)
     t, h, d = 256, 4, 32
     q, k, v = (torch.randn(t, h, d, device="cuda") for _ in range(3))
     sinks = torch.randn(h, device="cuda")
-    mask = create_block_mask(lambda b, hh, qi, ki: qi >= ki, 1, None, t, t, device="cuda")
+    mask = create_block_mask(
+        lambda b, hh, qi, ki: qi >= ki, 1, None, t, t, device="cuda"
+    )
     inner = FlexInnerAttention(FlexInnerAttention.Config())
     got = inner(
-        q, k, v, attention_masks=mask,
+        q,
+        k,
+        v,
+        attention_masks=mask,
         out_transform=lambda o, lse: apply_attention_sink_rescale(o, lse, sinks),
     )
     s = torch.einsum("qhd,khd->hqk", q.double(), k.double()) / d**0.5
-    s = s.masked_fill(~torch.ones(t, t, dtype=torch.bool, device="cuda").tril(), float("-inf"))
+    s = s.masked_fill(
+        ~torch.ones(t, t, dtype=torch.bool, device="cuda").tril(), float("-inf")
+    )
     logits = torch.cat([s, sinks.double()[:, None, None].expand(h, t, 1)], dim=-1)
     p = torch.softmax(logits, dim=-1)[..., :t]  # the sink carries no value
     want = torch.einsum("hqk,khd->qhd", p, v.double())
@@ -227,8 +250,16 @@ def test_model_with_conv_and_sinks_trains_one_step():
     assert 0 < sinks.std().item() < 0.05
     positions = torch.cat([torch.arange(100), torch.arange(156)]).cuda()
     tokens = torch.randint(0, cfg.vocab_size, (256,), device="cuda")
-    logits = model(tokens, positions=positions, attention_masks=model.get_attention_masks(positions))
+    logits = model(
+        tokens,
+        positions=positions,
+        attention_masks=model.get_attention_masks(positions),
+    )
     F.cross_entropy(logits.float(), tokens.roll(-1)).backward()
     attn = model.layers["0"].attention
     for p in (attn.q_conv.weight, attn.v_conv.weight, attn.sinks):
-        assert p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+        assert (
+            p.grad is not None
+            and torch.isfinite(p.grad).all()
+            and p.grad.abs().sum() > 0
+        )

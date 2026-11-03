@@ -1065,7 +1065,7 @@ class DiSCO(torch.optim.Optimizer):
         """A group's per-unit-type step factors, checked and logged once: only a
         compute whose update is linear in eta with an eta-free alpha (sso) may
         be scaled per unit; every unit needs a factor, every factor a unit."""
-        c, ue = rule.compute, dict(rule.compute.unit_eta)
+        c, unit_etas = rule.compute, dict(rule.compute.unit_eta)
         if not (getattr(c, "eta_linear", False) and rule.output == "update_coeffs"):
             raise ValueError(
                 f"group {gi} ({group.get('rule')}): unit_eta needs a compute whose "
@@ -1076,16 +1076,16 @@ class DiSCO(torch.optim.Optimizer):
         for e in es:
             for un in e.units:
                 t = _unit_type(e, un)
-                if t not in ue:
+                if t not in unit_etas:
                     raise ValueError(
                         f"group {gi}: {_key(e, un)} (type {t!r}) has no unit_eta factor"
                     )
                 used.add(t)
-                self._unit_eta[(e.i, un.pos)] = ue[t]
-                lines.append(f"{_key(e, un)} x{ue[t]!r}")
-        if set(ue) - used:
+                self._unit_eta[(e.i, un.pos)] = unit_etas[t]
+                lines.append(f"{_key(e, un)} x{unit_etas[t]!r}")
+        if set(unit_etas) - used:
             raise ValueError(
-                f"group {gi}: unit_eta {sorted(set(ue) - used)} matches no unit of the group"
+                f"group {gi}: unit_eta {sorted(set(unit_etas) - used)} matches no unit of the group"
             )
         logger.info(
             f"[DiSCO] group {gi} unit_eta, {len(lines)} units: {', '.join(lines)}"

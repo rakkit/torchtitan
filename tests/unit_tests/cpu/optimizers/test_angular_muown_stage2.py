@@ -137,8 +137,8 @@ def _reference(
         if tangent and mutate == "tangent_after_momentum":
             D = proj(D)
         O = _exact_polar(D, k)
-        Ot = O if mutate == "no_rescale" else O * U.norm() / O.norm()
-        V = U - lr * eta(t) * Ot
+        O_turn = O if mutate == "no_rescale" else O * U.norm() / O.norm()
+        V = U - lr * eta(t) * O_turn
         U_next = (
             V / V.norm(dim=1, keepdim=True)
             if sphere == "row"

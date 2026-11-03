@@ -163,10 +163,10 @@ def _reference(
                 su, so = (torch.linalg.matrix_norm(X, ord=2) for X in (U, O))
             else:
                 su, so = _power_sigma(U, v0, k), _power_sigma(O, vO, k)
-            Ot = O * (su if mutate == "no_sigma_O" else su / so)
+            O_turn = O * (su if mutate == "no_sigma_O" else su / so)
         else:
-            Ot = O * U.norm() / O.norm()
-        V = U - lr * eta(t) * Ot
+            O_turn = O * U.norm() / O.norm()
+        V = U - lr * eta(t) * O_turn
         U_next = V / V.norm(dim=1, keepdim=True)
         gam = (G * U).sum(dim=1, keepdim=True)
         if scale == "row":

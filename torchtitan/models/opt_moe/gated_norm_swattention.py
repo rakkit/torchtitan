@@ -449,12 +449,16 @@ class GatedNormSWAttention(GQAttention):
     def check_conv_init(config: "GatedNormSWAttention.Config") -> None:
         """The conv init, format and streams are stated choices: required with the conv, absent without."""
         conv = config.conv_kernel_size > 0
-        if conv != (config.conv_format is not None) or (conv and config.conv_format not in ("kda", "canon")):
+        if conv != (config.conv_format is not None) or (
+            conv and config.conv_format not in ("kda", "canon")
+        ):
             raise ValueError(
                 "conv_format is required exactly when conv_kernel_size > 0 and is kda | canon; "
                 f"got conv_kernel_size={config.conv_kernel_size}, conv_format={config.conv_format!r}"
             )
-        if conv != (config.conv_streams is not None) or (conv and config.conv_streams not in ("qkv", "kv")):
+        if conv != (config.conv_streams is not None) or (
+            conv and config.conv_streams not in ("qkv", "kv")
+        ):
             raise ValueError(
                 "conv_streams is required exactly when conv_kernel_size > 0 and is qkv | kv; "
                 f"got conv_kernel_size={config.conv_kernel_size}, conv_streams={config.conv_streams!r}"
@@ -499,12 +503,20 @@ class GatedNormSWAttention(GQAttention):
             xq = xq * self.q_multiplier.view(self.n_heads, self.head_dim)
         if self.k_multiplier is not None:
             xk = xk * self.k_multiplier.view(self.n_kv_heads, self.head_dim)
-        if self.k_conv is not None:  # q, k and v ("qkv"), or k and v only ("kv": q is untouched)
+        if (
+            self.k_conv is not None
+        ):  # q, k and v ("qkv"), or k and v only ("kv": q is untouched)
             fmt = self.conv_format
             if self.q_conv is not None:
-                xq = causal_short_conv(xq.flatten(-2), self.q_conv.weight, positions, fmt).view_as(xq)
-            xk = causal_short_conv(xk.flatten(-2), self.k_conv.weight, positions, fmt).view_as(xk)
-            xv = causal_short_conv(xv.flatten(-2), self.v_conv.weight, positions, fmt).view_as(xv)
+                xq = causal_short_conv(
+                    xq.flatten(-2), self.q_conv.weight, positions, fmt
+                ).view_as(xq)
+            xk = causal_short_conv(
+                xk.flatten(-2), self.k_conv.weight, positions, fmt
+            ).view_as(xk)
+            xv = causal_short_conv(
+                xv.flatten(-2), self.v_conv.weight, positions, fmt
+            ).view_as(xv)
 
         # QK norm before RoPE (per Qwen3); V norm has no upstream equivalent.
         if self.q_norm is not None:

@@ -97,12 +97,12 @@ def bitwise(a: str, b: str) -> int:
 
 
 def known(d: str, tol: float = 1e-3) -> int:
-    allk: dict[int, dict[str, float]] = {}
+    all_k: dict[int, dict[str, float]] = {}
     for r, paths in stores(d).items():
         for st, row in history(paths, lambda k: k.startswith("gnoise")).items():
-            allk.setdefault(st, {}).update(row)
+            all_k.setdefault(st, {}).update(row)
     bad, n_checked, worst = [], 0, 0.0
-    for st, m in sorted(allk.items()):
+    for st, m in sorted(all_k.items()):
         K = m.get("gnoise/K")
         if K is None:
             continue
@@ -144,7 +144,7 @@ def known(d: str, tol: float = 1e-3) -> int:
         if m.get("gnoise/N_check", 0.0) != 0.0:
             bad.append(f"step {st} N_check {m['gnoise/N_check']}")
     print(
-        f"checked {n_checked} components over {len(allk)} steps; worst |tr| / (n S) = {worst:.2e}; "
+        f"checked {n_checked} components over {len(all_k)} steps; worst |tr| / (n S) = {worst:.2e}; "
         f"{globals().get('_n_agree', [0])[0]} agreement values"
     )
     for line in bad[:20]:

@@ -37,7 +37,7 @@ import torch.nn.functional as F
 from ..helpers.power_iteration import top_pair_warm
 from ..kernels.floors import SUMSQ_FLOOR
 from ..kernels.gram_newton_schulz import gram_polar_factor
-from ..kernels.zeropower import zeropower_backends
+from ..kernels.zeropower import POLAR_EXPRESS_SAFETY_DEFAULT, zeropower_backends
 from . import gram_input_stats
 from .rules import (
     call_compiled,
@@ -173,19 +173,29 @@ _TILED_BACKENDS = {
 }
 
 
+# the backends whose polynomial takes the polar express safety factor
+POLAR_EXPRESS_BACKENDS = ("gram_polar_express", "polar_express", "polar_express_triton")
+
+
 @dataclass(frozen=True)
 class Orthogonalise(Compute):
     """A zeropower backend on the whole unit (Newton-Schulz, polar express, svd)."""
 
     backend: str = "newtonschulz5"
     steps: int = 5
-    safety: float = 1.01  # gram_polar_express only (the rule arg `safety`)
+    polar_express_safety: float = POLAR_EXPRESS_SAFETY_DEFAULT  # the rule arg
 
     def __post_init__(self):
         if self.backend not in zeropower_backends or self.backend == "identity":
             raise ValueError(f"unknown backend {self.backend!r}")
-        if self.safety != 1.01 and self.backend != "gram_polar_express":
-            raise ValueError(f"safety is gram_polar_express's, not {self.backend!r}'s")
+        if (
+            self.polar_express_safety != POLAR_EXPRESS_SAFETY_DEFAULT
+            and self.backend not in POLAR_EXPRESS_BACKENDS
+        ):
+            raise ValueError(
+                f"polar_express_safety is for {POLAR_EXPRESS_BACKENDS}, "
+                f"not {self.backend!r}"
+            )
 
     def check_unit(self, m, n):
         # Measured: quack's GEMM needs 8-aligned dims; the Triton kernels hang
@@ -199,9 +209,9 @@ class Orthogonalise(Compute):
             )
 
     def core(self, x):
-        if self.safety != 1.01:
+        if self.polar_express_safety != POLAR_EXPRESS_SAFETY_DEFAULT:
             return zeropower_backends[self.backend](
-                x, steps=self.steps, eps=EPS, safety=self.safety
+                x, steps=self.steps, eps=EPS, safety=self.polar_express_safety
             )
         return zeropower_backends[self.backend](x, steps=self.steps, eps=EPS)
 
@@ -2009,14 +2019,15 @@ def amphione(
 ) -> Rule:
     """Amphione (see `AmphioneMap`): the direction is the orthogonaliser
     `compute` (a whole-unit backend: gram_polar_express, polar_express,
-    newtonschulz5, svd, ...) with `steps` iterations; with gram_polar_express
-    its `safety` is the rule arg every gram_polar_express rule takes (code
-    default 1.01). `eta`: an `EtaSchedule` dict on the
+    newtonschulz5, svd, ...) with `steps` iterations; a polar express
+    backend's safety factor is the rule arg `polar_express_safety` (default
+    1.01). `eta`: an `EtaSchedule` dict on the
     group's lr (None: the trainer's schedule alone). The rule keeps its own
     momentum: the group sets momentum 1.0, nesterov false, weight_decay 0.
 
     What the optimizer study ran, where it differs from the defaults: Gram
-    Polar Express (6 steps) at safety 1.05; a constant trainer lr with eta = 1 - sqrt(t / T) (the
+    Polar Express (6 steps) at polar_express_safety 1.05 (its configs spelled
+    it `safety`); a constant trainer lr with eta = 1 - sqrt(t / T) (the
     applied step lr eta(t) is the logged eta_used/DiSCO/<group>, not lr/);
     the row lengths' (and columns') sign average gain_beta 0.9, never run at
     beta; g scaled x4 at step 1 by the optimizer (`onerate` radius 4), which

@@ -442,7 +442,13 @@ def pick(table: dict, key: str, what: str):
     return table[key]
 
 
-_RENAMED = {"pre_norm": "pre", "backend": "compute", "norm_factor": "scale"}
+_RENAMED = {
+    "pre_norm": "pre",
+    "backend": "compute",
+    "norm_factor": "scale",
+    "safety": "polar_express_safety",
+}
+_ROW_RENAMES = {"pre_norm", "backend", "norm_factor"}
 
 
 def rule_of(group: dict) -> Rule:
@@ -456,10 +462,14 @@ def rule_of(group: dict) -> Rule:
         raise ValueError(
             f"{name}: args {old} were renamed: "
             + ", ".join(f"{k} -> {_RENAMED[k]}" for k in old)
-            + " (a row normalisation such as embed_sqrt is now compute: row-l2"
-            " with scale: sqrt_n; see CONFIG_MIGRATION section 69)"
+            + (
+                " (a row normalisation such as embed_sqrt is now compute: row-l2"
+                " with scale: sqrt_n; see CONFIG_MIGRATION section 69)"
+                if set(old) & _ROW_RENAMES
+                else ""
+            )
         )
-    safety = args.pop("safety", None)
+    safety = args.pop("polar_express_safety", None)
     unknown = set(args) - set(preset.args)
     if unknown:
         raise ValueError(
@@ -469,28 +479,30 @@ def rule_of(group: dict) -> Rule:
     if safety is None:
         return rule
     if not (math.isfinite(float(safety)) and float(safety) >= 1.0):
-        raise ValueError(f"{name}: safety must be finite and >= 1, got {safety!r}")
-    rule, n = _with_gram_safety(rule, float(safety))
+        raise ValueError(
+            f"{name}: polar_express_safety must be finite and >= 1, got {safety!r}"
+        )
+    rule, n = _with_polar_express_safety(rule, float(safety))
     if not n and rule.kind != "rows":  # a row rule inherits the default group's args
         raise ValueError(
-            f"{name}: safety needs a gram_polar_express compute in the rule"
+            f"{name}: polar_express_safety needs a polar express compute in the rule"
         )
     return rule
 
 
-def _with_gram_safety(obj, safety: float):
-    """`obj` (a rule or compute tree) with every gram_polar_express Orthogonalise
-    at `safety`, and how many were set."""
+def _with_polar_express_safety(obj, safety: float):
+    """`obj` (a rule or compute tree) with every polar express Orthogonalise
+    at the safety factor `safety`, and how many were set."""
     import dataclasses
 
-    from .presets import Orthogonalise
+    from .presets import Orthogonalise, POLAR_EXPRESS_BACKENDS
 
     if isinstance(obj, Orthogonalise):
-        if obj.backend != "gram_polar_express":
+        if obj.backend not in POLAR_EXPRESS_BACKENDS:
             return obj, 0
-        return dataclasses.replace(obj, safety=safety), 1
+        return dataclasses.replace(obj, polar_express_safety=safety), 1
     if isinstance(obj, tuple):
-        out = [_with_gram_safety(o, safety) for o in obj]
+        out = [_with_polar_express_safety(o, safety) for o in obj]
         return tuple(o for o, _ in out), sum(n for _, n in out)
     if not dataclasses.is_dataclass(obj) or isinstance(obj, type):
         return obj, 0
@@ -499,7 +511,7 @@ def _with_gram_safety(obj, safety: float):
         if not f.init:
             continue
         v = getattr(obj, f.name)
-        nv, n = _with_gram_safety(v, safety)
+        nv, n = _with_polar_express_safety(v, safety)
         if n:
             changes[f.name], total = nv, total + n
     return (dataclasses.replace(obj, **changes) if changes else obj), total

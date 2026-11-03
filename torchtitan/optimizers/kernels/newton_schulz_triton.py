@@ -365,7 +365,9 @@ def newton_schulz_triton(G: Tensor, steps: int = 10, eps: float = 1e-7):
 
 # Code from The Polar Express (arXiv:2505.16932).
 @torch.compile(dynamic=False, fullgraph=True)
-def polar_express_triton(G: Tensor, steps: int = 5, eps: float = 1e-7):
+def polar_express_triton(
+    G: Tensor, steps: int = 5, eps: float = 1e-7, safety: float = 1.01
+):
     coeffs_base = [
         (8.28721201814563, -23.595886519098837, 17.300387312530933),
         (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
@@ -377,9 +379,10 @@ def polar_express_triton(G: Tensor, steps: int = 5, eps: float = 1e-7):
         (1.875000000000000, -1.250000000000000, 0.375000000000000),  # limit
     ]
 
-    # apply the 1/1.01 stabiliser **only** to the first seven triples
+    # apply the 1/safety stabiliser **only** to the first seven triples (the
+    # polar express safety factor; 1.01 is the paper code's, as zeropower's)
     coeffs_base = [
-        (a / 1.01, b / 1.01**3, c / 1.01**5) for (a, b, c) in coeffs_base[:-1]
+        (a / safety, b / safety**3, c / safety**5) for (a, b, c) in coeffs_base[:-1]
     ] + [coeffs_base[-1]]
 
     # extend the list so that coeffs[k] is defined for every k < steps, then

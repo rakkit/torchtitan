@@ -70,20 +70,34 @@ _POLAR_EXPRESS_STABILISED = [
 ] + [_POLAR_EXPRESS_BASE[-1]]
 
 
-def polar_express_coefficients(steps: int) -> list[tuple[float, float, float]]:
-    """First `steps` polar-express triples, repeating the limit triple if
-    `steps` exceeds the table."""
-    coeffs = _POLAR_EXPRESS_STABILISED + list(
-        repeat(
-            _POLAR_EXPRESS_STABILISED[-1],
-            max(0, steps - len(_POLAR_EXPRESS_STABILISED)),
-        )
-    )
+# The polar express safety factor f: every triple but the limit is p(x / f),
+# (a / f, b / f^3, c / f^5). 1.01 is the paper code's value and every polar
+# express backend's default (bitwise the stabilised table above); upstream's
+# Gram Newton-Schulz uses 1.05. The input normalisation stays at 1.01.
+POLAR_EXPRESS_SAFETY_DEFAULT = 1.01
+
+
+def polar_express_coefficients(
+    steps: int, safety: float = POLAR_EXPRESS_SAFETY_DEFAULT
+) -> list[tuple[float, float, float]]:
+    """First `steps` polar-express triples at the safety factor `safety`,
+    repeating the limit triple if `steps` exceeds the table."""
+    if safety == POLAR_EXPRESS_SAFETY_DEFAULT:
+        table = _POLAR_EXPRESS_STABILISED
+    else:
+        f = safety
+        table = [
+            (a / f, b / f**3, c / f**5) for a, b, c in _POLAR_EXPRESS_BASE[:-1]
+        ]
+        table.append(_POLAR_EXPRESS_BASE[-1])
+    coeffs = table + list(repeat(table[-1], max(0, steps - len(table))))
     return coeffs[:steps]
 
 
 @torch.compile
-def zeropower_via_polar_express(G, steps=5, eps=1e-7):
+def zeropower_via_polar_express(
+    G, steps=5, eps=1e-7, safety=POLAR_EXPRESS_SAFETY_DEFAULT
+):
     # https://arxiv.org/abs/2505.16932
     # Support 2D (unsqueezed to batch=1) and 3D inputs.
     is_2d = G.dim() == 2
@@ -93,7 +107,7 @@ def zeropower_via_polar_express(G, steps=5, eps=1e-7):
         G.dim() == 3
     ), f"Please make sure gradients are 2D or 3D tensors, got shape: {G.shape}"
 
-    coeffs = polar_express_coefficients(steps)
+    coeffs = polar_express_coefficients(steps, safety)
 
     original_dtype = G.dtype
     X = G.bfloat16()

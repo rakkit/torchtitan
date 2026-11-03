@@ -49,15 +49,19 @@ RECIPE = dict(
     radius=4.0,
     magnitude_lr=1.0,
     magnitude_rule="sign",
-    safety=1.05,
+    polar_express_safety=1.05,  # the stored configs spelled it `safety`
     gain_lr="tied",
 )
 # the stored column run v2ps2-f-row-row-off-w1024-2x-13.4B-bs.128-...-col.on-...-colk.0.0625-cu.in-...
 COLUMNS = dict(
     col_scale=True, col_gain_lr_mult=0.0625, col_units=list(AMPHIONE_COLUMN_UNITS)
 )
-STUDY = {"eta": TABLE, "radius": 4.0, "safety": 1.05}  # onerate's radius default is 4
-STUDY_AMPHIONE = {"eta": TABLE, "safety": 1.05, "gain_beta": 0.9}
+STUDY = {
+    "eta": TABLE,
+    "radius": 4.0,
+    "polar_express_safety": 1.05,
+}  # onerate's radius default is 4
+STUDY_AMPHIONE = {"eta": TABLE, "polar_express_safety": 1.05, "gain_beta": 0.9}
 # the stepping tests: no quack kernel on CPU (Gram Polar Express), so both rules
 # take the exact SVD polar. amphione has no step-1 rescale: onerate at radius 1.
 STEP = {"eta": TABLE, "radius": 1.0, "compute": "svd"}
@@ -114,9 +118,9 @@ def test_amphione_takes_any_whole_unit_orthogonaliser(compute):
 def test_amphione_refuses_a_row_or_gram_compute(compute):
     with pytest.raises(ValueError):
         rule_of({"rule": "amphione", "args": {"compute": compute}})
-    assert rule_of({"rule": "amphione", "args": {"safety": 1.01}}) == rule_of(
-        {"rule": "amphione"}
-    )
+    assert rule_of(
+        {"rule": "amphione", "args": {"polar_express_safety": 1.01}}
+    ) == rule_of({"rule": "amphione"})
     assert rule_of(
         {"rule": "amphione", "args": {"columns": True}}
     ).compute.col_units == (AMPHIONE_COLUMN_UNITS)

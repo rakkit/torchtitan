@@ -83,6 +83,11 @@ def hf_config(model, model_config=None) -> OptMoEConfig:
         raise ValueError(
             f"HF export has no sandwich norm, got post_norm_type={layer.post_norm_type!r}"
         )
+    if attn.conv_kernel_size > 0 and (attn.conv_format, attn.conv_streams) != ("kda", "qkv"):
+        raise ValueError(
+            "HF export has only the KDA-format conv on q, k and v, got "
+            f"conv_format={attn.conv_format!r}, conv_streams={attn.conv_streams!r}"
+        )
     head_dim = attn.head_dim or m.dim // attn.n_heads
     per_layer = [lc.attention for lc in m.layers]
     sliding = [a.sliding_window_size > 0 for a in per_layer]

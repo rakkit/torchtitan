@@ -78,6 +78,7 @@ def tiny_model_config(
     attn.conv_init_fn_type = "delay" if conv else None
     attn.conv_init_gain = 1.0 if conv else None
     attn.conv_streams = "qkv" if conv else None
+    attn.conv_format = "kda" if conv else None
     attn.attention_sinks = sinks
     return cfg
 

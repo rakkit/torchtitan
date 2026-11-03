@@ -91,8 +91,8 @@ class GatedNormSWAttention(GQAttention):
         # only the first qk_rope_dim dims are rotated and the rest pass through.
         sliding_window_size: int = -1
         conv_kernel_size: int = 0
-        """0: none. Else KDA / Gated DeltaNet's short convolution on q, k and v
-        after the projection: a depthwise causal conv of this width, then SiLU."""
+        """0: none. Else a short convolution after the projection (on the streams
+        conv_streams): a depthwise causal conv of this width, in the conv_format."""
         conv_init_fn_type: str | None = None
         """Required when conv_kernel_size > 0 (no default): "delay" or "random_opnorm"
         (utils.inits.conv_init_fn). None with the conv off."""
@@ -101,6 +101,10 @@ class GatedNormSWAttention(GQAttention):
         conv_streams: str | None = None
         """Required when conv_kernel_size > 0 (no default): "qkv" (a conv on q, k and v) or
         "kv" (k and v only; q passes through untouched and has no q_conv). None with the conv off."""
+        conv_format: str | None = None
+        """Required when conv_kernel_size > 0 (no default): "kda" (KDA / Gated DeltaNet:
+        silu(conv(x)) replaces x) or "canon" (Canon / Inkling: conv(x) + x, no activation).
+        None with the conv off."""
         attention_sinks: bool = False
         """A learned logit per head in the softmax denominator (gpt-oss)."""
         row_multipliers: tuple[str, ...] = ()
@@ -336,6 +340,7 @@ class GatedNormSWAttention(GQAttention):
             ).build()
 
         self.q_conv = self.k_conv = self.v_conv = None
+        self.conv_format = config.conv_format
         self.check_conv_init(config)
         if config.conv_kernel_size > 0:
 
@@ -428,8 +433,13 @@ class GatedNormSWAttention(GQAttention):
 
     @staticmethod
     def check_conv_init(config: "GatedNormSWAttention.Config") -> None:
-        """The conv init and the streams it acts on are stated choices: required with the conv, absent without."""
+        """The conv init, format and streams are stated choices: required with the conv, absent without."""
         conv = config.conv_kernel_size > 0
+        if conv != (config.conv_format is not None) or (conv and config.conv_format not in ("kda", "canon")):
+            raise ValueError(
+                "conv_format is required exactly when conv_kernel_size > 0 and is kda | canon; "
+                f"got conv_kernel_size={config.conv_kernel_size}, conv_format={config.conv_format!r}"
+            )
         if conv != (config.conv_streams is not None) or (conv and config.conv_streams not in ("qkv", "kv")):
             raise ValueError(
                 "conv_streams is required exactly when conv_kernel_size > 0 and is qkv | kv; "
@@ -476,10 +486,11 @@ class GatedNormSWAttention(GQAttention):
         if self.k_multiplier is not None:
             xk = xk * self.k_multiplier.view(self.n_kv_heads, self.head_dim)
         if self.k_conv is not None:  # q, k and v ("qkv"), or k and v only ("kv": q is untouched)
+            fmt = self.conv_format
             if self.q_conv is not None:
-                xq = causal_short_conv(xq.flatten(-2), self.q_conv.weight, positions).view_as(xq)
-            xk = causal_short_conv(xk.flatten(-2), self.k_conv.weight, positions).view_as(xk)
-            xv = causal_short_conv(xv.flatten(-2), self.v_conv.weight, positions).view_as(xv)
+                xq = causal_short_conv(xq.flatten(-2), self.q_conv.weight, positions, fmt).view_as(xq)
+            xk = causal_short_conv(xk.flatten(-2), self.k_conv.weight, positions, fmt).view_as(xk)
+            xv = causal_short_conv(xv.flatten(-2), self.v_conv.weight, positions, fmt).view_as(xv)
 
         # QK norm before RoPE (per Qwen3); V norm has no upstream equivalent.
         if self.q_norm is not None:

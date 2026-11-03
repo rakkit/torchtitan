@@ -131,6 +131,7 @@ def _container(opts, *, log_gain_stats=True):
     c.model_parts = [nn.Linear(2, 2)]  # no RMSNorm: the model gains are an empty family
     c.parallel_dims = None
     c.log_residual_stats, c.log_gain_stats = False, log_gain_stats
+    c.log_sink_stats = False
     c.log_norm_freq, c.dense_norm_steps = 10, 500
     c.optimizers = opts
     c._norms_armed = c._model_stats_armed = False

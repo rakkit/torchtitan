@@ -26,8 +26,8 @@ from torchtitan.models.common.config_utils import (
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Conv1d, Identity
 from torchtitan.models.common.rope import RoPE
-from torchtitan.models.gpt_oss.model import apply_attention_sink_rescale
 from torchtitan.protocols.module import Module
+from .utils.attention_sinks import apply_attention_sink_rescale
 from .utils.inits import conv_init_fn, make_param_init
 
 from .utils.norms import build_norm_config
@@ -108,6 +108,9 @@ class GatedNormSWAttention(GQAttention):
         None with the conv off."""
         attention_sinks: bool = False
         """A learned logit per head in the softmax denominator (gpt-oss)."""
+        sink_init: float | None = None
+        """Initial value of the sinks (needs attention_sinks): None = trunc_normal with
+        std 0.02 (gpt-oss's std, without its depth scaling), 0.0 = zeros."""
         row_multipliers: tuple[str, ...] = ()
         """Learned per-row output multipliers (init 1), y = m * (W x), i.e.
         W_eff = Diag(m) W (arXiv 2601.04890), on the named projections: "q", "k",
@@ -367,6 +370,13 @@ class GatedNormSWAttention(GQAttention):
         self.sinks = (
             nn.Parameter(torch.empty(self.n_heads)) if config.attention_sinks else None
         )
+        if config.sink_init not in (None, 0.0):
+            raise ValueError(
+                f"attention sink_init is None (trunc_normal 0.02) or 0.0 (zeros), got {config.sink_init!r}"
+            )
+        if config.sink_init is not None and not config.attention_sinks:
+            raise ValueError("attention sink_init needs attention_sinks")
+        self.sink_init = config.sink_init
         unknown = set(config.row_multipliers) - {"q", "k", "v", "o"}
         if unknown:
             raise ValueError(
@@ -393,8 +403,11 @@ class GatedNormSWAttention(GQAttention):
 
     def _init_self_parameters(self) -> None:
         if self.sinks is not None:
-            # gpt-oss's std, without its depth scaling
-            nn.init.trunc_normal_(self.sinks, std=0.02)
+            if self.sink_init is None:
+                # gpt-oss's std, without its depth scaling
+                nn.init.trunc_normal_(self.sinks, std=0.02)
+            else:
+                nn.init.zeros_(self.sinks)
         for m in (
             self.v_multiplier,
             self.o_multiplier,

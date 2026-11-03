@@ -171,6 +171,12 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         col_scale it also logs each unit's column gains c (col_gain_*: rms,
         mean log|c|, q10 / q50 / q90, relative update; DiSCO.col_gain_metrics)."""
 
+        log_sink_stats: bool = False
+        """Log every attention sink value (one logit per head and layer,
+        sink_value/<layer>.attention/head-<h>) after the step on the
+        log_norm_freq cadence (optimizers/model_stats.py). Needs a model with
+        attention sinks."""
+
         head_diag_diameter_iters: int = 10
         """Power-iteration count and farthest-point restarts for the row
         diameter behind gamma_H. Fixed, not convergence-tested, so the sweep
@@ -362,6 +368,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         self.parallel_dims = parallel_dims
         self.log_residual_stats: bool = config.log_residual_stats
         self.log_gain_stats: bool = config.log_gain_stats
+        self.log_sink_stats: bool = config.log_sink_stats
         self._model_stats_armed: bool = False
         self._gains_before: list[torch.Tensor] | None = None
         self._col_before: list | None = None  # per optimizer: c of the col_scale units before the step (log_gain_stats)
@@ -644,6 +651,11 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                 if before is not None:
                     metrics.update(o.col_gain_metrics(before))
             self._col_before = None
+        if self.log_sink_stats:
+            sinks = model_stats.sink_metrics(self.model_parts, self.parallel_dims)
+            if not sinks:
+                raise ValueError("log_sink_stats needs a model with attention sinks")
+            metrics.update(sinks)
         return metrics
 
     def arm_moe_publish(self) -> None:

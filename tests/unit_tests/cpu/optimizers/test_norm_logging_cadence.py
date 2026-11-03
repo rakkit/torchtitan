@@ -214,6 +214,7 @@ def _live_container(fake, monkeypatch, *, log_norm_freq: int = 5):
     container.parallel_dims = None
     container.log_residual_stats = False
     container.log_gain_stats = False
+    container.log_sink_stats = False
     container._model_stats_armed = False
     container._gains_before = None
     container.head_diag_probes = 512

@@ -48,9 +48,10 @@ def _causal_sdpa(
     return out, SimpleNamespace(lse=None, max_scores=None)
 
 
-def _tiny(*, gains: bool = True, seed: int = 0, n_layers: int = 2):
+def _tiny(*, gains: bool = True, seed: int = 0, n_layers: int = 2, sinks: bool = False):
     cfg = model_registry("gauge-d8-w256")
     cfg.n_layers, cfg.vocab_size = n_layers, 512
+    cfg.layer.attention.attention_sinks = sinks
     if gains:
         cfg.layer.norm_type = cfg.layer.attention.norm_type = cfg.norm_type = "rmsnorm"
     cfg._expand_layers()
@@ -228,12 +229,15 @@ def test_gain_metrics_match_direct_formulas():
     assert model_stats.gain_metrics([off], [], parallel_dims=None) == {}
 
 
-def _container(model, *, log_residual_stats: bool, log_gain_stats: bool):
+def _container(
+    model, *, log_residual_stats: bool, log_gain_stats: bool, log_sink_stats: bool = False
+):
     c = MagicMock(spec=DiSCOOptimizersContainer)
     c.model_parts = [model]
     c.parallel_dims = None
     c.log_residual_stats = log_residual_stats
     c.log_gain_stats = log_gain_stats
+    c.log_sink_stats = log_sink_stats
     c.log_norm_freq, c.dense_norm_steps = 10, 500
     c.optimizers = []
     c._norms_armed = False
@@ -299,3 +303,36 @@ def test_container_without_the_flags_reports_nothing():
         _forward(model, *_batch())
     got = c.collect_metrics(1)
     assert not any(k.startswith(("residual_rms/", "gain_")) for k in got)
+
+
+def test_container_logs_every_sink_value_on_the_cadence_and_only_when_asked():
+    model = _tiny(gains=False, sinks=True)
+    n_heads = model.layers["0"].attention.n_heads
+    with torch.no_grad():
+        for i in range(2):
+            model.layers[str(i)].attention.sinks.copy_(
+                torch.arange(n_heads, dtype=torch.float32) / 8 + i
+            )
+    c = _container(model, log_residual_stats=False, log_gain_stats=False, log_sink_stats=True)
+    c.begin_step(1, should_log=True, is_final_step=False)
+    got = c.collect_metrics(1)
+    sink = {k: v for k, v in got.items() if k.startswith("sink_value/")}
+    assert sink == {
+        f"sink_value/layers.{i}.attention/head-{h}": h / 8 + i
+        for i in range(2)
+        for h in range(n_heads)
+    }
+    assert not any(k.startswith("sink_value/") for k in c.collect_metrics(1))  # one read per armed step
+    c.begin_step(505, should_log=True, is_final_step=False)  # past dense, off cadence
+    assert not any(k.startswith("sink_value/") for k in c.collect_metrics(505))
+
+    off = _container(model, log_residual_stats=False, log_gain_stats=False)
+    off.begin_step(1, should_log=True, is_final_step=False)
+    assert not any(k.startswith("sink_value/") for k in off.collect_metrics(1))
+
+    plain = _container(
+        _tiny(gains=False), log_residual_stats=False, log_gain_stats=False, log_sink_stats=True
+    )
+    plain.begin_step(1, should_log=True, is_final_step=False)
+    with pytest.raises(ValueError, match="attention sinks"):
+        plain.collect_metrics(1)

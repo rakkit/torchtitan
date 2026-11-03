@@ -15,6 +15,9 @@ whether or not a step is armed.
 Gains: every RMSNorm weight, from the rank's local shard, before and after the
 optimizer step.
 
+Sinks: every attention sink value (one logit per head and layer) after the optimizer
+step.
+
 Everything here runs eagerly on logging steps only, outside the compiled
 region, with one packed all-reduce and one device-to-host copy per family.
 """
@@ -35,6 +38,7 @@ __all__ = [
     "residual_metrics",
     "snapshot_gains",
     "gain_metrics",
+    "sink_metrics",
 ]
 
 _WRAPPERS = re.compile(r"(_checkpoint_wrapped_module|_orig_mod|_fsdp_wrapped_module)\.")
@@ -158,3 +162,30 @@ def gain_metrics(
         out[f"gain_rms/{name}"] = (s2 / n) ** 0.5
         out[f"gain_rel_update/{name}"] = (sd / sb) ** 0.5 if sb > 0 else 0.0
     return out
+
+
+def sink_metrics(model_parts: list[nn.Module], parallel_dims) -> dict[str, float]:
+    """Every attention sink logit after the optimizer step, one value per head and layer.
+
+    The sinks are tiny vectors, so each is gathered in full (a collective on every rank
+    when sharded) and all of them are copied to the host at once."""
+    sinks = [
+        (_WRAPPERS.sub("", name)[: -len(".sinks")], p)
+        for part in model_parts
+        for name, p in part.named_parameters()
+        if _WRAPPERS.sub("", name).endswith(".attention.sinks")
+    ]
+    if not sinks:
+        return {}
+    _unsupported(parallel_dims)
+    # Detached: a metrics read, no gradient flows, so no grad_placements.
+    full = [
+        p.detach().full_tensor() if isinstance(p, DTensor) else p.detach()
+        for _, p in sinks
+    ]
+    values = torch.stack([f.float() for f in full]).tolist()
+    return {
+        f"sink_value/{name}/head-{h}": v
+        for (name, _), row in zip(sinks, values, strict=True)
+        for h, v in enumerate(row)
+    }

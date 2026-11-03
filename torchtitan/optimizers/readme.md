@@ -307,8 +307,8 @@ is an `EtaSchedule` dict (see "Angular schedule" below).
   types as DiSCO logs them without `layers.<i>.`).
 - Like `aus`, they are meant for the hidden matrices. A row group (embedding,
   head, routers) that inherits a sphere rule stays that row rule, unless
-  `row_direction: true` (`hyperball`, `elr`, `angular_muown`) makes the row
-  compute (`row-l2`) the sphere rule's direction.
+  `row_direction: true` (`hyperball`, `elr`, `angular_muown`, `onerate`,
+  `amphione`) makes the row compute (`row-l2`) the sphere rule's direction.
   - The default group's `lr` is the ELR, and a row group without its own
     `lr` inherits it. `moe_template_config()`'s row groups set none, so give
     them one.
@@ -361,13 +361,52 @@ step-1 rescale, so a larger start belongs in the init. Args:
 
 | arg | default | meaning |
 |---|---|---|
-| `compute`, `steps` | `gram_polar_express`, 6 | the whole-unit orthogonaliser (`polar_express`, `newtonschulz5`, `svd`, ...); row and Gram computes are refused |
+| `compute`, `steps` | `gram_polar_express`, 6 | the direction: an orthogonaliser (`polar_express`, `newtonschulz5`, `svd`, ...), or `row-l2` with `row_direction` (below); a Gram compute is refused |
+| `row_direction` | false | with a row compute: true = Amphione with that row compute as the direction; false = the plain row rule (below) |
+| `scale` | `one` | used only by that plain row rule (Amphione rescales O to `\|\|U\|\|_F`); never inherited from the default group |
 | `beta`, `nesterov` | 0.95, true | the direction's momentum |
 | `gain_beta` | None (= `beta`) | the average the row-length (and column) sign steps take |
 | `eta` | None | an `EtaSchedule` dict on the group's lr |
 | `columns` | false | column gains c, `W = Diag(g) U Diag(c)`, on `column_units` |
 | `column_units` | wq, wk, wv, w1, w3 | the unit types that learn c (`AMPHIONE_COLUMN_UNITS`) |
 | `column_lr_mult` | 0.0625 | c's sign step is `column_lr_mult * eta_t` |
+
+**Row computes and `row_direction`** (as on `hyperball`, `elr`,
+`angular_muown`, `onerate`):
+
+| `compute` | `row_direction` | the rule |
+|---|---|---|
+| an orthogonaliser | false | Amphione, `O = Orth(D + beta M)`: the hidden matrices |
+| `row-l2` | **true** | Amphione, `O = rowl2(D + beta M)`: the orthogonaliser is replaced by normalising each row on its own; everything else (unit rows, the rescale, the row lengths' sign step, the rate) is the same |
+| `row-l2` | false (default) | **not Amphione**: the plain row rule `W <- W - lr scale(m, n) rowl2(M)` |
+| an orthogonaliser | true | an error |
+
+The fall-back exists because a group without its own `rule` inherits the
+default group's. An embedding group written `{"args": {"compute": "row-l2",
+"scale": "sqrt_n"}}` under an `amphione` default stays a plain row-norm step,
+not Amphione with learned row lengths. To be unambiguous, give every group
+its own `rule` (the recipe does: `sgd` for the RMSNorm gains, `muon` for the
+embedding and head).
+
+`row-l2` as the direction is for the attention's short conv, a `[C, K]`
+unit (K = 4): every channel's filter is its own `1 x K` matrix, whose
+spectral normalisation is its l2 norm (the tiled orthogonalisers cannot run
+on K = 4 anyway). The optimizer study's conv group, at the hidden matrices'
+lr:
+
+```python
+"conv": {"match": r"(^|\.)attention\.(q|k|v)_conv\.weight$", "rule": "amphione",
+         "lr": 0.01562, "momentum": 1.0, "nesterov": False, "weight_decay": 0.0,
+         "args": {"compute": "row-l2", "row_direction": True}},
+```
+
+It inherits the default group's other `amphione` args (`eta`, `beta`,
+`gain_beta`, ...). With `columns: true` on the default, set `columns: false`
+on the conv group: the conv units are not in `column_units`, and DiSCO
+refuses a column unit type that matches no unit of the group. The study ran
+this group with the row lengths x4 at step 1 (`radius: 4`) from
+`conv_init_gain: 1`; without a step-1 rescale the counterpart is
+`conv_init_gain: 4` (not run).
 
 The rule keeps its own momentum: its group sets `momentum: 1.0`,
 `nesterov: false`, `weight_decay: 0`. Its state, `[M | g | m_g | r]` per unit

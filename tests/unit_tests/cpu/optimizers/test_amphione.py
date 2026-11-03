@@ -105,6 +105,12 @@ def test_amphione_defaults():
     assert (cm.beta, cm.nesterov, cm.gain_beta) == (0.95, True, None)
     assert (cm.column_units, cm.column_lr_mult) == (AMPHIONE_COLUMN_UNITS, 0.0625)
     assert cm.direction.compute.backend == "gram_polar_express"
+    assert rule_of(
+        {"rule": "amphione", "args": {"polar_express_safety": 1.01}}
+    ) == rule_of({"rule": "amphione"})
+    assert rule_of(
+        {"rule": "amphione", "args": {"columns": True}}
+    ).compute.col_units == (AMPHIONE_COLUMN_UNITS)
 
 
 @pytest.mark.parametrize("compute", ["polar_express", "newtonschulz5", "svd"])
@@ -114,16 +120,69 @@ def test_amphione_takes_any_whole_unit_orthogonaliser(compute):
     assert amphione.compute.direction == onerate.compute.direction
 
 
-@pytest.mark.parametrize("compute", ["row-l2", "sign", "gram_polar"])
-def test_amphione_refuses_a_row_or_gram_compute(compute):
-    with pytest.raises(ValueError):
-        rule_of({"rule": "amphione", "args": {"compute": compute}})
-    assert rule_of(
-        {"rule": "amphione", "args": {"polar_express_safety": 1.01}}
-    ) == rule_of({"rule": "amphione"})
-    assert rule_of(
-        {"rule": "amphione", "args": {"columns": True}}
-    ).compute.col_units == (AMPHIONE_COLUMN_UNITS)
+def test_amphione_refuses_a_gram_compute_and_a_row_direction_without_a_row_compute():
+    with pytest.raises(ValueError, match="Gram compute"):
+        rule_of({"rule": "amphione", "args": {"compute": "gram_polar"}})
+    with pytest.raises(ValueError, match="row_direction needs a row compute"):
+        rule_of({"rule": "amphione", "args": {"row_direction": True}})
+
+
+# ------------------------------------------------------- row computes: row_direction
+# the stored conv group's args (q, k, v conv weights) of
+# v2ps2-f-row-row-off-w1024-2x-13.4B-bs.128-...-cv.dlncq-cvg.1-gains.sign0.5-seed.1-stats
+CONV_RECIPE = dict(
+    compute="row-l2",
+    steps=6,
+    scale="one",
+    warmup=0,
+    c=0.0,
+    native_norm=False,
+    sphere="row",
+    magnitude_shape="row",
+    tangent=False,
+    radius=4.0,
+    magnitude_lr=1.0,
+    magnitude_rule="sign",
+    gain_lr="tied",
+    row_direction=True,
+)
+
+
+def test_onerate_is_the_study_conv_rule():
+    assert rule_of({"rule": "onerate", "args": dict(CONV_RECIPE)}) == rule_of(
+        {"rule": "angular_muown", "args": dict(CONV_RECIPE)}
+    )
+
+
+@pytest.mark.parametrize("scale", ["one", "sqrt_n", "inv_sqrt_n"])
+def test_a_row_compute_without_row_direction_is_the_plain_row_rule(scale):
+    """An embedding or head group that inherits `rule: amphione` and sets its own
+    row compute gets that row rule, as under hyperball / elr / angular_muown."""
+    args = {"compute": "row-l2", "scale": scale}
+    amphione = rule_of({"rule": "amphione", "args": args})
+    assert amphione.kind == "rows"
+    assert not isinstance(amphione.compute, AmphioneMap)
+    assert amphione == rule_of({"rule": "onerate", "args": args})
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_a_row_direction_steps_bitwise_as_the_study_conv_rule(dtype):
+    """row-l2 as the direction (row_direction) on [C, 4] conv-like units, against
+    onerate with the stored conv group's args at radius 1 (amphione has no step-1
+    rescale) and the same row-length average."""
+    onerate = rule_of({"rule": "onerate", "args": {**CONV_RECIPE, "radius": 1.0}})
+    amphione = rule_of(
+        {
+            "rule": "amphione",
+            "args": {"compute": "row-l2", "row_direction": True, "gain_beta": 0.9},
+        }
+    )
+    assert isinstance(amphione.compute, AmphioneMap)
+    w, grads = _case(units=3, m=16, n=4, dtype=dtype)
+    for (wa, sa), (wb, sb) in zip(
+        _run(amphione.compute, w, grads), _run(onerate.compute, w, grads)
+    ):
+        assert torch.equal(wa, wb) and torch.equal(sa, sb)
 
 
 def _case(units=3, m=16, n=8, steps=9, seed=0, dtype=torch.float32):

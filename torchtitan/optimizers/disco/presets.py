@@ -2005,7 +2005,7 @@ def onerate(
     return angular_muown(**locals())
 
 
-@register("amphione")
+@register("amphione", own={"scale"})
 def amphione(
     eta=None,
     beta=0.95,
@@ -2016,14 +2016,32 @@ def amphione(
     column_lr_mult=0.0625,
     compute="gram_polar_express",
     steps=6,
+    row_direction=False,
+    scale="one",
 ) -> Rule:
-    """Amphione (see `AmphioneMap`): the direction is the orthogonaliser
-    `compute` (a whole-unit backend: gram_polar_express, polar_express,
-    newtonschulz5, svd, ...) with `steps` iterations; a polar express
-    backend's safety factor is the rule arg `polar_express_safety` (default
-    1.01). `eta`: an `EtaSchedule` dict on the
-    group's lr (None: the trainer's schedule alone). The rule keeps its own
-    momentum: the group sets momentum 1.0, nesterov false, weight_decay 0.
+    """Amphione (see `AmphioneMap`). `compute` picks the direction:
+
+    - an orthogonaliser (gram_polar_express, polar_express, newtonschulz5,
+      svd, ...) with `steps` iterations: O = Orth(D + beta M), the hidden
+      matrices' rule. A polar express backend's safety factor is the rule arg
+      `polar_express_safety` (default 1.01).
+    - a row compute (`row-l2`) with `row_direction: true`: the same rule with
+      O = rowl2(D + beta M), each row of the unit normalised on its own in
+      place of the orthogonaliser (a [C, K] conv: every channel's filter as
+      its own 1 x K matrix, whose spectral normalisation is its l2 norm).
+    - a row compute with `row_direction: false` (the default): NOT Amphione.
+      The rule is that plain row rule (`pre` identity, `compute`, `scale`),
+      as under hyperball / elr / angular_muown. This is for a group that
+      inherits `rule: amphione` from the default group and sets its own row
+      compute (an embedding or head without its own `rule`).
+    - `row_direction: true` with an orthogonaliser is an error.
+
+    `scale` is used only by that plain row rule (Amphione rescales O to
+    ||U||_F); a group never inherits it from the default group.
+
+    `eta`: an `EtaSchedule` dict on the group's lr (None: the trainer's
+    schedule alone). The rule keeps its own momentum: the group sets
+    momentum 1.0, nesterov false, weight_decay 0.
 
     What the optimizer study ran, where it differs from the defaults: Gram
     Polar Express (6 steps) at polar_express_safety 1.05 (its configs spelled
@@ -2032,16 +2050,15 @@ def amphione(
     the row lengths' (and columns') sign average gain_beta 0.9, never run at
     beta; g scaled x4 at step 1 by the optimizer (`onerate` radius 4), which
     this rule leaves to the init. Its column runs used column_units
-    AMPHIONE_COLUMN_UNITS at column_lr_mult 0.0625."""
-    direction = _whole_unit("amphione", "identity", compute, steps, "one")
-    if direction.kind == "rows":
-        raise ValueError(
-            f"amphione orthogonalises the whole unit; {compute!r} is a row compute"
-        )
+    AMPHIONE_COLUMN_UNITS at column_lr_mult 0.0625. Its conv group (q, k, v
+    conv weights) ran this rule with `row-l2` and `row_direction: true`."""
+    inner = _whole_unit("amphione", "identity", compute, steps, scale)
+    if _row_rule("amphione", inner, compute, row_direction):
+        return inner
     return Rule(
         (),
         AmphioneMap(
-            Rule((), direction.compute, scale=direction.scale),
+            Rule((), inner.compute, scale=inner.scale),
             beta=float(beta),
             nesterov=bool(nesterov),
             gain_beta=None if gain_beta is None else float(gain_beta),

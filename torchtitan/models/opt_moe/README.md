@@ -24,9 +24,11 @@ defaults) and must be absent without it:
 The study's conv setting: `conv_kernel_size: 4`, `canon`, `qkv`, `delay` at
 gain 1, the conv weights in their own optimizer group (`match:
 (^|\.)attention\.(q|k|v)_conv\.weight$`) on the hidden rule with `row-l2` as
-the direction (`row_direction: true`), the same lr, and the row lengths x4 at
-step 1 (`radius: 4`). `amphione` takes no row direction yet, so that group
-is `onerate` today. `random_opnorm`, `torch_default` and `kv` are ablations.
+the direction (`rule: amphione`, `compute: row-l2`, `row_direction: true`;
+see "Row computes and `row_direction`" in `torchtitan/optimizers/readme.md`),
+the same lr, and the row lengths x4 at step 1 (`radius: 4`); `amphione` has
+no step-1 rescale, so its counterpart is `conv_init_gain: 4` (not run).
+`random_opnorm`, `torch_default` and `kv` are ablations.
 
 **Sinks.** `attention_sinks: true` (already on `llm-0.5.3`) adds one learned
 logit per head to the softmax denominator: the output is

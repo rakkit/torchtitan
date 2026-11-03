@@ -98,6 +98,9 @@ class GatedNormSWAttention(GQAttention):
         (utils.inits.conv_init_fn). None with the conv off."""
         conv_init_gain: float | None = None
         """Required with conv_init_fn_type: the per-channel operator norm of the init."""
+        conv_streams: str | None = None
+        """Required when conv_kernel_size > 0 (no default): "qkv" (a conv on q, k and v) or
+        "kv" (k and v only; q passes through untouched and has no q_conv). None with the conv off."""
         attention_sinks: bool = False
         """A learned logit per head in the softmax denominator (gpt-oss)."""
         row_multipliers: tuple[str, ...] = ()
@@ -351,7 +354,8 @@ class GatedNormSWAttention(GQAttention):
                     sharding_config=config.linear_sharding_config,
                 ).build()
 
-            self.q_conv = conv(self.n_heads * self.head_dim)
+            if config.conv_streams == "qkv":
+                self.q_conv = conv(self.n_heads * self.head_dim)
             self.k_conv = conv(self.n_kv_heads * self.head_dim)
             self.v_conv = conv(self.n_kv_heads * self.head_dim)
         self.sinks = (
@@ -424,8 +428,13 @@ class GatedNormSWAttention(GQAttention):
 
     @staticmethod
     def check_conv_init(config: "GatedNormSWAttention.Config") -> None:
-        """The conv init is a stated choice: required with the conv, absent without."""
+        """The conv init and the streams it acts on are stated choices: required with the conv, absent without."""
         conv = config.conv_kernel_size > 0
+        if conv != (config.conv_streams is not None) or (conv and config.conv_streams not in ("qkv", "kv")):
+            raise ValueError(
+                "conv_streams is required exactly when conv_kernel_size > 0 and is qkv | kv; "
+                f"got conv_kernel_size={config.conv_kernel_size}, conv_streams={config.conv_streams!r}"
+            )
         if conv != (config.conv_init_fn_type is not None) or conv != (
             config.conv_init_gain is not None
         ):
@@ -466,11 +475,11 @@ class GatedNormSWAttention(GQAttention):
             xq = xq * self.q_multiplier.view(self.n_heads, self.head_dim)
         if self.k_multiplier is not None:
             xk = xk * self.k_multiplier.view(self.n_kv_heads, self.head_dim)
-        if self.q_conv is not None:
-            xq, xk, xv = (
-                causal_short_conv(t.flatten(-2), c.weight, positions).view_as(t)
-                for t, c in ((xq, self.q_conv), (xk, self.k_conv), (xv, self.v_conv))
-            )
+        if self.k_conv is not None:  # q, k and v ("qkv"), or k and v only ("kv": q is untouched)
+            if self.q_conv is not None:
+                xq = causal_short_conv(xq.flatten(-2), self.q_conv.weight, positions).view_as(xq)
+            xk = causal_short_conv(xk.flatten(-2), self.k_conv.weight, positions).view_as(xk)
+            xv = causal_short_conv(xv.flatten(-2), self.v_conv.weight, positions).view_as(xv)
 
         # QK norm before RoPE (per Qwen3); V norm has no upstream equivalent.
         if self.q_norm is not None:

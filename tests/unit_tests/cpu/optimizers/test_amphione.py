@@ -387,3 +387,89 @@ def test_disco_amphione_is_onerate(one_rank, columns):
         assert a.col_gain_metrics(a.col_gain_snapshot()) == b.col_gain_metrics(
             b.col_gain_snapshot()
         )
+
+
+# ------------------------------------------- frozen row lengths (the MoE router gate)
+FROZEN = (AMPHIONE_COLUMN_UNITS[1], AMPHIONE_COLUMN_UNITS[3])  # wk in wqkv, w1 in w13
+
+
+def _run_frozen(cm, w, grads, frozen, lr=0.03):
+    state = w.new_zeros(w.shape[0], *cm.state_shape(*w.shape[1:]))
+    out = []
+    for t, G in enumerate(grads, start=1):
+        res = cm.run(G, w, state, StepCtx(lr, 0.0, t, frozen=frozen))
+        w, state = res.weight, res.state
+        out.append((w, state))
+    return out
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_amphione_frozen_lengths_step_bitwise_as_onerate(dtype):
+    onerate = rule_of({"rule": "onerate", "args": {**STEP, "frozen_units": ["u"]}})
+    amphione = rule_of(
+        {"rule": "amphione", "args": {**STEP_AMPHIONE, "frozen_length_units": ["u"]}}
+    )
+    w, grads = _case(dtype=dtype)
+    mask = torch.tensor([True, False, True])
+    out = _run_frozen(amphione.compute, w, grads, mask)
+    for (wa, sa), (wb, sb) in zip(out, _run_frozen(onerate.compute, w, grads, mask)):
+        assert torch.equal(wa, wb) and torch.equal(sa, sb)
+    n = w.shape[-1]
+    start = out[0][1][..., n]  # g after step 1: the frozen units' start lengths
+    assert torch.equal(start[0], w[0].norm(dim=-1)) and torch.equal(
+        start[2], w[2].norm(dim=-1)
+    )
+    for wa, sa in out:
+        assert torch.equal(sa[0, :, n], start[0]) and torch.equal(sa[2, :, n], start[2])
+    assert not torch.equal(out[-1][1][1, :, n], start[1])  # the other unit learns g
+    assert not torch.equal(out[-1][0][0], w[0])  # the frozen unit's rows still turn
+
+
+@pytest.mark.parametrize(
+    "args,match",
+    [
+        ({"frozen_length_units": ["u", "u"]}, "distinct unit types"),
+        ({"frozen_length_units": [""]}, "distinct unit types"),
+        ({"frozen_length_units": ["u"], "columns": True}, "with columns"),
+    ],
+)
+def test_amphione_frozen_lengths_refusals(args, match):
+    with pytest.raises(ValueError, match=match):
+        rule_of({"rule": "amphione", "args": {**STEP_AMPHIONE, **args}})
+
+
+def test_amphione_frozen_lengths_need_the_mask():
+    amphione = rule_of(
+        {"rule": "amphione", "args": {**STEP_AMPHIONE, "frozen_length_units": ["u"]}}
+    )
+    w, grads = _case()
+    with pytest.raises(ValueError, match="needs the stack's mask"):
+        _run_frozen(amphione.compute, w, grads[:1], None)
+
+
+def test_amphione_frozen_lengths_are_the_groups_own():
+    from torchtitan.optimizers.disco.rules import RULES
+
+    assert "frozen_length_units" not in RULES["amphione"].inherits
+    assert RULES["amphione"].args["frozen_length_units"] == ()
+
+
+def test_disco_amphione_frozen_lengths_is_onerate(one_rank):
+    a, pa = _disco("amphione", {**STEP_AMPHIONE, "frozen_length_units": list(FROZEN)})
+    b, pb = _disco("onerate", {**STEP, "frozen_units": list(FROZEN)})
+    c, pc = _disco("amphione", STEP_AMPHIONE)  # nothing frozen
+    for s in range(6):
+        g = torch.Generator().manual_seed(100 + s)
+        grads = [0.1 * torch.randn(*shape, generator=g) for shape in SHAPES]
+        for ps in (pa, pb, pc):
+            for p, gr in zip(ps, grads):
+                p.grad = gr.clone()
+        a.step()
+        b.step()
+        c.step()
+        for x, y in zip(pa, pb):
+            assert torch.equal(x, y)
+            assert torch.equal(a.state[x]["rule_state"], b.state[y]["rule_state"])
+        assert a.eta_used == b.eta_used
+    # the mask reached the rule: the fused wqkv and w13 differ from the unfrozen run, wo and w2 do not
+    assert [torch.equal(x, z) for x, z in zip(pa, pc)] == [False, True, False, True]

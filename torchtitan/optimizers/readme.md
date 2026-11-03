@@ -370,6 +370,7 @@ step-1 rescale, so a larger start belongs in the init. Args:
 | `columns` | false | column gains c, `W = Diag(g) U Diag(c)`, on `column_units` |
 | `column_units` | wq, wk, wv, w1, w3 | the unit types that learn c (`AMPHIONE_COLUMN_UNITS`) |
 | `column_lr_mult` | 0.0625 | c's sign step is `column_lr_mult * eta_t` |
+| `frozen_length_units` | () | unit types of the group whose row lengths g stay at their start; their rows still turn (the MoE router gate: `["moe.router.gate"]`, the study's MoE setting, there `onerate` / `angular_muown` `frozen_units`); each type must name a unit of the group; never inherited from the default group; not with `columns` |
 
 **Row computes and `row_direction`** (as on `hyperball`, `elr`,
 `angular_muown`, `onerate`):

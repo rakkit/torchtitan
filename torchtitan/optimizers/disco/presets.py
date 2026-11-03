@@ -1314,6 +1314,11 @@ class AmphioneMap(Compute):
     G Diag(c), then m_c <- b m_c + (1 - b) gamma_c and
     c <- c - `column_lr_mult` eta_t sign(m_c).
 
+    `frozen_length_units`: unit types whose row lengths g stay at their start
+    (DiSCO passes their mask in the step context, as for angular_muown's
+    `frozen_units`); their rows U still turn and m_g still averages. Not with
+    `columns` (angular_muown refuses that pair too; never run).
+
     State per unit [M | g | m_g | r], shape (m, n + 3); with columns three
     more rows [c; m_c; r], shape (m + 3, n + 3). The r column and row are
     unused and carried as they are: the layout is the one the optimizer
@@ -1328,6 +1333,7 @@ class AmphioneMap(Compute):
     columns: bool = False
     column_units: tuple[str, ...] = AMPHIONE_COLUMN_UNITS
     column_lr_mult: float = 0.0625
+    frozen_length_units: tuple[str, ...] = ()
     needs_weight = True
     has_state = True
     owns_momentum = True
@@ -1339,6 +1345,15 @@ class AmphioneMap(Compute):
             raise ValueError("amphione needs beta and gain_beta in [0, 1)")
         if self.columns and not self.column_units:
             raise ValueError("amphione columns needs column_units")
+        fu = self.frozen_length_units
+        if len(set(fu)) != len(fu) or not all(isinstance(u, str) and u for u in fu):
+            raise ValueError(
+                f"amphione frozen_length_units: distinct unit types, got {fu!r}"
+            )
+        if fu and self.columns:
+            raise ValueError(
+                "amphione frozen_length_units with columns: not supported (never run)"
+            )
         if not (math.isfinite(self.column_lr_mult) and self.column_lr_mult >= 0):
             raise ValueError(
                 f"amphione column_lr_mult must be finite and >= 0, got {self.column_lr_mult!r}"
@@ -1351,6 +1366,10 @@ class AmphioneMap(Compute):
     @property
     def col_units(self) -> tuple[str, ...]:  # DiSCO maps these to ctx.colmask
         return self.column_units if self.columns else ()
+
+    @property
+    def frozen_units(self) -> tuple[str, ...]:  # DiSCO maps these to ctx.frozen
+        return self.frozen_length_units
 
     def check_unit(self, m, n):
         self.direction.compute.check_unit(m, n)
@@ -1391,6 +1410,13 @@ class AmphioneMap(Compute):
         mg = b * mg + (1.0 - b) * gamma
         g_new = g - eta_t * torch.sign(mg)
         g_new = torch.copysign(g_new.abs().clamp_min(_AM_EPS), g_new)
+        if self.frozen_length_units:  # these units keep their start lengths
+            f = ctx.frozen
+            if f is None or f.shape != g.shape[:1]:
+                raise ValueError(
+                    "amphione frozen_length_units needs the stack's mask in the step context"
+                )
+            g_new = torch.where(f.to(g.device)[:, None], g, g_new)
         new = torch.cat([M, g_new[..., None], mg[..., None], r[..., None]], dim=-1)
         if not self.columns:
             return Result(
@@ -2005,7 +2031,7 @@ def onerate(
     return angular_muown(**locals())
 
 
-@register("amphione", own={"scale"})
+@register("amphione", own={"scale", "frozen_length_units"})
 def amphione(
     eta=None,
     beta=0.95,
@@ -2014,6 +2040,7 @@ def amphione(
     columns=False,
     column_units=AMPHIONE_COLUMN_UNITS,
     column_lr_mult=0.0625,
+    frozen_length_units=(),
     compute="gram_polar_express",
     steps=6,
     row_direction=False,
@@ -2039,6 +2066,11 @@ def amphione(
     `scale` is used only by that plain row rule (Amphione rescales O to
     ||U||_F); a group never inherits it from the default group.
 
+    `frozen_length_units`: unit types of the group whose row lengths stay at
+    their start (their rows still turn), e.g. `["moe.router.gate"]`, the
+    study's MoE setting (onerate / angular_muown `frozen_units`). Each type
+    must name a unit of the group; a group never inherits it.
+
     `eta`: an `EtaSchedule` dict on the group's lr (None: the trainer's
     schedule alone). The rule keeps its own momentum: the group sets
     momentum 1.0, nesterov false, weight_decay 0.
@@ -2051,7 +2083,10 @@ def amphione(
     beta; g scaled x4 at step 1 by the optimizer (`onerate` radius 4), which
     this rule leaves to the init. Its column runs used column_units
     AMPHIONE_COLUMN_UNITS at column_lr_mult 0.0625. Its conv group (q, k, v
-    conv weights) ran this rule with `row-l2` and `row_direction: true`."""
+    conv weights) ran this rule with `row-l2` and `row_direction: true`. Its
+    MoE runs froze the router gate's lengths (`moe.router.gate`) after the
+    step-1 x4, at router init scion_normal_output std 1: without the step-1
+    rescale the same start is router_init_std 4 (not run)."""
     inner = _whole_unit("amphione", "identity", compute, steps, scale)
     if _row_rule("amphione", inner, compute, row_direction):
         return inner
@@ -2066,6 +2101,7 @@ def amphione(
             columns=bool(columns),
             column_units=tuple(column_units),
             column_lr_mult=float(column_lr_mult),
+            frozen_length_units=tuple(frozen_length_units),
         ),
     )
 

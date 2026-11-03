@@ -94,10 +94,11 @@ class GatedNormSWAttention(GQAttention):
         """0: none. Else a short convolution after the projection (on the streams
         conv_streams): a depthwise causal conv of this width, in the conv_format."""
         conv_init_fn_type: str | None = None
-        """Required when conv_kernel_size > 0 (no default): "delay" or "random_opnorm"
-        (utils.inits.conv_init_fn). None with the conv off."""
+        """Required when conv_kernel_size > 0 (no default): "delay", "random_opnorm" or
+        "torch_default" (utils.inits.conv_init_fn). None with the conv off."""
         conv_init_gain: float | None = None
-        """Required with conv_init_fn_type: the per-channel operator norm of the init."""
+        """Required with conv_init_fn_type: the per-channel operator norm of the init
+        (delay / random_opnorm), or the factor on the nn.Conv1d default draw (torch_default)."""
         conv_streams: str | None = None
         """Required when conv_kernel_size > 0 (no default): "qkv" (a conv on q, k and v) or
         "kv" (k and v only; q passes through untouched and has no q_conv). None with the conv off."""

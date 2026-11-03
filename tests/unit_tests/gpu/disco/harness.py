@@ -75,6 +75,8 @@ def tiny_model_config(
     attn.head_dim = 32
     attn.sliding_window_size = 16
     attn.conv_kernel_size = conv
+    attn.conv_init_fn_type = "delay" if conv else None
+    attn.conv_init_gain = 1.0 if conv else None
     attn.attention_sinks = sinks
     return cfg
 

@@ -1004,6 +1004,10 @@ class AngularMuownMap(Compute):
                 "group's momentum: the angular_muown preset builds it"
             )
 
+    def check_unit(self, m, n):
+        # The step is the direction's compute on the unit: its limits are ours.
+        self.direction.compute.check_unit(m, n)
+
     def state_shape(self, m, n):
         if self.magnitude_rule == "cosine_raw":  # + the ambient raw-G momentum
             return (m, 2 * n + 3)

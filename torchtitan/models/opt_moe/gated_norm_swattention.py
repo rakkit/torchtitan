@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from functools import partial
 
 from typing import Any
 
@@ -29,7 +28,7 @@ from torchtitan.models.common.nn_modules import Conv1d, Identity
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.gpt_oss.model import apply_attention_sink_rescale
 from torchtitan.protocols.module import Module
-from .utils.inits import make_param_init
+from .utils.inits import conv_init_fn, make_param_init
 
 from .utils.norms import build_norm_config
 from .utils.short_conv import causal_short_conv
@@ -94,6 +93,11 @@ class GatedNormSWAttention(GQAttention):
         conv_kernel_size: int = 0
         """0: none. Else KDA / Gated DeltaNet's short convolution on q, k and v
         after the projection: a depthwise causal conv of this width, then SiLU."""
+        conv_init_fn_type: str | None = None
+        """Required when conv_kernel_size > 0 (no default): "delay" or "random_opnorm"
+        (utils.inits.conv_init_fn). None with the conv off."""
+        conv_init_gain: float | None = None
+        """Required with conv_init_fn_type: the per-channel operator norm of the init."""
         attention_sinks: bool = False
         """A learned logit per head in the softmax denominator (gpt-oss)."""
         row_multipliers: tuple[str, ...] = ()
@@ -329,6 +333,7 @@ class GatedNormSWAttention(GQAttention):
             ).build()
 
         self.q_conv = self.k_conv = self.v_conv = None
+        self.check_conv_init(config)
         if config.conv_kernel_size > 0:
 
             def conv(channels: int) -> Conv1d:
@@ -338,7 +343,11 @@ class GatedNormSWAttention(GQAttention):
                     kernel_size=config.conv_kernel_size,
                     groups=channels,
                     bias=False,
-                    param_init={"weight": partial(nn.init.trunc_normal_, std=0.02)},
+                    param_init={
+                        "weight": conv_init_fn(
+                            config.conv_init_fn_type, config.conv_init_gain
+                        )
+                    },
                     sharding_config=config.linear_sharding_config,
                 ).build()
 
@@ -412,6 +421,21 @@ class GatedNormSWAttention(GQAttention):
             torch.cat([xq_rot, xq_pass], dim=-1),
             torch.cat([xk_rot, xk_pass], dim=-1),
         )
+
+    @staticmethod
+    def check_conv_init(config: "GatedNormSWAttention.Config") -> None:
+        """The conv init is a stated choice: required with the conv, absent without."""
+        conv = config.conv_kernel_size > 0
+        if conv != (config.conv_init_fn_type is not None) or conv != (
+            config.conv_init_gain is not None
+        ):
+            raise ValueError(
+                "conv_init_fn_type and conv_init_gain are required exactly when "
+                f"conv_kernel_size > 0; got conv_kernel_size={config.conv_kernel_size}, "
+                f"{config.conv_init_fn_type!r}, {config.conv_init_gain!r}"
+            )
+        if conv:
+            conv_init_fn(config.conv_init_fn_type, config.conv_init_gain)
 
     def param_layouts(self) -> dict:
         """The fused wqkv is three units (q / k / v rows interleaved per KV group)."""

@@ -71,6 +71,8 @@ def _tiny(conv=4, sinks=True):
     cfg = model_registry("mis-8b-proxy")
     cfg.n_layers, cfg.swa_pattern, cfg.rope_pattern = 2, "SF", None
     cfg.layer.attention.conv_kernel_size = conv
+    cfg.layer.attention.conv_init_fn_type = "delay" if conv else None
+    cfg.layer.attention.conv_init_gain = 1.0 if conv else None
     cfg.layer.attention.attention_sinks = sinks
     cfg.update_from_config(
         config=SimpleNamespace(

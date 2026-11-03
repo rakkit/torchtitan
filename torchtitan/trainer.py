@@ -18,10 +18,10 @@ import torch
 import tyro
 from torch.distributed.elastic.multiprocessing.errors import record
 
-from torchtitan import nanprobe
-
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
+
+from torchtitan.observability import nanprobe
 from torchtitan.observability.data_consumption import (
     build_data_mix_metrics,
     DataMixMetricsLike,

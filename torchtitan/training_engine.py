@@ -19,8 +19,6 @@ from torch.distributed.pipelining.schedules import (
     PipelineScheduleMulti,
 )
 
-from torchtitan import nanprobe
-
 from torchtitan.components.checkpointer import BaseCheckpointManager, CheckpointManager
 from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.components.data.types import TrainingMicrobatch
@@ -52,7 +50,8 @@ from torchtitan.distributed.cuda_graph import (
     wrap_with_cuda_graph,
 )
 from torchtitan.models.common.aux_loss import AuxLoss
-from torchtitan.observability import structured_logger as sl
+
+from torchtitan.observability import nanprobe, structured_logger as sl
 from torchtitan.observability.metrics import (
     build_device_memory_monitor,
     DeviceMemoryMonitor,

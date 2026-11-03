@@ -41,10 +41,9 @@ from torch.distributed.tensor import distribute_tensor, DTensor
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from torch.profiler import record_function
 
-from torchtitan import nanprobe
-
 from torchtitan.distributed.utils import fsdp_shard_mesh, metrics_shard_mesh
-from torchtitan.observability import structured_logger as sl
+
+from torchtitan.observability import nanprobe, structured_logger as sl
 from torchtitan.optimizers.disco import gram_input_stats
 
 from ..helpers import gram_helper

@@ -1272,6 +1272,139 @@ class AngularMuownMap(Compute):
         )
 
 
+# the input-side unit types whose column gains the optimizer study learned
+AMPHIONE_COLUMN_UNITS = (
+    "attention.qkv_linear.wq",
+    "attention.qkv_linear.wk",
+    "attention.qkv_linear.wv",
+    "feed_forward.w1",
+    "feed_forward.w3",
+)
+
+
+@dataclass(frozen=True)
+class AmphioneMap(Compute):
+    """Amphione: one learning rate for weight amplitude and phase. Each unit
+    is W = Diag(g) U, U with unit rows and g its signed row lengths. From the
+    raw gradient G, with eta_t = lr eta(t) (`eta` an `EtaSchedule`, None: 1)
+    and b = `gain_beta` (None: `beta`):
+
+        gamma = rowdot(G, U),  D = Diag(g) G
+        M <- beta M + D,  O = direction(D + beta M)  (M without nesterov)
+        O <- O ||U||_F / ||O||_F
+        U <- RowNorm(U - eta_t O)
+        m_g <- b m_g + (1 - b) gamma,  g <- g - eta_t sign(m_g)
+
+    g starts at the step-1 row norms (a zero row at sqrt(0.33)), U at the
+    step-1 rows; |g| >= 1e-7 keeps its sign.
+
+    `columns`: W = Diag(g) U Diag(c) on the `column_units` types (DiSCO
+    passes their mask in the step context; other units keep c = 1). c starts
+    at 1; before the step gamma_c = coldot(G, Diag(g) U) and G becomes
+    G Diag(c), then m_c <- b m_c + (1 - b) gamma_c and
+    c <- c - `column_lr_mult` eta_t sign(m_c).
+
+    State per unit [M | g | m_g | r], shape (m, n + 3); with columns three
+    more rows [c; m_c; r], shape (m + 3, n + 3). The r column and row are
+    unused and carried as they are: the layout is the one the optimizer
+    study's runs checkpointed, and DiSCO's column-gain logging reads c from
+    the third row from the bottom."""
+
+    direction: Rule
+    beta: float = 0.95
+    nesterov: bool = True
+    gain_beta: float | None = None
+    eta: EtaSchedule | None = None
+    columns: bool = False
+    column_units: tuple[str, ...] = AMPHIONE_COLUMN_UNITS
+    column_lr_mult: float = 0.0625
+    needs_weight = True
+    has_state = True
+    owns_momentum = True
+    output = "weight"
+
+    def __post_init__(self):
+        b = self.beta if self.gain_beta is None else self.gain_beta
+        if not (0.0 <= self.beta < 1.0 and 0.0 <= b < 1.0):
+            raise ValueError("amphione needs beta and gain_beta in [0, 1)")
+        if self.columns and not self.column_units:
+            raise ValueError("amphione columns needs column_units")
+        if not (math.isfinite(self.column_lr_mult) and self.column_lr_mult >= 0):
+            raise ValueError(
+                f"amphione column_lr_mult must be finite and >= 0, got {self.column_lr_mult!r}"
+            )
+
+    @property
+    def col_scale(self) -> bool:  # DiSCO's column-gain logging reads this
+        return self.columns
+
+    @property
+    def col_units(self) -> tuple[str, ...]:  # DiSCO maps these to ctx.colmask
+        return self.column_units if self.columns else ()
+
+    def check_unit(self, m, n):
+        self.direction.compute.check_unit(m, n)
+
+    def state_shape(self, m, n):
+        return (m + 3, n + 3) if self.columns else (m, n + 3)
+
+    def run(self, x, w, state, ctx):
+        n, t = x.shape[-1], ctx.t
+        b = self.beta if self.gain_beta is None else self.gain_beta
+        dt = torch.promote_types(w.dtype, torch.float32)  # at least fp32
+        W, G, S = w.to(dt), x.to(dt), state.to(dt)
+        if self.columns:  # c = 1 on an empty state
+            m = x.shape[-2]
+            Sc, S = S[..., m:, :n], S[..., :m, :]
+            c = torch.where(Sc[..., 0, :] == 0, 1.0, Sc[..., 0, :])
+        M, g, mg, r = S[..., :n], S[..., n], S[..., n + 1], S[..., n + 2]
+        # g == 0 exactly: no state yet (|g| >= 1e-7 after any step)
+        norm = (W / c[..., None, :] if self.columns else W).norm(dim=-1)
+        start = torch.where(norm > _AM_EPS, norm, torch.full_like(norm, _AM_ZERO_ROW))
+        g = torch.where(g == 0, start, g)
+        U = W / torch.copysign(g.abs().clamp_min(_AM_EPS), g)[..., None]
+        if self.columns:  # dL/dc at Diag(g) U Diag(c); then G Diag(c) is G for U and g
+            U = U / c[..., None, :]
+            gamma_c = (G * (g[..., None] * U)).sum(dim=-2)
+            G = G * c[..., None, :]
+        gamma = (G * U).sum(dim=-1)
+        D = g[..., None] * G
+        M = self.beta * M + D
+        O = self.direction.run_whole(D + self.beta * M if self.nesterov else M)
+        O = O.update.to(dt)
+        eta_t = ctx.lr * (1.0 if self.eta is None else self.eta(t))
+        uu = U.square().sum(dim=(-2, -1), keepdim=True)
+        oo = O.square().sum(dim=(-2, -1), keepdim=True)
+        O = O * torch.where(oo >= SUMSQ_FLOOR, (uu / oo).sqrt(), 0.0)
+        V = U - eta_t * O
+        U_new = V / V.norm(dim=-1, keepdim=True).clamp_min(_AM_EPS)
+        mg = b * mg + (1.0 - b) * gamma
+        g_new = g - eta_t * torch.sign(mg)
+        g_new = torch.copysign(g_new.abs().clamp_min(_AM_EPS), g_new)
+        new = torch.cat([M, g_new[..., None], mg[..., None], r[..., None]], dim=-1)
+        if not self.columns:
+            return Result(
+                weight=(g_new[..., None] * U_new).to(w.dtype), state=new.to(state.dtype)
+            )
+        mask = ctx.colmask
+        if mask is None or mask.shape != c.shape[:1]:
+            raise ValueError(
+                "amphione columns needs the stack's mask in the step context"
+            )
+        mask = mask.to(c.device)[:, None]
+        mc = b * Sc[..., 1, :] + (1.0 - b) * gamma_c
+        c_new = c - (eta_t * self.column_lr_mult) * torch.sign(mc)
+        c_new = torch.copysign(c_new.abs().clamp_min(_AM_EPS), c_new)
+        c_new = torch.where(mask, c_new, c)
+        mc = torch.where(mask, mc, Sc[..., 1, :])
+        rows = torch.stack([c_new, mc, Sc[..., 2, :]], dim=-2)
+        rows = torch.cat([rows, torch.zeros_like(rows[..., :3])], dim=-1)
+        return Result(
+            weight=(g_new[..., None] * U_new * c_new[..., None, :]).to(w.dtype),
+            state=torch.cat([new, rows], dim=-2).to(state.dtype),
+        )
+
+
 @dataclass(frozen=True)
 class LieRelativeMap(Compute):
     """V3a (theory-radius-norm.md 6.6, reduced form): relative trust in the RMS -> RMS
@@ -1821,7 +1954,98 @@ def angular_muown(
     )
 
 
+@register("onerate", own={"scale"})
+def onerate(
+    compute="gram_polar_express",
+    steps=6,
+    scale="one",
+    beta=0.95,
+    nesterov=True,
+    betas=(0.9, 0.95),
+    eps=1e-8,
+    warmup=0,
+    c=0.0,
+    p=1.0,
+    magnitude_lr=1.0,
+    eta=None,
+    magnitude_shape="row",
+    magnitude_rule="sign",
+    sphere="row",
+    tangent=False,
+    native_norm=False,
+    radius=4.0,
+    turn_norm="frobenius",
+    frozen_units=(),
+    col_scale=False,
+    gain_param="raw",
+    gain_lr="tied",
+    gain_lr_mult=1.0,
+    col_gain_param=None,
+    col_gain_lr_mult=None,
+    col_gauge=False,
+    col_units=(),
+    row_direction=False,
+) -> Rule:
+    """OneRate, the optimizer study's name for Amphione, kept for ablations:
+    `angular_muown` with the study recipe's settings as its defaults (radius
+    4, the lengths' sign average betas[0] 0.9) and every switch of it still
+    open. `amphione` with radius 4 and gain_beta 0.9 steps as it does; its
+    `columns` is col_scale with col_gain_lr_mult 1/16 on col_units
+    AMPHIONE_COLUMN_UNITS. The final recipe is `amphione`."""
+    return angular_muown(**locals())
+
+
+@register("amphione")
+def amphione(
+    eta=None,
+    beta=0.95,
+    nesterov=True,
+    gain_beta=None,
+    columns=False,
+    column_units=AMPHIONE_COLUMN_UNITS,
+    column_lr_mult=0.0625,
+    compute="gram_polar_express",
+    steps=6,
+) -> Rule:
+    """Amphione (see `AmphioneMap`): the direction is the orthogonaliser
+    `compute` (a whole-unit backend: gram_polar_express, polar_express,
+    newtonschulz5, svd, ...) with `steps` iterations; with gram_polar_express
+    its `safety` is the rule arg every gram_polar_express rule takes (code
+    default 1.01). `eta`: an `EtaSchedule` dict on the
+    group's lr (None: the trainer's schedule alone). The rule keeps its own
+    momentum: the group sets momentum 1.0, nesterov false, weight_decay 0.
+
+    What the optimizer study ran, where it differs from the defaults: Gram
+    Polar Express (6 steps) at safety 1.05; a constant trainer lr with eta = 1 - sqrt(t / T) (the
+    applied step lr eta(t) is the logged eta_used/DiSCO/<group>, not lr/);
+    the row lengths' (and columns') sign average gain_beta 0.9, never run at
+    beta; g scaled x4 at step 1 by the optimizer (`onerate` radius 4), which
+    this rule leaves to the init. Its column runs used column_units
+    AMPHIONE_COLUMN_UNITS at column_lr_mult 0.0625."""
+    direction = _whole_unit("amphione", "identity", compute, steps, "one")
+    if direction.kind == "rows":
+        raise ValueError(
+            f"amphione orthogonalises the whole unit; {compute!r} is a row compute"
+        )
+    return Rule(
+        (),
+        AmphioneMap(
+            Rule((), direction.compute, scale=direction.scale),
+            beta=float(beta),
+            nesterov=bool(nesterov),
+            gain_beta=None if gain_beta is None else float(gain_beta),
+            eta=eta_of("amphione", eta),
+            columns=bool(columns),
+            column_units=tuple(column_units),
+            column_lr_mult=float(column_lr_mult),
+        ),
+    )
+
+
 __all__ = [
+    "AMPHIONE_COLUMN_UNITS",
+    "amphione",
+    "AmphioneMap",
     "angular_muown",
     "AngularMuownMap",
     "lie_relative",
@@ -1841,6 +2065,7 @@ __all__ = [
     "left_polar",
     "lm_head",
     "muon",
+    "onerate",
     "Orthogonalise",
     "plain",
     "PRE",

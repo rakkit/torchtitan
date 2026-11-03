@@ -167,8 +167,9 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
 
         log_gain_stats: bool = False
         """Log each RMSNorm gain's mean, RMS and ||dg|| / ||g|| on the
-        log_norm_freq cadence (optimizers/model_stats.py). With angular_muown
-        col_scale it also logs each unit's column gains c (col_gain_*: rms,
+        log_norm_freq cadence (optimizers/model_stats.py). With column gains
+        (amphione columns, angular_muown col_scale) it also logs each unit's
+        column gains c (col_gain_*: rms,
         mean log|c|, q10 / q50 / q90, relative update; DiSCO.col_gain_metrics)."""
 
         log_sink_stats: bool = False

@@ -26,20 +26,27 @@ A momentum outside (0, 1) bypasses the buffer: the rule gets the raw gradient.
 optimizers/
   container.py      DiSCOOptimizersContainer: config, param groups, arming, metrics hand-off
   moe_balance.py    MoE load-balance bias hook; router metrics on logging steps
+  model_stats.py    residual, RMSNorm-gain and sink statistics (log_*_stats)
+  gnoise.py         gradient-noise logging; gnoise_research.py, gnoise_math.py
   utils.py          FQN cleanup, the DiSCO kwargs the container passes
   disco/
     optimizer.py    DiSCO: build (families, exchanges, metric registry), step(), state
     layout.py       families (classify), per-rank row tables
     rules.py        what a rule is: Phase, Compute, Chain, Rule, Result; the registry
     presets.py      the built-ins: pre phases, computes, presets sgd/muon/right_polar/
-                    lm_head/left_polar/aus/hyperball/elr/sso
+                    lm_head/left_polar/aus/hyperball/elr/sso/amphione/onerate/
+                    angular_muown/lie_relative
     transport.py    Exchange (one packed all-to-all pair), Replicated (all-gather)
     metrics.py      MetricSink: per-unit registry, one flat buffer, one gather, unpack
+    gram_input_stats.py  sigma_1 / ||X||_F of gram_polar_express's inputs (log_gram_input)
   kernels/          orthogonaliser backends: zeropower, triton Newton-Schulz,
                     Gram Newton-Schulz, underflow floors
   helpers/          norm_helper, gram_helper, radial_helper, head_geometry, power_iteration
   export/           spectrum / gram-vector Parquet export (W&B artifacts)
 models/common/param_layout.py   the declaration vocabulary models use (ParamLayout, UnitSpec)
+components/optimizer/schedule_tables.py   knots for group lr_table / eta table schedules
+components/optimizer/averages.py          weight power averages, snapshots, scoring (averages)
+observability/nanprobe.py                  env-gated NaN probe (debugging)
 ```
 
 ## Configuring it
@@ -156,9 +163,9 @@ transport.
 | stage | config (`args`) | choices |
 |---|---|---|
 | pre | `pre` | `identity`, `row-l2`, `col-l2`, `mat-l2`, `col-center`. A phase acts on the rows a rank holds, or declares `reduce` and supplies a fixed-size statistic summed over every rank holding rows of the unit (one packed all-reduce for all units). Phases are told the unit's true row count, never a shard's |
-| compute | `compute` (+ `steps`) | the only place a direction is formed. Row maps `identity`, `row-l2`, `sign`; orthogonalisers `newtonschulz5`, `newtonschulz5_triton`, `polar_express`, `polar_express_triton`, `gram_polar_express`, `svd`; `gram_polar` (the polar factor through the `[n, n]` Gram); chains `main+row_map+...` (`gram_polar+row-l2`) |
+| compute | `compute` (+ `steps`) | the only place a direction is formed. Row maps `identity`, `row-l2`, `sign`, `row-l2-deflate` (row-l2 after removing the momentum's top right singular direction from every row; needs the whole unit); orthogonalisers `newtonschulz5`, `newtonschulz5_triton`, `polar_express`, `polar_express_triton`, `gram_polar_express`, `svd`; `gram_polar` (the polar factor through the `[n, n]` Gram); chains `main+row_map+...` (`gram_polar+row-l2`) |
 | post | (preset-internal) | phases that need a statistic over all rows after the compute (the LM head's re-centring) |
-| scale | `scale` | the unit's step relative to `lr`, from its shape `[m, n]` = `[d_out, d_in]`: `one`, `spectral` (sqrt(m/n)), `image_spectral`, `n`, `sqrt_n`, `inv_n`, `inv_sqrt_n`, `sqrt_mn`. A constant per unit, the last multiply of the compiled compute (for a Gram compute, or after a reducing post phase, it runs after it) |
+| scale | `scale` | the unit's step relative to `lr`, from its shape `[m, n]` = `[d_out, d_in]`: `one`, `spectral` (sqrt(m/n)), `image_spectral`, `n`, `sqrt_n`, `inv_n`, `inv_sqrt_n`, `sqrt_mn`, `rms_parity` (min(sqrt(m/n), 1): unit rows at the Frobenius norm of polar x spectral). A constant per unit, the last multiply of the compiled compute (for a Gram compute, or after a reducing post phase, it runs after it) |
 
 A `Compute` declares where the unit must be whole (`kind`: `rows` = the rows a
 rank holds, `gram` = those rows plus one `[n, n]` all-reduce, `unit` = whole on
@@ -188,6 +195,10 @@ keyword arguments are its args and defaults:
 | `hyperball` | `FrobeniusAUS`, radius kept: `W+ = r N(W - s r N(U))`, r = `\|\|W\|\|_F` | as `muon` without a scale; `tangent` false, `exact_angle` false, `eta` none | `scale` |
 | `elr` | `FrobeniusAUS`, radius free: `W+ = d W - s r N(U)`, d the decay | as `hyperball` | `scale` |
 | `sso` | `SpectralSphere`: `W+ = (R / sigma) W - s R orth(M^ + lambda* u v^T)`, `R = scale(m, n)` | as `muon`; `sigma_iters` 8, `solve_steps` 12, `lambda0` 1e-3, `eta` none | |
+| `amphione` | `AmphioneMap`: `W = Diag(g) U`, unit rows turned by the orthogonalised momentum, row lengths by a sign step, one rate `lr eta(t)`; optional column gains (see "Amphione" below) | `gram_polar_express` 6, `beta` 0.95, Nesterov, `gain_beta` = `beta`, no `eta`, columns off | |
+| `onerate` | `angular_muown` with the optimizer study's Amphione settings as defaults (radius 4, row-length average 0.9), every switch open: for ablations | as the study ran | `scale` |
+| `angular_muown` | `AngularMuownMap` (arXiv 2606.23637) and the study's switches: length rules, sphere, tangent, radius, turn norm, frozen units, column scales | `polar_express` 5, `image_spectral`, warmup 100, Adam lengths | `scale` |
+| `lie_relative` | `LieRelativeMap`: a relative step in the RMS -> RMS norm, `\|\|dW P^-1\|\|_S = eta` (`P = sym(Q^T W)`, `Q = Orth(W)`), second-order exp map, transported momentum | `gram_polar_express` 6, `one`, `beta` 0.95, Nesterov | `scale` |
 
 `right_polar`, `lm_head` and `left_polar` are the symmetry-compatible rules of
 Lau & Su (arXiv 2605.18106); the paper's other two are configs: row-norm only
@@ -292,8 +303,12 @@ is an `EtaSchedule` dict (see "Angular schedule" below).
   `elr` keeps weight decay.
 - A radius-relative step never moves a zero-norm unit under `hyperball` or
   `elr`; the first step warns if one exists.
+- `sso` takes `unit_eta`, `{unit type: factor}` on each unit's step (unit
+  types as DiSCO logs them without `layers.<i>.`).
 - Like `aus`, they are meant for the hidden matrices. A row group (embedding,
-  head, routers) that inherits a sphere rule stays that row rule.
+  head, routers) that inherits a sphere rule stays that row rule, unless
+  `row_direction: true` (`hyperball`, `elr`, `angular_muown`) makes the row
+  compute (`row-l2`) the sphere rule's direction.
   - The default group's `lr` is the ELR, and a row group without its own
     `lr` inherits it. `moe_template_config()`'s row groups set none, so give
     them one.
@@ -302,7 +317,7 @@ is an `EtaSchedule` dict (see "Angular schedule" below).
     `eta` of shape `sqrt_decay` on top of a WSD.
 
 **Angular schedule.** Every matrix rule (`muon`, `aus`, `hyperball`, `elr`,
-`sso`, `angular_muown`) takes `eta`, an `EtaSchedule` dict that multiplies
+`sso`, `angular_muown`, `onerate`, `amphione`, `lie_relative`) takes `eta`, an `EtaSchedule` dict that multiplies
 the group's lr for the direction step only: the step is `lr_t eta(t)`, lr_t
 the trainer's schedule. Weight decay keeps `1 - lr_t wd`, and angular-muown's
 magnitudes keep lr_t. `eta(t)` is 1 up to `start`; after it, with
@@ -311,9 +326,73 @@ magnitudes keep lr_t. `eta(t)` is 1 up to `start`; after it, with
 shape takes only its own keys; `table` takes `points`, `((step, value), ...)` with increasing steps: eta is linear between them and the first / last value outside. A row group under a default with `eta` keeps
 its lr (`muon` does not pass `eta` on; the sphere rules return the row rule).
 The value used is logged as `eta_schedule/DiSCO/<group>` and
-`eta_used/DiSCO/<group>` (lr_t eta(t)).
+`eta_used/DiSCO/<group>` (lr_t eta(t)); `lr/DiSCO/<group>` is lr_t alone, so
+with an `eta` the applied step is `eta_used`, not `lr/`. A schedule can live
+in the trainer instead: `lr_scheduler.decay_type: "sqrt"` with
+`warmup_steps: 0` and `decay_ratio: 1.0` is `1 - sqrt(t / T)` at the
+optimizer's step t, the same curve as `eta` of shape `sqrt_decay` with
+`start: 0`, applied to every group, and `lr/` is then the applied rate.
 
-**Column scales (`angular_muown` `col_scale: true`, off by default).** W =
+**Per-group schedules.** A group may replace the trainer's schedule by its
+own keys: `warmup_steps`, `decay_ratio`, `decay_type`, `min_lr_factor`, or
+`lr_table`, knots `((step, factor), ...)` on the optimizer's step t (linear
+between them, the first / last factor outside; not with the other keys).
+`components/optimizer/schedule_tables.py` builds knots for the trainer's WSD,
+a horizon-free base `(1 + D / D1)^-q` in tokens and a cooldown of any table.
+`momentum_k: k` schedules a group's momentum field as `m_t = min(1, k / t)`
+(the new gradient's weight; beta_t = 1 - k / t), logged as
+`momentum_used/DiSCO/<group>`. Checkpoints leave `lr_table` and `momentum_k`
+out, so a run resumed from another run's checkpoint takes its own.
+
+**Amphione** (`rule: amphione`). Each hidden matrix is `W = Diag(g) U`: U has
+unit rows, g holds their signed lengths. From the raw gradient G, with
+`eta_t = lr eta(t)` and `b = gain_beta` (None: `beta`):
+
+```
+gamma = rowdot(G, U),  D = Diag(g) G
+M <- beta M + D,  O = Orth(D + beta M)      (Nesterov; M without)
+O <- O ||U||_F / ||O||_F
+U <- RowNorm(U - eta_t O)
+m_g <- b m_g + (1 - b) gamma,  g <- g - eta_t sign(m_g)
+```
+
+g starts at the step-1 row norms (a zero row at sqrt(0.33)); there is no
+step-1 rescale, so a larger start belongs in the init. Args:
+
+| arg | default | meaning |
+|---|---|---|
+| `compute`, `steps` | `gram_polar_express`, 6 | the whole-unit orthogonaliser (`polar_express`, `newtonschulz5`, `svd`, ...); row and Gram computes are refused |
+| `beta`, `nesterov` | 0.95, true | the direction's momentum |
+| `gain_beta` | None (= `beta`) | the average the row-length (and column) sign steps take |
+| `eta` | None | an `EtaSchedule` dict on the group's lr |
+| `columns` | false | column gains c, `W = Diag(g) U Diag(c)`, on `column_units` |
+| `column_units` | wq, wk, wv, w1, w3 | the unit types that learn c (`AMPHIONE_COLUMN_UNITS`) |
+| `column_lr_mult` | 0.0625 | c's sign step is `column_lr_mult * eta_t` |
+
+The rule keeps its own momentum: its group sets `momentum: 1.0`,
+`nesterov: false`, `weight_decay: 0`. Its state, `[M | g | m_g | r]` per unit
+(three more rows `[c; m_c; r]` with columns, `r` unused), has the layout the
+optimizer study's runs checkpointed. A group config:
+
+```python
+"default": {"rule": "amphione", "lr": 0.01562, "momentum": 1.0, "nesterov": False,
+            "weight_decay": 0.0,
+            "args": {"compute": "gram_polar_express", "steps": 6,
+                     "polar_express_safety": 1.05}},
+```
+
+What the optimizer study ran, where it differs from these defaults: Gram
+Polar Express at `polar_express_safety` 1.05; a constant trainer lr with
+`eta` = 1 - sqrt(t / T); the row-length average 0.9 (angular_muown's default
+`betas`, never run at 0.95); the row lengths scaled x4 at step 1 by the
+optimizer (`onerate` `radius: 4`), measured to match x4 in the init within
+0.003 in loss. `onerate` is that rule with every `angular_muown` switch
+open, for ablations; with `radius: 1` and the same `gain_beta` it steps
+bitwise as `amphione` (`tests/unit_tests/cpu/optimizers/test_amphione.py`).
+
+**Column scales (`amphione` `columns: true`, `angular_muown` `col_scale: true`;
+off by default).** Under `amphione` c takes the sign step above at
+`column_lr_mult * eta_t` on the `column_units`. Under `angular_muown`: W =
 Diag(g) U Diag(c) (MuonMD, arXiv 2606.25971 Eq. 1): c starts at 1 and is moved
 by the row scales' rule (Adam or sign, same betas, eps and rate lr_t x
 `magnitude_lr`) on dL/dc_j = sum_i G_ij g_i U_ij; U's gradient is Diag(g) G
@@ -555,6 +634,31 @@ and under CUDA graphs (the capture runs in the eager forward body).
 **MoE router metrics** come from `moe_balance.py`'s hook, which updates the
 router bias every step and publishes the metrics only on armed steps.
 
+**Cadence.** `dense_norm_steps: N` also logs the norms every step up to N
+(needs `metrics.dense_log_steps` at least as large). `effective_rank_freq: N`
+computes `effective_rank`, the one norm that needs the whole spectrum, only
+on norm steps divisible by N (and steps 1 and last). `spectral_norm_freq: N`,
+a multiple of `log_norm_freq`, does the same for every SVD-based metric
+(`rms_to_rms`, `stable_rank`, `condition_number`, `effective_rank*`, the
+spectra, the spectral radial metrics); the SVD-free norms keep
+`log_norm_freq`.
+
+**Model statistics** (`optimizers/model_stats.py`, off by default, on the
+`log_norm_freq` cadence):
+- `log_residual_stats`: the RMS of every block's input and residual write and
+  of the final norm's input, taken in opt_moe's eager layer loop between the
+  compiled blocks (the blocks' graphs are the same either way).
+- `log_gain_stats`: each RMSNorm gain's mean, RMS and `||dg|| / ||g||`; with
+  column gains (`amphione` `columns`, `angular_muown` `col_scale`) also each
+  unit's c (`col_gain_*`: rms, mean log|c|, q10 / q50 / q90, relative update),
+  read from the rule state.
+- `log_sink_stats`: every attention sink value,
+  `sink_value/<layer>.attention/head-<h>` (needs a model with sinks).
+- `log_gram_input`: on spectral norm steps, sigma_1 / ||X||_F of every tensor
+  `gram_polar_express` receives, per unit (`gram_input_s1f/<unit>`), and the
+  count of units in [0.94, 0.955], where the iteration fails at
+  `polar_express_safety` 1.01 (`disco/gram_input_stats.py`).
+
 ## Orthogonaliser backends
 
 | backend | notes |
@@ -567,6 +671,57 @@ router bias every step and publishes the metrics only on armed steps.
 
 The triton backends are autotuned, so they are not bitwise reproducible across
 runs; bitwise tests use `svd` or `gram_polar_express`.
+
+**Polar express safety factor** (`args.polar_express_safety`, default 1.01).
+The polar express backends (`gram_polar_express`, `polar_express`,
+`polar_express_triton`) evaluate every triple but the limit at x / f:
+`(a / f, b / f^3, c / f^5)`; the input normalisation stays at 1.01. 1.01 is
+the paper code's value and today's kernels to the bit; upstream's Gram
+Newton-Schulz uses 1.05, and the optimizer study ran `gram_polar_express` at
+1.05 (its configs spelled the key `safety`, which now fails as renamed).
+`newtonschulz5` and `svd` have no such factor and refuse it. A row group that
+inherits it from the default ignores it.
+
+## Weight averages (`averages`, off by default)
+
+`components/optimizer/averages.py`, a sibling of EMA in the training engine.
+After step s (counted from `start_step`, every `every` steps) the power
+average with exponent gamma is `avg <- avg + (s^gamma / S) (w - avg)`, S the
+sum of s^gamma so far (gamma 0: the plain mean).
+
+| key | meaning |
+|---|---|
+| `gammas` | the exponents, e.g. `[0, 1, 3, 7]`; empty: none |
+| `start_step`, `every` | when the updates fire |
+| `renorm` | `[regex, mode]` pairs on canonical FQNs, first match wins: `frobenius` / `spectral` scale each unit of the average to the live unit's norm (the radius a rule holds), `rows` to the averaged row lengths, `none` |
+| `evaluate` | score every average with the validator whenever the trainer validates (`avg_g<gamma>`) |
+| `snapshot_steps`, `snapshot_folder` | write the full weights (fp32, canonical FQNs) after these steps |
+| `export_steps` | write each renormalised average after these steps |
+| `score_files` | score these weight files (e.g. a mixture of snapshots) with the validator at start, then stop |
+| `start_from_gamma` | right after the run's first load of `initial_load_path` (not on a restart from its own checkpoint), replace the weights by this gamma's renormalised average and stop averaging; the optimizer state is the checkpoint's |
+
+## Validation sequence length
+
+`validator.fixed_seq_len` (default None: the training `max_context_length`,
+so existing configs are unchanged) scores every run on sequences of that
+length, so runs with different training context lengths are compared on the
+same sequences. The RoPE caches cover it when it is longer than the training
+context.
+
+## NaN probe (debugging, inert by default)
+
+`torchtitan/observability/nanprobe.py` is gated by environment variables and does nothing
+unless `NAN_PROBE_FROM` (first step) and `NAN_PROBE_DIR` (output folder) are
+set. From that step it writes, per rank, summaries of each tensor (count of
+non-finite entries, largest finite magnitude, RMS, worst row) at the
+microbatch losses, after the backward, after the update, and inside DiSCO
+(effective gradients, every rule call, the updates), plus no_grad forward
+probes of the step's microbatch; a backward probe runs only on a step that
+is already non-finite (the trainer's assert follows). Its hooks sit in
+`training_engine.py`, `trainer.py` and `disco/optimizer.py`. `NAN_PROBE_STOP` (last step),
+`NAN_PROBE_BIG` (the magnitude it flags, default 1e4), `NAN_PROBE_EAGER`
+(default 1) and `NAN_PROBE_FORCE_BAD` (a smoke test of the bad-step path)
+tune it.
 
 ## Tests and benchmarks
 

@@ -100,8 +100,6 @@ def gauge_config(
             track_router_metrics=False,
             quantile_balance_bins=None,
             moe_comm_backend="standard",
-            norm_everywhere=False,
-            norm_type="np_rmsnorm",
         )
         layer.n_dense_layers = 0
     return cfg

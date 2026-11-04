@@ -44,7 +44,7 @@ class GatedNormSWAttention(GQAttention):
     Q/K/V projection, output projection, RoPE, QK-norm and the inner attention
     backend all come from ``GQAttention``, including its pluggable
     ``qkv_linear``. Only what upstream has no equivalent for is added here:
-    V-norm, mid-norm, sigmoid gating and partial RoPE.
+    sigmoid gating, attention sinks, the Canon short conv, partial RoPE and NoPE.
 
     The config keeps the flat, string-valued authoring surface the flavor
     registry uses (``attn_backend="flex"``, ``qk_norm=True``, ...) and
@@ -63,71 +63,44 @@ class GatedNormSWAttention(GQAttention):
         n_kv_heads: int | None = None
         head_dim: int | None = None
         qk_norm: bool = False
-        mid_norm: bool = False
-        v_norm: bool = False
-        norm_everywhere: bool = False
-        gated_attention_type: str | None = None  # "none", "head-wise", "element-wise"
-        gate_only: bool = False
+        gated_attention_type: str | None = None  # None (no gate) or "element-wise"
         norm_eps: float = 1e-30
-        norm_type: str = "np_rmsnorm"
-        mid_norm_position: str = "after"  # "after" or "before"
-        head_wise_mid_norm: bool = False
-        use_rope: bool = True
-        # flex + block_causal, matching upstream. Upstream removed sdpa as a
-        # language-model backend entirely (config_utils.get_attention_config
-        # raises on it) because sdpa takes only a boolean is_causal and cannot
-        # consume per-document positions. Batches are token-flat, so a plain
-        # causal mask spans the whole concatenated stream and attends across
-        # the document boundaries that `positions` resets mark, while RoPE has
-        # already restarted at each one. Measured cost of flex over sdpa is
-        # ~3% of step time; block_causal over causal is free (flex skips
-        # fully-masked blocks).
+        norm_type: str = "rmsnorm"
+        # flex, matching upstream: masks are always per document (block causal),
+        # since batches are token-flat and `positions` resets at each document.
         attn_backend: str = "flex"
-        attn_mask_type: str = "block_causal"
 
-        qk_rope_dim: int | None = None
-        # Number of head dimensions to apply RoPE to.  None (default) means full
-        # head_dim (standard RoPE).  Set to a smaller value for partial RoPE where
-        # only the first qk_rope_dim dims are rotated and the rest pass through.
         sliding_window_size: int = -1
+
+        # === Canon short conv ===
         conv_kernel_size: int = 0
-        """0: none. Else a short convolution after the projection (on the streams
-        conv_streams): a depthwise causal conv of this width, in the conv_format."""
-        conv_init_fn_type: str | None = None
-        """Required when conv_kernel_size > 0 (no default): "delay", "random_opnorm" or
-        "torch_default" (utils.inits.conv_init_fn). None with the conv off."""
-        conv_init_gain: float | None = None
-        """Required with conv_init_fn_type: the per-channel operator norm of the init
-        (delay / random_opnorm), or the factor on the nn.Conv1d default draw (torch_default)."""
-        conv_streams: str | None = None
-        """Required when conv_kernel_size > 0 (no default): "qkv" (a conv on q, k and v) or
-        "kv" (k and v only; q passes through untouched and has no q_conv). None with the conv off."""
-        conv_format: str | None = None
-        """Required when conv_kernel_size > 0 (no default): "kda" (KDA / Gated DeltaNet:
-        silu(conv(x)) replaces x) or "canon" (Canon / Inkling: conv(x) + x, no activation).
-        None with the conv off."""
+        """0: no conv (the conv fields below then do nothing). Else the Canon short
+        conv after the projection: x + conv(x), a depthwise causal conv of this width."""
+        conv_streams: str = "qkv"
+        """"qkv" (a conv on q, k and v) or "kv" (k and v only; q has no q_conv)."""
+        conv_init_fn_type: str = "delay"
+        """"delay", "random_opnorm" or "torch_default" (utils.inits.conv_init_fn)."""
+        conv_init_gain: float = 4.0
+        """The per-channel operator norm of the init (delay / random_opnorm), or the
+        factor on the nn.Conv1d default draw (torch_default). 4.0: the x4 in the init
+        of the production recipe (never run; the study ran 1.0 with its optimizer's
+        step-1 x4)."""
+
+        # === Attention sinks ===
         attention_sinks: bool = False
         """A learned logit per head in the softmax denominator (gpt-oss)."""
-        sink_init: float | None = None
-        """Initial value of the sinks (needs attention_sinks): None = trunc_normal with
-        std 0.02 (gpt-oss's std, without its depth scaling), 0.0 = zeros."""
-        row_multipliers: tuple[str, ...] = ()
-        """Learned per-row output multipliers (init 1), y = m * (W x), i.e.
-        W_eff = Diag(m) W (arXiv 2601.04890), on the named projections: "q", "k",
-        "v" (those rows of wqkv) and/or "o" (wo, the block's residual write). On
-        q/k the qk-norm removes a head's overall scale, so only the profile of
-        its rows acts."""
-        scalar_multipliers: bool = False
-        """Make each of `row_multipliers` a single learned scalar per projection
-        (shape [1], W_eff = m W) instead of one per row."""
+        sinks_init_fn_type: str = "zeros"
+        sinks_init_std: float = 0.0
 
         # Filled in by OPTMoEModel.Config expansion from ``attn_backend`` and the
-        # model-level rope/rope_of_swa configs. Declared with defaults so the
+        # model-level rope / rope_of_swa / rope_pattern. Declared with defaults so the
         # compact flavor registry in __init__.py does not have to spell them out.
         inner_attention: InnerAttention.Config = field(
             default_factory=FlexInnerAttention.Config
         )
         rope: RoPE.Config | None = None
+        """None: NoPE (as upstream's GQAttention). Else RoPE on the first `rope.dim`
+        head dims: partial RoPE when `rope.dim < head_dim`, the rest pass through."""
 
         wq_init_fn_type: str = "scaled_orthogonal"
         wk_init_fn_type: str = "scaled_orthogonal"
@@ -158,8 +131,8 @@ class GatedNormSWAttention(GQAttention):
         With TP off, every Linear takes the same Invariant placement, so one
         config for all of them is sufficient."""
         norm_sharding_config: Any | None = None
-        """Sharding plan for the norms this config builds internally (qk_norm,
-        v_norm, mid_norm). They are not config fields, so `sharding.py` cannot
+        """Sharding plan for the norms this config builds internally (the
+        qk_norm). They are not config fields, so `sharding.py` cannot
         reach them the way it reaches `attention_norm`/`ffn_norm`; it threads
         the plan in here instead. Inert for parameter-free norm types."""
 
@@ -203,7 +176,7 @@ class GatedNormSWAttention(GQAttention):
             )
 
             qk_norm = None
-            if self.qk_norm or self.norm_everywhere:
+            if self.qk_norm:
                 qk_norm = build_norm_config(
                     self.norm_type,
                     head_dim,
@@ -260,81 +233,34 @@ class GatedNormSWAttention(GQAttention):
             raise ValueError(
                 f"n_kv_heads ({self.n_kv_heads}) must be <= n_heads ({self.n_heads})"
             )
-        self.use_rope = config.use_rope
+        # The rotated width: rope.dim (its cos/sin cache is built at rope.dim).
         self.qk_rope_dim: int = (
-            config.qk_rope_dim if config.qk_rope_dim is not None else self.head_dim
+            self.head_dim if config.rope is None else config.rope.dim
         )
-        assert (
-            self.qk_rope_dim <= self.head_dim
-        ), f"qk_rope_dim ({self.qk_rope_dim}) must be <= head_dim ({self.head_dim})"
-        # `_apply_rope` slices Q/K to qk_rope_dim and hands them to a RoPE whose
-        # cos/sin cache is sized by `rope.dim`. If the two disagree the rotation
-        # silently uses the wrong frequencies (or broadcasts), so pin them.
-        if config.rope is not None and config.rope.dim != self.qk_rope_dim:
+        if self.qk_rope_dim > self.head_dim:
             raise ValueError(
-                f"rope.dim ({config.rope.dim}) must equal the rotated width "
-                f"qk_rope_dim ({self.qk_rope_dim}); the RoPE cache is built at "
-                "rope.dim but only qk_rope_dim head dims are rotated."
+                f"rope.dim ({self.qk_rope_dim}) must be <= head_dim ({self.head_dim})"
             )
         self.partial_rope = self.qk_rope_dim != self.head_dim
-        if not self.use_rope:
-            # GQAttention always builds a RoPE; drop it so NoPE layers carry no
-            # unused cache and cannot accidentally apply it.
-            self.rope = None
 
+        if config.gated_attention_type not in (None, "element-wise"):
+            raise ValueError(
+                "gated_attention_type must be None (no gate) or 'element-wise', "
+                f"got {config.gated_attention_type!r}"
+            )
         self.gated_attention_type = config.gated_attention_type
-        self.gate_only = config.gate_only
         self.sliding_window_size = config.sliding_window_size
-        self.mid_norm_position = config.mid_norm_position
-        assert self.mid_norm_position in (
-            "after",
-            "before",
-        ), f"mid_norm_position ({self.mid_norm_position}) must be 'after' or 'before'"
-        self.head_wise_mid_norm = config.head_wise_mid_norm
         self.attn_backend = config.attn_backend
 
-        identity = Identity.Config()
-        self.v_norm = identity.build()
-        self.mid_norm = identity.build()
-        self.gate_proj = identity.build()
+        self.gate_proj = Identity.Config().build()
 
         dim = config.dim
-        if config.v_norm or config.norm_everywhere:
-            self.v_norm = build_norm_config(
-                config.norm_type,
-                self.head_dim,
-                config.norm_eps,
-                sharding_config=config.norm_sharding_config,
-            ).build()
-        # `not gate_only` mirrors the forward call sites, which skip
-        # mid_norm entirely when gate_only is set.
-        if (config.mid_norm or config.norm_everywhere) and not config.gate_only:
-            mid_dim = (
-                self.n_heads * self.head_dim
-                if self.mid_norm_position == "after" and not self.head_wise_mid_norm
-                else self.head_dim
-            )
-            self.mid_norm = build_norm_config(
-                config.norm_type,
-                mid_dim,
-                config.norm_eps,
-                sharding_config=config.norm_sharding_config,
-            ).build()
-
         gate_init = {
             "weight": make_param_init(
                 config.w_gate_init_fn_type, config.w_gate_init_std, config.residual_div
             )
         }
-        if self.gated_attention_type == "head-wise":
-            # G1-style: one gate per attention head.
-            self.gate_proj = Linear.Config(
-                in_features=dim,
-                out_features=self.n_heads,
-                param_init=gate_init,
-                sharding_config=config.linear_sharding_config,
-            ).build()
-        elif self.gated_attention_type == "element-wise":
+        if self.gated_attention_type == "element-wise":
             # Dense gate over the full attention output channel dimension.
             self.gate_proj = Linear.Config(
                 in_features=dim,
@@ -344,9 +270,11 @@ class GatedNormSWAttention(GQAttention):
             ).build()
 
         self.q_conv = self.k_conv = self.v_conv = None
-        self.conv_format = config.conv_format
-        self.check_conv_init(config)
         if config.conv_kernel_size > 0:
+            if config.conv_streams not in ("qkv", "kv"):
+                raise ValueError(
+                    f"conv_streams must be qkv | kv, got {config.conv_streams!r}"
+                )
 
             def conv(channels: int) -> Conv1d:
                 return Conv1d.Config(
@@ -370,52 +298,13 @@ class GatedNormSWAttention(GQAttention):
         self.sinks = (
             nn.Parameter(torch.empty(self.n_heads)) if config.attention_sinks else None
         )
-        if config.sink_init not in (None, 0.0):
-            raise ValueError(
-                f"attention sink_init is None (trunc_normal 0.02) or 0.0 (zeros), got {config.sink_init!r}"
-            )
-        if config.sink_init is not None and not config.attention_sinks:
-            raise ValueError("attention sink_init needs attention_sinks")
-        self.sink_init = config.sink_init
-        unknown = set(config.row_multipliers) - {"q", "k", "v", "o"}
-        if unknown:
-            raise ValueError(
-                "attention row_multipliers takes 'q', 'k', 'v' and/or 'o', got "
-                f"{sorted(unknown)}"
-            )
-        if config.scalar_multipliers and not config.row_multipliers:
-            raise ValueError("attention scalar_multipliers needs row_multipliers")
-        if config.scalar_multipliers and {"q", "k"} & set(config.row_multipliers):
-            raise ValueError(
-                "attention scalar_multipliers on q/k would be removed by the qk-norm"
-            )
-        self.scalar_multipliers = config.scalar_multipliers
-
-        def multiplier(name: str, size: int) -> nn.Parameter | None:
-            if name not in config.row_multipliers:
-                return None
-            return nn.Parameter(torch.empty(1 if config.scalar_multipliers else size))
-
-        self.v_multiplier = multiplier("v", self.n_kv_heads * self.head_dim)
-        self.o_multiplier = multiplier("o", dim)
-        self.q_multiplier = multiplier("q", self.n_heads * self.head_dim)
-        self.k_multiplier = multiplier("k", self.n_kv_heads * self.head_dim)
+        self.sinks_init = make_param_init(
+            config.sinks_init_fn_type, config.sinks_init_std
+        )
 
     def _init_self_parameters(self) -> None:
         if self.sinks is not None:
-            if self.sink_init is None:
-                # gpt-oss's std, without its depth scaling
-                nn.init.trunc_normal_(self.sinks, std=0.02)
-            else:
-                nn.init.zeros_(self.sinks)
-        for m in (
-            self.v_multiplier,
-            self.o_multiplier,
-            self.q_multiplier,
-            self.k_multiplier,
-        ):
-            if m is not None:
-                nn.init.ones_(m)
+            self.sinks_init(self.sinks)
 
     def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
         return apply_attention_sink_rescale(out, lse, self.sinks)
@@ -445,35 +334,6 @@ class GatedNormSWAttention(GQAttention):
             torch.cat([xk_rot, xk_pass], dim=-1),
         )
 
-    @staticmethod
-    def check_conv_init(config: "GatedNormSWAttention.Config") -> None:
-        """The conv init, format and streams are stated choices: required with the conv, absent without."""
-        conv = config.conv_kernel_size > 0
-        if conv != (config.conv_format is not None) or (
-            conv and config.conv_format not in ("kda", "canon")
-        ):
-            raise ValueError(
-                "conv_format is required exactly when conv_kernel_size > 0 and is kda | canon; "
-                f"got conv_kernel_size={config.conv_kernel_size}, conv_format={config.conv_format!r}"
-            )
-        if conv != (config.conv_streams is not None) or (
-            conv and config.conv_streams not in ("qkv", "kv")
-        ):
-            raise ValueError(
-                "conv_streams is required exactly when conv_kernel_size > 0 and is qkv | kv; "
-                f"got conv_kernel_size={config.conv_kernel_size}, conv_streams={config.conv_streams!r}"
-            )
-        if conv != (config.conv_init_fn_type is not None) or conv != (
-            config.conv_init_gain is not None
-        ):
-            raise ValueError(
-                "conv_init_fn_type and conv_init_gain are required exactly when "
-                f"conv_kernel_size > 0; got conv_kernel_size={config.conv_kernel_size}, "
-                f"{config.conv_init_fn_type!r}, {config.conv_init_gain!r}"
-            )
-        if conv:
-            conv_init_fn(config.conv_init_fn_type, config.conv_init_gain)
-
     def param_layouts(self) -> dict:
         """The fused wqkv is three units (q / k / v rows interleaved per KV group)."""
         from torchtitan.models.common.param_layout import named, ParamLayout, qkv_units
@@ -494,38 +354,27 @@ class GatedNormSWAttention(GQAttention):
     ) -> torch.Tensor:
         num_tokens = x_TD.shape[0]
         xq, xk, xv = self.qkv_linear(x_TD)  # upstream's fused QKVLinear
-        if self.v_multiplier is not None:
-            m = self.v_multiplier
-            xv = xv * (
-                m if self.scalar_multipliers else m.view(self.n_kv_heads, self.head_dim)
-            )
-        if self.q_multiplier is not None:
-            xq = xq * self.q_multiplier.view(self.n_heads, self.head_dim)
-        if self.k_multiplier is not None:
-            xk = xk * self.k_multiplier.view(self.n_kv_heads, self.head_dim)
         if (
             self.k_conv is not None
         ):  # q, k and v ("qkv"), or k and v only ("kv": q is untouched)
-            fmt = self.conv_format
             if self.q_conv is not None:
                 xq = causal_short_conv(
-                    xq.flatten(-2), self.q_conv.weight, positions, fmt
+                    xq.flatten(-2), self.q_conv.weight, positions
                 ).view_as(xq)
             xk = causal_short_conv(
-                xk.flatten(-2), self.k_conv.weight, positions, fmt
+                xk.flatten(-2), self.k_conv.weight, positions
             ).view_as(xk)
             xv = causal_short_conv(
-                xv.flatten(-2), self.v_conv.weight, positions, fmt
+                xv.flatten(-2), self.v_conv.weight, positions
             ).view_as(xv)
 
-        # QK norm before RoPE (per Qwen3); V norm has no upstream equivalent.
+        # QK norm before RoPE (per Qwen3).
         if self.q_norm is not None:
             xq = self.q_norm(xq)
         if self.k_norm is not None:
             xk = self.k_norm(xk)
-        xv = self.v_norm(xv)
 
-        if self.use_rope:
+        if self.rope is not None:  # None: NoPE
             xq, xk = self._apply_rope(xq, xk, positions)
 
         # No sdpa branch: `build_inner_attention` delegates to upstream's
@@ -546,43 +395,12 @@ class GatedNormSWAttention(GQAttention):
         )
         output = output.contiguous()
 
-        # "before" mid-norm: per-head norm applied before gating.
-        # output shape here: [T, n_local_heads, head_dim]
-        if self.mid_norm_position == "before" and not self.gate_only:
-            output = self.mid_norm(output)
-
-        # The string "none" is listed as a legal value for this field, but it
-        # is truthy: it entered this block, computed a full fp32 sigmoid over
-        # [T, D] and then matched neither branch below, so the result was
-        # discarded -- no gating, plus the cost of computing one.
-        if self.gated_attention_type not in (None, "none"):
+        if self.gated_attention_type == "element-wise":
             # Gate in float32 for numeric stability, then cast back.
+            # gate: [T, n_local_heads * head_dim]
             orig_dtype = output.dtype
             gate = torch.sigmoid(self.gate_proj(x_TD).float())
-            if self.gated_attention_type == "head-wise":
-                # gate: [T, n_local_heads] -> broadcast over head_dim
-                output = (output.float() * gate.unsqueeze(-1)).to(orig_dtype)
-            elif self.gated_attention_type == "element-wise":
-                # gate: [T, n_local_heads * head_dim]
-                output = (output.reshape(num_tokens, -1).float() * gate).to(orig_dtype)
-            else:
-                raise ValueError(
-                    f"unknown gated_attention_type "
-                    f"{self.gated_attention_type!r}; the gate would be "
-                    "computed and silently discarded."
-                )
+            output = (output.reshape(num_tokens, -1).float() * gate).to(orig_dtype)
 
-        # "after" mid-norm: per-head or over the concatenated head output.
-        if self.mid_norm_position == "after" and not self.gate_only:
-            if self.head_wise_mid_norm:
-                output = output.reshape(num_tokens, -1, self.head_dim)
-                output = self.mid_norm(output)
-                output = output.reshape(num_tokens, -1)
-            else:
-                output = output.reshape(num_tokens, -1)
-                output = self.mid_norm(output)
-        else:
-            output = output.reshape(num_tokens, -1)
-        if self.o_multiplier is not None:
-            return self.wo(output) * self.o_multiplier
+        output = output.reshape(num_tokens, -1)
         return self.wo(output)

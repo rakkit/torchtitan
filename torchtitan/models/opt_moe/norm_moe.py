@@ -17,8 +17,6 @@ So the fork now subclasses upstream instead of duplicating it. The routed
 experts are upstream's ``RoutedExperts`` (fused ``w13`` ``[E, 2, F, D]``, one
 grouped GEMM). What remains here is only what upstream has no equivalent for:
 
-  * the mid-norm (``norm_everywhere``), an activation wrapper
-    (``MidNormActivation``) kept for testing it.
   * the sequence-wise / batch-wise auxiliary load-balance loss, whose gradient
     is injected at the layer via ``LoadBalanceLoss`` rather than returned.
     Upstream's MoE is aux-loss-free and steers balance purely through the
@@ -48,8 +46,9 @@ from typing import Any, Literal, NamedTuple
 import torch
 import torch.nn.functional as F
 
-from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.activation import BinaryActivationFn, SwiGLU
+
+from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.config_utils import (
     fused_grouped_gate_up_param_init,
     make_token_dispatcher_config,
@@ -60,7 +59,6 @@ from torchtitan.models.common.param_layout import named, ParamLayout
 from torchtitan.protocols.module import Module
 
 from .norm_ffn import FeedForward
-from .utils.activations import ffn_activation
 from .utils.inits import build_init_fn, make_param_init
 from .utils.moe_utils import calc_gate_scaling_factor
 
@@ -909,9 +907,6 @@ def make_norm_moe_config(
     score_func: str = "sigmoid",
     load_balance_coeff: float | None = 1e-3,
     aux_loss: LoadBalanceLoss.Config | None = None,
-    norm_everywhere: bool = False,
-    norm_type: str = "np_rmsnorm",
-    norm_eps: float = 1e-30,
     activation_fn: BinaryActivationFn.Config | None = None,
     residual_div: float = 1.0,
     init_gate_as_residual: bool = False,
@@ -982,7 +977,9 @@ def make_norm_moe_config(
                 num_linears=2,
                 param_init=fused_grouped_gate_up_param_init(
                     {
-                        "w1_EFD": _expert_init(w1_init_fn_type, w1_init_std, 0, layer_id),
+                        "w1_EFD": _expert_init(
+                            w1_init_fn_type, w1_init_std, 0, layer_id
+                        ),
                         "w3_EFD": _expert_init(
                             w3_init_fn_type, w3_init_std / w3_div, 2, layer_id
                         ),
@@ -999,12 +996,7 @@ def make_norm_moe_config(
                     )
                 },
             ),
-            activation_fn=ffn_activation(
-                activation_fn,
-                mid_norm=norm_everywhere,
-                norm_type=norm_type,
-                norm_eps=norm_eps,
-            ),
+            activation_fn=activation_fn,
             # Upstream's factory, not a hardcoded LocalTokenDispatcher: that
             # class only ever does local dispatch, so EP>1 could never work
             # however the mesh was configured -- despite the docstrings in this
@@ -1030,9 +1022,6 @@ def make_norm_moe_config(
                 dim=dim,
                 hidden_dim=hidden_dim * num_shared_experts,
                 activation_fn=activation_fn,
-                norm_everywhere=norm_everywhere,
-                norm_type=norm_type,
-                norm_eps=norm_eps,
                 w1_init_fn_type=w1_init_fn_type,
                 w2_init_fn_type=w2_init_fn_type,
                 w3_init_fn_type=w3_init_fn_type,
@@ -1083,12 +1072,7 @@ class MoE:
         """EP communication backend: "standard" (all-to-all, falls back to local
         dispatch at EP=1), "deepep" or "hybridep". Upstream selects this per
         flavor rather than per run."""
-        norm_everywhere: bool = False
-        norm_type: str = "np_rmsnorm"
-        norm_eps: float = 1e-30
-        activation_fn: BinaryActivationFn.Config = field(
-            default_factory=SwiGLU.Config
-        )
+        activation_fn: BinaryActivationFn.Config = field(default_factory=SwiGLU.Config)
         # NOTE there is deliberately no `force_router_on_fp32`. 0.4.0 needed it to wrap
         # the router gate in autocast(float32); upstream's RouterGateLinear
         # (models/common/linear.py) now yields FP32 logits unconditionally -- CUDA bf16
@@ -1131,9 +1115,6 @@ class MoE:
                 score_func=self.score_func,
                 load_balance_coeff=self.load_balance_coeff,
                 aux_loss=self.aux_loss,
-                norm_everywhere=self.norm_everywhere,
-                norm_type=self.norm_type,
-                norm_eps=self.norm_eps,
                 activation_fn=self.activation_fn,
                 residual_div=self.residual_div,
                 init_gate_as_residual=self.init_gate_as_residual,

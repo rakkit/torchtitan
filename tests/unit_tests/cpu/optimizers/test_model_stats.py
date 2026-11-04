@@ -52,8 +52,9 @@ def _tiny(*, gains: bool = True, seed: int = 0, n_layers: int = 2, sinks: bool =
     cfg = model_registry("gauge-d8-w256")
     cfg.n_layers, cfg.vocab_size = n_layers, 512
     cfg.layer.attention.attention_sinks = sinks
-    if gains:
-        cfg.layer.norm_type = cfg.layer.attention.norm_type = cfg.norm_type = "rmsnorm"
+    # learnable gains (rmsnorm, the default) or none (the parameter-free np_rmsnorm)
+    norm = "rmsnorm" if gains else "np_rmsnorm"
+    cfg.layer.norm_type = cfg.layer.attention.norm_type = cfg.norm_type = norm
     cfg._expand_layers()
     with torch.device("meta"):
         model = cfg.build()

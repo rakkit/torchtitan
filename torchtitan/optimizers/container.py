@@ -7,8 +7,8 @@
 """DiSCO-aware optimizer container.
 
 Groups are the named `optimizer.groups` (`default` required, the others
-matched by `kind` or `match`, first match wins), or upstream's
-`optimizer.param_groups` instead; a group's kwargs are DiSCO's
+matched by `kind` or `match`, first match wins); upstream's
+`optimizer.param_groups` is accepted for other optimizers only. A group's kwargs are DiSCO's
 `lr / weight_decay / decoupled_wd / momentum / nesterov / rule / args`. On
 top of upstream:
 the MoE load-balance hook, and the arming and collection of the optimizer's
@@ -47,9 +47,7 @@ from torchtitan.optimizers.helpers import norm_helper
 __all__ = ["DiSCOOptimizersContainer"]
 logger = logging.getLogger(__name__)
 
-_DISCO_ONLY_KEYS = frozenset(
-    {"rule", "args", "momentum", "nesterov", "decoupled_wd", "momentum_k"}
-)
+_DISCO_ONLY_KEYS = frozenset({"rule", "args", "momentum", "nesterov", "decoupled_wd"})
 _KIND = "\x00kind:"  # a group pattern resolved per model part from its declarations
 
 
@@ -250,6 +248,13 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         if not config.groups:
             if not config.param_groups:
                 raise ValueError("optimizer.groups needs at least a `default` entry")
+            if any(pg.optimizer_name == "DiSCO" for pg in config.param_groups):
+                # DiSCO tells its default group from the named ones by the
+                # container's marking (below), which only `groups` carries.
+                raise ValueError(
+                    "DiSCO groups are written as optimizer.groups (named, with a "
+                    "`default`); optimizer.param_groups is for other optimizers"
+                )
             return list(config.param_groups)
         if config.param_groups:
             raise ValueError("set optimizer.groups or optimizer.param_groups, not both")
@@ -272,6 +277,10 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                     "declared parameter kind) or `match` (an FQN regex)"
                 )
             kw = {k: v for k, v in g.items() if k not in ("match", "kind", "optimizer")}
+            if g.get("optimizer", "DiSCO") == "DiSCO":
+                # A named group always carries `args`: DiSCO then tells it from the
+                # default group, which alone takes the rule's `own` default args.
+                kw.setdefault("args", {})
             out.append(
                 ParamGroupConfig(
                     pattern=g["match"] if "match" in g else _KIND + g["kind"],
@@ -409,8 +418,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                         raise ValueError(
                             "DiSCO has no default lr: set it in optimizer.groups."
                             "default, or, when the default group is another "
-                            "optimizer (or upstream's param_groups is used), in "
-                            "optimizer_factory_kwargs_by_name['DiSCO']"
+                            "optimizer, in optimizer_factory_kwargs_by_name['DiSCO']"
                         )
                     kwargs["param_layouts"] = layouts
                 optimizer = cls(groups, **kwargs)
@@ -467,7 +475,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
 
     # The lr scheduler reads a group's lr_table from the config; checkpoints
     # leave it out, so a branch may run another table than its source run.
-    _CONFIG_ONLY_SCHEDULER_KEYS = ("lr_table", "momentum_k")
+    _CONFIG_ONLY_SCHEDULER_KEYS = ("lr_table",)
 
     def state_dict(self) -> dict[str, Any]:
         sd = super().state_dict()
@@ -685,8 +693,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                 for gi, (s, eta) in optimizer.eta_used.items():
                     metrics[f"eta_schedule/DiSCO/{gi}"] = s
                     metrics[f"eta_used/DiSCO/{gi}"] = eta
-                for gi, m in optimizer.momentum_used.items():
-                    metrics[f"momentum_used/DiSCO/{gi}"] = m
         if self.gnoise is not None:
             metrics.update(self.gnoise.collect())
         metrics.update(self.collect_moe_metrics())

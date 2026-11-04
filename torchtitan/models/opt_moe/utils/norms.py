@@ -25,7 +25,7 @@ class SingleScaleRMSNorm(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         normalized_shape: int
-        eps: float = 1e-6
+        eps: float = 1e-5
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -111,7 +111,7 @@ def norm_has_parameters(norm_type: str) -> bool:
 
 
 def build_norm_config(
-    norm_type: str, dim: int, eps: float = 1e-6, *, sharding_config=None
+    norm_type: str, dim: int, eps: float = 1e-5, *, sharding_config=None
 ):
     """Return the ``Module.Config`` for the requested norm type.
 

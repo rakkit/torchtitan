@@ -24,11 +24,7 @@ from torch import nn
 
 from torchtitan.models.common.param_layout import ParamLayout, qkv_units, stacked_units
 from torchtitan.optimizers.disco.optimizer import DiSCO
-from torchtitan.optimizers.disco.presets import (
-    AMPHIONE_COLUMN_UNITS,
-    AmphioneMap,
-    EtaSchedule,
-)
+from torchtitan.optimizers.disco.presets import AMPHIONE_COLUMN_UNITS, AmphioneMap
 from torchtitan.optimizers.disco.rules import Compute, Rule, rule_of, StepCtx
 
 TABLE = {"shape": "table", "points": [[0, 1.0], [4, 0.5], [8, 0.0]]}
@@ -61,14 +57,15 @@ STUDY = {
     "radius": 4.0,
     "polar_express_safety": 1.05,
 }  # onerate's radius default is 4
-STUDY_AMPHIONE = {"eta": TABLE, "polar_express_safety": 1.05, "gain_beta": 0.9}
+STUDY_AMPHIONE = {"polar_express_safety": 1.05, "gain_beta": 0.9}
 # the stepping tests: no quack kernel on CPU (Gram Polar Express), so both rules
 # take the exact SVD polar. amphione has no step-1 rescale: onerate at radius 1.
-STEP = {"eta": TABLE, "radius": 1.0, "compute": "svd"}
-STEP_AMPHIONE = {"eta": TABLE, "gain_beta": 0.9, "compute": "svd"}
+# amphione steps at the trainer's lr (no eta schedule): onerate without its eta.
+STEP = {"radius": 1.0, "compute": "svd"}
+STEP_AMPHIONE = {"gain_beta": 0.9, "compute": "svd"}
 # amphione's default gain_beta (None) is beta: onerate's lengths average at 0.95 too
 STEP_DEFAULT = {**STEP, "betas": (0.95, 0.95)}
-STEP_AMPHIONE_DEFAULT = {"eta": TABLE, "compute": "svd"}
+STEP_AMPHIONE_DEFAULT = {"compute": "svd"}
 
 
 def _pair(columns, onerate_args, amphione_args):
@@ -101,7 +98,7 @@ def test_amphione_has_the_study_direction(columns):
 def test_amphione_defaults():
     cm = rule_of({"rule": "amphione"}).compute
     assert isinstance(cm, AmphioneMap)
-    assert (cm.eta, cm.columns, cm.col_units) == (None, False, ())
+    assert (cm.columns, cm.col_units) == (False, ())
     assert (cm.beta, cm.nesterov, cm.gain_beta) == (0.95, True, None)
     assert (cm.column_units, cm.column_lr_mult) == (AMPHIONE_COLUMN_UNITS, 0.0625)
     assert cm.direction.compute.backend == "gram_polar_express"
@@ -111,6 +108,13 @@ def test_amphione_defaults():
     assert rule_of(
         {"rule": "amphione", "args": {"columns": True}}
     ).compute.col_units == (AMPHIONE_COLUMN_UNITS)
+
+
+def test_amphione_has_no_eta_schedule():
+    """The step size is the trainer's lr: an eta schedule is refused."""
+    assert not hasattr(rule_of({"rule": "amphione"}).compute, "eta")
+    with pytest.raises(ValueError, match="eta"):
+        rule_of({"rule": "amphione", "args": {"eta": TABLE}})
 
 
 @pytest.mark.parametrize("compute", ["polar_express", "newtonschulz5", "svd"])
@@ -238,7 +242,6 @@ class _Polar(Compute):
 
 
 LR, BETA = 0.05, 0.95  # the lengths average at beta (gain_beta default)
-ETA = EtaSchedule("sqrt_decay", start=0, total=12)
 
 
 def _reference(w, grads, columns):
@@ -252,7 +255,7 @@ def _reference(w, grads, columns):
         mg, mc = torch.zeros_like(g), torch.zeros_like(c)
         unit = []
         for t, G in enumerate(Gs, start=1):
-            eta_t = LR * ETA(t)
+            eta_t = LR  # the trainer's lr at this step
             if columns:
                 gamma_c = (G * (g[:, None] * U)).sum(dim=0)
                 G = G * c[None, :]
@@ -279,10 +282,7 @@ def test_amphione_step_is_its_equations(columns):
     rule = rule_of(
         {
             "rule": "amphione",
-            "args": {
-                "eta": {"shape": "sqrt_decay", "start": 0, "total": 12},
-                "columns": columns,
-            },
+            "args": {"columns": columns},
         }
     )
     cm = dataclasses.replace(rule.compute, direction=Rule((), _Polar(), scale="one"))
@@ -473,3 +473,33 @@ def test_disco_amphione_frozen_lengths_is_onerate(one_rank):
         assert a.eta_used == b.eta_used
     # the mask reached the rule: the fused wqkv and w13 differ from the unfrozen run, wo and w2 do not
     assert [torch.equal(x, z) for x, z in zip(pa, pc)] == [False, True, False, True]
+
+
+def test_a_same_rule_group_does_not_take_the_defaults_own_args(one_rank):
+    """`own` args (frozen_length_units, scale) are never taken from the default
+    group, also by a group that runs the default's rule: an amphione conv group
+    under an MoE default must not inherit the router's frozen lengths."""
+    g = torch.Generator().manual_seed(0)
+    params = [nn.Parameter(torch.randn(*s, generator=g) * 0.3) for s in SHAPES]
+    plain = {"momentum": 1.0, "nesterov": False, "weight_decay": 0.0}
+    opt = DiSCO(
+        [
+            {"params": params[:3], "param_names": NAMES[:3], **plain},
+            {
+                "params": params[3:],
+                "param_names": NAMES[3:],
+                **plain,
+                "rule": "amphione",
+                "args": {"compute": "svd"},
+            },
+        ],
+        parallel_dims=_NoParallel(),
+        lr=0.03,
+        rule="amphione",
+        args={**STEP_AMPHIONE, "frozen_length_units": [FROZEN[0]]},
+        param_layouts=LAYOUTS,
+    )
+    own, same = opt.param_groups[0]["args"], opt.param_groups[1]["args"]
+    assert own["frozen_length_units"] == [FROZEN[0]]
+    assert "frozen_length_units" not in same
+    assert same["compute"] == "svd" and same["gain_beta"] == 0.9  # its own; inherited

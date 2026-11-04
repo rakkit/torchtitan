@@ -1296,8 +1296,8 @@ AMPHIONE_COLUMN_UNITS = (
 class AmphioneMap(Compute):
     """Amphione: one learning rate for weight amplitude and phase. Each unit
     is W = Diag(g) U, U with unit rows and g its signed row lengths. From the
-    raw gradient G, with eta_t = lr eta(t) (`eta` an `EtaSchedule`, None: 1)
-    and b = `gain_beta` (None: `beta`):
+    raw gradient G, with eta_t = lr (the trainer's schedule) and b =
+    `gain_beta` (None: `beta`):
 
         gamma = rowdot(G, U),  D = Diag(g) G
         M <- beta M + D,  O = direction(D + beta M)  (M without nesterov)
@@ -1329,7 +1329,6 @@ class AmphioneMap(Compute):
     beta: float = 0.95
     nesterov: bool = True
     gain_beta: float | None = None
-    eta: EtaSchedule | None = None
     columns: bool = False
     column_units: tuple[str, ...] = AMPHIONE_COLUMN_UNITS
     column_lr_mult: float = 0.0625
@@ -1378,7 +1377,7 @@ class AmphioneMap(Compute):
         return (m + 3, n + 3) if self.columns else (m, n + 3)
 
     def run(self, x, w, state, ctx):
-        n, t = x.shape[-1], ctx.t
+        n = x.shape[-1]
         b = self.beta if self.gain_beta is None else self.gain_beta
         dt = torch.promote_types(w.dtype, torch.float32)  # at least fp32
         W, G, S = w.to(dt), x.to(dt), state.to(dt)
@@ -1401,7 +1400,7 @@ class AmphioneMap(Compute):
         M = self.beta * M + D
         O = self.direction.run_whole(D + self.beta * M if self.nesterov else M)
         O = O.update.to(dt)
-        eta_t = ctx.lr * (1.0 if self.eta is None else self.eta(t))
+        eta_t = ctx.lr
         uu = U.square().sum(dim=(-2, -1), keepdim=True)
         oo = O.square().sum(dim=(-2, -1), keepdim=True)
         O = O * torch.where(oo >= SUMSQ_FLOOR, (uu / oo).sqrt(), 0.0)
@@ -2033,7 +2032,6 @@ def onerate(
 
 @register("amphione", own={"scale", "frozen_length_units"})
 def amphione(
-    eta=None,
     beta=0.95,
     nesterov=True,
     gain_beta=None,
@@ -2071,15 +2069,15 @@ def amphione(
     study's MoE setting (onerate / angular_muown `frozen_units`). Each type
     must name a unit of the group; a group never inherits it.
 
-    `eta`: an `EtaSchedule` dict on the group's lr (None: the trainer's
-    schedule alone). The rule keeps its own momentum: the group sets
-    momentum 1.0, nesterov false, weight_decay 0.
+    The step size is the group's lr from the trainer's scheduler (no eta
+    schedule). The rule keeps its own momentum: the group sets momentum 1.0,
+    nesterov false, weight_decay 0.
 
     What the optimizer study ran, where it differs from the defaults: Gram
     Polar Express (6 steps) at polar_express_safety 1.05 (its configs spelled
-    it `safety`); a constant trainer lr with eta = 1 - sqrt(t / T) (the
-    applied step lr eta(t) is the logged eta_used/DiSCO/<group>, not lr/);
-    the row lengths' (and columns') sign average gain_beta 0.9, never run at
+    it `safety`); a constant trainer lr with an eta table 1 - sqrt(t / T)
+    (onerate), where this rule takes the trainer's sqrt schedule; the row
+    lengths' (and columns') sign average gain_beta 0.9, never run at
     beta; g scaled x4 at step 1 by the optimizer (`onerate` radius 4), which
     this rule leaves to the init. Its column runs used column_units
     AMPHIONE_COLUMN_UNITS at column_lr_mult 0.0625. Its conv group (q, k, v
@@ -2097,7 +2095,6 @@ def amphione(
             beta=float(beta),
             nesterov=bool(nesterov),
             gain_beta=None if gain_beta is None else float(gain_beta),
-            eta=eta_of("amphione", eta),
             columns=bool(columns),
             column_units=tuple(column_units),
             column_lr_mult=float(column_lr_mult),

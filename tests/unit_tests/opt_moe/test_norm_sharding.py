@@ -7,8 +7,8 @@
 """Norms built INSIDE a module must still receive a sharding plan.
 
 `attention_norm`, `ffn_norm` and the root `norm` are config fields, so
-`sharding.py` reaches them directly. `qk_norm`, `v_norm`, `mid_norm` and
-`embeddings_norm` are built inside `__init__`/`to_gqa_config`, so the plan is
+`sharding.py` reaches them directly. `qk_norm` and `embeddings_norm` are
+built inside `__init__`/`to_gqa_config`, so the plan is
 threaded in via `norm_sharding_config`. With a PARAMETRIC norm type those
 weights would otherwise stay plain tensors and `fully_shard` rejects them under
 `spmd_backend="spmd_types"`.
@@ -101,8 +101,6 @@ def main():
             n_kv_heads=4,
             norm_type=norm_type,
             qk_norm=True,
-            v_norm=True,
-            mid_norm=True,
             rope=CosSinRoPE.Config(dim=16, max_context_length=128),
             norm_sharding_config=plan(),
         )
@@ -110,7 +108,7 @@ def main():
             attn = cfg.build()
         missing, covered = [], 0
         for mod_name, mod in attn.named_modules():
-            if not mod_name.endswith(("q_norm", "k_norm", "v_norm", "mid_norm")):
+            if not mod_name.endswith(("q_norm", "k_norm")):
                 continue
             sc = getattr(mod, "_sharding_config", None)
             for pname, _ in mod.named_parameters(recurse=False):
@@ -118,7 +116,7 @@ def main():
                     missing.append(f"{mod_name}.{pname}")
                 else:
                     covered += 1
-        expected = len(NORM_PARAM_NAMES[norm_type]) * 4  # q, k, v, mid
+        expected = len(NORM_PARAM_NAMES[norm_type]) * 2  # q, k
         check(
             f"{norm_type}: all internal norm params covered",
             not missing and covered == expected,
@@ -136,20 +134,22 @@ def main():
     from torchtitan.models.opt_moe.config_registry import moe_template_config
     from torchtitan.models.opt_moe.sharding import set_opt_moe_sharding_config
 
-    for flavor, norm_type in (
-        ("gauge-d16-w512-embeddings-norm", "rmsnorm"),  # exercises embeddings_norm
-        ("bsc-1B-7B-opt-g-proxy-8layers", "rmsnorm"),  # an MoE model
+    for flavor, norm_type, embeddings_norm in (
+        ("gauge-d16-w512", "rmsnorm", True),  # exercises embeddings_norm
+        ("mis-8b-proxy", "rmsnorm", False),  # an MoE model
     ):
         if flavor not in moe_opt_moe_configs:
             check(f"{flavor}: present in registry", False, "flavor missing")
             continue
         spec = copy.deepcopy(moe_opt_moe_configs[flavor])
         spec.n_layers = 2
+        spec.swa_pattern = (
+            spec.rope_pattern
+        ) = None  # the flavor's patterns are per layer
         spec.norm_type = norm_type
         spec.layer.attention.norm_type = norm_type
         spec.layer.attention.qk_norm = True
-        spec.layer.attention.v_norm = True
-        spec.layer.attention.mid_norm = True
+        spec.use_embeddings_norm = embeddings_norm
         # `update_from_config` populates tok_embeddings/layers, which
         # set_opt_moe_sharding_config walks.
         job = moe_template_config()

@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""opt_moe attention's optional short conv (KDA / Gated DeltaNet) and sinks
+"""opt_moe attention's optional short conv (Canon: x + conv(x)) and sinks
 (gpt-oss), against references written from their equations."""
 
 from types import SimpleNamespace
@@ -19,13 +19,13 @@ from torchtitan.models.opt_moe.utils.short_conv import causal_short_conv
 
 
 def _reference_conv(x, w, positions):
-    """Per document: `silu(conv1d(x, w, padding=K-1))[:L]`, in fp64."""
+    """Per document: `x + conv1d(x, w, padding=K-1)[:L]` (Canon), in fp64."""
     k, out = w.shape[-1], torch.empty_like(x, dtype=torch.float64)
     starts = (positions == 0).nonzero().flatten().tolist() + [x.shape[0]]
     for a, b in zip(starts[:-1], starts[1:]):
         doc = x[a:b].double().T[None]  # [1, C, L]
         y = F.conv1d(doc, w.double(), padding=k - 1, groups=w.shape[0])[0, :, : b - a]
-        out[a:b] = F.silu(y).T
+        out[a:b] = x[a:b].double() + y.T
     return out
 
 
@@ -38,7 +38,7 @@ def _docs(lengths, c=6, seed=0):
 def test_short_conv_is_a_causal_depthwise_conv_per_document():
     x, w, positions = _docs([1, 5, 2, 9])
     torch.testing.assert_close(
-        causal_short_conv(x, w, positions, "kda").double(),
+        causal_short_conv(x, w, positions).double(),
         _reference_conv(x, w, positions),
         rtol=1e-6,
         atol=1e-6,
@@ -47,17 +47,13 @@ def test_short_conv_is_a_causal_depthwise_conv_per_document():
 
 def test_short_conv_sees_neither_the_future_nor_the_previous_document():
     x, w, positions = _docs([7, 7])
-    base = causal_short_conv(x, w, positions, "kda")
+    base = causal_short_conv(x, w, positions)
     later = x.clone()
     later[5:] += 1.0  # the future of token 4, and the whole second document
-    torch.testing.assert_close(
-        causal_short_conv(later, w, positions, "kda")[:5], base[:5]
-    )
+    torch.testing.assert_close(causal_short_conv(later, w, positions)[:5], base[:5])
     earlier = x.clone()
     earlier[:7] += 1.0  # the whole first document
-    torch.testing.assert_close(
-        causal_short_conv(earlier, w, positions, "kda")[7:], base[7:]
-    )
+    torch.testing.assert_close(causal_short_conv(earlier, w, positions)[7:], base[7:])
 
 
 def test_short_conv_gradients_match_the_reference():
@@ -65,22 +61,22 @@ def test_short_conv_gradients_match_the_reference():
     xa, wa = x.clone().requires_grad_(), w.clone().requires_grad_()
     xb, wb = x.double().requires_grad_(), w.double().requires_grad_()
     g = torch.randn(x.shape, dtype=torch.float64)
-    (causal_short_conv(xa, wa, positions, "kda").double() * g).sum().backward()
+    (causal_short_conv(xa, wa, positions).double() * g).sum().backward()
     (_reference_conv(xb, wb, positions) * g).sum().backward()
     torch.testing.assert_close(xa.grad.double(), xb.grad, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(wa.grad.double(), wb.grad, rtol=1e-5, atol=1e-5)
 
 
-def _tiny(conv=4, sinks=True, sink_init=None):
+def _tiny(conv=4, sinks=True, sinks_init_fn_type=None, sinks_init_std=None, gate=None):
     cfg = model_registry("mis-8b-proxy")
     cfg.n_layers, cfg.swa_pattern, cfg.rope_pattern = 2, "SF", None
-    cfg.layer.attention.conv_kernel_size = conv
-    cfg.layer.attention.conv_init_fn_type = "delay" if conv else None
-    cfg.layer.attention.conv_init_gain = 1.0 if conv else None
-    cfg.layer.attention.conv_streams = "qkv" if conv else None
-    cfg.layer.attention.conv_format = "kda" if conv else None
+    cfg.layer.attention.conv_kernel_size = conv  # the other conv fields: their defaults
     cfg.layer.attention.attention_sinks = sinks
-    cfg.layer.attention.sink_init = sink_init
+    cfg.layer.attention.gated_attention_type = gate
+    if sinks_init_fn_type is not None:
+        cfg.layer.attention.sinks_init_fn_type = sinks_init_fn_type
+    if sinks_init_std is not None:
+        cfg.layer.attention.sinks_init_std = sinks_init_std
     cfg.update_from_config(
         config=SimpleNamespace(
             parallelism=ParallelismConfig(),
@@ -104,6 +100,22 @@ def test_conv_weights_are_declared_and_disco_takes_them_as_matrices():
     p = dict(model.named_parameters())[convs[0]]
     assert classify(convs[0], p, layouts[convs[0]], row_rule=True) is Family.LOCAL
     assert classify(convs[0], p, layouts[convs[0]], row_rule=False) is Family.REPLICATED
+
+
+def test_the_gate_is_none_or_element_wise():
+    """Only the element-wise gate exists: gate_proj maps dim to every output
+    channel; no gate adds no parameter; any other value is refused at build."""
+    with torch.device("meta"):
+        gated = _tiny(conv=0, sinks=False, gate="element-wise").build()
+        plain = _tiny(conv=0, sinks=False, gate=None).build()
+    at = gated.layers["0"].attention
+    dim = at.wo.weight.shape[0]  # wo: n_heads * head_dim -> dim
+    assert tuple(at.gate_proj.weight.shape) == (at.n_heads * at.head_dim, dim)
+    assert not any("gate_proj" in n for n, _ in plain.named_parameters())
+    for bad in ("head-wise", "none"):
+        with pytest.raises(ValueError, match="element-wise"):
+            with torch.device("meta"):
+                _tiny(conv=0, sinks=False, gate=bad).build()
 
 
 def test_features_off_add_nothing():
@@ -148,8 +160,8 @@ def _init_on_cpu(cfg):
     return model
 
 
-def test_sinks_are_zero_at_init_with_sink_init_zero():
-    model = _init_on_cpu(_tiny(conv=0, sinks=True, sink_init=0.0))
+def test_sinks_are_zero_at_init_by_default():
+    model = _init_on_cpu(_tiny(conv=0, sinks=True))
     sinks = [model.layers[str(i)].attention.sinks for i in range(2)]
     assert all(
         s.shape == (model.layers["0"].attention.n_heads,) and (s == 0).all()
@@ -158,19 +170,17 @@ def test_sinks_are_zero_at_init_with_sink_init_zero():
     assert all(s.requires_grad for s in sinks)  # still learned
 
 
-def test_sink_init_none_keeps_the_trunc_normal_init():
-    model = _init_on_cpu(_tiny(conv=0, sinks=True, sink_init=None))
+def test_sinks_take_any_init_type_of_the_init_helper():
+    model = _init_on_cpu(
+        _tiny(
+            conv=0, sinks=True, sinks_init_fn_type="trunc_normal", sinks_init_std=0.02
+        )
+    )
     sinks = torch.cat([model.layers[str(i)].attention.sinks for i in range(2)])
-    assert 0 < sinks.std().item() < 0.05 and (sinks != 0).any()
-
-
-def test_sink_init_takes_none_or_zero_and_needs_sinks():
-    with pytest.raises(ValueError, match="sink_init"):
+    assert 0 < sinks.std().item() < 0.05 and (sinks != 0).any()  # std 0.02
+    with pytest.raises(NotImplementedError, match="init_fn_type"):
         with torch.device("meta"):
-            _tiny(conv=0, sinks=True, sink_init=0.5).build()
-    with pytest.raises(ValueError, match="needs attention_sinks"):
-        with torch.device("meta"):
-            _tiny(conv=0, sinks=False, sink_init=0.0).build()
+            _tiny(conv=0, sinks=True, sinks_init_fn_type="no_such_init").build()
 
 
 def test_sink_metrics_log_every_value_of_every_layer():
@@ -239,7 +249,7 @@ def test_sinks_are_a_softmax_with_one_more_logit():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="flex attention needs CUDA")
 def test_model_with_conv_and_sinks_trains_one_step():
-    cfg = _tiny()
+    cfg = _tiny(sinks_init_fn_type="trunc_normal")  # non-zero sinks: their rescale acts
     with torch.device("meta"):
         model = cfg.build()
     model.to_empty(device="cuda")

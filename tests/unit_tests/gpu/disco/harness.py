@@ -55,6 +55,8 @@ def tiny_model_config(
     """mis-8b-proxy's architecture shrunk until a 4-rank test runs in seconds;
     `conv` / `sinks`: the attention's short conv width and sinks."""
     cfg = model_registry(flavor)
+    # parameter-free norms: the references here are written for the matrices alone
+    cfg.norm_type = cfg.layer.norm_type = cfg.layer.attention.norm_type = "np_rmsnorm"
     cfg.dim = dim
     cfg.n_layers = n_layers
     cfg.vocab_size = vocab_size
@@ -75,10 +77,7 @@ def tiny_model_config(
     attn.head_dim = 32
     attn.sliding_window_size = 16
     attn.conv_kernel_size = conv
-    attn.conv_init_fn_type = "delay" if conv else None
-    attn.conv_init_gain = 1.0 if conv else None
-    attn.conv_streams = "qkv" if conv else None
-    attn.conv_format = "kda" if conv else None
+    attn.conv_init_gain = 1.0  # the harness's references start the conv at gain 1
     attn.attention_sinks = sinks
     return cfg
 

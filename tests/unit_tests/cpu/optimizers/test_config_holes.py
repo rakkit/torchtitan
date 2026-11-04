@@ -14,6 +14,7 @@ import pytest
 import torch.distributed as dist
 import torch.nn as nn
 
+from torchtitan.components.optimizer import ParamGroupConfig
 from torchtitan.models.common.param_layout import ParamLayout
 from torchtitan.models.opt_moe.config_registry import moe_template_config
 from torchtitan.optimizers.container import DiSCOOptimizersContainer
@@ -48,14 +49,22 @@ class _Decoder(nn.Module):
         super().__init__()
         self.tok_embeddings = nn.Embedding(64, 16)
         self.wq = nn.Linear(16, 16, bias=False)
-        self.gate = nn.Linear(16, 4, bias=False)
+        self.moe = (
+            nn.Module()
+        )  # the router at the model's path: the template freezes moe.router.gate
+        self.moe.router = nn.Module()
+        self.moe.router.gate = nn.Linear(
+            16, 8, bias=False
+        )  # 8 experts: Gram Polar Express needs dims % 8
+        self.norm = nn.RMSNorm(16)  # learnable gains: the template's gains group
         self.lm_head = nn.Linear(16, 64, bias=False)
 
     def param_layouts(self):
         return {
             "tok_embeddings.weight": ParamLayout("embedding"),
             "wq.weight": ParamLayout("matrix"),
-            "gate.weight": ParamLayout("router"),
+            "moe.router.gate.weight": ParamLayout("router"),
+            "norm.weight": ParamLayout("vector"),
             "lm_head.weight": ParamLayout("unembedding"),
         }
 
@@ -86,6 +95,16 @@ def test_an_adamw_group_refuses_disco_keys(key):
         DiSCOOptimizersContainer._param_group_configs(cfg)
 
 
+def test_disco_in_upstreams_param_groups_is_refused():
+    """Only `groups` marks DiSCO's named groups; in upstream's list a named group
+    would take the default rule's `own` args."""
+    cfg = DiSCOOptimizersContainer.Config()
+    cfg.groups = {}
+    cfg.param_groups = [ParamGroupConfig(pattern=".*", optimizer_name="DiSCO")]
+    with pytest.raises(ValueError, match="optimizer.groups"):
+        DiSCOOptimizersContainer._param_group_configs(cfg)
+
+
 def test_disco_without_a_default_lr_says_so():
     """An AdamW default group used to end in `TypeError: missing 'lr'`."""
     cfg = DiSCOOptimizersContainer.Config()
@@ -97,3 +116,47 @@ def test_disco_without_a_default_lr_says_so():
         DiSCOOptimizersContainer(
             cfg, model_parts=[_Decoder()], parallel_dims=_NoParallel()
         )
+
+
+def test_a_named_group_with_only_an_lr_does_not_take_the_defaults_own_args():
+    """A named group that sets neither `rule` nor `args` runs the default's rule
+    but is not the default group: it must not take the rule's `own` args (here
+    the router's frozen row lengths, which name no unit of the group)."""
+    cfg = moe_template_config().optimizer  # its default group freezes moe.router.gate
+    cfg.groups = {"wq": {"match": r"^wq\.weight$", "lr": 0.003}, **cfg.groups}
+    c = DiSCOOptimizersContainer(
+        cfg, model_parts=[_Decoder()], parallel_dims=_NoParallel()
+    )
+    groups = {tuple(g["param_names"]): g for o in c.optimizers for g in o.param_groups}
+    wq = groups[("wq.weight",)]
+    assert wq["rule"] == "amphione" and wq["lr"] == 0.003
+    assert "frozen_length_units" not in wq["args"]
+    assert wq["args"]["polar_express_safety"] == 1.05  # inherited
+    gate = next(g for names, g in groups.items() if "moe.router.gate.weight" in names)
+    assert gate["args"]["frozen_length_units"] == ["moe.router.gate"]
+
+
+def test_a_named_group_under_the_defaults_rule_keeps_its_other_default_args():
+    """Only the rule's `own` args stay with the default group: a named amphione
+    group with args of its own still takes the default's polar_express_safety
+    (an arg of no preset, so no rule `inherits` it)."""
+    cfg = moe_template_config().optimizer  # its default group freezes moe.router.gate
+    cfg.groups = {
+        "wq": {
+            "match": r"^wq\.weight$",
+            "rule": "amphione",
+            "args": {"gain_beta": 0.9},
+        },
+        **cfg.groups,
+    }
+    c = DiSCOOptimizersContainer(
+        cfg, model_parts=[_Decoder()], parallel_dims=_NoParallel()
+    )
+    wq = next(
+        g
+        for o in c.optimizers
+        for g in o.param_groups
+        if g["param_names"] == ["wq.weight"]
+    )
+    assert wq["args"]["polar_express_safety"] == 1.05 and wq["args"]["gain_beta"] == 0.9
+    assert "frozen_length_units" not in wq["args"]

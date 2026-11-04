@@ -95,7 +95,6 @@ class _FakeDiSCO:
         self.steps_that_computed: list[int] = []
         self._step_index = 0
         self.eta_used: dict[int, tuple[float, float]] = {}
-        self.momentum_used: dict[int, float] = {}
 
     def calculate_norm_at_next_step(self, norms_to_log=None, gram_level=None, **kw):
         self.need_to_calculate_norm = True

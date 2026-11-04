@@ -95,9 +95,12 @@ config.optimizer.groups = {
   vocabulary matrices under a gathering rule; a Gram compute on a wide unit;
   declared units that overlap or misstate their shape; a stateful rule whose
   state shape differs across one parameter's units.
-- `moe_template_config()`'s groups are a valid run on their own: Muon on the
-  matrices, the row rules on the embedding, head and routers (by kind).
-- `optimizer.groups` and upstream's `optimizer.param_groups` are alternatives;
+- `moe_template_config()`'s groups are a valid run on their own: the production
+  recipe (amphione on the matrices with the router gate's row lengths frozen, a
+  sign step on the RMSNorm gains, row-l2 on the embedding and the head).
+- DiSCO groups are written as `optimizer.groups`; upstream's
+  `optimizer.param_groups` is for other optimizers only (DiSCO in it is an
+  error: only `groups` marks the named groups apart from the default one), and
   setting both is an error.
 
 Container fields (`--optimizer.<field>`):
@@ -195,7 +198,7 @@ keyword arguments are its args and defaults:
 | `hyperball` | `FrobeniusAUS`, radius kept: `W+ = r N(W - s r N(U))`, r = `\|\|W\|\|_F` | as `muon` without a scale; `tangent` false, `exact_angle` false, `eta` none | `scale` |
 | `elr` | `FrobeniusAUS`, radius free: `W+ = d W - s r N(U)`, d the decay | as `hyperball` | `scale` |
 | `sso` | `SpectralSphere`: `W+ = (R / sigma) W - s R orth(M^ + lambda* u v^T)`, `R = scale(m, n)` | as `muon`; `sigma_iters` 8, `solve_steps` 12, `lambda0` 1e-3, `eta` none | |
-| `amphione` | `AmphioneMap`: `W = Diag(g) U`, unit rows turned by the orthogonalised momentum, row lengths by a sign step, one rate `lr eta(t)`; optional column gains (see "Amphione" below) | `gram_polar_express` 6, `beta` 0.95, Nesterov, `gain_beta` = `beta`, no `eta`, columns off | |
+| `amphione` | `AmphioneMap`: `W = Diag(g) U`, unit rows turned by the orthogonalised momentum, row lengths by a sign step, one rate: the group's lr from the trainer's scheduler; optional column gains (see "Amphione" below) | `gram_polar_express` 6, `beta` 0.95, Nesterov, `gain_beta` = `beta`, columns off | |
 | `onerate` | `angular_muown` with the optimizer study's Amphione settings as defaults (radius 4, row-length average 0.9), every switch open: for ablations | as the study ran | `scale` |
 | `angular_muown` | `AngularMuownMap` (arXiv 2606.23637) and the study's switches: length rules, sphere, tangent, radius, turn norm, frozen units, column scales | `polar_express` 5, `image_spectral`, warmup 100, Adam lengths | `scale` |
 | `lie_relative` | `LieRelativeMap`: a relative step in the RMS -> RMS norm, `\|\|dW P^-1\|\|_S = eta` (`P = sym(Q^T W)`, `Q = Orth(W)`), second-order exp map, transported momentum | `gram_polar_express` 6, `one`, `beta` 0.95, Nesterov | `scale` |
@@ -316,8 +319,8 @@ is an `EtaSchedule` dict (see "Angular schedule" below).
     `lr_scheduler` with `decay_type: "sqrt"` and `decay_ratio: 1.0`, or an
     `eta` of shape `sqrt_decay` on top of a WSD.
 
-**Angular schedule.** Every matrix rule (`muon`, `aus`, `hyperball`, `elr`,
-`sso`, `angular_muown`, `onerate`, `amphione`, `lie_relative`) takes `eta`, an `EtaSchedule` dict that multiplies
+**Angular schedule.** Every matrix rule but `amphione` (`muon`, `aus`, `hyperball`, `elr`,
+`sso`, `angular_muown`, `onerate`, `lie_relative`) takes `eta`, an `EtaSchedule` dict that multiplies
 the group's lr for the direction step only: the step is `lr_t eta(t)`, lr_t
 the trainer's schedule. Weight decay keeps `1 - lr_t wd`, and angular-muown's
 magnitudes keep lr_t. `eta(t)` is 1 up to `start`; after it, with
@@ -339,14 +342,13 @@ own keys: `warmup_steps`, `decay_ratio`, `decay_type`, `min_lr_factor`, or
 between them, the first / last factor outside; not with the other keys).
 `components/optimizer/schedule_tables.py` builds knots for the trainer's WSD,
 a horizon-free base `(1 + D / D1)^-q` in tokens and a cooldown of any table.
-`momentum_k: k` schedules a group's momentum field as `m_t = min(1, k / t)`
-(the new gradient's weight; beta_t = 1 - k / t), logged as
-`momentum_used/DiSCO/<group>`. Checkpoints leave `lr_table` and `momentum_k`
-out, so a run resumed from another run's checkpoint takes its own.
+Checkpoints leave `lr_table` out, so a run resumed from another run's
+checkpoint takes its own.
 
 **Amphione** (`rule: amphione`). Each hidden matrix is `W = Diag(g) U`: U has
 unit rows, g holds their signed lengths. From the raw gradient G, with
-`eta_t = lr eta(t)` and `b = gain_beta` (None: `beta`):
+`eta_t = lr` (the group's lr at this step, from the trainer's scheduler; the
+rule takes no `eta` schedule) and `b = gain_beta` (None: `beta`):
 
 ```
 gamma = rowdot(G, U),  D = Diag(g) G
@@ -366,7 +368,6 @@ step-1 rescale, so a larger start belongs in the init. Args:
 | `scale` | `one` | used only by that plain row rule (Amphione rescales O to `\|\|U\|\|_F`); never inherited from the default group |
 | `beta`, `nesterov` | 0.95, true | the direction's momentum |
 | `gain_beta` | None (= `beta`) | the average the row-length (and column) sign steps take |
-| `eta` | None | an `EtaSchedule` dict on the group's lr |
 | `columns` | false | column gains c, `W = Diag(g) U Diag(c)`, on `column_units` |
 | `column_units` | wq, wk, wv, w1, w3 | the unit types that learn c (`AMPHIONE_COLUMN_UNITS`) |
 | `column_lr_mult` | 0.0625 | c's sign step is `column_lr_mult * eta_t` |
@@ -401,7 +402,7 @@ lr:
          "args": {"compute": "row-l2", "row_direction": True}},
 ```
 
-It inherits the default group's other `amphione` args (`eta`, `beta`,
+It inherits the default group's other `amphione` args (`beta`,
 `gain_beta`, ...). With `columns: true` on the default, set `columns: false`
 on the conv group: the conv units are not in `column_units`, and DiSCO
 refuses a column unit type that matches no unit of the group. The study ran
@@ -423,7 +424,8 @@ optimizer study's runs checkpointed. A group config:
 
 What the optimizer study ran, where it differs from these defaults: Gram
 Polar Express at `polar_express_safety` 1.05; a constant trainer lr with
-`eta` = 1 - sqrt(t / T); the row-length average 0.9 (angular_muown's default
+an `eta` table 1 - sqrt(t / T) (on `onerate`; `amphione` takes the trainer's
+sqrt schedule instead); the row-length average 0.9 (angular_muown's default
 `betas`, never run at 0.95); the row lengths scaled x4 at step 1 by the
 optimizer (`onerate` `radius: 4`), measured to match x4 in the init within
 0.003 in loss. `onerate` is that rule with every `angular_muown` switch

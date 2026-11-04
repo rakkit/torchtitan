@@ -115,7 +115,7 @@ def set_opt_moe_sharding_config(
             "bias": dense_param_placement(tp=spmd.I),
         }
     )
-    # Norms built INSIDE a module (qk_norm, v_norm, mid_norm, embeddings_norm)
+    # Norms built INSIDE a module (qk_norm, embeddings_norm)
     # are not config fields, so nothing here can reach them the way
     # `attention_norm`/`ffn_norm` are reached below. Every sibling model stamps
     # its own inner norms (qwen3/sharding.py, deepseek_v3/sharding.py,
@@ -134,7 +134,7 @@ def set_opt_moe_sharding_config(
     # shardings, unlike qwen3's qk_norm plan (`models/qwen3/sharding.py`) which
     # also sets in_src/in_dst/out_src/out_dst to `attention_activation_placement()`.
     # Copying qwen3 here would be WRONG: one plan is shared by norms with
-    # DIFFERENT activation layouts -- qk_norm/v_norm see a per-head layout,
+    # DIFFERENT activation layouts -- qk_norm sees a per-head layout,
     # while `embeddings_norm` sees the residual stream. Stamping a head layout
     # on the residual-stream norm would mis-declare it. Getting activations
     # right needs a per-site plan, which is only required once SP or TP is
@@ -160,10 +160,6 @@ def set_opt_moe_sharding_config(
     for layer_cfg in config.layers:
         layer_cfg.attention_norm.sharding_config = norm
         layer_cfg.ffn_norm.sharding_config = norm
-        # Sandwich norms see the branch output, the same [T, D] layout.
-        for post in (layer_cfg.post_attention_norm, layer_cfg.post_ffn_norm):
-            if post is not None:
-                post.sharding_config = norm
         # Localize q/k/v at the kernel boundary without changing placements.
         # Upstream #4322 moved the CP k/v all-gather OUT of this local_map and
         # into the CP attention implementations themselves
@@ -186,27 +182,15 @@ def set_opt_moe_sharding_config(
         # fields), so the plan is threaded in via `linear_sharding_config`.
         layer_cfg.attention.linear_sharding_config = _replicated_linear
         layer_cfg.attention.norm_sharding_config = _replicated_norm
-        # The attention's own vectors (sinks, row multipliers) and the FFN's row
-        # multipliers are direct parameters, so they need placements too.
-        own = (("sinks",) if layer_cfg.attention.attention_sinks else ()) + tuple(
-            f"{n}_multiplier" for n in layer_cfg.attention.row_multipliers
-        )
-        if own:
+        # The sinks are a direct parameter of the attention, so they need a
+        # placement too.
+        if layer_cfg.attention.attention_sinks:
             layer_cfg.attention.sharding_config = ShardingConfig(
-                state_shardings={n: dense_param_placement(tp=spmd.I) for n in own}
+                state_shardings={"sinks": dense_param_placement(tp=spmd.I)}
             )
         ff = getattr(layer_cfg, "feed_forward", None)
         if ff is not None:
             ff.linear_sharding_config = _replicated_linear
-            own_ff = tuple(f"{n}_multiplier" for n in ff.row_multipliers) + (
-                ("swish_beta",) if ff.swish_beta else ()
-            )
-            if own_ff:
-                ff.sharding_config = ShardingConfig(
-                    state_shardings={
-                        n: dense_param_placement(tp=spmd.I) for n in own_ff
-                    }
-                )
 
         # MoE layers: the routed experts' grouped linears, the router gate and
         # the shared experts each need a weight placement before fully_shard.

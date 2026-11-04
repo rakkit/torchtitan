@@ -30,7 +30,6 @@ apply writes -- see `metrics.py`.
 import functools
 import hashlib
 import logging
-import math
 import re
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -191,6 +190,13 @@ class DiSCO(torch.optim.Optimizer):
         else:
             self.is_dp_rank_0 = dist.get_rank() == 0
         self._default_args = dict(args or {})
+        params = list(params)
+        # The default group sets neither `rule` nor `args` (the container passes
+        # its `.*` group bare); every other group is a named one.
+        if params and isinstance(params[0], dict):
+            named = [("rule" in p or "args" in p) for p in params]
+        else:  # one implicit group of tensors: the default group
+            named = [False]
         super().__init__(
             params,
             dict(
@@ -211,9 +217,8 @@ class DiSCO(torch.optim.Optimizer):
             "decay_type",
             "min_lr_factor",
             "lr_table",
-            "momentum_k",
         }
-        for g in self.param_groups:
+        for g, is_named in zip(self.param_groups, named, strict=True):
             unknown = sorted(
                 set(g) - set(self.defaults) - {"params", "param_names"} - scheduler_keys
             )
@@ -223,19 +228,19 @@ class DiSCO(torch.optim.Optimizer):
                     f"{unknown}; a rule's settings (compute, scale, pre, steps, "
                     "...) go inside `args`"
                 )
-            # The default rule takes every default arg; another rule takes the
-            # ones it inherits. The group's own args win key by key.
-            if g["rule"] == rule:
+            # The default group takes every default arg; a named group under the
+            # default's rule every one but the rule's `own` args; a named group
+            # under another rule the ones its rule inherits. The group's own
+            # args win key by key.
+            if not is_named:
                 base = self._default_args
+            elif g["rule"] == rule:
+                own = RULES[rule].own if rule in RULES else frozenset()
+                base = {k: v for k, v in self._default_args.items() if k not in own}
             else:
                 known = RULES[g["rule"]].inherits if g["rule"] in RULES else ()
                 base = {k: v for k, v in self._default_args.items() if k in known}
             g["args"] = {**base, **(g["args"] or {})}
-            k = g.get("momentum_k")
-            if k is not None and not (math.isfinite(float(k)) and float(k) > 0.0):
-                raise ValueError(
-                    f"DiSCO group {g.get('param_names', [])[:2]}: momentum_k must be finite and > 0, got {k!r}"
-                )
         # Metric arming, set per logging step by the container.
         self.need_to_calculate_norm = False
         self.norms_to_log: list[str] = list(NORM_FUNCTIONS.keys())
@@ -258,9 +263,6 @@ class DiSCO(torch.optim.Optimizer):
         # group -> (eta(t), lr eta(t)) of the last step, for groups whose
         # rule has an eta schedule
         self.eta_used: dict[int, tuple[float, float]] = {}
-        # group -> the momentum field m_t = min(1, k / t) applied at the last
-        # step, for groups with `momentum_k` (the scheduled momentum)
-        self.momentum_used: dict[int, float] = {}
         # LM-head geometry. `head_probe_h` is the head's input for a few probe
         # tokens; the container sets it for one norm step, step() drops it.
         self.head_probe_h: torch.Tensor | None = None
@@ -805,8 +807,7 @@ class DiSCO(torch.optim.Optimizer):
         # The travelling rows are the momentum itself (no pre phase, no
         # nesterov): the exchange may keep its views of them across steps.
         self._eff_is_moment = all(
-            self.param_groups[e.group_idx].get("momentum_k") is None
-            and 0.0 < self.param_groups[e.group_idx]["momentum"] < 1.0
+            0.0 < self.param_groups[e.group_idx]["momentum"] < 1.0
             and not self.param_groups[e.group_idx]["nesterov"]
             and not e.rule.pre
             for e in self.fam[Family.SHARDED]
@@ -878,7 +879,6 @@ class DiSCO(torch.optim.Optimizer):
         if logging_step and not self._sink_ready:
             self._register_metric_units()
         with self._span("disco_prepare_grads"):
-            self._scheduled_momentum()
             eff = self._effective_grads()
             self._phase_pass(eff, "pre")
         if nanprobe.on():
@@ -937,43 +937,24 @@ class DiSCO(torch.optim.Optimizer):
         ctx = self._ctx(e)
         return ctx.lr, ctx.decay
 
-    def _scheduled_momentum(self) -> None:
-        """A group with `momentum_k` takes the momentum field m_t = min(1, k / t)
-        at its step t = 1, 2, ... (the weight of the NEW gradient: 1 = no
-        momentum, buf = g; then beta_t = 1 - k / t)."""
-        for gi, g in enumerate(self.param_groups):
-            k = g.get("momentum_k")
-            if k is not None:
-                g["momentum"] = self.momentum_used[gi] = min(
-                    1.0, float(k) / (int(g["t"]) + 1)
-                )
-
     def _effective_grads(self) -> dict[int, torch.Tensor]:
         """Momentum pass (one call per momentum value, all groups together),
         then each entry's effective gradient as fp32 rows `[nl, C]`."""
         groups, moments = [], {}
-        scheduled = []
         for gi, es, _ in self._groups:
             g = self.param_groups[gi]
             m, nesterov = float(g["momentum"]), bool(g["nesterov"])
-            sched = g.get("momentum_k") is not None
             grads = []
             for e in es:
                 gr = e.param.grad
                 if gr is None:
                     raise RuntimeError(f"[DiSCO] {e.name} has no gradient")
                 grads.append(gr.to_local() if isinstance(gr, DTensor) else gr)
-            groups.append((es, grads, m, nesterov, sched))
-            if (
-                sched
-            ):  # a new value every step: the eager pass (no compile specialisation per value), also at m = 1 (buf = g)
-                scheduled.append(([self._bufs_local[e.i] for e in es], grads, m))
-            elif 0.0 < m < 1.0:
+            groups.append((es, grads, m, nesterov))
+            if 0.0 < m < 1.0:
                 bufs, gs = moments.setdefault(m, ([], []))
                 bufs += [self._bufs_local[e.i] for e in es]
                 gs += grads
-        for bufs, gs, m in scheduled:
-            _momentum(bufs, gs, m)
         for m, (bufs, gs) in moments.items():
             if bufs[0].is_cuda:
                 with torch._dynamo.config.patch(
@@ -983,9 +964,9 @@ class DiSCO(torch.optim.Optimizer):
             else:
                 _momentum(bufs, gs, m)
         eff = {}
-        for es, grads, m, nesterov, sched in groups:
+        for es, grads, m, nesterov in groups:
             out = grads
-            if 0.0 < m < 1.0 or sched:
+            if 0.0 < m < 1.0:
                 out = [self._bufs_local[e.i] for e in es]
                 if nesterov:
                     out = torch._foreach_lerp(out, grads, m)

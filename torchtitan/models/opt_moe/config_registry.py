@@ -14,44 +14,98 @@ from torchtitan.optimizers.container import DiSCOOptimizersContainer
 from torchtitan.trainer import Trainer
 from . import model_registry
 
+# The hidden matrices' lr of the recipe (the study's one lr across sizes, batch 128 x 4096).
+_LR = 0.01562
+
 
 def moe_template_config() -> Trainer.Config:
+    # The production MoE recipe, model and optimizer side, on the mis-8b flavor (as
+    # reproduce_cfgs/configs/0.5.4-debug/production-moe-336m.py; a run config still
+    # writes every setting). Model: RMSNorm gains, no depth or residual scaling,
+    # every hidden matrix (attention with its gate, FFN, experts) scaled-orthogonal
+    # at std 4 (amphione has no step-1 rescale: the x4 is in the init), the router
+    # gate too, embedding scion-normal std 0.02, head scion-normal std 1.
+    m = model_registry("mis-8b")
+    m.norm_type = m.layer.norm_type = m.layer.attention.norm_type = "rmsnorm"
+    m.layer.depth_init = "identity"
+    m.layer.residual_scale = "identity"
+    m.layer.init_gate_as_residual = False
+    m.first_in_init_fn_type, m.first_in_init_std = "scion_normal_input", 0.02
+    m.final_out_init_fn_type, m.final_out_init_std = "scion_normal_output", 1.0
+    for module, names in (
+        (m.layer.attention, ("wq", "wk", "wv", "wo", "w_gate")),
+        (m.layer.feed_forward, ("w1", "w2", "w3")),
+        (m.layer.moe, ("w1", "w2", "w3")),
+    ):
+        for w in names:
+            setattr(module, f"{w}_init_fn_type", "scaled_orthogonal")
+            setattr(module, f"{w}_init_std", 4.0)
+    m.layer.moe.router_init_fn_type = "scaled_orthogonal"
+    m.layer.moe.router_init_std = 4.0
     return Trainer.Config(
         hf_assets_path="./assets/hf/gpt-oss-120b",
         metrics=MetricsProcessor.Config(log_freq=1),
-        model=model_registry("bsc-1B-7B-opt-g"),
+        model=m,
         # No `dataloader=` default. Every recipe assigns `config.dataloader` from
         # `components/data/mix.make_pretrain_dataloader_config`, and a template default
         # that no run uses is a trap: it decides the shape of anything that forgets to.
-        # The groups every recipe overrides (`config.optimizer.groups`); a
-        # valid DiSCO run on its own: Muon on the matrices, the row rules on
-        # the vocabulary matrices and the routers.
+        # Optimizer: amphione on every hidden matrix (the experts and the router
+        # included; the router gate's row lengths frozen), a sign step on the RMSNorm
+        # gains, row-l2 on the embedding and the head. `momentum` of an sgd / muon
+        # group is the new gradient's weight (0.05 = beta 0.95); amphione keeps its
+        # own momentum (`beta`, `nesterov`).
         optimizer=DiSCOOptimizersContainer.Config(
             groups={
-                "embedding": {
-                    "kind": "embedding",
-                    "args": {"compute": "row-l2", "scale": "sqrt_n"},
-                },
-                "unembedding": {
-                    "kind": "unembedding",
-                    "args": {"compute": "row-l2", "scale": "inv_sqrt_n"},
-                },
-                "router": {
-                    "kind": "router",
-                    "args": {"compute": "row-l2", "scale": "inv_sqrt_n"},
+                "gains": {
+                    "match": r"(^|\.)(q_norm|k_norm|attention_norm|ffn_norm|norm)\.weight$",
+                    "rule": "sgd",
+                    "args": {"pre": "identity", "compute": "sign", "scale": "one"},
+                    "lr": 0.5 * _LR,
+                    "momentum": 0.05,
+                    "nesterov": True,
+                    "weight_decay": 0.0,
+                    "decoupled_wd": False,
                 },
                 "default": {
-                    "lr": 8e-4,
-                    "weight_decay": 0.1,
-                    "momentum": 0.95,
+                    "lr": _LR,
+                    "weight_decay": 0.0,
+                    "decoupled_wd": False,
+                    "momentum": 1.0,
                     "nesterov": False,
+                    "rule": "amphione",
+                    "args": {
+                        "beta": 0.95,
+                        "nesterov": True,
+                        "gain_beta": None,
+                        "compute": "gram_polar_express",
+                        "steps": 6,
+                        "polar_express_safety": 1.05,
+                        "frozen_length_units": ["moe.router.gate"],
+                    },
+                },
+                "embedding": {
+                    "match": r"tok_embeddings\.weight",
+                    "rule": "muon",
+                    "args": {"compute": "row-l2", "scale": "sqrt_n", "pre": "identity"},
+                    "lr": 0.001953,
+                    "momentum": 0.05,
+                    "nesterov": True,
+                    "weight_decay": 0.0,
+                    "decoupled_wd": False,
+                },
+                "lm_head": {
+                    "match": r"(output|lm_head)\.weight",
                     "rule": "muon",
                     "args": {
-                        "compute": "newtonschulz5",
-                        "steps": 5,
-                        "scale": "spectral",
+                        "compute": "row-l2",
+                        "scale": "inv_sqrt_n",
                         "pre": "identity",
                     },
+                    "lr": 0.125,
+                    "momentum": 0.01,  # beta 0.99 (batch 128 x 4096)
+                    "nesterov": True,
+                    "weight_decay": 0.0,
+                    "decoupled_wd": False,
                 },
             }
         ),
@@ -66,12 +120,20 @@ def moe_template_config() -> Trainer.Config:
         # `loss_fn.inner` to wire lm_head, and every token count we run
         # (1024/4096/8192/40960) divides by 8.
         loss=ChunkedLossWrapper.Config(num_chunks=8),
-        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=20),
+        # One schedule for every group: no warmup, sqrt decay over the whole run.
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=0, decay_ratio=1.0, decay_type="sqrt", min_lr_factor=0.0
+        ),
         training=TrainingConfig(
             # 4 sequences x 4096 tokens, expressed the way 0.5.0 expresses it.
             num_tokens_per_microbatch_per_dp_rank=4 * 4096,
             max_context_length=4096,
             steps=100,
+            # fp32 with bf16 params and fp32 gradient reduction; no clipping
+            dtype="float32",
+            mixed_precision_param="bfloat16",
+            mixed_precision_reduce="float32",
+            max_norm=0.0,
             # CUDA graphs require fixed shapes and no host sync inside the
             # captured region. OPT MoE's token-choice routing computes
             # per-expert token counts on the host for the grouped-GEMM offsets,

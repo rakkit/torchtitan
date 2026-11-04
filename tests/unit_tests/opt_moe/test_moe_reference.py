@@ -21,7 +21,7 @@ import torch
 from torchtitan.models.opt_moe.norm_moe import make_norm_moe_config
 
 
-def reference_moe(moe, x_TD, *, mid_norm: bool):
+def reference_moe(moe, x_TD):
     """Naive MoE: for each token, apply each of its top-k experts directly."""
     router = moe.router
     experts = moe.routed_experts
@@ -49,9 +49,6 @@ def reference_moe(moe, x_TD, *, mid_norm: bool):
             # accumulation, not precision.
             h = torch.nn.functional.silu(xt @ w1[e].bfloat16().t())
             h = h * (xt @ w3[e].bfloat16().t())
-            if mid_norm:  # parameter-free RMS norm over the hidden dim
-                hf = h.float()
-                h = (hf * torch.rsqrt(hf.pow(2).mean() + 1e-30)).to(h.dtype)
             y = h @ w2[e].bfloat16().t()
             out[t] += y.float() * topk_scores[t, k].float()
 
@@ -60,7 +57,7 @@ def reference_moe(moe, x_TD, *, mid_norm: bool):
     return out
 
 
-def run_case(*, norm_everywhere, num_shared_experts, top_k, label):
+def run_case(*, num_shared_experts, top_k, label):
     torch.manual_seed(0)
     cfg = make_norm_moe_config(
         dim=64,
@@ -68,7 +65,6 @@ def run_case(*, norm_everywhere, num_shared_experts, top_k, label):
         num_experts=6,
         top_k=top_k,
         num_shared_experts=num_shared_experts,
-        norm_everywhere=norm_everywhere,
         load_balance_coeff=1e-3,
     )
     moe = cfg.build().cuda()
@@ -79,50 +75,26 @@ def run_case(*, norm_everywhere, num_shared_experts, top_k, label):
     x = torch.randn(48, 64, device="cuda")
     with torch.no_grad():
         fast = moe(x)
-        ref = reference_moe(moe, x, mid_norm=norm_everywhere)
+        ref = reference_moe(moe, x)
 
     d = (fast.float() - ref).abs().max().item()
     scale = ref.abs().max().item()
     ok = d < 5e-2 * scale
     print(
         f"  {'OK  ' if ok else 'FAIL'} {label}: max|d|={d:.3e} "
-        f"scale={scale:.3f} rel={d/scale:.2e}"
+        f"scale={scale:.3f} rel={d / scale:.2e}"
     )
     return not ok
 
 
 def main() -> int:
     failures = 0
-    failures += run_case(
-        norm_everywhere=False,
-        num_shared_experts=0,
-        top_k=1,
-        label="top_k=1, no shared, no mid-norm",
-    )
-    failures += run_case(
-        norm_everywhere=False,
-        num_shared_experts=0,
-        top_k=2,
-        label="top_k=2, no shared, no mid-norm",
-    )
-    failures += run_case(
-        norm_everywhere=True,
-        num_shared_experts=0,
-        top_k=2,
-        label="top_k=2, no shared, mid-norm",
-    )
-    failures += run_case(
-        norm_everywhere=True,
-        num_shared_experts=1,
-        top_k=2,
-        label="top_k=2, shared expert, mid-norm",
-    )
-    failures += run_case(
-        norm_everywhere=True,
-        num_shared_experts=1,
-        top_k=4,
-        label="top_k=4, shared expert, mid-norm",
-    )
+    for num_shared_experts, top_k in ((0, 1), (0, 2), (1, 2), (1, 4)):
+        failures += run_case(
+            num_shared_experts=num_shared_experts,
+            top_k=top_k,
+            label=f"top_k={top_k}, shared experts {num_shared_experts}",
+        )
     print()
     print("MATCHES REFERENCE" if failures == 0 else f"{failures} CASE(S) FAILED")
     return 1 if failures else 0

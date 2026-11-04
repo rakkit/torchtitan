@@ -123,18 +123,13 @@ class OPTMoETransformerBlock(TransformerBlock):
         # from ``norm_type``/``norm_eps`` instead, so they stay unset.
         attention_norm: Any = None
         ffn_norm: Any = None
-        # Sandwich norm on each branch output before the residual add, stamped
-        # from ``post_norm_type`` ("none" = plain pre-norm block).
-        post_attention_norm: Any = None
-        post_ffn_norm: Any = None
 
         n_dense_layers: int = 0
         init_gate_as_residual: bool = False
         depth_init: bool | str = "total_depth"
         residual_scale: str = "identity"
         norm_eps: float = 1e-30
-        norm_type: str = "np_rmsnorm"
-        post_norm_type: str = "none"
+        norm_type: str = "rmsnorm"
         prenorm_gain_init: float = 1.0
         """Constant init of the attention_norm / ffn_norm gains (``norm_type="rmsnorm"``
         only). 1.0 leaves the norms on their stock ``reset_parameters`` (ones)."""
@@ -196,13 +191,13 @@ class OPTMoETransformerBlock(TransformerBlock):
             self._mask_key = "full"
 
         # Per-layer debug metadata surfaced in __repr__/print(model).
-        self._repr_use_rope: bool = config.attention.use_rope
+        self._repr_use_rope: bool = config.attention.rope is not None
         self._repr_swa_window_size: int = (
             config.attention.sliding_window_size if self.use_swa else -1
         )
         self._repr_rope_theta: float = (
             float(config.attention.rope.theta)
-            if config.attention.use_rope and config.attention.rope is not None
+            if config.attention.rope is not None
             else -1.0
         )
 
@@ -233,16 +228,6 @@ class OPTMoETransformerBlock(TransformerBlock):
         # would still take the multiply path and still fail. Hence per-term.
         self._skip_identity_mul = self.identity_scale == 1.0
         self._skip_block_mul = self.block_scale == 1.0
-
-        # Registered last: module order is init-RNG order.
-        self.post_attention_norm = (
-            None
-            if config.post_attention_norm is None
-            else config.post_attention_norm.build()
-        )
-        self.post_ffn_norm = (
-            None if config.post_ffn_norm is None else config.post_ffn_norm.build()
-        )
 
     def extra_repr(self) -> str:
         return (
@@ -305,8 +290,6 @@ class OPTMoETransformerBlock(TransformerBlock):
         # restores AC. Non-unit scales still hit the torch bug -- see the
         # migration doc.
         _attn_out = self.attention(self.attention_norm(x), layer_mask, positions)
-        if self.post_attention_norm is not None:
-            _attn_out = self.post_attention_norm(_attn_out)
         _lhs = x if self._skip_identity_mul else self.identity_scale * x
         _rhs = _attn_out if self._skip_block_mul else self.block_scale * _attn_out
         h = _lhs + _rhs
@@ -317,8 +300,6 @@ class OPTMoETransformerBlock(TransformerBlock):
             )
         else:
             mlp_output = self.feed_forward(self.ffn_norm(h))
-        if self.post_ffn_norm is not None:
-            mlp_output = self.post_ffn_norm(mlp_output)
 
         _lhs = h if self._skip_identity_mul else self.identity_scale * h
         _rhs = mlp_output if self._skip_block_mul else self.block_scale * mlp_output
@@ -428,7 +409,7 @@ class OPTMoEModel(Decoder):
 
         rope: RoPE.Config
         norm_eps: float = 1e-30
-        norm_type: str = "np_rmsnorm"
+        norm_type: str = "rmsnorm"
         norm_sharding_config: Any | None = None
         """Sharding plan for `embeddings_norm`, which this config builds
         internally. See GatedNormSWAttention.Config.norm_sharding_config."""
@@ -455,7 +436,9 @@ class OPTMoEModel(Decoder):
         # Per-layer RoPE vs NoPE selection.
         # String: one char per layer — 'R' = RoPE, 'N' = NoPE.  E.g. ``"RRRN"``.
         # list[bool]: True = RoPE, False = NoPE.
-        # None keeps the uniform behaviour from ``layer.attention.use_rope``.
+        # None: RoPE on every layer. A layer's RoPE is ``rope`` (full-attention
+        # layers) or ``rope_of_swa`` (SWA layers, when set); partial RoPE when its
+        # ``dim`` is below head_dim.
 
         swa_pattern: str | list[bool] | None = None
         # Per-layer sliding-window vs full-attention selection.
@@ -477,15 +460,8 @@ class OPTMoEModel(Decoder):
             base_attn = self.layer.attention
             assert isinstance(base_attn, GatedNormSWAttention.Config)
 
-            def post_norm():
-                if self.layer.post_norm_type == "none":
-                    return None
-                return build_norm_config(
-                    self.layer.post_norm_type, self.dim, self.layer.norm_eps
-                )
-
             use_rope = _parse_layer_pattern(
-                self.rope_pattern, n_layers, "R", "N", default_true=base_attn.use_rope
+                self.rope_pattern, n_layers, "R", "N", default_true=True
             )
             use_swa = _parse_layer_pattern(
                 self.swa_pattern,
@@ -529,14 +505,12 @@ class OPTMoEModel(Decoder):
                 attn_cfg = _dc.replace(
                     base_attn,
                     dim=self.dim,
-                    use_rope=use_rope[layer_id],
                     sliding_window_size=swa_window if use_swa[layer_id] else -1,
                     # SWA requires FlexInnerAttention; non-SWA keeps the configured backend.
                     attn_backend=attn_backend,
-                    # Always stamped: GQAttention requires a rope config to
-                    # build. NoPE layers drop the module in the attention's
-                    # __init__ once use_rope is known, so no cache is retained.
-                    rope=layer_rope,
+                    # None on a NoPE layer (rope_pattern "N"): upstream's
+                    # GQAttention builds no RoPE then.
+                    rope=layer_rope if use_rope[layer_id] else None,
                     residual_div=residual_div_attn,
                 )
                 attn_cfg.inner_attention = attn_cfg.build_inner_attention()
@@ -578,8 +552,6 @@ class OPTMoEModel(Decoder):
                         feed_forward=ff_cfg,
                         attention_norm=pre_norm(),
                         ffn_norm=pre_norm(),
-                        post_attention_norm=post_norm(),
-                        post_ffn_norm=post_norm(),
                         dim=self.dim,
                         layer_id=layer_id,
                         n_layers=n_layers,
@@ -866,20 +838,15 @@ class OPTMoEModel(Decoder):
         """Return attention masks appropriate for the mix of layer backends.
 
         Returns:
-            ``None``                                  — all layers use SDPA.
-            ``{"full": BlockMask}``                   — flex layers, no SWA.
-            ``{"full": BlockMask, "swa": BlockMask}`` — mixed flex full + SWA.
+            ``{"full": BlockMask}``                   -- flex layers, no SWA.
+            ``{"full": BlockMask, "swa": BlockMask}`` -- mixed flex full + SWA.
             Delegates to ``super()`` for varlen.
         """
-        has_flex = any(
-            getattr(layer, "attn_backend", "sdpa") in ("flex", "flex_flash")
-            for layer in self.layers.values()
-        )
         has_swa = any(
             getattr(layer, "use_swa", False) for layer in self.layers.values()
         )
         has_varlen = any(
-            getattr(layer, "attn_backend", "sdpa") == "varlen"
+            getattr(layer, "attn_backend", None) == "varlen"
             for layer in self.layers.values()
         )
 
@@ -892,56 +859,23 @@ class OPTMoEModel(Decoder):
                 max_num_documents=max_num_documents,
                 max_context_length=max_context_length,
             )
-        if not has_flex:
-            # All SDPA -- PyTorch handles causal masking internally, which can
-            # only ever be plain causal. SDPA cannot express a document mask,
-            # so silently returning None here would drop a `block_causal`
-            # request on the floor; 0.4.0 rejected this combination explicitly
-            # and that guard must not be lost. It matters more under 0.5.0 than
-            # it did under 0.4.0: batches are token-flat now, so plain causal
-            # spans the whole concatenated stream and attends across the
-            # document boundaries that `positions` resets mark, while RoPE has
-            # already restarted at each one.
-            # Read from the layer *template*, not `self.config.layers[i]`:
-            # attn_mask_type is uniform across layers (it selects which masks to
-            # build for the whole model), and the window has to come from the
-            # template too because expanded non-SWA layers carry -1. A per-layer
-            # attn_mask_type override would therefore be ignored -- that is not
-            # a supported configuration.
-            base_attn = self.config.layer.attention
-            mask_type = getattr(base_attn, "attn_mask_type", "causal")
-            if mask_type != "causal":
-                raise ValueError(
-                    f"attn_mask_type {mask_type!r} requires attn_backend='flex'; "
-                    "SDPA only supports 'causal'. Set the attention's "
-                    "attn_backend to 'flex', or use 'causal'."
-                )
-            return None
 
-        # Document boundaries now come from `positions` resetting to 0 rather
-        # than from scanning for eos_id, so the mask no longer needs the
-        # tokenizer or the raw token ids.
+        # Every layer is flex here: the block refuses any backend but flex,
+        # flex_flash and varlen. Document boundaries come from `positions`
+        # resetting to 0, so masks are always per document (block causal).
         attn_config = self.config.first_attention
         assert attn_config is not None
         base_attn = self.config.layer.attention
         assert isinstance(base_attn, GatedNormSWAttention.Config)
-        if base_attn.attn_mask_type == "block_causal":
-            # Upstream's helper is the reference for causal + packed-document
-            # masking; use it rather than re-deriving the mask mods here.
-            mask_mods = [
-                get_causal_mask_mod(),
-                get_efficient_causal_mask_mod_for_packed_document(positions),
-            ]
-            full_mask = self._create_flex_attention_mask_for_document(
-                positions, attn_config
-            )
-        elif base_attn.attn_mask_type == "causal":
-            mask_mods = [get_causal_mask_mod()]
-            full_mask = self._create_flex_attention_mask(
-                positions, attn_config, mask_mods
-            )
-        else:
-            raise ValueError(f"Unknown attn_mask_type: {base_attn.attn_mask_type!r}")
+        # Upstream's helper is the reference for causal + packed-document
+        # masking; use it rather than re-deriving the mask mods here.
+        mask_mods = [
+            get_causal_mask_mod(),
+            get_efficient_causal_mask_mod_for_packed_document(positions),
+        ]
+        full_mask = self._create_flex_attention_mask_for_document(
+            positions, attn_config
+        )
         if not has_swa:
             return {"full": full_mask}
 

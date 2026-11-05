@@ -14,7 +14,6 @@ import torch.nn.functional as F
 
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.opt_moe import build_model_config
-from torchtitan.models.opt_moe.gated_swa_attention import causal_short_conv
 
 
 def _reference_conv(x, w, positions):
@@ -30,37 +29,58 @@ def _reference_conv(x, w, positions):
 
 def _docs(lengths, c=6, seed=0):
     torch.manual_seed(seed)
-    positions = torch.cat([torch.arange(n) for n in lengths])
-    return torch.randn(len(positions), c), torch.randn(c, 1, 4), positions
-
-
-def test_short_conv_is_a_causal_depthwise_conv_per_document():
-    x, w, positions = _docs([1, 5, 2, 9])
-    torch.testing.assert_close(
-        causal_short_conv(x, w, positions).double(),
-        _reference_conv(x, w, positions),
-        rtol=1e-6,
-        atol=1e-6,
+    positions = torch.cat([torch.arange(n) for n in lengths]).cuda()
+    return (
+        torch.randn(len(positions), c, device="cuda"),
+        torch.randn(c, 1, 4, device="cuda"),
+        positions,
     )
 
 
+def _conv(x, w, positions):
+    from torchtitan.models.common.attention import create_varlen_metadata_for_document
+    from torchtitan.models.common.attention.linear_attention import (
+        LinearAttentionMetadata,
+    )
+    from torchtitan.models.opt_moe.gated_swa_attention import canon_short_conv
+
+    meta = LinearAttentionMetadata(
+        varlen=create_varlen_metadata_for_document(positions),
+        num_conv_history_tokens=w.shape[-1] - 1,
+    )
+    return canon_short_conv(x, w, meta)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the conv kernel needs CUDA")
+def test_short_conv_is_a_causal_depthwise_conv_per_document():
+    x, w, positions = _docs([1, 5, 2, 9])
+    torch.testing.assert_close(
+        _conv(x, w, positions).double(),
+        _reference_conv(x, w, positions),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the conv kernel needs CUDA")
 def test_short_conv_sees_neither_the_future_nor_the_previous_document():
     x, w, positions = _docs([7, 7])
-    base = causal_short_conv(x, w, positions)
+    base = _conv(x, w, positions)
     later = x.clone()
     later[5:] += 1.0  # the future of token 4, and the whole second document
-    torch.testing.assert_close(causal_short_conv(later, w, positions)[:5], base[:5])
+    torch.testing.assert_close(_conv(later, w, positions)[:5], base[:5])
     earlier = x.clone()
     earlier[:7] += 1.0  # the whole first document
-    torch.testing.assert_close(causal_short_conv(earlier, w, positions)[7:], base[7:])
+    torch.testing.assert_close(_conv(earlier, w, positions)[7:], base[7:])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the conv kernel needs CUDA")
 def test_short_conv_gradients_match_the_reference():
     x, w, positions = _docs([3, 8])
     xa, wa = x.clone().requires_grad_(), w.clone().requires_grad_()
     xb, wb = x.double().requires_grad_(), w.double().requires_grad_()
-    g = torch.randn(x.shape, dtype=torch.float64)
-    (causal_short_conv(xa, wa, positions).double() * g).sum().backward()
+    g = torch.randn(x.shape, dtype=torch.float64, device="cuda")
+    (_conv(xa, wa, positions).double() * g).sum().backward()
     (_reference_conv(xb, wb, positions) * g).sum().backward()
     torch.testing.assert_close(xa.grad.double(), xb.grad, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(wa.grad.double(), wb.grad, rtol=1e-5, atol=1e-5)

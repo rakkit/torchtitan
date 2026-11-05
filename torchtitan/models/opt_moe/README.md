@@ -48,7 +48,7 @@ MoE recipe on `mis-8b`.
 | `gated_attention_type` | None | None: no gate; `element-wise`: `gate_proj` `[n_heads * head_dim, dim]`, the attention output multiplied by `sigmoid(gate_proj(x))` (fp32) before `wo`. Any other value is refused |
 | `attention_sinks` | false | one learned logit per head in the softmax denominator (gpt-oss): `out * sigmoid(lse - s)` |
 | `sinks_init_fn_type`, `sinks_init_std` | `zeros`, 0.0 | the sinks' init, any init type of `param_init.py`; `zeros` ignores the std |
-| `conv_kernel_size` | 0 | the Canon short conv: `x + conv(x)`, a depthwise causal conv of this width on the streams below, after the projection; it restarts at every packed document. 0: no conv, and the conv arguments below do nothing |
+| `conv_kernel_size` | 0 | the Canon short conv: `x + conv(x)`, a depthwise causal conv of this width on the streams below, after the projection (attn_gym's CUDA `causal_conv1d`); it restarts at every packed document. 0: no conv, and the conv arguments below do nothing |
 | `conv_streams` | `qkv` | `qkv` (q, k and v) or `kv` (q passes through and has no `q_conv`) |
 | `conv_init_fn_type`, `conv_init_gain` | `delay`, 4.0 | `delay` (one tap of +-gain per channel), `random_opnorm` (a random filter with operator norm gain) or `torch_default` (gain x the `nn.Conv1d` draw); 4.0 is the recipe's x4 in the init (never run: the study ran 1.0 with its optimizer's step-1 x4) |
 | `attn_backend` | - | `flex`, `flex_flash` or `varlen` (upstream's configs, sliding-window variants included); masks are always per document (block causal) |

@@ -7,7 +7,6 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 import torch_remat as remat
 from torch import nn
 
@@ -17,37 +16,36 @@ from torchtitan.models.common.attention import (
     GQAttention,
     VarlenAttentionMetadata,
 )
+from torchtitan.models.common.attention.linear_attention import LinearAttentionMetadata
+from torchtitan.models.common.attn_gym import causal_conv1d, require_attn_gym
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Conv1d
 from torchtitan.models.common.param_layout import named, ParamLayout, qkv_units
 
 
-# The Canon / Inkling short convolution on a token-flat stream.
-@local_compile("opt_moe_short_conv", batch_invariant=True)
-def causal_short_conv(
+class ShortConvDocuments:
+    """The key of the Canon short conv's document offsets in the attention
+    metadata map (an ``LinearAttentionMetadata``, built by
+    ``OPTMoEModel._get_attention_metadata`` from the positions); never built."""
+
+
+def canon_short_conv(
     x_TC: torch.Tensor,
-    weight_C1K: torch.Tensor,
-    positions_T: torch.Tensor | None,
+    weight_C1W: torch.Tensor,
+    conv_metadata: LinearAttentionMetadata | None,
 ) -> torch.Tensor:
-    """Depthwise causal conv (`nn.Conv1d` orientation: `w[..., -1]` multiplies
-    the current token), accumulated in fp32. Tap `j` reaches `j` tokens back only
-    where `positions >= j`: positions restart at every packed document, so a
-    document never sees the previous one. Returns `conv(x) + x` (Canon /
-    Inkling: residual, no activation)."""
-    k = weight_C1K.shape[-1]
-    x = x_TC.float()
-    w = weight_C1K.squeeze(1).float()
-    if positions_T is None:
-        positions_T = torch.arange(x.shape[0], device=x.device)
-    y = x * w[:, k - 1]
-    for j in range(1, k):
-        back = F.pad(x[:-j], (0, 0, j, 0))
-        y = (
-            y
-            + torch.where((positions_T >= j).unsqueeze(-1), back, 0.0) * w[:, k - 1 - j]
-        )
-    y = y + x
-    return y.to(x_TC.dtype)
+    """The Canon / Inkling short conv ``x + conv(x)`` (residual, no activation)
+    on a token-flat stream: attn_gym's depthwise causal conv (``nn.Conv1d``
+    orientation: ``w[..., -1]`` multiplies the current token; fp32
+    accumulation), restarted at every document of ``conv_metadata`` (None: one
+    document)."""
+    varlen = None if conv_metadata is None else conv_metadata.varlen
+    conv_1TC = causal_conv1d(
+        x_TC.unsqueeze(0),
+        weight_C1W.squeeze(1).to(x_TC.dtype),
+        cu_seqlens=None if varlen is None else varlen.cu_seq_q,
+    )
+    return conv_1TC.squeeze(0) + x_TC
 
 
 # Attention sinks: a copy of gpt_oss's apply_attention_sink_rescale (same math),
@@ -116,6 +114,8 @@ class GatedSWAttention(GQAttention):
         self.q_conv = config.q_conv.build() if config.q_conv is not None else None
         self.k_conv = config.k_conv.build() if config.k_conv is not None else None
         self.v_conv = config.v_conv.build() if config.v_conv is not None else None
+        if self.k_conv is not None:
+            require_attn_gym(causal_conv1d)
         self.sinks = (
             nn.Parameter(torch.empty(self.n_heads)) if config.attention_sinks else None
         )
@@ -135,7 +135,11 @@ class GatedSWAttention(GQAttention):
         x_TD: torch.Tensor,
         attention_metadata: FlexAttentionMetadata | VarlenAttentionMetadata | None,
         positions: torch.Tensor | None = None,
+        *,
+        conv_metadata: LinearAttentionMetadata | None = None,
     ) -> torch.Tensor:
+        """``conv_metadata``: the short conv's document offsets (the model's
+        ``ShortConvDocuments`` entry)."""
         xq, xk, xv = self.qkv_linear(x_TD)
         gate = self.gate_proj(x_TD) if self.gate_proj is not None else None
         # The q / k / v preparation reads the projection's outputs with bare ops.
@@ -143,15 +147,21 @@ class GatedSWAttention(GQAttention):
         # The Canon short conv (on q, k and v, or k and v only), the QK norm
         # (before RoPE, per Qwen3), then RoPE (partial, or none for NoPE).
         if self.k_conv is not None:
+            if conv_metadata is None and positions is not None:
+                # Packed documents without their offsets: the conv would run across them.
+                raise ValueError(
+                    "the short conv needs its document offsets (the model's "
+                    "_get_attention_metadata) when positions are given"
+                )
             if self.q_conv is not None:
-                xq = causal_short_conv(
-                    xq.flatten(-2), self.q_conv.weight, positions
+                xq = canon_short_conv(
+                    xq.flatten(-2), self.q_conv.weight, conv_metadata
                 ).view_as(xq)
-            xk = causal_short_conv(
-                xk.flatten(-2), self.k_conv.weight, positions
+            xk = canon_short_conv(
+                xk.flatten(-2), self.k_conv.weight, conv_metadata
             ).view_as(xk)
-            xv = causal_short_conv(
-                xv.flatten(-2), self.v_conv.weight, positions
+            xv = canon_short_conv(
+                xv.flatten(-2), self.v_conv.weight, conv_metadata
             ).view_as(xv)
         if self.q_norm is not None:
             xq = self.q_norm(xq)

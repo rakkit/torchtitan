@@ -16,7 +16,12 @@ from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.local_compile import LocalCompileConfig
 
-from torchtitan.models.common.attention import AttentionMetadata, AttentionMetadataMap
+from torchtitan.models.common.attention import (
+    AttentionMetadata,
+    AttentionMetadataMap,
+    create_varlen_metadata_for_document,
+)
+from torchtitan.models.common.attention.linear_attention import LinearAttentionMetadata
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.feed_forward import DenseFeedForward
 from torchtitan.models.common.moe import MoE, RoutedExperts, TokenChoiceTopKRouter
@@ -26,6 +31,7 @@ from torchtitan.models.common.param_layout import (
     ParamLayout,
     stacked_units,
 )
+from .gated_swa_attention import ShortConvDocuments
 from .state_dict_adapter import OPTMoEStateDictAdapter
 
 
@@ -78,13 +84,18 @@ class OPTMoETransformerBlock(TransformerBlock):
         attention_metadata: AttentionMetadata | None = None,
         positions: torch.Tensor | None = None,
         *,
+        conv_metadata: LinearAttentionMetadata | None = None,
         padding_mask: torch.Tensor | None = None,
         aux_loss_denominator: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """``x``: ``[T, D]``; ``padding_mask`` (True: not counted): upstream's
+        """``x``: ``[T, D]``; ``conv_metadata``: the attention short conv's
+        document offsets; ``padding_mask`` (True: not counted): upstream's
         padding mask, the tokens the MoE leaves out of its balance statistics."""
         _attn_out = self.attention(
-            self.attention_norm(x), attention_metadata, positions
+            self.attention_norm(x),
+            attention_metadata,
+            positions,
+            conv_metadata=conv_metadata,
         )
         # The residual add reads the attention output with bare ops.
         remat.recompute_needs_tensor(_attn_out)
@@ -241,7 +252,6 @@ class OPTMoEModel(Decoder):
                     "fused_binary_activation",
                     "fp32_to_bf16_split",
                     "rope",
-                    "opt_moe_short_conv",
                     "opt_moe_sink_rescale",
                     "opt_moe_attention_output",
                 ]
@@ -253,6 +263,41 @@ class OPTMoEModel(Decoder):
         # Set to [] by the optimizer container on logging steps (log_residual_stats);
         # forward then appends its residual statistics. Not a buffer.
         self.residual_capture: list[torch.Tensor] | None = None
+        # The attention short conv's width (0: no conv; every layer has the same).
+        self.conv_kernel_size = next(
+            (
+                layer.attention.k_conv.kernel_size
+                for layer in config.layers
+                if layer.attention.k_conv is not None
+            ),
+            0,
+        )
+
+    def _get_attention_metadata(
+        self,
+        positions: torch.Tensor,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        max_num_documents: int | None = None,
+    ) -> AttentionMetadataMap:
+        """Upstream's inner-attention metadata, plus the short conv's document
+        offsets (the ``ShortConvDocuments`` entry) when the attention has a conv."""
+        attention_metadata = super()._get_attention_metadata(
+            positions,
+            padding_mask=padding_mask,
+            max_num_documents=max_num_documents,
+        )
+        if self.conv_kernel_size > 0:
+            attention_metadata[ShortConvDocuments] = LinearAttentionMetadata(
+                varlen=create_varlen_metadata_for_document(
+                    positions,
+                    padding_mask=padding_mask,
+                    max_num_documents=max_num_documents,
+                    max_context_length=self.config.max_context_length,
+                ),
+                num_conv_history_tokens=self.conv_kernel_size - 1,
+            )
+        return attention_metadata
 
     def forward(
         self,
@@ -284,6 +329,11 @@ class OPTMoEModel(Decoder):
         # Residual statistics (log_residual_stats): taken in this eager loop, so
         # the blocks and their compiled graphs are the same either way.
         rows = [] if self.residual_capture is not None else None
+        conv_metadata = (
+            None
+            if attention_metadata is None
+            else attention_metadata.get(ShortConvDocuments)
+        )
         for layer in self.layers.values():
             meta = (
                 None
@@ -294,6 +344,7 @@ class OPTMoEModel(Decoder):
                 h,
                 meta,
                 positions,
+                conv_metadata=conv_metadata,
                 padding_mask=padding_mask,
                 aux_loss_denominator=aux_loss_denominator,
             )

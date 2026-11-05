@@ -30,6 +30,7 @@ import torch.nn.functional as F
 
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.opt_moe import build_model_config
+from torchtitan.models.opt_moe.gated_swa_attention import ShortConvDocuments
 
 T, DIM, HEADS, KV_HEADS, HEAD_DIM, WINDOW, THETA = 256, 128, 4, 2, 32, 32, 10000.0
 DOCS = (100, 3, 153)
@@ -250,7 +251,12 @@ def test_layer_matches_its_equations(variant):
             if router is not None
             else None
         )
-        out = layer(x, metadata.get(type(layer.attention.inner_attention)), positions)
+        out = layer(
+            x,
+            metadata.get(type(layer.attention.inner_attention)),
+            positions,
+            conv_metadata=metadata.get(ShortConvDocuments),
+        )
         if hook is not None:
             hook.remove()
         g = torch.randn_like(out)

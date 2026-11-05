@@ -312,3 +312,8 @@ class LRSchedulersContainer(Stateful, Configurable):
             scheduler.last_epoch = last_epoch
             scheduler._step_count = last_epoch + 1
             scheduler._last_lr = scheduler.get_lr()
+            # The next step runs this run's schedule, not the lr the checkpoint
+            # holds (a resume with a changed schedule); on a plain resume they
+            # are equal.
+            for group, lr in zip(scheduler.optimizer.param_groups, scheduler._last_lr):
+                group["lr"] = lr

@@ -37,8 +37,15 @@ class ConfigLoader:
     """Load a Python config recipe with a deliberately small CLI surface."""
 
     def load(self, args: list[str] | None = None) -> Configurable.Config:
-        namespace = self._parser().parse_args(args)
-        config = self._load_config(namespace.module, namespace.config)
+        parser = self._parser()
+        namespace, extra = parser.parse_known_args(args)
+        if _is_config_file(namespace.config):
+            config = _load_config_file(namespace.config)
+        elif namespace.module is None:
+            parser.error("--module is required unless --config names a .py recipe file")
+        else:
+            config = self._load_config(namespace.module, namespace.config)
+        _apply_field_overrides(config, extra)
 
         if namespace.override:
             override_config = getattr(config, "override", None)
@@ -67,7 +74,7 @@ class ConfigLoader:
         )
         parser.add_argument(
             "--module",
-            required=True,
+            required=False,
             help="Fully qualified Python module containing the config factory.",
         )
         parser.add_argument(
@@ -203,3 +210,101 @@ class ConfigLoader:
                 "tokenizer.model file. Download the Hugging Face assets and "
                 "update the recipe."
             )
+
+
+# ---------------------------------------------------------------------------
+# This fork's launchers (reproduce_cfgs/sbatch): `--config` may be a recipe FILE
+# (`/path/recipe.py` or `/path/recipe.py:factory`, default factory `make_config`),
+# and `--a.b.c value` arguments set config fields. Upstream's own surface
+# (`--module` + factory name) is unchanged.
+
+
+def _is_config_file(spec: str) -> bool:
+    return spec.split(":", 1)[0].endswith(".py")
+
+
+def _load_config_file(spec: str) -> Configurable.Config:
+    import importlib.util
+
+    path, _, fn = spec.partition(":")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"--config file {path!r} does not exist")
+    module_spec = importlib.util.spec_from_file_location("_titan_recipe", path)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    name = fn or "make_config"
+    factory = getattr(module, name, None)
+    if factory is None or not callable(factory):
+        raise ValueError(f"{path} has no config factory {name!r}")
+    config = factory()
+    if not isinstance(config, Configurable.Config):
+        raise TypeError(f"{path}:{name} must return Configurable.Config")
+    return config
+
+
+def _apply_field_overrides(config: Any, extra: list[str]) -> None:
+    """`--a.b.c value` (or `--a.b.c=value`, or `--a.b.c` alone for a bool field:
+    true): set that field, the value read as
+    the field's current type (bool: true / false; a list or dict: JSON; None
+    for a field that is None: JSON, else the string)."""
+    import json
+
+    i = 0
+    while i < len(extra):
+        arg = extra[i]
+        if not arg.startswith("--") or len(arg) == 2:
+            raise ValueError(f"unexpected argument {arg!r}")
+        key, eq, value = arg[2:].partition("=")
+        bare = not eq and (i + 1 >= len(extra) or extra[i + 1].startswith("--"))
+        if not eq and not bare:
+            value, i = extra[i + 1], i + 1
+        i += 1
+        # Field names take `_` for `-`; dict keys (e.g. optimizer group names)
+        # are used as written.
+        *path, leaf = key.split(".")
+        target = config
+        for part in path:
+            target = _child(target, part, key)
+        current = _child(target, leaf, key)
+        if bare:  # `--a.b` alone: a bool field set to true
+            if not isinstance(current, bool):
+                raise ValueError(f"--{key} needs a value")
+            value = "true"
+        if isinstance(current, bool):
+            if value.lower() not in ("true", "false", "1", "0"):
+                raise ValueError(f"--{key} is a bool: true or false, got {value!r}")
+            new = value.lower() in ("true", "1")
+        elif isinstance(current, int):
+            new = int(value)
+        elif isinstance(current, float):
+            new = float(value)
+        elif isinstance(current, str):
+            new = value
+        elif isinstance(current, (list, tuple, dict)) or current is None:
+            try:
+                new = json.loads(value)
+            except json.JSONDecodeError:
+                if current is not None:
+                    raise ValueError(f"--{key} needs JSON, got {value!r}") from None
+                new = value
+            if isinstance(current, tuple):
+                new = tuple(new)
+        else:
+            raise ValueError(
+                f"--{key}: cannot set a {type(current).__qualname__} from the command line"
+            )
+        if isinstance(target, dict):
+            target[leaf] = new
+        else:
+            setattr(target, leaf.replace("-", "_"), new)
+
+
+def _child(target: Any, part: str, key: str) -> Any:
+    if isinstance(target, dict):
+        if part not in target:
+            raise ValueError(f"--{key}: no key {part!r} (has {sorted(target)})")
+        return target[part]
+    name = part.replace("-", "_")
+    if not hasattr(target, name):
+        raise ValueError(f"--{key}: {type(target).__qualname__} has no {name!r}")
+    return getattr(target, name)

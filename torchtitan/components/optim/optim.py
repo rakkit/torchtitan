@@ -100,9 +100,11 @@ class Optim(Configurable):
         training_steps: int,
         pp_has_last_stage: bool,
         cuda_graph_annotation_config: dict[str, Any] | None = None,
+        output_dir: str | None = None,
     ) -> None:
         self.config = config
         self.parallelism_context = parallelism_context
+        self.output_dir = output_dir
         self.pp_has_last_stage = pp_has_last_stage
         self.parameters = [
             parameter
@@ -122,7 +124,7 @@ class Optim(Configurable):
                 "Optim graph capture is disabled because the runtime or model "
                 "parameter device does not support graph capture."
             )
-        self.optimizers = config.optimizer.build(
+        self.optimizers = self._build_optimizers(
             model_parts=model_parts,
             enable_accelerator_graph=enable_accelerator_graph,
         )
@@ -145,6 +147,16 @@ class Optim(Configurable):
                 name="optimizer",
                 annotation_config=cuda_graph_annotation_config,
             )
+
+    def _build_optimizers(
+        self, *, model_parts: list[nn.Module], enable_accelerator_graph: bool
+    ) -> OptimizersContainer:
+        """Build the optimizers container. A subclass whose container needs more
+        context (the parallelism context, ``self.output_dir``) overrides this."""
+        return self.config.optimizer.build(
+            model_parts=model_parts,
+            enable_accelerator_graph=enable_accelerator_graph,
+        )
 
     def zero_grad(self, *, set_to_none: bool = True) -> None:
         """Clear gradients owned by the optimizers."""

@@ -706,3 +706,138 @@ def clip_grad_norm_(
     for params in params_by_mesh.values():
         torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm, foreach)
     return total_norm
+
+
+def get_param_dtype(module: torch.nn.Module) -> torch.dtype | None:
+    """Return the dtype parameters of ``module`` have during forward.
+
+    Uses the FSDP mixed-precision policy when there is one, otherwise the dtype
+    of the first parameter. Returns ``None`` for a module with no parameters.
+    """
+    fsdp_state_fn = getattr(module, "_get_fsdp_state", None)
+    param_dtype = None
+    if fsdp_state_fn is not None:
+        fsdp_state = fsdp_state_fn()
+        param_dtype = fsdp_state._mp_policy.param_dtype
+    # In the non-FSDP case, or if the mixed-precision policy did not set a
+    # param_dtype, fall back to the model parameters.
+    if param_dtype is None:
+        first_param = next(module.parameters(), None)
+        param_dtype = None if first_param is None else first_param.dtype
+    return param_dtype
+
+
+# ---------------------------------------------------------------------------
+# Per-rank ("shard-local") metrics logging -- shared predicate.
+#
+# DiSCO partitions per-parameter metric ownership over exactly one mesh, and
+# `metrics.save_all_shard_ranks` must hand a logger to exactly the ranks of
+# that mesh. When the two disagree the failure is silent: the ranks that own a
+# slice compute it, store it, and have no logger to write it to. That is not
+# hypothetical -- it is what pure DDP did before these helpers existed.
+#
+# Keep this the single source of truth. `components/metrics.py` uses it to
+# decide who builds a logger, and DiSCO's metric sink uses it to decide who
+# keeps replicated (embed/scalar) metrics and to assert the two agree.
+# ---------------------------------------------------------------------------
+
+
+def fsdp_shard_mesh(parallelism_context: "ParallelismContext") -> DeviceMesh | None:
+    """The mesh FSDP shards parameters over, under EITHER spmd backend.
+
+    ``parallelism.spmd_backend`` decides how the device mesh is NAMED, not how
+    it is laid out (``distributed/parallelism_context.py``):
+
+    * ``partial_dtensor`` folds ``dp_shard`` and ``cp`` into a single ``fsdp``
+      axis, so ``get_optional_mesh("fsdp")`` works.
+    * ``spmd_types`` keeps them separate -- there IS no ``fsdp`` axis and asking
+      for one raises ``ValueError: Invalid mesh dim: 'fsdp'``. FSDP shards over
+      ``["dp_shard"] (+ ["cp"] when cp > 1)`` there (``distributed/fsdp.py``),
+      which is the SAME device set.
+
+    Verified equivalent at world_size 8: ``fsdp`` is 8 under partial_dtensor for
+    both cp=1 and cp=2; under spmd_types ``dp_shard`` is 8 at cp=1 and
+    ``["dp_shard", "cp"]`` is 8 at cp=2.
+
+    Resolving by backend instead of hard-coding ``"fsdp"`` is what lets DiSCO
+    run under both. It matters beyond Context Parallel: ``partial_dtensor`` is
+    slated for removal upstream (four ``TODO: remove once the partial_dtensor
+    backend is removed`` markers), so hard-coding the name is on borrowed time.
+    """
+    if not parallelism_context.fsdp_enabled:
+        return None
+    if getattr(parallelism_context, "spmd_backend", "spmd_types") == "partial_dtensor":
+        return parallelism_context.get_optional_mesh("fsdp")
+    if not parallelism_context.cp_enabled:
+        return parallelism_context.get_optional_mesh("dp_shard")
+    # With CP on, FSDP shards over dp_shard AND cp (distributed/fsdp.py builds
+    # DataParallelMeshDims(shard=("dp_shard", "cp"))) and `fully_shard`
+    # FLATTENS them into a single "dp_shard_cp" axis. Returning the 2-D
+    # ("dp_shard", "cp") submesh here looks right by `.size()` but is unusable:
+    # `get_group()` and `get_local_rank()` both raise on a mesh with ndim > 1,
+    # which is every caller that does more than ask for the size.
+    sub = parallelism_context.get_optional_mesh(["dp_shard", "cp"])
+    if sub is None:
+        return None
+    return sub._flatten("dp_shard_cp")
+
+
+def metrics_shard_mesh(parallelism_context: "ParallelismContext") -> DeviceMesh | None:
+    """The mesh DiSCO spreads per-parameter metric ownership over.
+
+    This mirrors DiSCO's family classifier (``disco.layout.classify``), and
+    must keep mirroring it:
+
+    * ``fsdp_enabled`` -- every non-scalar param is FSDP or Expert, and both are
+      owned ``param_idx % fsdp_world_size`` on the ``fsdp`` mesh.
+      ``dp_replicate`` then holds bit-identical replicas, so only one replica
+      should log.
+    * otherwise -- every non-scalar param is replicated, owned
+      ``i % world_size`` on the ``dp_replicate`` mesh (DiSCO's replicated
+      family). Here ``dp_replicate`` *is* the shard dimension, so every
+      replica owns a distinct slice and every replica must log.
+
+    Returns None when there is no data-parallel sharding at all (single rank,
+    or PP/TP only), i.e. one rank owns everything.
+    """
+    if parallelism_context.fsdp_enabled:
+        return fsdp_shard_mesh(parallelism_context)
+    if parallelism_context.dp_replicate_enabled:
+        return parallelism_context.get_optional_mesh("dp_replicate")
+    return None
+
+
+def metrics_shard_rank(parallelism_context: "ParallelismContext") -> tuple[int, int]:
+    """``(local_rank, world_size)`` within ``metrics_shard_mesh``; ``(0, 1)`` if none."""
+    mesh = metrics_shard_mesh(parallelism_context)
+    if mesh is None:
+        return 0, 1
+    return mesh.get_local_rank(), mesh.size()
+
+
+def rank_owns_metrics_shard(parallelism_context: "ParallelismContext") -> bool:
+    """Whether this rank owns a distinct slice of the per-parameter metrics.
+
+    The rule ``metrics.save_all_shard_ranks`` is trying to express: *open the
+    mesh ownership is partitioned over, and require local rank 0 in every other
+    mesh.*
+
+    ``tp`` must be rank 0 in both cases -- TP ranks hold shards of the *same*
+    parameter, so they are not distinct logging work.
+    """
+    is_tp_0 = (
+        parallelism_context.get_optional_mesh("tp").get_local_rank() == 0
+        if parallelism_context.tp_enabled
+        else True
+    )
+    if parallelism_context.fsdp_enabled:
+        # `fsdp` is the shard mesh; replicas duplicate it, so pin to replica 0.
+        is_rep_0 = (
+            parallelism_context.get_optional_mesh("dp_replicate").get_local_rank() == 0
+            if parallelism_context.dp_replicate_enabled
+            else True
+        )
+    else:
+        # `dp_replicate` IS the shard mesh -- every replica owns its own slice.
+        is_rep_0 = True
+    return is_tp_0 and is_rep_0

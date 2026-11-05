@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Unit tests for opt_moe_plugins (no GPU required).
+set -euo pipefail
+
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export VLLM_TEST_DISABLE_V1_MULTIPROCESSING=1
+export VLLM_TEST_DISABLE_VLLM_PLUGINS=1
+export TOKENIZERS_PARALLELISM=false
+
+export VLLM_TEST_SEED=0
+export VLLM_TEST_FIX_MISTRAL_REGEX=1
+export VLLM_TEST_DISABLE_PREFIX_CACHING=1
+
+export VLLM_STAGING_MOE_DISABLE_FUSED=0
+export VLLM_STAGING_MOE_DISABLE_FUSED_TOPK_BIAS=0
+export VLLM_OPT_MOE_DISABLE_FUSED=0
+export VLLM_OPT_MOE_DISABLE_FUSED_TOPK_BIAS=0
+
+python -m pytest opt_moe_plugins/tests/unit -v "$@"

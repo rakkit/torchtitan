@@ -28,6 +28,7 @@ from torchtitan.components.optim import OptimizersContainer
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelismContext
 from torchtitan.observability.logging import Color, NoColor
+from torchtitan.distributed.utils import rank_owns_metrics_shard
 from torchtitan.tools import utils
 from torchtitan.tools.utils import device_module, device_type
 
@@ -179,8 +180,39 @@ class TensorBoardLogger(BaseLogger):
         self.writer.close()
 
 
+def _logs_here(config, parallelism_context: ParallelismContext) -> bool:
+    """With `save_for_all_ranks`, whether this rank logs: every rank, or only
+    the ranks that own a distinct slice of DiSCO's metrics
+    (`save_all_shard_ranks`), or local rank 0 of the loss and TP meshes
+    (`save_first_dp_and_tp`)."""
+    if config.save_all_shard_ranks:
+        return rank_owns_metrics_shard(parallelism_context)
+    if config.save_first_dp_and_tp:
+        loss_mesh = parallelism_context.get_optional_mesh("loss")
+        tp_mesh = parallelism_context.get_optional_mesh("tp")
+        return (loss_mesh is None or loss_mesh.get_local_rank() == 0) and (
+            tp_mesh is None or tp_mesh.get_local_rank() == 0
+        )
+    return True
+
+
+def wandb_run_per_rank(config, *, pp_enabled: bool) -> bool:
+    """Whether more than one rank writes a W&B run (see `_logs_here`):
+    `save_first_dp_and_tp` still logs once per PP stage."""
+    return config.save_for_all_ranks and (
+        config.save_all_shard_ranks or not config.save_first_dp_and_tp or pp_enabled
+    )
+
+
 class WandBLogger(BaseLogger):
-    """Logger implementation for Weights & Biases."""
+    """Logger implementation for Weights & Biases.
+
+    With `rank` set (several ranks log), each rank writes its own run,
+    `<name>-rank<N>` / `<id>-rank<N>`, all in one group (`WANDB_RUN_GROUP`, else
+    the run name, else `default_group`), which the W&B UI folds into one row.
+    One id on every rank would make the offline runs overwrite each other on
+    `wandb sync`.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseLogger.Config):
@@ -193,6 +225,8 @@ class WandBLogger(BaseLogger):
         log_dir: str,
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
+        rank: int | None = None,
+        default_group: str | None = None,
     ):
         # Import wandb here to avoid startup import
         import wandb
@@ -207,15 +241,23 @@ class WandBLogger(BaseLogger):
         tags = None
         if tags_env := os.getenv("WANDB_RUN_TAGS"):
             tags = [t.strip() for t in tags_env.split(",") if t.strip()] or None
+        name = os.getenv("WANDB_RUN_NAME", None)
+        run_id = os.getenv("WANDB_RUN_ID", None)
+        group = os.getenv("WANDB_RUN_GROUP", None)
+        if rank is not None:  # one W&B run per logging rank, grouped
+            name = name or os.getenv("WANDB_NAME", None)
+            group = group or name or run_id or default_group
+            name = f"{name or group}-rank{rank}"
+            run_id = f"{run_id}-rank{rank}" if run_id else None
 
         self.wandb.init(
             entity=os.getenv("WANDB_TEAM", None),
             project=os.getenv("WANDB_PROJECT", "torchtitan"),
-            name=os.getenv("WANDB_RUN_NAME", None),
-            id=os.getenv("WANDB_RUN_ID", None),
+            name=name,
+            id=run_id,
             notes=os.getenv("WANDB_RUN_NOTES", None),
             tags=tags,
-            group=os.getenv("WANDB_RUN_GROUP", None),
+            group=group,
             job_type=os.getenv("WANDB_RUN_JOB_TYPE", None),
             resume_from=os.getenv("WANDB_RESUME_FROM", None),
             fork_from=os.getenv("WANDB_FORK_FROM", None),
@@ -229,7 +271,9 @@ class WandBLogger(BaseLogger):
             (k if self.tag is None else f"{self.tag}/{k}"): v
             for k, v in metrics.items()
         }
-        self.wandb.log(wandb_metrics, step=step, commit=True)
+        # No commit: the row stays open for later writes at this step (validation
+        # logs after training); the next step or `close` commits it.
+        self.wandb.log(wandb_metrics, step=step)
 
     def close(self) -> None:
         if self.wandb.run is not None:
@@ -407,6 +451,31 @@ class MetricsProcessor(Configurable):
         only stage that computes loss metrics.
         """
 
+        save_all_shard_ranks: bool = False
+        """
+        Whether every shard rank saves its own metrics instead of one rank
+        saving metrics gathered from all of them.
+
+        Logs on exactly the ranks that own a distinct slice of the metrics --
+        the mesh DiSCO partitions parameter ownership over is opened up, and
+        local rank 0 is required in every other mesh (see
+        distributed/utils.rank_owns_metrics_shard):
+
+          * with FSDP/EP: any fsdp rank, at dp_replicate rank 0 and tp rank 0.
+            Replicas hold bit-identical copies, so only one logs.
+          * pure DDP: ownership is spread over dp_replicate itself, so *every*
+            dp_replicate rank logs, at tp rank 0.
+
+        Each shard rank already computes exactly its own subset, so the union
+        across ranks equals what the single-rank path logs. This lets DiSCO skip
+        the logging all_gather and stops one rank building the metrics dict for
+        the whole model. The cost is one W&B run per shard rank.
+        """
+
+        save_first_dp_and_tp: bool = False
+        """Log only from local rank 0 of the loss mesh (dp_replicate x dp_shard
+        x cp) and tp rank 0."""
+
         def __post_init__(self) -> None:
             if self.log_freq <= 0:
                 raise ValueError("metrics.log_freq must be greater than 0.")
@@ -456,16 +525,24 @@ class MetricsProcessor(Configurable):
                 log_dir = os.path.join(log_dir, f"replica_{ft_replica_id}")
             if config.save_for_all_ranks:
                 log_dir = os.path.join(log_dir, f"rank_{rank}")
+            logs_here = _logs_here(config, parallelism_context)
+            per_rank = wandb_run_per_rank(
+                config, pp_enabled=parallelism_context.pp_enabled
+            )
             for logger_config in config.loggers:
                 if rank != metrics_rank and (
-                    not config.save_for_all_ranks or logger_config.metrics_rank_only
+                    not config.save_for_all_ranks
+                    or logger_config.metrics_rank_only
+                    or not logs_here
                 ):
                     continue
-                self.loggers.append(
-                    logger_config.build(
-                        log_dir=log_dir, config_dict=config_dict, tag=tag
+                kw = dict(log_dir=log_dir, config_dict=config_dict, tag=tag)
+                if per_rank and isinstance(logger_config, WandBLogger.Config):
+                    kw.update(
+                        rank=rank,
+                        default_group=os.path.basename(os.path.normpath(dump_folder)),
                     )
-                )
+                self.loggers.append(logger_config.build(**kw))
         self.parallelism_context = parallelism_context
         self.config = config
         self.device_memory_monitor = device_memory_monitor
@@ -593,8 +670,21 @@ class MetricsProcessor(Configurable):
         self.device_memory_monitor.reset_peak_stats()
 
     def log_validation(
-        self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
+        self,
+        loss: float,
+        step: int,
+        extra_metrics: dict[str, Any] | None = None,
+        tag: str | None = None,
     ):
+        if tag is not None:  # another weight set scored at this step: its loss only
+            for metric_logger in self.loggers:
+                metric_logger.log({f"validation_metrics/{tag}/loss": loss}, step)
+            logger.info(
+                f"{self.color.yellow}validate step: {step:2}  [{tag}]  {self.color.green}loss: {loss:7.4f}{self.color.reset}"
+            )
+            self.ntokens_since_last_log = 0
+            self.time_last_log = time.perf_counter()
+            return
         time_delta = time.perf_counter() - self.time_last_log
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()

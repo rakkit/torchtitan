@@ -1,0 +1,144 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""The residual capture (OPTMoEModel._trunk, armed on logging steps) under
+activation recompute (torch_remat's default regions), on one GPU: the captured
+RMS equals an eager recomputation, and an armed step's forward and backward are
+bitwise those of an unarmed step (the hard check). (llm-0.5.4 also tested its
+per-block compile here; upstream removed that compile.)
+"""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
+from torchtitan.models.opt_moe import model_registry
+from torchtitan.optimizers import model_stats
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+DOCS = (640, 384)  # one block-causal batch of 1024 tokens, two documents
+VOCAB = 1024
+
+
+def _model(*, dtype: torch.dtype, seed: int = 0, remat: bool = True):
+    cfg = model_registry("gauge-d16-w512")
+    cfg.n_layers, cfg.vocab_size = 2, VOCAB
+    cfg.layer.norm_type = cfg.layer.attention.norm_type = cfg.norm_type = "rmsnorm"
+    cfg.layer.depth_init = "identity"
+    cfg.finalize(parallelism=ParallelismConfig(), max_context_length=4096)
+    with torch.device("meta"):
+        model = cfg.build()
+    model.to_empty(device="cuda")
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        model.init_states(buffer_device=torch.device("cuda"))
+    model.to(dtype)
+    if remat:
+        DefaultActivationRematConfig().apply(model)
+    return model
+
+
+def _batch(seed: int):
+    g = torch.Generator().manual_seed(seed)
+    tokens = torch.randint(0, VOCAB, (sum(DOCS),), generator=g).cuda()
+    positions = torch.cat([torch.arange(n) for n in DOCS]).cuda()
+    return tokens, positions
+
+
+def _masks(model, positions):
+    return model._get_attention_metadata(positions)
+
+
+def _step(model, tokens, positions, *, armed: bool):
+    """One forward + backward; returns (output, loss, {name: grad}) and leaves no grads."""
+    model.zero_grad(set_to_none=True)
+    if armed:
+        model_stats.arm_residual_capture([model])
+    out = model(tokens, positions, _masks(model, positions))
+    loss = torch.nn.functional.cross_entropy(out.float(), torch.roll(tokens, -1))
+    loss.backward()
+    stats = model_stats.residual_metrics([model], parallelism_context=None) if armed else {}
+    assert model.residual_capture is None
+    grads = {n: p.grad.detach().clone() for n, p in model.named_parameters()}
+    model.zero_grad(set_to_none=True)
+    return out.detach().clone(), loss.detach().clone(), grads, stats
+
+
+def _assert_bitwise(a, b, label):
+    out_a, loss_a, grads_a, _ = a
+    out_b, loss_b, grads_b, _ = b
+    assert torch.equal(out_a, out_b), f"{label}: output"
+    assert torch.equal(loss_a, loss_b), f"{label}: loss"
+    assert grads_a.keys() == grads_b.keys()
+    for n in grads_a:
+        assert torch.equal(grads_a[n], grads_b[n]), f"{label}: grad {n}"
+
+
+def test_captured_rms_equals_eager_recomputation():
+    """fp32: the capture of the recompute-wrapped model matches the RMS
+    recomputed by hooks on a plain twin with the same weights and input."""
+    comp = _model(dtype=torch.float32)
+    eager = _model(dtype=torch.float32, remat=False)
+    tokens, positions = _batch(7)
+    seen = {}
+    handles = []
+    for i, block in eager.layers.items():
+
+        def pre(m, args, kwargs, i=i):
+            seen[("in", i)] = args[0].detach().double()
+
+        def post(m, args, kwargs, out, i=i):
+            seen[("out", i)] = out.detach().double()
+
+        handles += [
+            block.register_forward_pre_hook(pre, with_kwargs=True),
+            block.register_forward_hook(post, with_kwargs=True),
+        ]
+    with torch.no_grad():
+        eager(tokens, positions, _masks(eager, positions))
+    for h in handles:
+        h.remove()
+    last = max(eager.layers.keys(), key=int)
+    want = {}
+    for i in eager.layers.keys():
+        x, y = seen[("in", i)], seen[("out", i)]
+        want[f"residual_rms/in/L-{i}"] = math.sqrt(float(x.square().mean()))
+        want[f"residual_rms/write/L-{i}"] = math.sqrt(float((y - x).square().mean()))
+    want["residual_rms/final_norm_in"] = math.sqrt(
+        float(seen[("out", last)].square().mean())
+    )
+    _, _, _, got = _step(comp, tokens, positions, armed=True)
+    assert got.keys() == want.keys()
+    for k, v in want.items():
+        assert got[k] == pytest.approx(v, rel=1e-5), k
+
+
+def test_armed_forward_and_backward_are_bitwise():
+    """The hard check (bf16, recompute): unarmed / armed / unarmed on one model,
+    and a fresh model armed first -- outputs, loss and every gradient
+    torch.equal."""
+    a = _model(dtype=torch.bfloat16, seed=3)
+    tokens, positions = _batch(11)
+    _step(a, tokens, positions, armed=False)  # warmup
+    u1 = _step(a, tokens, positions, armed=False)
+    on = _step(a, tokens, positions, armed=True)
+    u2 = _step(a, tokens, positions, armed=False)
+    assert on[3], "the armed step captured nothing"
+    _assert_bitwise(u1, on, "unarmed vs armed")
+    _assert_bitwise(u1, u2, "unarmed vs unarmed after an armed step")
+
+    b = _model(dtype=torch.bfloat16, seed=3)
+    first = _step(b, tokens, positions, armed=True)  # armed first
+    then = _step(b, tokens, positions, armed=False)
+    _assert_bitwise(first, then, "fresh model: armed first vs unarmed after")
+    # Across the two models this also compares two compilations of the same code.
+    _assert_bitwise(u1, first, "first model unarmed vs fresh model armed first")

@@ -95,18 +95,18 @@ def test_unknown_config_lists_available_functions() -> None:
         )
 
 
-def test_general_config_flags_are_rejected() -> None:
-    with pytest.raises(SystemExit):
-        ConfigLoader().load(
-            [
-                "--module",
-                "torchtitan_recipes.tests.models.llama3",
-                "--config",
-                "llama3_debugmodel",
-                "--training.steps",
-                "5",
-            ]
-        )
+def test_field_flags_set_existing_fields_only() -> None:
+    """This fork's loader extension (LLM_054_PLAN.md Q-C): `--a.b value` sets an
+    existing config field, typed by its current value; an unknown one is refused."""
+    base = [
+        "--module",
+        "torchtitan_recipes.tests.models.llama3",
+        "--config",
+        "llama3_debugmodel",
+    ]
+    assert ConfigLoader().load(base + ["--training.steps", "5"]).training.steps == 5
+    with pytest.raises(ValueError, match="has no 'not_a_field'"):
+        ConfigLoader().load(base + ["--training.not_a_field", "5"])
 
 
 def test_operational_overrides() -> None:

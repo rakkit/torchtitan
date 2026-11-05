@@ -156,7 +156,7 @@ def test_graph_engine_pp_does_not_initialize_eager_schedule():
             [
                 "train checkpoint eval:blocked",
                 "train checkpoint eval:allowed",
-                "train checkpoint",
+                "train checkpoint eval:allowed",  # this fork also validates on the last step
             ],
             id="eval-not-due",
         ),
@@ -176,7 +176,7 @@ def test_graph_engine_pp_does_not_initialize_eager_schedule():
             [
                 "train checkpoint eval:allowed",
                 "train checkpoint eval:allowed",
-                "train checkpoint",
+                "train checkpoint eval:allowed",  # this fork also validates on the last step
             ],
             id="capture-disabled",
         ),
@@ -188,7 +188,7 @@ def test_graph_engine_pp_does_not_initialize_eager_schedule():
             [
                 "train checkpoint eval:allowed",
                 "train checkpoint eval:allowed",
-                "train checkpoint",
+                "train checkpoint eval:allowed",  # this fork also validates on the last step
             ],
             id="unsupported-platform",
         ),

@@ -24,7 +24,7 @@ from torchtitan.distributed.fsdp_lifecycle import complete_fsdp_grouped_forward
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.base.module import Module
 from torchtitan.models.common.linear import GroupedLinear
-from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.moe import MoE, RoutedExperts
 
 __all__ = [
     "apply_fsdp_to_decoder",
@@ -313,6 +313,7 @@ def apply_fsdp_to_decoder(
     dp_mesh_dims: "DataParallelMeshDims | None" = None,
     edp_mesh_dims: "DataParallelMeshDims | None" = None,
     symm_mem_scope: FSDPSymmMemScope = None,
+    expert_shard_dim: int | None = None,
 ):
     """
     Apply data parallelism (via FSDP2) to a decoder-style transformer model.
@@ -353,6 +354,15 @@ def apply_fsdp_to_decoder(
         edp_mesh_dims: Sibling of ``dp_mesh_dims`` for the sparse SPMD mesh
             used by routed experts.
         symm_mem_scope: Which FSDP modules use symmetric-memory communication.
+        expert_shard_dim (int | None): Pin routed-expert params to this shard
+            dim instead of choosing one by heuristic. ``None`` (default) keeps
+            the heuristic: ``Shard(1)`` when the shard degree exceeds
+            ``num_experts``, else ``Shard(0)``. ``opt_moe`` pins ``0`` because
+            DiSCO's expert path does the LMO on each rank's LOCAL buffer with
+            no gather, which is only the true LMO when a rank owns WHOLE expert
+            matrices -- i.e. under ``Shard(0)``. Under ``Shard(1)`` each rank
+            holds a row-block of every expert, so orthogonalizing it is not
+            orthogonalizing the matrix.
     """
     mp_policy = mixed_precision_policy(
         model,
@@ -419,8 +429,16 @@ def apply_fsdp_to_decoder(
         #   shard their output features when FSDP degree > num_experts
         # Dense blocks use the default mesh with only stacked-parameter
         # placement overrides.
+        # Upstream's MoE, or any MoE module built on upstream's RoutedExperts
+        # (opt_moe's NormMoE): its experts take the expert placements below.
         moe = next(
-            (m for m in transformer_block.children() if isinstance(m, MoE)), None
+            (
+                m
+                for m in transformer_block.children()
+                if isinstance(m, MoE)
+                or isinstance(getattr(m, "routed_experts", None), RoutedExperts)
+            ),
+            None,
         )
         if moe is not None:
             routed_experts = moe.routed_experts
@@ -439,16 +457,24 @@ def apply_fsdp_to_decoder(
                 if "cp" in dp_storage_mesh.mesh_dim_names:
                     expert_sharding_size *= dp_storage_mesh["cp"].size()
 
-            expert_param_placements = {
-                param: Shard(0) for param in routed_experts.parameters()
-            }
-            if expert_sharding_size > num_experts:
-                expert_param_placements.update(
-                    linear_param_shard_placements(
-                        routed_experts,
-                        include_unstacked_grouped=True,
+            if expert_shard_dim is not None:
+                # Caller pinned the dim (opt_moe pins 0 for DiSCO); the
+                # row-sharding fallback below must not override it.
+                expert_param_placements = {
+                    param: Shard(expert_shard_dim)
+                    for param in routed_experts.parameters()
+                }
+            else:
+                expert_param_placements = {
+                    param: Shard(0) for param in routed_experts.parameters()
+                }
+                if expert_sharding_size > num_experts:
+                    expert_param_placements.update(
+                        linear_param_shard_placements(
+                            routed_experts,
+                            include_unstacked_grouped=True,
+                        )
                     )
-                )
             if ep_degree == 1:
                 param_placements = stacked_param_placements.copy()
                 param_placements.update(expert_param_placements)

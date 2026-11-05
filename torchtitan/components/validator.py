@@ -43,6 +43,13 @@ from torchtitan.tools import utils
 logger = logging.getLogger(__name__)
 
 
+def validation_seq_len(validator_config: Any, max_context_length: int) -> int:
+    """Sequence length of the validation sequences: the validator's own
+    ``fixed_seq_len`` when set, else the training ``max_context_length``."""
+    fixed = getattr(validator_config, "fixed_seq_len", None)
+    return max_context_length if fixed is None else fixed
+
+
 class BaseValidator(Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
@@ -62,11 +69,19 @@ class BaseValidator(Configurable):
     ):
         self.config = config
 
-    def validate(self, model_parts: list[BaseModel], step: int) -> None:
+    def validate(
+        self, model_parts: list[BaseModel], step: int, tag: str | None = None
+    ) -> None:
         raise NotImplementedError("validate method not implemented")
 
-    def should_validate(self, step: int) -> bool:
-        return step == 1 or step % self.config.freq == 0
+    def should_validate(self, step: int, total_steps: int | None = None) -> bool:
+        """Step 1, every `freq`-th step, and the last step (`total_steps`)
+        even when it does not land on a `freq` boundary."""
+        return (
+            step == 1
+            or step % self.config.freq == 0
+            or (total_steps is not None and step == total_steps)
+        )
 
 
 class Validator(BaseValidator):
@@ -111,14 +126,48 @@ class Validator(BaseValidator):
         )
         """DataLoader configuration for validation"""
 
+        slice_shards: int = 0
+        """Score one fixed slice whatever the data-parallel degree and the
+        training microbatch: the dataset read as `slice_shards` data-parallel
+        shards, in order, the first `slice_sequences` sequences of each, in
+        microbatches of `slice_microbatch` sequences, split evenly over the
+        ranks (`slice_plan`). `steps` stays -1: the slice sets the step count.
+        0: each rank reads its own shard for `steps` training microbatches, so
+        the tokens scored depend on both."""
+
+        slice_sequences: int = 0
+        slice_microbatch: int = 0
+
+        fixed_seq_len: int | None = None
+        """Sequence length of the validation sequences. None: the training
+        ``max_context_length`` (the trainer passes ``validation_seq_len``). Set it
+        to score runs with different training context lengths on the same
+        sequences."""
+
         def __post_init__(self):
             BaseValidator.Config.__post_init__(self)
+            if self.fixed_seq_len is not None and self.fixed_seq_len <= 0:
+                raise ValueError(
+                    f"validator fixed_seq_len must be positive, got {self.fixed_seq_len}"
+                )
             if not (self.steps > 0 or self.steps == -1):
                 raise ValueError(
                     f"validation steps must be positive or -1, got {self.steps}"
                 )
+            fixed = (self.slice_shards, self.slice_sequences, self.slice_microbatch)
+            if any(fixed) and not all(x > 0 for x in fixed):
+                raise ValueError(
+                    "set slice_shards, slice_sequences and slice_microbatch all "
+                    f"positive, or all 0; got {fixed}"
+                )
+            if any(fixed) and self.steps != -1:
+                raise ValueError("a fixed slice sets the step count: leave steps at -1")
 
     # TODO: improve the constructor signature
+    # The fixed validation slice: (shard, skip, take) per microbatch run of this
+    # rank, from the config's slice fields; None reads the validation loader.
+    plan: list[tuple[int, int, int]] | None = None
+
     def __init__(
         self,
         config: Config,
@@ -144,11 +193,24 @@ class Validator(BaseValidator):
         self.tokenizer = tokenizer
         self.parallelism_context = parallelism_context
         self.loss_fn = loss_fn
-        # A bounded validation run repeats data; steps=-1 consumes one finite pass.
-        self.dl_config = replace(config.dataloader, repeat=config.steps != -1)
         self.dp_world_size = dp_world_size
         self.dp_rank = dp_rank
-        if config.steps == -1 and self.dp_world_size > 1:
+        if config.slice_shards:
+            if pp_schedule is not None:
+                raise ValueError("a fixed validation slice does not support PP")
+            self.plan = slice_plan(
+                config.slice_shards,
+                config.slice_sequences,
+                config.slice_microbatch,
+                dp_world_size,
+                dp_rank,
+            )
+            # Every rank takes the same count, so the collectives line up.
+            self.dl_config = replace(config.dataloader, repeat=True)
+        else:
+            # A bounded validation run repeats data; steps=-1 consumes one finite pass.
+            self.dl_config = replace(config.dataloader, repeat=config.steps != -1)
+        if config.steps == -1 and self.dp_world_size > 1 and self.plan is None:
             raise ValueError(
                 "validation.steps=-1 runs one finite pass (dataloader "
                 "repeat=False). With data-parallel degree > 1, ranks can exhaust "
@@ -177,13 +239,31 @@ class Validator(BaseValidator):
                 "using eager validation."
             )
 
-    def should_validate(self, step: int) -> bool:
+    def _slice_microbatches(self) -> Iterator[TrainingMicrobatch]:
+        """This rank's microbatches of the fixed slice, in order."""
+        cfg = self.config
+        for shard, skip, take in self.plan:
+            loader = self.dl_config.build(
+                dp_world_size=cfg.slice_shards,
+                dp_rank=shard,
+                tokenizer=self.tokenizer,
+                max_context_length=self.seq_len,
+                num_tokens_per_microbatch=cfg.slice_microbatch * self.seq_len,
+            )
+            it = iterate_and_close_dataloader(loader)
+            for _ in range(skip):
+                next(it)
+            for _ in range(take):
+                yield next(it)
+            it.close()
+
+    def should_validate(self, step: int, total_steps: int | None = None) -> bool:
         """Return whether validation is scheduled or eval capture is pending.
 
         With eval accelerator graphs enabled, validate after each training update until
         eval captures. These passes warm up eval and capture it before training capture.
         """
-        return super().should_validate(step) or (
+        return super().should_validate(step, total_steps) or (
             self._accelerator_graph_enabled
             and not accelerator_graph_manager.capture_allowed
         )
@@ -272,6 +352,7 @@ class Validator(BaseValidator):
         self,
         model_parts: list[BaseModel],
         step: int,
+        tag: str | None = None,
     ) -> None:
         modes = [
             (module, module.training) for m in model_parts for module in m.modules()
@@ -297,20 +378,23 @@ class Validator(BaseValidator):
                 else 1
             )
 
-            validation_dataloader = self.dl_config.build(
-                dp_world_size=self.dp_world_size,
-                dp_rank=self.dp_rank,
-                tokenizer=self.tokenizer,
-                max_context_length=self.seq_len,
-                num_tokens_per_microbatch=self.num_tokens_per_microbatch,
-            )
-
-            validation_iterator = iter(
-                iterate_and_close_dataloader(validation_dataloader)
-            )
+            if self.plan is None:
+                validation_dataloader = self.dl_config.build(
+                    dp_world_size=self.dp_world_size,
+                    dp_rank=self.dp_rank,
+                    tokenizer=self.tokenizer,
+                    max_context_length=self.seq_len,
+                    num_tokens_per_microbatch=self.num_tokens_per_microbatch,
+                )
+                validation_iterator = iter(
+                    iterate_and_close_dataloader(validation_dataloader)
+                )
+                max_steps = self.config.steps
+            else:  # this rank's microbatches of the fixed slice
+                validation_iterator = self._slice_microbatches()
+                max_steps = sum(take for _, _, take in self.plan)
             while True:
-                # pyrefly: ignore [missing-attribute, unsupported-operation]
-                if self.config.steps != -1 and num_steps >= self.config.steps:
+                if max_steps != -1 and num_steps >= max_steps:
                     break
 
                 try:
@@ -384,10 +468,40 @@ class Validator(BaseValidator):
                 global_loss_sum = float(accumulated_loss.item())
             global_avg_loss = global_loss_sum / num_global_valid_tokens
 
-            self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
+            # tag only when set: the untagged call is upstream's
+            self.metrics_processor.log_validation(
+                loss=global_avg_loss,
+                step=step,
+                **({"tag": tag} if tag is not None else {}),
+            )
         finally:
             for module, training in modes:
                 module.training = training
+
+
+def slice_plan(
+    shards: int, sequences: int, microbatch: int, world: int, rank: int
+) -> list[tuple[int, int, int]]:
+    """Rank `rank` of `world`'s share of a fixed validation slice, as
+    (shard, microbatches to skip, microbatches to take) per shard it touches.
+    The slice is the first `sequences` sequences of each of `shards` shards, in
+    shard order; the ranks take equal consecutive runs of it."""
+    total = shards * sequences
+    if sequences % microbatch or total % (world * microbatch):
+        raise ValueError(
+            f"a slice of {shards} x {sequences} sequences does not split into "
+            f"microbatches of {microbatch} evenly over {world} ranks"
+        )
+    per = total // world
+    lo, hi = rank * per, (rank + 1) * per
+    out = []
+    for shard in range(shards):
+        a, b = max(lo, shard * sequences), min(hi, (shard + 1) * sequences)
+        if a < b:
+            out.append(
+                (shard, (a - shard * sequences) // microbatch, (b - a) // microbatch)
+            )
+    return out
 
 
 def iterate_and_close_dataloader(

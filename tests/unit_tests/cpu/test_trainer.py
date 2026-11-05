@@ -128,7 +128,7 @@ def _training_loop(trainer: TrainingEngine) -> SimpleNamespace:
     if not hasattr(trainer.config, "model"):
         trainer.config.model = SimpleNamespace(traverse=lambda _: iter(()))
 
-    return SimpleNamespace(
+    fake_trainer = SimpleNamespace(
         engine=trainer,
         config=trainer.config,
         gradient_accumulation_steps=trainer.gradient_accumulation_steps,
@@ -136,6 +136,15 @@ def _training_loop(trainer: TrainingEngine) -> SimpleNamespace:
         metrics_processor=trainer.metrics_processor,
         _local_num_flops_since_last_log=0,
     )
+    # Same idiom as the attributes patched onto `trainer` above: a duck-typed
+    # `self` still has to carry what `train_step` reads off it. A
+    # SimpleNamespace does not inherit Trainer's class-level
+    # `data_mix_metrics` null object, so it needs one of its own.
+    fake_trainer.data_mix_metrics = Trainer.data_mix_metrics
+    fake_trainer._is_final_step = lambda step: Trainer._is_final_step(
+        fake_trainer, step
+    )
+    return fake_trainer
 
 
 def test_microbatch_generator_preserves_labels() -> None:
@@ -882,8 +891,10 @@ def test_initialize_optim_builds_component() -> None:
                 optim=optim_config,
                 profiler=Profiler.Config(),
                 training=SimpleNamespace(steps=10),
+                averages=None,
             ),
             model_parts=[MagicMock()],
+            output_dir="./outputs",
             pp_has_last_stage=True,
             model_cls=SimpleNamespace(_register_optimizer_hooks=MagicMock()),
             parallelism_context=MagicMock(),
@@ -898,6 +909,7 @@ def test_initialize_optim_builds_component() -> None:
         training_steps=10,
         pp_has_last_stage=True,
         cuda_graph_annotation_config=None,
+        output_dir="./outputs",
     )
     engine.model_cls._register_optimizer_hooks.assert_called_once_with(
         optim.optimizers,

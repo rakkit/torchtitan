@@ -109,6 +109,13 @@ def decoder_input_sharding() -> dict[str, SpmdType]:
     return {
         "input": token_id_placement(),
         "positions": token_id_placement(),
+        # Optional per-token document id, sharded exactly like `positions` so a
+        # CP shard can tell a document boundary from a load-balancer seam.
+        # `positions` alone cannot: "headtail" concatenates two NON-adjacent
+        # global chunks, and the join carries no reset, so a reset-only rule
+        # merges two unrelated documents. Only models that emit `doc_id` pay
+        # for this; `prepare_context_parallel_input` ignores absent keys.
+        "doc_id": token_id_placement(),
         "padding_mask": token_id_placement(),
         "labels": SpmdType(
             {DP: spmd.V, CP: spmd.V, TP: spmd.I},

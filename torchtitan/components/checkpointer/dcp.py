@@ -181,6 +181,7 @@ class CheckpointManager(BaseCheckpointManager):
         # Loading & Saving Policy
         self.load_only = config.load_only
         self.exclude_from_loading = config.exclude_from_loading
+
         self.initial_load_path = config.initial_load_path
         self.initial_load_model_only = config.initial_load_model_only
         self.initial_load_in_hf = config.initial_load_in_hf

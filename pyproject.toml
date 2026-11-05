@@ -28,7 +28,7 @@ optional-dependencies.flux = {file = [".ci/docker/requirements-flux.txt"]}
 
 [tool.codespell]
 skip = ["*.json"]
-ignore-words-list = ["assertin", "datas" ,"indx", "inpt", "nd", "socio-economic"]
+ignore-words-list = ["assertin", "datas" ,"indx", "inpt", "nd", "socio-economic", "fro", "numer"]
 
 # ---- Explicit project build information ---- #
 [build-system]

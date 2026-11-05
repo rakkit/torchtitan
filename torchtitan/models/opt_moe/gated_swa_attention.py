@@ -11,22 +11,51 @@ import torch_remat as remat
 from torch import nn
 
 from torchtitan.distributed.local_compile import local_compile
+from torchtitan.distributed.parallelism_context import MeshAxisName
+from torchtitan.distributed.spmd_types import spmd_mesh_group
 from torchtitan.models.common.attention import (
     FlexAttentionMetadata,
     GQAttention,
     VarlenAttentionMetadata,
 )
+from torchtitan.models.common.attention.cp_attention import CPInnerAttention
+from torchtitan.models.common.attention.cp_linear_attention import (
+    ContextParallelLinearAttentionMetadata,
+    prepare_cp_linear_attention_metadata,
+)
 from torchtitan.models.common.attention.linear_attention import LinearAttentionMetadata
-from torchtitan.models.common.attn_gym import causal_conv1d, require_attn_gym
+from torchtitan.models.common.attn_gym import (
+    causal_conv1d,
+    context_parallel_conv_history,
+    ContextParallelRouting,
+    require_attn_gym,
+)
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Conv1d
 from torchtitan.models.common.param_layout import named, ParamLayout, qkv_units
 
 
-class ShortConvDocuments:
+class ShortConvDocuments(
+    CPInnerAttention[LinearAttentionMetadata, ContextParallelLinearAttentionMetadata]
+):
     """The key of the Canon short conv's document offsets in the attention
-    metadata map (an ``LinearAttentionMetadata``, built by
-    ``OPTMoEModel._get_attention_metadata`` from the positions); never built."""
+    metadata map (a ``LinearAttentionMetadata``, built by
+    ``OPTMoEModel._get_attention_metadata`` from the positions); never built.
+
+    A ``CPInnerAttention`` so that upstream's ``Decoder._cp_shard`` prepares the
+    entry with the batch's CP token permutation, as it does for Gated DeltaNet's
+    conv: the result routes each local fragment's ``W - 1`` preceding tokens,
+    held by whichever rank owns them."""
+
+    @staticmethod
+    def prepare_cp_metadata(
+        attention_metadata: LinearAttentionMetadata,
+        *,
+        permutation: torch.Tensor | None,
+    ) -> ContextParallelLinearAttentionMetadata:
+        return prepare_cp_linear_attention_metadata(
+            attention_metadata, permutation=permutation, family="OPT MoE short conv"
+        )
 
 
 def canon_short_conv(
@@ -38,12 +67,26 @@ def canon_short_conv(
     on a token-flat stream: attn_gym's depthwise causal conv (``nn.Conv1d``
     orientation: ``w[..., -1]`` multiplies the current token; fp32
     accumulation), restarted at every document of ``conv_metadata`` (None: one
-    document)."""
-    varlen = None if conv_metadata is None else conv_metadata.varlen
+    document). Under CP (``ContextParallelLinearAttentionMetadata``) the rank's
+    tokens are fragments of the global order; each fragment starts from the
+    ``W - 1`` tokens before it, exchanged across the CP ranks (upstream's
+    ``context_parallel_conv_history``, differentiable)."""
+    initial_state = None
+    if isinstance(conv_metadata, ContextParallelLinearAttentionMetadata):
+        routing = conv_metadata.cp_routing
+        cu_seqlens = routing.cu_seqlens
+        initial_state = context_parallel_conv_history(
+            x_TC.unsqueeze(0), routing, spmd_mesh_group(MeshAxisName.CP)
+        )
+    elif conv_metadata is not None and conv_metadata.varlen is not None:
+        cu_seqlens = conv_metadata.varlen.cu_seq_q
+    else:
+        cu_seqlens = None
     conv_1TC = causal_conv1d(
         x_TC.unsqueeze(0),
         weight_C1W.squeeze(1).to(x_TC.dtype),
-        cu_seqlens=None if varlen is None else varlen.cu_seq_q,
+        cu_seqlens=cu_seqlens,
+        initial_state=initial_state,
     )
     return conv_1TC.squeeze(0) + x_TC
 
@@ -115,7 +158,9 @@ class GatedSWAttention(GQAttention):
         self.k_conv = config.k_conv.build() if config.k_conv is not None else None
         self.v_conv = config.v_conv.build() if config.v_conv is not None else None
         if self.k_conv is not None:
-            require_attn_gym(causal_conv1d)
+            require_attn_gym(
+                causal_conv1d, context_parallel_conv_history, ContextParallelRouting
+            )
         self.sinks = (
             nn.Parameter(torch.empty(self.n_heads)) if config.attention_sinks else None
         )

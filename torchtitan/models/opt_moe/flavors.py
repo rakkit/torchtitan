@@ -265,15 +265,9 @@ def build_opt_moe_layers(
     dispatcher: all-to-all under EP, local dispatch without (DeepEP / HybridEP:
     upstream's ``TokenDispatcherTransform`` on the recipe).
 
-    ``enable_cp``: the attention runs under Context Parallel (flex backends
-    only, no conv or sinks).
+    ``enable_cp``: the attention runs under Context Parallel (all-gather K/V,
+    flex or varlen).
     """
-    if enable_cp and (conv_kernel_size > 0 or attention_sinks):
-        raise NotImplementedError(
-            "the attention short conv and sinks do not support CP"
-        )
-    if enable_cp and attn_backend not in ("flex", "flex_flash"):
-        raise ValueError("Context Parallel needs the flex attention backend")
     if gated_attention_type not in (None, "element-wise"):
         raise ValueError(
             "gated_attention_type must be None (no gate) or 'element-wise', "
@@ -794,13 +788,15 @@ def build_model_config(
         **copy.deepcopy(overrides),
     )
     if parallelism.context_parallel_degree > 1:
-        # the CP versions of the flex inner attentions (all-gather KV)
+        # the CP versions of the inner attentions (all-gather K/V)
         from torchtitan.config.transform.context_parallel import (
             ContextParallelTransform,
         )
         from torchtitan.models.common.attention.cp_attention import (
             AllGatherKVFlexInnerAttention,
             AllGatherKVSlidingWindowFlexInnerAttention,
+            AllGatherKVSlidingWindowVarlenInnerAttention,
+            AllGatherKVVarlenInnerAttention,
         )
 
         ContextParallelTransform(
@@ -808,6 +804,10 @@ def build_model_config(
                 FlexInnerAttention: AllGatherKVFlexInnerAttention,
                 SlidingWindowFlexInnerAttention: (
                     AllGatherKVSlidingWindowFlexInnerAttention
+                ),
+                VarlenInnerAttention: AllGatherKVVarlenInnerAttention,
+                SlidingWindowVarlenInnerAttention: (
+                    AllGatherKVSlidingWindowVarlenInnerAttention
                 ),
             }
         ).transform(config)

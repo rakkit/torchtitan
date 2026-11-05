@@ -127,8 +127,9 @@ In short: qk-norm, `rmsnorm` gains, no depth scaling, every hidden matrix
 
 ## HF export
 
-`hf_assests/setup_hf.py` still reads the removed flat spec; the HF export is
-rewritten for this model in wave 5 of the `llm-0.5.4` plan.
+`state_dict_adapter.py` maps the native state dict to HF-style names (fused
+projections split). The HF configuration / modeling files are written for this
+model in wave 5 of the `llm-0.5.4` plan.
 
 ## What the optimizer study measured (13.4B tokens, batch 128, run learning rates)
 

@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Native opt_moe <-> HF (`hf_assests/modeling_opt_moe.py`) state dicts.
+"""Native opt_moe <-> HF state dicts (HF-style names; the HF model files
+are written in wave 5).
 
 `wqkv` and the dense / shared `w13` are split into HF's projections; routed
 experts stay 3D (`w13` `[E, 2, F, D]` <-> `gate_up_proj` `[E, 2F, D]`)."""

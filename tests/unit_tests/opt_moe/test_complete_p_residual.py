@@ -7,7 +7,6 @@
 """CompleteP residual, alpha = 1, base depth K (arXiv 2505.01618 Table 1):
 h = x + (K / L) * f(x). References are written from that equation."""
 
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,7 +14,6 @@ import torch.nn.functional as F
 
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.opt_moe import build_model_config
-from torchtitan.models.opt_moe.hf_assests.setup_hf import hf_config
 from torchtitan.models.opt_moe.param_init import setup_residual_scale
 
 
@@ -109,8 +107,3 @@ def test_block_equals_its_equation_off_base(n_layers, base):
     h = x + s * layer.attention(layer.attention_norm(x), None, pos)
     ref = h + s * layer.feed_forward(layer.ffn_norm(h))
     torch.testing.assert_close(layer(x, None, pos), ref, rtol=1e-12, atol=1e-12)
-
-
-def test_hf_export_carries_the_scale():
-    c = hf_config(SimpleNamespace(config=_cfg(4, "complete_p_base16")))
-    assert (c.residual_block_scale, c.residual_identity_scale) == (4.0, 1.0)

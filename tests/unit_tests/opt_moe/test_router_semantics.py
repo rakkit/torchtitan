@@ -16,7 +16,29 @@ training curve.
 import pytest
 import torch
 
-from torchtitan.models.opt_moe.flavors import make_norm_moe_config
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.opt_moe import build_model_config
+
+
+def _moe_config(*, dim, hidden_dim, num_experts, top_k, **kw):
+    """One OptMoE layer's config: gauge-d8-w256 built with a single MoE layer
+    (no depth scaling, as one layer alone)."""
+    return (
+        build_model_config(
+            "gauge-d8-w256",
+            parallelism=ParallelismConfig(),
+            n_layers=1,
+            dim=dim,
+            n_dense_layers=0,
+            depth_init="identity",
+            moe_hidden_dim=hidden_dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            **kw,
+        )
+        .layers[0]
+        .feed_forward
+    )
 
 
 def reference_routing(x, gate_w, bias, top_k, route_scale):
@@ -35,7 +57,7 @@ def reference_routing(x, gate_w, bias, top_k, route_scale):
 def test_routing_follows_the_deepseek_v3_equations(top_k, with_bias):
     torch.manual_seed(0)
     dim, num_experts, T = 64, 8, 128
-    router = make_norm_moe_config(
+    router = _moe_config(
         dim=dim, hidden_dim=128, num_experts=num_experts, top_k=top_k
     ).router.build()
     router.eval()

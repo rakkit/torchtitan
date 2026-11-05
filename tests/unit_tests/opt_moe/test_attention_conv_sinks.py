@@ -83,7 +83,7 @@ def _tiny(conv=4, sinks=True, sinks_init_fn_type=None, sinks_init_std=None, gate
         n_layers=2,
         swa_pattern="SF",
         rope_pattern=None,
-        attention=attention,
+        **attention,
     )
 
 

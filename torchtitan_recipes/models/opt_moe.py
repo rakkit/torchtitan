@@ -4,8 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The OPT MoE training template: the production MoE recipe on mis-8b, which
-run configs start from (``config = moe_template_config()``)."""
+"""Verified OPT MoE model recipes."""
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
@@ -23,48 +22,35 @@ from torchtitan.trainer import Trainer
 _LR = 0.01562
 
 
-def _production_model_args() -> dict:
-    """The production MoE recipe's model arguments (as
-    reproduce_cfgs/configs/0.5.4-debug/production-moe-336m.py; a run config still
-    writes every setting): RMSNorm gains, no depth or residual scaling, every
-    hidden matrix (attention with its gate, FFN, experts, router gate)
-    scaled-orthogonal at std 4 (amphione has no step-1 rescale: the x4 is in the
-    init), embedding scion-normal std 0.02, head scion-normal std 1."""
-
-    def inits(*names: str) -> dict:
-        out = {}
-        for w in names:
-            out[f"{w}_init_fn_type"] = "scaled_orthogonal"
-            out[f"{w}_init_std"] = 4.0
-        return out
-
-    return dict(
-        norm_type="rmsnorm",
-        depth_init="identity",
-        residual_scale="identity",
-        init_gate_as_residual=False,
-        first_in_init_fn_type="scion_normal_input",
-        first_in_init_std=0.02,
-        final_out_init_fn_type="scion_normal_output",
-        final_out_init_std=1.0,
-        attention=inits("wqkv", "wo", "w_gate"),
-        feed_forward=inits("w1", "w2", "w3"),
-        moe=inits("w1", "w2", "w3", "router"),
-    )
+# The production init (the optimizer study's MoE recipe): RMSNorm gains, no depth
+# or residual scaling, every hidden matrix (attention with its gate, FFN, experts,
+# router gate) scaled-orthogonal at std 4 (amphione has no step-1 rescale: the x4
+# is in the init), embedding scion-normal std 0.02, head scion-normal std 1.
+_PRODUCTION_INIT = dict(
+    depth_init="identity",
+    embedding_init_std=0.02,
+    **{
+        f"{w}_init_{k}": v
+        for w in ("wqkv", "wo", "w_gate", "w1", "w2", "w3", "router")
+        for k, v in (("fn_type", "scaled_orthogonal"), ("std", 4.0))
+    },
+)
 
 
-def moe_template_config() -> Trainer.Config:
+def opt_moe_mis_8b() -> Trainer.Config:
+    """mis-8b on the optimizer study's production MoE recipe: amphione on every
+    hidden matrix, the production init, FSDP over every GPU, 4 x 4096 tokens per
+    microbatch."""
     parallelism = ParallelismConfig(data_parallel_shard_degree=-1)
     model = build_model_config(
-        "mis-8b", parallelism=parallelism, seq_len=4096, **_production_model_args()
+        "mis-8b", parallelism=parallelism, seq_len=4096, **_PRODUCTION_INIT
     )
     return Trainer.Config(
         hf_assets_path="./assets/hf/gpt-oss-120b",
         metrics=MetricsProcessor.Config(log_freq=1),
         model=model,
-        # No `dataloader=` default. Every recipe assigns `config.dataloader` from
-        # `components/data/mix.make_pretrain_dataloader_config`, and a template default
-        # that no run uses is a trap: it decides the shape of anything that forgets to.
+        # No `dataloader=`: every run sets it from
+        # `components/data/mix.make_pretrain_dataloader_config`.
         # Optimizer: amphione on every hidden matrix (the experts and the router
         # included; the router gate's row scales frozen), a sign step on the RMSNorm
         # gains, row-l2 on the embedding and the head. `momentum` of an sgd / muon
@@ -131,7 +117,7 @@ def moe_template_config() -> Trainer.Config:
             ),
         ),
         # Plain chunked cross-entropy. The load-balance term is no longer added
-        # here: NormMoE injects its gradient at the layer via LoadBalanceLoss,
+        # here: OptMoE injects its gradient at the layer via LoadBalanceLoss,
         # so the model returns logits alone.
         # ChunkedLossWrapper splits the token dim and runs lm_head + CE per
         # chunk, so the [T, vocab] logits never exist all at once. With

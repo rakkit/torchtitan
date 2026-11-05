@@ -223,13 +223,13 @@ def check_experts(
     """Per routed expert: small batch = (EP group, microbatch), n = the group's routed
     count; at EP 1 every rank is its own group (g from `solo`), at EP > 1 g from `gsolo`."""
     errors = []
-    from torchtitan.models.opt_moe.norm_moe import NormMoE
+    from torchtitan.models.opt_moe.moe import OptMoE
 
-    moes = sorted(n for n, mod in model.named_modules() if isinstance(mod, NormMoE))
+    moes = sorted(n for n, mod in model.named_modules() if isinstance(mod, OptMoE))
     E_of = {
         n: mod.num_experts
         for n, mod in model.named_modules()
-        if isinstance(mod, NormMoE)
+        if isinstance(mod, OptMoE)
     }
     off, o = {}, 0
     for k in moes:

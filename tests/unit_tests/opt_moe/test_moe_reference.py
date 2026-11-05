@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""NormMoE's fast path must match a naive per-token, per-expert reference.
+"""OptMoE's fast path must match a naive per-token, per-expert reference.
 
 The production path routes with argsort, runs experts through a grouped GEMM,
 and scatter-adds the results back. The reference below does the obvious thing
@@ -18,7 +18,29 @@ than two implementations sharing an assumption.
 import pytest
 import torch
 
-from torchtitan.models.opt_moe.flavors import make_norm_moe_config
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.opt_moe import build_model_config
+
+
+def _moe_config(*, dim, hidden_dim, num_experts, top_k, **kw):
+    """One OptMoE layer's config: gauge-d8-w256 built with a single MoE layer
+    (no depth scaling, as one layer alone)."""
+    return (
+        build_model_config(
+            "gauge-d8-w256",
+            parallelism=ParallelismConfig(),
+            n_layers=1,
+            dim=dim,
+            n_dense_layers=0,
+            depth_init="identity",
+            moe_hidden_dim=hidden_dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            **kw,
+        )
+        .layers[0]
+        .feed_forward
+    )
 
 
 def reference_moe(moe, x_TD):
@@ -61,7 +83,7 @@ def reference_moe(moe, x_TD):
 @pytest.mark.parametrize("num_shared_experts, top_k", [(0, 1), (0, 2), (1, 2), (1, 4)])
 def test_moe_matches_the_naive_reference(num_shared_experts, top_k):
     torch.manual_seed(0)
-    cfg = make_norm_moe_config(
+    cfg = _moe_config(
         dim=64,
         hidden_dim=32,
         num_experts=6,

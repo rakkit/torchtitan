@@ -16,7 +16,7 @@ import torch.nn as nn
 
 from torchtitan.models.common.param_layout import ParamLayout
 from torchtitan.optimizers.container import DiSCOOptimizersContainer
-from torchtitan_recipes.models.opt_moe import moe_template_config
+from torchtitan_recipes.models.opt_moe import opt_moe_mis_8b
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -55,12 +55,12 @@ class _Decoder(nn.Module):
         self.wq = nn.Linear(16, 16, bias=False)
         self.feed_forward = (
             nn.Module()
-        )  # the router at the model's path: the template freezes feed_forward.router.gate
+        )  # the router at the model's path: the recipe freezes feed_forward.router.gate
         self.feed_forward.router = nn.Module()
         self.feed_forward.router.gate = nn.Linear(
             16, 8, bias=False
         )  # 8 experts: Gram Polar Express needs dims % 8
-        self.norm = nn.RMSNorm(16)  # learnable gains: the template's gains group
+        self.norm = nn.RMSNorm(16)  # learnable gains: the recipe's gains group
         self.lm_head = nn.Linear(16, 64, bias=False)
 
     def param_layouts(self):
@@ -73,9 +73,9 @@ class _Decoder(nn.Module):
         }
 
 
-def test_the_template_groups_build():
-    """The template's groups must be a valid run on their own."""
-    cfg = moe_template_config().optim.optimizer
+def test_the_recipe_groups_build():
+    """The recipe's groups must be a valid run on their own."""
+    cfg = opt_moe_mis_8b().optim.optimizer
     DiSCOOptimizersContainer(
         cfg, model_parts=[_Decoder()], parallelism_context=_NoParallel()
     )
@@ -131,9 +131,7 @@ def test_a_named_group_with_only_an_lr_does_not_take_the_defaults_own_args():
     """A named group that sets neither `rule` nor `args` runs the default's rule
     but is not the default group: it must not take the rule's `own` args (here
     the router's frozen row lengths, which name no unit of the group)."""
-    cfg = (
-        moe_template_config().optim.optimizer
-    )  # its default group freezes moe.router.gate
+    cfg = opt_moe_mis_8b().optim.optimizer  # its default group freezes the router gate
     cfg.groups = {"wq": {"match": r"^wq\.weight$", "lr": 0.003}, **cfg.groups}
     c = DiSCOOptimizersContainer(
         cfg, model_parts=[_Decoder()], parallelism_context=_NoParallel()
@@ -153,9 +151,7 @@ def test_a_named_group_under_the_defaults_rule_keeps_its_other_default_args():
     """Only the rule's `own` args stay with the default group: a named amphione
     group with args of its own still takes the default's polar_express_safety
     (an arg of no preset, so no rule `inherits` it)."""
-    cfg = (
-        moe_template_config().optim.optimizer
-    )  # its default group freezes moe.router.gate
+    cfg = opt_moe_mis_8b().optim.optimizer  # its default group freezes the router gate
     cfg.groups = {
         "wq": {
             "match": r"^wq\.weight$",

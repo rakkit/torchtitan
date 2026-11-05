@@ -6,7 +6,7 @@
 
 """Regressions for the MoE router metrics pipeline.
 
-Producer: ``NormMoE`` and its router's buffers. Consumer:
+Producer: ``OptMoE`` and its router's buffers. Consumer:
 ``optimizers/container.py``'s step pre-hook.
 """
 
@@ -15,11 +15,33 @@ import types
 import torch
 import torch.nn as nn
 
-from torchtitan.models.opt_moe.flavors import make_norm_moe_config
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.opt_moe import build_model_config
 from torchtitan.optimizers.moe_balance import (
     publish_moe_metrics,
     register_moe_load_balancing_hook,
 )
+
+
+def _moe_config(*, dim, hidden_dim, num_experts, top_k, **kw):
+    """One OptMoE layer's config: gauge-d8-w256 built with a single MoE layer
+    (no depth scaling, as one layer alone)."""
+    return (
+        build_model_config(
+            "gauge-d8-w256",
+            parallelism=ParallelismConfig(),
+            n_layers=1,
+            dim=dim,
+            n_dense_layers=0,
+            depth_init="identity",
+            moe_hidden_dim=hidden_dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            **kw,
+        )
+        .layers[0]
+        .feed_forward
+    )
 
 
 def _moe(**kw):
@@ -30,9 +52,7 @@ def _moe(**kw):
     dispatcher, whose collective path needs an ambient DeviceMesh that a CPU
     unit test has no business creating.
     """
-    moe = make_norm_moe_config(
-        dim=32, hidden_dim=64, num_experts=8, top_k=2, **kw
-    ).build()
+    moe = _moe_config(dim=32, hidden_dim=64, num_experts=8, top_k=2, **kw).build()
     moe.routed_experts = _StubExperts()
     return moe
 

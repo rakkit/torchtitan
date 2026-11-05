@@ -291,7 +291,7 @@ class TestSetup(DTensorTestBase):
     def _router(self, aux):
         dev = self._device()
         mcfg = H.gauge_config(moe=True)
-        mcfg["moe"]["aux_loss"] = aux
+        mcfg["aux_loss"] = aux
         with tempfile.TemporaryDirectory() as tmp:
             pd, model, cont, cfg = H.build(
                 dict(dp_replicate=1, dp_shard=4),

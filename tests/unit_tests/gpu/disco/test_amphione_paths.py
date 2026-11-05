@@ -70,7 +70,7 @@ class TestAmphionePaths(DTensorTestBase):
         device = self._device()
         pd = harness.parallelism_context(world_size=4, device_type=device.type, **topo)
         model_cfg = harness.tiny_model_config(moe=moe)
-        model_cfg["attention"]["n_kv_heads"] = 2  # MHA: one state shape per wqkv
+        model_cfg["n_kv_heads"] = 2  # MHA: one state shape per wqkv
         cfg = harness.trainer_config(
             model_cfg,
             compute="svd",
@@ -157,7 +157,7 @@ class TestAmphionePaths(DTensorTestBase):
         device = self._device()
         pd = harness.parallelism_context(world_size=4, device_type=device.type, **topo)
         model_cfg = harness.tiny_model_config(moe=True)
-        model_cfg["attention"]["n_kv_heads"] = 1
+        model_cfg["n_kv_heads"] = 1
         cfg = harness.trainer_config(
             model_cfg,
             compute="svd",

@@ -28,7 +28,7 @@ def test_every_norm_parameter_has_a_placement(flavor, norm_type):
         swa_pattern=None,
         rope_pattern=None,
         norm_type=norm_type,
-        attention=dict(qk_norm=True),
+        qk_norm=True,
     )
     with torch.device("meta"):
         model = cfg.build()

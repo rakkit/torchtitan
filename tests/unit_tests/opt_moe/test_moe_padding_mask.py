@@ -4,57 +4,31 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The MoE's padding mask, from the batch to every MoE layer: upstream's padding
-mask by default; with ``enable_token_mask_for_moe`` every token whose label is
-ignored."""
+"""Upstream's padding mask reaches every MoE layer: the padding tokens stay out
+of the router's counts and the gate entropy."""
 
-from unittest.mock import patch
-
-import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.opt_moe import build_model_config
 
 TOP_K = 2
 
 
-def _config(token_mask: bool):
+def _config():
     return build_model_config(
         "gauge-d8-w256",
         parallelism=ParallelismConfig(),
         seq_len=64,
         n_layers=2,
         n_dense_layers=0,
-        moe=dict(hidden_dim=64, num_experts=8, top_k=TOP_K),
-        enable_token_mask_for_moe=token_mask,
+        moe_hidden_dim=64,
+        num_experts=8,
+        top_k=TOP_K,
     )
-
-
-@pytest.mark.parametrize("token_mask", [False, True])
-def test_preprocess_sets_the_moe_padding_mask(token_mask):
-    with torch.device("meta"):
-        model = _config(token_mask).build()
-    labels = torch.tensor([5, IGNORE_INDEX, 7, IGNORE_INDEX, 9, 3])
-    upstream_padding = torch.tensor([False, False, False, False, False, True])
-    upstream = (
-        torch.zeros(6, dtype=torch.long),
-        labels,
-        {"padding_mask": upstream_padding},
-        {},
-    )
-    with patch.object(Decoder, "preprocess_inputs", return_value=upstream):
-        _, _, model_kwargs, _ = model.preprocess_inputs(
-            {}, parallelism_context=None, parallelism=ParallelismConfig()
-        )
-    expected = labels == IGNORE_INDEX if token_mask else upstream_padding
-    assert torch.equal(model_kwargs["padding_mask"], expected)
-    assert "loss_mask" not in model_kwargs
 
 
 class _CausalSDPA(nn.Module):
@@ -72,7 +46,7 @@ class _StubExperts(nn.Module):
 
 def test_forward_hands_the_padding_mask_to_every_moe_layer():
     with torch.device("meta"):
-        model = _config(False).build()
+        model = _config().build()
     model.to_empty(device="cpu")
     torch.manual_seed(0)
     with torch.no_grad():

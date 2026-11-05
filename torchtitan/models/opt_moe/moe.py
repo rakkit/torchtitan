@@ -19,14 +19,13 @@ import torch_remat as remat
 from torchtitan.models.common.moe import MoE
 
 
-class NormMoE(MoE):
+class OptMoE(MoE):
     """Upstream's MoE with opt_moe's routing statistics.
 
-    ``padding_mask_T`` (True: not counted) keeps tokens out of the router's
-    counts and auxiliary losses, as upstream's; with the model's
-    ``enable_token_mask_for_moe`` it is every token whose label is ignored
-    (``OPTMoEModel.preprocess_inputs``). The experts still process every token
-    (upstream's routed experts ignore the mask).
+    ``padding_mask_T`` (True: not counted, upstream's padding mask) keeps
+    tokens out of the router's counts and auxiliary losses, as upstream's. The
+    experts still process every token (upstream's routed experts ignore the
+    mask).
 
     The statistics, summed over the step's forwards (not on remat replay) and
     over the counted tokens: the router's ``tokens_per_expert_E`` (upstream's)

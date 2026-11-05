@@ -80,14 +80,14 @@ def _model(variant: dict):
         swa_pattern=variant["swa_pattern"],
         rope_pattern=variant["rope_pattern"],
         rope=dict(dim=variant["rope_dim"], theta=THETA),
-        attention=dict(
-            n_heads=HEADS,
-            n_kv_heads=KV_HEADS,
-            head_dim=HEAD_DIM,
-            **variant["attention"],
-        ),
-        feed_forward=dict(hidden_dim=96),
-        moe=dict(hidden_dim=48, num_experts=8, top_k=2),
+        n_heads=HEADS,
+        n_kv_heads=KV_HEADS,
+        head_dim=HEAD_DIM,
+        **variant["attention"],
+        dense_hidden_dim=96,
+        moe_hidden_dim=48,
+        num_experts=8,
+        top_k=2,
         residual_scale=variant["residual_scale"],
     )
     with torch.device("meta"):

@@ -6,7 +6,7 @@
 
 """The production recipe on 4 ranks under FSDP against its single-rank meaning.
 
-Groups: `moe_template_config()`'s (amphione on every hidden matrix with the
+Groups: `opt_moe_mis_8b()`'s (amphione on every hidden matrix with the
 router gate's row lengths frozen, sgd sign on the RMSNorm gains, row-l2 on the
 embedding and the head), plus the conv group (amphione, row-l2 direction) and
 the sinks group (sgd sign). Model: a tiny MoE with learnable-gain RMSNorm,
@@ -32,7 +32,7 @@ import harness  # noqa: E402
 from torchtitan.optimizers.disco.optimizer import _unit_type  # noqa: E402
 from torchtitan.optimizers.disco.rules import StepCtx  # noqa: E402
 
-from torchtitan_recipes.models.opt_moe import moe_template_config  # noqa: E402
+from torchtitan_recipes.models.opt_moe import opt_moe_mis_8b  # noqa: E402
 
 pytestmark = pytest.mark.multi_gpu
 
@@ -96,9 +96,9 @@ class TestRecipePaths(DTensorTestBase):
             moe=True, conv=4, sinks=True, num_experts=8
         )
         model_cfg["norm_type"] = "rmsnorm"  # learnable gains
-        model_cfg["attention"]["n_kv_heads"] = n_kv_heads
+        model_cfg["n_kv_heads"] = n_kv_heads
         cfg = harness.trainer_config(model_cfg, **FSDP)
-        groups = copy.deepcopy(moe_template_config().optim.optimizer.groups)
+        groups = copy.deepcopy(opt_moe_mis_8b().optim.optimizer.groups)
         if device.type == "cpu":  # gram_polar_express runs quack's CUDA kernels only
             args = groups["default"]["args"]
             args["compute"] = "svd"

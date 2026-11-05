@@ -81,8 +81,8 @@ class OPTMoETransformerBlock(TransformerBlock):
         padding_mask: torch.Tensor | None = None,
         aux_loss_denominator: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """``x``: ``[T, D]``; ``padding_mask`` (True: not counted): the tokens the
-        MoE leaves out of its balance statistics (``OPTMoEModel.preprocess_inputs``)."""
+        """``x``: ``[T, D]``; ``padding_mask`` (True: not counted): upstream's
+        padding mask, the tokens the MoE leaves out of its balance statistics."""
         _attn_out = self.attention(
             self.attention_norm(x), attention_metadata, positions
         )
@@ -226,10 +226,7 @@ class OPTMoEModel(Decoder):
         name: str = "opt_moe"
         flavor: str = ""
         build_args: dict[str, Any] = field(default_factory=dict)
-        """The flavor's arguments merged with the run's overrides (plain values)."""
-        enable_token_mask_for_moe: bool = False
-        """Keep tokens whose label is ignored out of the MoE balance statistics
-        (``preprocess_inputs`` builds the mask)."""
+        """The recipe's overrides of the flavor's settings (plain values)."""
         built_for: dict[str, bool] | None = None
         """The parallelism (tp / cp / ep / sp on or off) the per-layer configs
         were built for; ``parallelize`` refuses another one (a command-line
@@ -273,8 +270,8 @@ class OPTMoEModel(Decoder):
                 not the first pipeline stage.
             positions: Position indices ``[T]``.
             attention_metadata: The inner attentions' metadata, by type.
-            padding_mask: Tokens left out of the MoE balance statistics (True:
-                not counted); see ``preprocess_inputs``.
+            padding_mask: Upstream's padding mask (True: padding), the tokens
+                the MoE leaves out of its balance statistics.
         """
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
@@ -322,32 +319,3 @@ class OPTMoEModel(Decoder):
         if self._skip_lm_head:
             return h
         return self.lm_head(h) if self.lm_head is not None else h
-
-    def preprocess_inputs(
-        self,
-        input_dict: dict[str, Any],
-        *,
-        parallelism_context: ParallelismContext,
-        parallelism: ParallelismConfig,
-        max_num_documents: int | None = None,
-        global_routing_token_counts: torch.Tensor | None = None,
-        **kwargs: Any,
-    ):
-        """Upstream's (masks, CP shards, SPMD types). With
-        ``enable_token_mask_for_moe`` the MoE's padding mask becomes every token
-        whose label is ignored (padding, and the prompt under SFT), from the
-        CP-sharded labels so its layout matches the hidden states the router
-        sees; the attention masks were built from upstream's padding mask."""
-        inputs, labels, model_kwargs, loss_kwargs = super().preprocess_inputs(
-            input_dict,
-            parallelism_context=parallelism_context,
-            parallelism=parallelism,
-            max_num_documents=max_num_documents,
-            global_routing_token_counts=global_routing_token_counts,
-            **kwargs,
-        )
-        if self.config.enable_token_mask_for_moe:
-            from torchtitan.components.loss import IGNORE_INDEX
-
-            model_kwargs["padding_mask"] = labels == IGNORE_INDEX
-        return inputs, labels, model_kwargs, loss_kwargs

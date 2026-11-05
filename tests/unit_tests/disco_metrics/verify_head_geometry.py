@@ -263,9 +263,9 @@ if dev == "cpu":
     print("  SKIP  no accelerator")
 try:
     from torchtitan.models.opt_moe import build_model_config
-    from torchtitan_recipes.models.opt_moe import moe_template_config
+    from torchtitan_recipes.models.opt_moe import opt_moe_mis_8b
 
-    job = moe_template_config()
+    job = opt_moe_mis_8b()
     job.model = build_model_config(
         "gauge-d8-w256", parallelism=job.parallelism, vocab_size=2048
     )

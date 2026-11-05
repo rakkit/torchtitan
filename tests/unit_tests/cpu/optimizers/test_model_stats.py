@@ -55,7 +55,7 @@ def _tiny(*, gains: bool = True, seed: int = 0, n_layers: int = 2, sinks: bool =
         parallelism=ParallelismConfig(),
         n_layers=n_layers,
         vocab_size=512,
-        attention=dict(attention_sinks=sinks),
+        attention_sinks=sinks,
         # learnable gains (rmsnorm, the default) or none (the parameter-free np_rmsnorm)
         norm_type="rmsnorm" if gains else "np_rmsnorm",
     )

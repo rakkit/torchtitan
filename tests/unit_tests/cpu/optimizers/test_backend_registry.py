@@ -23,7 +23,7 @@ import pytest
 from torchtitan.optimizers.disco.rules import rule_of
 from torchtitan.optimizers.kernels.zeropower import zeropower_backends
 
-# The backends a shipped recipe or the template config may name.
+# The backends a shipped recipe may name.
 PRODUCTION_BACKENDS = ["newtonschulz5", "polar_express", "gram_polar_express", "svd"]
 
 _PROBE = """

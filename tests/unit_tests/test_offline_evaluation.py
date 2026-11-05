@@ -44,7 +44,7 @@ from torchtitan.evaluation.runtime import (
     upsert_result,
 )
 from torchtitan.models.opt_moe import build_model_config
-from torchtitan_recipes.models.opt_moe import moe_template_config
+from torchtitan_recipes.models.opt_moe import opt_moe_mis_8b
 from torchtitan_recipes.tests.models.llama3 import llama3_debugmodel
 
 
@@ -95,7 +95,7 @@ class TestOfflineEvaluationConfig(unittest.TestCase):
     def test_latest_job_config_and_model_rehydration(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            original = moe_template_config()
+            original = opt_moe_mis_8b()
             original.hf_assets_path = "/tmp/tokenizer-assets"
             original.model = build_model_config(
                 "mis-8b-proxy",
@@ -104,7 +104,7 @@ class TestOfflineEvaluationConfig(unittest.TestCase):
                 n_layers=4,
                 swa_pattern="SFSF",
                 rope_pattern="RRNR",
-                attention=dict(conv_kernel_size=4),
+                conv_kernel_size=4,
             )
 
             older = root / "job_config_20260101-0000.json"

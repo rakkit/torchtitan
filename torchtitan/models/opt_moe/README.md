@@ -4,10 +4,9 @@ A token-flat decoder (`x` is `[T, D]`, document boundaries travel in
 `positions`) built on upstream's modules: `GQAttention` with the fused
 `QKVLinear`, `DenseFeedForward` (`w13` `[2, F, D]`), `RoutedExperts` (`w13`
 `[E, 2, F, D]`, one grouped GEMM). The files follow upstream's model layout:
-`gated_swa_attention.py` (`GatedSWAttention`), `norm_moe.py` (`NormMoE`:
-upstream's `MoE` plus the routing statistics) and `model.py` (block and model)
-hold the modules
-and their Configs; `flavors.py` builds the complete, sharded config;
+`gated_swa_attention.py` (`GatedSWAttention`), `moe.py` (`OptMoE`: upstream's
+`MoE` plus the routing statistics) and `model.py` (block and model) hold the
+modules and their Configs; `flavors.py` builds the complete, sharded config;
 `sharding.py` holds the sharding constructors it uses. The optimizer side
 (`amphione` and the other DiSCO rules) is `torchtitan/optimizers/readme.md`.
 
@@ -16,44 +15,43 @@ KV; not with the conv or the sinks). TP is refused at build.
 
 ## Building a model
 
-`build_model_config(flavor, *, parallelism, seq_len, **overrides)`: a flavor is
-a function in `flavors.py` that writes out the builder's arguments
-(`MODEL_FLAVORS`: name -> (function, default context length), as upstream's
-models); a run passes the arguments it changes, and the result is the complete
-config for that parallelism (nothing changes it afterwards):
+`build_model_config(flavor, *, parallelism, seq_len, rope_length, **overrides)`
+returns the complete config for that parallelism (nothing changes it
+afterwards). In `flavors.py`, `_opt_moe_config` writes the model config (the
+embedding, final norm and head; the blocks from `build_opt_moe_layers`) and
+holds, with `build_opt_moe_layers`, the default of every setting below; a
+flavor is a function passing the settings it changes (`MODEL_FLAVORS`: name ->
+(function, default context length), as upstream's models). A recipe's keywords
+replace the flavor's setting of the same name; an unknown name raises:
 
 ```python
 from torchtitan.models.opt_moe import build_model_config
 
 config.model = build_model_config(
-    "gauge-d16-w512", parallelism=config.parallelism, seq_len=4096,
-    depth_init="identity", swa_pattern="SSSF" * 4, sliding_window_size=128,
-    attention=dict(gated_attention_type="element-wise", conv_kernel_size=4),
-    moe=dict(hidden_dim=224, num_experts=64, top_k=8), n_dense_layers=0,
+    "production-moe-336m", parallelism=config.parallelism, seq_len=4096,
+    norm_eps=1e-30, wo_init_std=4.0,
 )
 ```
 
-`attention`, `feed_forward`, `moe`, `rope` and `rope_of_swa` merge key by key
-into the flavor's; every other argument replaces it; an unknown name raises.
-The merged arguments are kept in `config.build_args` (plain values, in the
+The recipe's keywords are kept in `config.build_args` (plain values, in the
 dumped `job_config.json`): offline evaluation rebuilds the run's model with
-`build_model_config(flavor, **build_args)`. The training template is
-`torchtitan_recipes/models/opt_moe.py` (`moe_template_config()`, the production
-MoE recipe on `mis-8b`).
+`build_model_config(flavor, **build_args)`. The recipe
+`torchtitan_recipes/models/opt_moe.py` (`opt_moe_mis_8b()`) is the production
+MoE recipe on `mis-8b`.
 
-## Attention (`attention=dict(...)`: `make_gated_swa_attention_config`)
+## Attention
 
 | argument | default | meaning |
 |---|---|---|
-| `n_heads`, `n_kv_heads`, `head_dim` | -, `n_heads`, `dim // n_heads` | GQA shape |
-| `qk_norm` | false | a norm of the model's `norm_type` on each q and k head, before RoPE |
+| `n_heads`, `n_kv_heads`, `head_dim` | - | GQA shape |
+| `qk_norm` | - | a norm of the model's `norm_type` on each q and k head, before RoPE |
 | `gated_attention_type` | None | None: no gate; `element-wise`: `gate_proj` `[n_heads * head_dim, dim]`, the attention output multiplied by `sigmoid(gate_proj(x))` (fp32) before `wo`. Any other value is refused |
 | `attention_sinks` | false | one learned logit per head in the softmax denominator (gpt-oss): `out * sigmoid(lse - s)` |
 | `sinks_init_fn_type`, `sinks_init_std` | `zeros`, 0.0 | the sinks' init, any init type of `param_init.py`; `zeros` ignores the std |
 | `conv_kernel_size` | 0 | the Canon short conv: `x + conv(x)`, a depthwise causal conv of this width on the streams below, after the projection; it restarts at every packed document. 0: no conv, and the conv arguments below do nothing |
 | `conv_streams` | `qkv` | `qkv` (q, k and v) or `kv` (q passes through and has no `q_conv`) |
 | `conv_init_fn_type`, `conv_init_gain` | `delay`, 4.0 | `delay` (one tap of +-gain per channel), `random_opnorm` (a random filter with operator norm gain) or `torch_default` (gain x the `nn.Conv1d` draw); 4.0 is the recipe's x4 in the init (never run: the study ran 1.0 with its optimizer's step-1 x4) |
-| `attn_backend` | `flex` | `flex`, `flex_flash` or `varlen` (upstream's configs, sliding-window variants included); masks are always per document (block causal) |
+| `attn_backend` | - | `flex`, `flex_flash` or `varlen` (upstream's configs, sliding-window variants included); masks are always per document (block causal) |
 | `w{qkv,o,_gate}_init_fn_type`, `..._init_std` | `scaled_orthogonal`, 1.0 | the projections' init (q, k and v: one fused `wqkv`) |
 
 The model chooses the attention per layer: `swa_pattern` (`S` sliding window,
@@ -67,24 +65,23 @@ each a dict of `CosSinRoPE.Config` fields (the cache is `seq_len` long, or
 
 ## Feed-forward and MoE
 
-- `feed_forward=dict(...)`: `hidden_dim`, the `w1`, `w2`, `w3` init types and
-  stds (SwiGLU).
-- `moe=dict(...)` (`make_norm_moe_config`, on upstream's routers):
-  `num_experts`, `num_shared_experts`, `top_k`, `hidden_dim` (each expert's),
-  `scaling_factor` (the router's `route_scale` on the renormalized top-k
-  weights; 1.0 in every flavor), `score_func`;
+- `n_dense_layers`: the first layers are a dense SwiGLU FFN of
+  `dense_hidden_dim`, the rest an `OptMoE` (on upstream's routers):
+  `num_experts`, `num_shared_experts` (1), `top_k`, `moe_hidden_dim` (each
+  expert's), `route_scale` (1.0: the factor on the renormalized top-k
+  weights), `score_func` (`sigmoid`);
   balancing by the expert bias (`load_balance_coeff`,
   `bias_update_norm_factor`), by upstream's quantile-balanced router
   (`quantile_balance_bins`, sigmoid scores only) or
   upstream's auxiliary loss
   (`aux_loss=dict(loss_type="microbatch_wise" | "batch_wise", coeff=...)`);
-  the router's and the experts' init types and stds. Tokens go all-to-all under
-  EP (DeepEP / HybridEP: upstream's `TokenDispatcherTransform` on the recipe).
-  Upstream's padding mask keeps padding tokens out of the balance statistics;
-  with `enable_token_mask_for_moe` (SFT) it is every token whose label is
-  ignored (prompt and padding). The experts still process every token.
-- `n_dense_layers`: the first layers take the dense `feed_forward`, the rest
-  the MoE.
+  `router_init_fn_type` / `router_init_std` (`scion_normal_output`, 1.0).
+  Tokens go all-to-all under EP (DeepEP / HybridEP: upstream's
+  `TokenDispatcherTransform` on the recipe). Upstream's padding mask keeps
+  padding tokens out of the balance statistics; the experts still process
+  every token.
+- `w{1,2,3}_init_fn_type`, `..._init_std` (`scaled_orthogonal`, 1.0): one
+  init for the dense FFN, the routed and the shared experts.
 
 ## Block and model
 
@@ -95,8 +92,8 @@ each a dict of `CosSinRoPE.Config` fields (the cache is `seq_len` long, or
 | `residual_scale` | `identity` | `x = identity_scale x + block_scale f(x)`: `depth_scale_{R,N}`, `complete_p_{R,N}`, `complete_p_base<K>` (CompleteP, arXiv 2505.01618) |
 | `init_gate_as_residual` | false | the FFN's up projection takes the output projections' depth divisor |
 | `prenorm_gain_init` | 1.0 | a constant init of the attention_norm / ffn_norm gains (`rmsnorm` only) |
-| `first_in_init_*`, `final_out_init_*` | `scion_normal_input` / `scion_normal_output`, 1.0 | the embedding's and the head's init |
-| `enable_token_mask_for_moe` | false | every token whose label is ignored (prompt and padding) stays out of the MoE balance statistics (SFT); off: upstream's padding mask (padding only) |
+| `embedding_init_*`, `lm_head_init_*` | `scion_normal_input` / `scion_normal_output`, 1.0 | the embedding's and the head's init |
+| `vocab_size` | 201088 | |
 
 Residual statistics: with the optimizer's `log_residual_stats`, the eager
 layer loop records the RMS of every block's input and residual write and of
@@ -109,8 +106,8 @@ bins), `mis-30b-a3b`, `mis-100b-a5b`, and the gauge models `gauge-d8-w256`,
 `gauge-d16-w256`, `gauge-d16-w512` and `gauge-d16-w1024` (the optimizer
 study's 84M and 336M models), used by tests and the study's configs, and
 `production-dense-336m` / `production-moe-336m`: the study's production recipe
-at 336M (dense, and every FFN an MoE of 64 + 1 experts, top 8), every model
-setting written out.
+at 336M (the gauge-d16-w1024 shape; dense, and every FFN an MoE of 64 + 1
+experts, top 8).
 
 ## Recipes
 
@@ -119,10 +116,10 @@ The optimizer study's production runs: the flavors `production-dense-336m` /
 `reproduce_cfgs/configs/0.5.5-debug/production-dense-336m.py` /
 `production-moe-336m.py` (the rest), with the gate, sink and conv blocks
 commented in them as overrides of the flavor.
-In short: qk-norm, `rmsnorm` gains, no depth scaling, every hidden matrix
-`scaled_orthogonal` at std 4, embedding `scion_normal_input` std 0.02, head
-`scion_normal_output` std 1; MoE: 64 routed experts + 1 shared, top 8,
-`scaling_factor` 1.0, sigmoid scores, the bias update (sign, 0.001), router
+In short: qk-norm, `rmsnorm` gains, depth init `total_depth_R`, every hidden
+matrix `scaled_orthogonal` at std 4, embedding `scion_normal_input` std 0.02,
+head `scion_normal_output` std 1; MoE: 64 routed experts + 1 shared, top 8,
+`route_scale` 1.0, sigmoid scores, the bias update (sign, 0.001), router
 `scaled_orthogonal` std 4.
 
 ## HF export

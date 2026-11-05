@@ -318,7 +318,7 @@ class TestResearchExperts(DTensorTestBase):
         keys = [(G, 0) for G in groups]
         errors = []
         moes = sorted(
-            n for n, mod in model.named_modules() if type(mod).__name__ == "NormMoE"
+            n for n, mod in model.named_modules() if type(mod).__name__ == "OptMoE"
         )
         off = {k: 4 * i for i, k in enumerate(moes)}
         K = len(groups)

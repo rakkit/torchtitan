@@ -6,27 +6,20 @@
 
 """OPT MoE model flavors.
 
-``build_model_config(flavor, *, parallelism, seq_len, **overrides)`` builds the
-complete, sharded ``OPTMoEModel.Config``: ``_opt_moe_config`` loops over the
-layers (SWA / RoPE patterns, depth-init divisors, dense-first layers, residual
-scales) and builds each component with its sharding. A flavor is a function
-that writes out the builder's arguments (``MODEL_FLAVORS``: flavor -> (function,
-default context length)); a run passes the arguments it changes::
+``_opt_moe_config`` writes the complete, sharded ``OPTMoEModel.Config`` (the
+embedding, final norm and head; the blocks from ``build_opt_moe_layers``); the
+defaults of every setting are in these two functions. A flavor is the settings
+it changes; a recipe's ``build_model_config`` keywords replace the flavor's
+setting of the same name (a name neither function takes raises)::
 
     build_model_config(
-        "gauge-d16-w512", parallelism=parallelism, seq_len=4096,
-        depth_init="identity", swa_pattern="SSSF" * 4, sliding_window_size=128,
-        attention=dict(gated_attention_type="element-wise", conv_kernel_size=4),
-        moe=dict(hidden_dim=224, num_experts=64, top_k=8),
+        "production-moe-336m", parallelism=parallelism, seq_len=4096,
+        norm_eps=1e-30, wo_init_std=4.0,
     )
 
-``attention`` / ``feed_forward`` / ``moe`` / ``rope`` / ``rope_of_swa`` are
-merged key by key into the flavor's (their keys are the keyword arguments of
-``make_gated_swa_attention_config``, ``_feed_forward_config``,
-``make_norm_moe_config`` and ``CosSinRoPE.Config``); every other argument
-replaces the flavor's. All values are plain, so the merged arguments are kept
-in ``config.build_args`` and ``build_model_config(flavor, **build_args)``
-rebuilds the same model for another parallelism.
+The recipe's keywords are kept in ``config.build_args``, so
+``build_model_config(flavor, **build_args)`` rebuilds the same model for
+another parallelism (evaluation, checkpoint conversion).
 """
 
 import copy
@@ -38,6 +31,7 @@ from typing import Any, Literal
 from torch import nn
 
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.activation import Sigmoid, Softmax, SqrtSoftplus
 from torchtitan.models.common.attention import (
     FlexInnerAttention,
@@ -78,7 +72,7 @@ from torchtitan.models.common.rope import CosSinRoPE, RoPE
 
 from .gated_swa_attention import GatedSWAttention
 from .model import layout_flags, OPTMoEModel, OPTMoETransformerBlock
-from .norm_moe import NormMoE
+from .moe import OptMoE
 from .param_init import (
     conv_init_fn,
     make_expert_param_init,
@@ -92,332 +86,74 @@ from .sharding import (
     routed_expert_weight_sharding_config,
 )
 
+__all__ = ["MODEL_FLAVORS", "build_model_config", "build_opt_moe_layers"]
+
 _SCORE_FUNCS = {
     "sigmoid": Sigmoid.Config,
     "softmax": Softmax.Config,
     "sqrtsoftplus": SqrtSoftplus.Config,
 }
 
-__all__ = [
-    "MODEL_FLAVORS",
-    "build_model_config",
-    "make_gated_swa_attention_config",
-    "make_norm_moe_config",
-]
-
 
 def _norm(
-    norm_type: Literal["rmsnorm", "np_rmsnorm"], dim: int, eps: float
+    norm_type: Literal["rmsnorm", "np_rmsnorm"],
+    dim: int,
+    eps: float,
+    *,
+    sharding_config: ShardingConfig | None = None,
 ) -> RMSNorm.Config:
     """Upstream's RMSNorm: with learnable gains ("rmsnorm") or without ("np_rmsnorm")."""
     if norm_type not in ("rmsnorm", "np_rmsnorm"):
         raise ValueError(f"norm_type must be rmsnorm | np_rmsnorm, got {norm_type!r}")
     return RMSNorm.Config(
-        normalized_shape=dim, eps=eps, elementwise_affine=norm_type == "rmsnorm"
+        normalized_shape=dim,
+        eps=eps,
+        elementwise_affine=norm_type == "rmsnorm",
+        sharding_config=sharding_config,
     )
 
 
-def make_gated_swa_attention_config(
-    *,
-    dim: int,
-    n_heads: int,
-    n_kv_heads: int | None = None,
-    head_dim: int | None = None,
-    qk_norm: bool = False,
-    attn_backend: Literal["flex", "flex_flash", "varlen"] = "flex",
-    gated_attention_type: Literal["element-wise"] | None = None,
-    conv_kernel_size: int = 0,
-    conv_streams: Literal["qkv", "kv"] = "qkv",
-    conv_init_fn_type: str = "delay",
-    conv_init_gain: float = 4.0,
-    attention_sinks: bool = False,
-    sinks_init_fn_type: str = "zeros",
-    sinks_init_std: float = 0.0,
-    wqkv_init_fn_type: str = "scaled_orthogonal",
-    wo_init_fn_type: str = "scaled_orthogonal",
-    w_gate_init_fn_type: str = "scaled_orthogonal",
-    wqkv_init_std: float = 1.0,
-    wo_init_std: float = 1.0,
-    w_gate_init_std: float = 1.0,
-    sliding_window_size: int | None,
-    rope: RoPE.Config | None,
-    norm_type: str,
-    norm_eps: float,
-    residual_div: float,
-    enable_sp: bool,
-) -> GatedSWAttention.Config:
-    """One layer's complete, sharded attention config: upstream's GQA part
-    (``make_gqa_config``), then the gate, the convs and the sinks.
-
-    ``conv_kernel_size`` 0: no conv; else the Canon short conv ``x + conv(x)`` of
-    this width on q, k and v (``conv_streams`` "qkv") or k and v ("kv"), each
-    channel initialized by ``conv_init_fn_type`` ("delay", "random_opnorm",
-    "torch_default") at ``conv_init_gain``. ``sliding_window_size`` None: a
-    full-attention layer; ``rope`` None: a NoPE layer; ``residual_div``: the
-    depth-init divisor of wo and the gate.
-    """
-    if conv_kernel_size > 0 and conv_streams not in ("qkv", "kv"):
-        raise ValueError(f"conv_streams must be qkv | kv, got {conv_streams!r}")
-    inner = get_attention_config(attn_backend)
-    if sliding_window_size is not None:
-        if isinstance(inner, FlexInnerAttention.Config):
-            inner = SlidingWindowFlexInnerAttention.Config(
-                block_size=inner.block_size,
-                kernel_options=inner.kernel_options,
-                sliding_window_size=sliding_window_size,
-            )
-        else:
-            assert isinstance(inner, VarlenInnerAttention.Config)
-            inner = SlidingWindowVarlenInnerAttention.Config(
-                **{f.name: getattr(inner, f.name) for f in dataclasses.fields(inner)},
-                sliding_window_size=sliding_window_size,
-            )
-    n_kv = n_heads if n_kv_heads is None else n_kv_heads
-    head = head_dim if head_dim is not None else dim // n_heads
-    gqa = make_gqa_config(
-        dim=dim,
-        n_heads=n_heads,
-        n_kv_heads=n_kv,
-        head_dim=head_dim,
-        wqkv_param_init={"weight": make_param_init(wqkv_init_fn_type, wqkv_init_std)},
-        wo_param_init={
-            "weight": make_param_init(wo_init_fn_type, wo_init_std, residual_div)
-        },
-        inner_attention=inner,
-        rope=rope,
-        qk_norm=_norm(norm_type, head, norm_eps) if qk_norm else None,
-        enable_sp=enable_sp,
-    )
-    fields = {f.name: getattr(gqa, f.name) for f in dataclasses.fields(gqa)}
-    if gated_attention_type == "element-wise":
-        fields["gate_proj"] = Linear.Config(
-            in_features=dim,
-            out_features=n_heads * head,
-            param_init={
-                "weight": make_param_init(
-                    w_gate_init_fn_type, w_gate_init_std, residual_div
-                )
-            },
-            sharding_config=dense_linear_sharding_config(),
-        )
-    elif gated_attention_type is not None:
-        raise ValueError(
-            "gated_attention_type must be None (no gate) or 'element-wise', "
-            f"got {gated_attention_type!r}"
-        )
-    if conv_kernel_size > 0:
-
-        def conv(channels: int) -> Conv1d.Config:
-            return Conv1d.Config(
-                in_channels=channels,
-                out_channels=channels,
-                kernel_size=conv_kernel_size,
-                groups=channels,
-                bias=False,
-                param_init={"weight": conv_init_fn(conv_init_fn_type, conv_init_gain)},
-                sharding_config=dense_linear_sharding_config(),
-            )
-
-        if conv_streams == "qkv":
-            fields["q_conv"] = conv(n_heads * head)
-        fields["k_conv"] = conv(n_kv * head)
-        fields["v_conv"] = conv(n_kv * head)
-    if attention_sinks:
-        fields["attention_sinks"] = True
-        fields["param_init"] = {
-            "sinks": make_param_init(sinks_init_fn_type, sinks_init_std)
-        }
-        fields["sharding_config"] = attention_sinks_state_sharding(gqa.sharding_config)
-    return GatedSWAttention.Config(**fields)
-
-
-def _feed_forward_config(
+def _ffn(
     *,
     dim: int,
     hidden_dim: int,
-    w1_init_fn_type: str = "scaled_orthogonal",
-    w2_init_fn_type: str = "scaled_orthogonal",
-    w3_init_fn_type: str = "scaled_orthogonal",
-    w1_init_std: float = 1.0,
-    w2_init_std: float = 1.0,
-    w3_init_std: float = 1.0,
-    residual_div: float,
-    init_gate_as_residual: bool,
+    w1_init: Callable,
+    w2_init: Callable,
+    w3_init: Callable,
 ) -> DenseFeedForward.Config:
     """A SwiGLU FFN (upstream's ``DenseFeedForward``, gate and up in one
-    ``[2, F, D]`` ``w13``) with its own initializer per projection:
-    ``residual_div`` divides w2 (and w3 with ``init_gate_as_residual``)."""
-    w3_div = residual_div if init_gate_as_residual else 1.0
-    linear_sharding = dense_linear_sharding_config()
+    ``[2, F, D]`` ``w13``) with one initializer per projection."""
+    sharding = dense_linear_sharding_config()
     return DenseFeedForward.Config(
         w13=Linear.Config(
             in_features=dim,
             out_features=hidden_dim,
             num_linears=2,
             param_init=fused_gate_up_param_init(
-                {"weight": make_param_init(w1_init_fn_type, w1_init_std)},
-                {"weight": make_param_init(w3_init_fn_type, w3_init_std, w3_div)},
+                {"weight": w1_init}, {"weight": w3_init}
             ),
-            sharding_config=linear_sharding,
+            sharding_config=sharding,
         ),
         w2=Linear.Config(
             in_features=hidden_dim,
             out_features=dim,
-            param_init={
-                "weight": make_param_init(w2_init_fn_type, w2_init_std, residual_div)
-            },
-            sharding_config=linear_sharding,
+            param_init={"weight": w2_init},
+            sharding_config=sharding,
         ),
     )
 
 
-def make_norm_moe_config(
-    *,
-    dim: int,
-    hidden_dim: int,
-    num_experts: int,
-    top_k: int,
-    num_shared_experts: int = 1,
-    scaling_factor: float = 1.0,
-    score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "sigmoid",
-    load_balance_coeff: float | None = 1e-3,
-    bias_update_norm_factor: str = "sign",
-    aux_loss: dict[str, Any] | None = None,
-    quantile_balance_bins: int | None = None,
-    track_router_metrics: bool = True,
-    w1_init_fn_type: str = "scaled_orthogonal",
-    w2_init_fn_type: str = "scaled_orthogonal",
-    w3_init_fn_type: str = "scaled_orthogonal",
-    w1_init_std: float = 1.0,
-    w2_init_std: float = 1.0,
-    w3_init_std: float = 1.0,
-    router_init_fn_type: str = "scion_normal_output",
-    router_init_std: float = 1.0,
-    layer_id: int = 0,
-    residual_div: float = 1.0,
-    init_gate_as_residual: bool = False,
-    enable_ep: bool = False,
-) -> NormMoE.Config:
-    """One layer's complete, sharded MoE config: ``num_experts`` routed SwiGLU
-    experts of ``hidden_dim`` (each drawn with its own seed), upstream's top-k
-    router, ``num_shared_experts`` shared experts as one FFN.
-
-    ``scaling_factor``: the router's ``route_scale`` (the factor on the
-    renormalized top-k weights); ``load_balance_coeff``: the expert-bias update
-    rate (None: no bias); ``quantile_balance_bins``: upstream's quantile-balanced
-    router (the bias solved from the required-bias histogram) instead of the
-    sign nudge; ``aux_loss``: upstream's auxiliary load-balance loss,
-    ``dict(loss_type="microbatch_wise" | "batch_wise", coeff=...)`` (None: none).
-    The token dispatcher: all-to-all under EP, local dispatch without (DeepEP /
-    HybridEP: upstream's ``TokenDispatcherTransform`` on the recipe).
-    """
-    aux_loss_cfg = None
-    if aux_loss is not None:
-        aux_args = dict(aux_loss)
-        loss_type = aux_args.pop("loss_type", None)
-        if loss_type == "microbatch_wise":
-            aux_loss_cfg = MicrobatchWiseLoadBalanceLoss.Config(**aux_args)
-        elif loss_type == "batch_wise":
-            aux_loss_cfg = BatchWiseLoadBalanceLoss.Config(
-                **aux_args, num_experts=num_experts
-            )
-        else:
-            raise ValueError(
-                "aux_loss needs loss_type 'microbatch_wise' or 'batch_wise', "
-                f"got {loss_type!r}"
-            )
-    router_args = dict(
-        num_experts=num_experts,
-        # fp32 output; "hi_mid_lo": close to fp32 gradients (upstream's
-        # router setting).
-        gate=HiMidLoLinear.Config(
-            backward_mode="hi_mid_lo",
-            in_features=dim,
-            out_features=num_experts,
-            param_init={
-                "weight": make_param_init(router_init_fn_type, router_init_std)
-            },
-            sharding_config=dense_linear_sharding_config(),
-        ),
-        score_func=_SCORE_FUNCS[score_func](),
-        top_k=top_k,
-        # The top-k weights renormalized to sum 1 (upstream's default is off).
-        route_norm=True,
-        route_scale=scaling_factor,
-        aux_loss=aux_loss_cfg,
-        sharding_config=router_sharding_config() if enable_ep else None,
-    )
-    if quantile_balance_bins is not None:
-        router = QuantileBalancedTopKRouter.Config(
-            **router_args, num_bins=quantile_balance_bins
-        )
-    else:
-        router = TokenChoiceTopKRouter.Config(**router_args)
-    w3_div = residual_div if init_gate_as_residual else 1.0
-    expert_weight_sharding = routed_expert_weight_sharding_config(enable_ep=enable_ep)
-    return NormMoE.Config(
-        num_experts=num_experts,
-        load_balance_coeff=load_balance_coeff,
-        bias_update_norm_factor=bias_update_norm_factor,
-        track_router_metrics=track_router_metrics,
-        router=router,
-        routed_experts=RoutedExperts.Config(
-            w13=GroupedLinear.Config(
-                group_size=num_experts,
-                in_features=dim,
-                out_features=hidden_dim,
-                num_linears=2,
-                param_init=fused_grouped_gate_up_param_init(
-                    {
-                        "w1_EFD": make_expert_param_init(
-                            w1_init_fn_type, w1_init_std, slot=0, layer_id=layer_id
-                        ),
-                        "w3_EFD": make_expert_param_init(
-                            w3_init_fn_type,
-                            w3_init_std / w3_div,
-                            slot=2,
-                            layer_id=layer_id,
-                        ),
-                    }
-                ),
-                sharding_config=expert_weight_sharding,
-            ),
-            w2=GroupedLinear.Config(
-                group_size=num_experts,
-                in_features=hidden_dim,
-                out_features=dim,
-                param_init={
-                    "weight": make_expert_param_init(
-                        w2_init_fn_type,
-                        w2_init_std / residual_div,
-                        slot=1,
-                        layer_id=layer_id,
-                    )
-                },
-                sharding_config=expert_weight_sharding,
-            ),
-            # All-to-all under EP, local dispatch at EP 1 (no EP mesh).
-            token_dispatcher=AllToAllTokenDispatcher.Config(
-                num_experts=num_experts, top_k=top_k
-            ),
-            sharding_config=routed_experts_sharding_config() if enable_ep else None,
-        ),
-        shared_experts=(
-            _feed_forward_config(
-                dim=dim,
-                hidden_dim=hidden_dim * num_shared_experts,
-                w1_init_fn_type=w1_init_fn_type,
-                w2_init_fn_type=w2_init_fn_type,
-                w3_init_fn_type=w3_init_fn_type,
-                w1_init_std=w1_init_std,
-                w2_init_std=w2_init_std,
-                w3_init_std=w3_init_std,
-                residual_div=residual_div,
-                init_gate_as_residual=init_gate_as_residual,
-            )
-            if num_shared_experts > 0
-            else None
-        ),
+def _aux_loss_config(aux_loss: dict[str, Any], num_experts: int):
+    """Upstream's auxiliary load-balance loss from
+    ``dict(loss_type="microbatch_wise" | "batch_wise", coeff=...)``."""
+    args = dict(aux_loss)
+    loss_type = args.pop("loss_type", None)
+    if loss_type == "microbatch_wise":
+        return MicrobatchWiseLoadBalanceLoss.Config(**args)
+    if loss_type == "batch_wise":
+        return BatchWiseLoadBalanceLoss.Config(**args, num_experts=num_experts)
+    raise ValueError(
+        f"aux_loss needs loss_type 'microbatch_wise' or 'batch_wise', got {loss_type!r}"
     )
 
 
@@ -436,146 +172,368 @@ def _layer_pattern(
     return [c == on for c in pattern]
 
 
-def _opt_moe_config(
+def build_opt_moe_layers(
     *,
-    parallelism: ParallelismConfig,
-    seq_len: int,
-    rope_length: int | None,
-    dim: int,
     n_layers: int,
-    attention: dict[str, Any],
-    rope: dict[str, Any],
-    feed_forward: dict[str, Any] | None = None,
-    moe: dict[str, Any] | None = None,
-    n_dense_layers: int = 0,
-    vocab_size: int = 201088,
+    dim: int,
+    norm_type: Literal["rmsnorm", "np_rmsnorm"],
+    norm_eps: float,
+    prenorm_gain_init: float = 1.0,
+    residual_scale: str = "identity",
+    depth_init: str = "total_depth_R",
+    # attention
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+    qk_norm: bool,
+    attn_backend: Literal["flex", "flex_flash", "varlen"],
+    rope: RoPE.Config,
+    rope_of_swa: RoPE.Config | None = None,
+    rope_pattern: str | None = None,
     sliding_window_size: int | None = None,
     swa_pattern: str | None = None,
-    rope_pattern: str | None = None,
-    rope_of_swa: dict[str, Any] | None = None,
-    norm_type: str = "rmsnorm",
-    norm_eps: float = 1e-30,
-    prenorm_gain_init: float = 1.0,
-    depth_init: str = "total_depth_R",
-    residual_scale: str = "identity",
+    gated_attention_type: Literal["element-wise"] | None = None,
+    conv_kernel_size: int = 0,
+    conv_streams: Literal["qkv", "kv"] = "qkv",
+    attention_sinks: bool = False,
+    wqkv_init_fn_type: str = "scaled_orthogonal",
+    wqkv_init_std: float = 1.0,
+    wo_init_fn_type: str = "scaled_orthogonal",
+    wo_init_std: float = 1.0,
+    w_gate_init_fn_type: str = "scaled_orthogonal",
+    w_gate_init_std: float = 1.0,
+    conv_init_fn_type: str = "delay",
+    conv_init_gain: float = 4.0,
+    sinks_init_fn_type: str = "zeros",
+    sinks_init_std: float = 0.0,
+    # feed-forward
+    n_dense_layers: int,
+    dense_hidden_dim: int | None = None,
+    moe_hidden_dim: int | None = None,
+    num_experts: int | None = None,
+    num_shared_experts: int = 1,
+    top_k: int | None = None,
+    route_scale: float = 1.0,
+    score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "sigmoid",
+    load_balance_coeff: float | None = 1e-3,
+    bias_update_norm_factor: str = "sign",
+    aux_loss: dict[str, Any] | None = None,
+    quantile_balance_bins: int | None = None,
+    track_router_metrics: bool = True,
+    w1_init_fn_type: str = "scaled_orthogonal",
+    w1_init_std: float = 1.0,
+    w2_init_fn_type: str = "scaled_orthogonal",
+    w2_init_std: float = 1.0,
+    w3_init_fn_type: str = "scaled_orthogonal",
+    w3_init_std: float = 1.0,
     init_gate_as_residual: bool = False,
-    first_in_init_fn_type: str = "scion_normal_input",
-    first_in_init_std: float = 1.0,
-    final_out_init_fn_type: str = "scion_normal_output",
-    final_out_init_std: float = 1.0,
-    enable_weight_tying: bool = False,
-    enable_token_mask_for_moe: bool = False,
-) -> OPTMoEModel.Config:
-    """The complete model config.
+    router_init_fn_type: str = "scion_normal_output",
+    router_init_std: float = 1.0,
+    enable_sp: bool,
+    enable_ep: bool,
+    enable_cp: bool,
+) -> list[OPTMoETransformerBlock.Config]:
+    """The sharded per-layer ``OPTMoETransformerBlock`` configs.
 
-    Layers: the first ``n_dense_layers`` dense (``feed_forward``), the rest MoE
-    (``moe``). ``swa_pattern`` ("S" sliding-window / "F" full per layer; None:
+    Norms and residuals: ``norm_type`` / ``norm_eps`` for the q/k and block
+    norms, ``prenorm_gain_init`` the block norms' starting gain;
+    ``residual_scale`` / ``depth_init`` the residual scales and the per-layer
+    init divisors of wo, the gate and the FFN / expert w2 (param_init.py).
+
+    Attention: ``swa_pattern`` ("S" sliding-window / "F" full per layer; None:
     every layer sliding-window when ``sliding_window_size`` is set) and
     ``rope_pattern`` ("R" RoPE / "N" NoPE per layer; None: RoPE everywhere) pick
-    each layer's attention; sliding-window layers take ``rope_of_swa`` when set.
-    ``rope``: ``CosSinRoPE.Config`` fields (partial RoPE when ``dim`` <
-    head_dim), its cache ``max(seq_len, rope_length)`` long. ``norm_type`` /
-    ``norm_eps``: every norm (q/k, block and final norms).
-    ``depth_init`` / ``residual_scale``: the per-layer init divisors and the
-    residual scales (param_init.py).
+    each layer's; sliding-window layers take ``rope_of_swa`` when set.
+    ``gated_attention_type`` "element-wise": the output times
+    ``sigmoid(gate_proj(x))``; ``conv_kernel_size`` > 0: the Canon short conv
+    ``x + conv(x)`` on q, k and v (``conv_streams`` "qkv") or k and v ("kv"),
+    each channel initialized by ``conv_init_fn_type`` ("delay",
+    "random_opnorm", "torch_default") at ``conv_init_gain``;
+    ``attention_sinks``: one learned logit per head in the softmax.
+
+    Feed-forward: layers ``< n_dense_layers`` a dense SwiGLU FFN of
+    ``dense_hidden_dim``, the rest an ``OptMoE``: ``num_experts`` routed experts
+    of ``moe_hidden_dim`` (each drawn with its own seed) and
+    ``num_shared_experts`` shared ones as one FFN; upstream's top-k router with
+    the top-k weights renormalized and scaled by ``route_scale``;
+    ``load_balance_coeff`` the expert-bias update rate (None: no bias),
+    ``quantile_balance_bins`` upstream's quantile-balanced router instead of the
+    sign nudge, ``aux_loss`` upstream's auxiliary load-balance loss
+    (``dict(loss_type="microbatch_wise" | "batch_wise", coeff=...)``). One
+    w1 / w2 / w3 init for the dense FFN, the routed and the shared experts; w3
+    takes the depth divisor too with ``init_gate_as_residual``. The token
+    dispatcher: all-to-all under EP, local dispatch without (DeepEP / HybridEP:
+    upstream's ``TokenDispatcherTransform`` on the recipe).
+
+    ``enable_cp``: the attention runs under Context Parallel (flex backends
+    only, no conv or sinks).
     """
-    tp = parallelism.tensor_parallel_degree > 1
-    cp = parallelism.context_parallel_degree > 1
-    enable_sp = parallelism.enable_sequence_parallel and tp
-    enable_ep = parallelism.expert_parallel_degree > 1
-    if tp:
-        raise NotImplementedError(
-            "OPT MoE has no tensor-parallel plan (its gate, convs, sinks and "
-            "NormMoE are replicated over TP): run with tensor_parallel_degree=1"
-        )
-    if cp and (
-        attention.get("conv_kernel_size", 0) > 0 or attention.get("attention_sinks")
-    ):
+    if enable_cp and (conv_kernel_size > 0 or attention_sinks):
         raise NotImplementedError(
             "the attention short conv and sinks do not support CP"
         )
-    if cp and attention.get("attn_backend", "flex") not in ("flex", "flex_flash"):
+    if enable_cp and attn_backend not in ("flex", "flex_flash"):
         raise ValueError("Context Parallel needs the flex attention backend")
+    if gated_attention_type not in (None, "element-wise"):
+        raise ValueError(
+            "gated_attention_type must be None (no gate) or 'element-wise', "
+            f"got {gated_attention_type!r}"
+        )
+    if conv_kernel_size > 0 and conv_streams not in ("qkv", "kv"):
+        raise ValueError(f"conv_streams must be qkv | kv, got {conv_streams!r}")
     use_swa = _layer_pattern(
         swa_pattern, n_layers, "S", "F", default=sliding_window_size is not None
     )
     if any(use_swa) and sliding_window_size is None:
         raise ValueError("sliding-window layers need sliding_window_size")
     use_rope = _layer_pattern(rope_pattern, n_layers, "R", "N", default=True)
-    if n_dense_layers > 0 and feed_forward is None:
-        raise ValueError(f"n_dense_layers={n_dense_layers} needs feed_forward")
-    if n_dense_layers < n_layers and moe is None:
+    if n_dense_layers > 0 and dense_hidden_dim is None:
+        raise ValueError(f"n_dense_layers={n_dense_layers} needs dense_hidden_dim")
+    if n_dense_layers < n_layers and None in (moe_hidden_dim, num_experts, top_k):
         raise ValueError(
-            f"layers {n_dense_layers}..{n_layers - 1} are MoE layers: they need moe"
+            f"layers {n_dense_layers}..{n_layers - 1} are MoE layers: they need "
+            "moe_hidden_dim, num_experts and top_k"
         )
-    cache_length = max(seq_len, rope_length or 0)
-    rope_cfg = CosSinRoPE.Config(**rope, max_context_length=cache_length)
-    rope_of_swa_cfg = (
-        CosSinRoPE.Config(**rope_of_swa, max_context_length=cache_length)
-        if rope_of_swa is not None
-        else None
-    )
+    if prenorm_gain_init != 1.0 and norm_type != "rmsnorm":
+        raise ValueError(
+            "prenorm_gain_init != 1 needs norm_type='rmsnorm' "
+            f"(got {norm_type!r}): no gain to initialise"
+        )
     block_scale, identity_scale = setup_residual_scale(residual_scale, n_layers)
     block_norm_sharding = norm_sharding_config(enable_sp=enable_sp)
 
-    def block_norm():
-        cfg = _norm(norm_type, dim, norm_eps)
+    def block_norm() -> RMSNorm.Config:
+        cfg = _norm(norm_type, dim, norm_eps, sharding_config=block_norm_sharding)
         if prenorm_gain_init != 1.0:
-            if norm_type != "rmsnorm":
-                raise ValueError(
-                    "prenorm_gain_init != 1 needs norm_type='rmsnorm' "
-                    f"(got {norm_type!r}): no gain to initialise"
-                )
             cfg.param_init = {
                 "weight": functools.partial(nn.init.constant_, val=prenorm_gain_init)
             }
-        cfg.sharding_config = block_norm_sharding
         return cfg
+
+    def conv(channels: int) -> Conv1d.Config:
+        return Conv1d.Config(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=conv_kernel_size,
+            groups=channels,
+            bias=False,
+            param_init={"weight": conv_init_fn(conv_init_fn_type, conv_init_gain)},
+            sharding_config=dense_linear_sharding_config(),
+        )
 
     layers = []
     for layer_id in range(n_layers):
-        residual_div_attn, residual_div_ffn = setup_depth_init(
-            depth_init, layer_id, n_layers
-        )
+        div_attn, div_ffn = setup_depth_init(depth_init, layer_id, n_layers)
+        w3_div = div_ffn if init_gate_as_residual else 1.0
+
+        inner = get_attention_config(attn_backend)
+        if use_swa[layer_id]:
+            if isinstance(inner, FlexInnerAttention.Config):
+                inner = SlidingWindowFlexInnerAttention.Config(
+                    block_size=inner.block_size,
+                    kernel_options=inner.kernel_options,
+                    sliding_window_size=sliding_window_size,
+                )
+            else:
+                assert isinstance(inner, VarlenInnerAttention.Config)
+                inner = SlidingWindowVarlenInnerAttention.Config(
+                    **{
+                        f.name: getattr(inner, f.name)
+                        for f in dataclasses.fields(inner)
+                    },
+                    sliding_window_size=sliding_window_size,
+                )
         layer_rope = (
-            rope_of_swa_cfg
-            if use_swa[layer_id] and rope_of_swa_cfg is not None
-            else rope_cfg
+            rope_of_swa if use_swa[layer_id] and rope_of_swa is not None else rope
         )
-        attention_cfg = make_gated_swa_attention_config(
-            **attention,
+        gqa = make_gqa_config(
             dim=dim,
-            sliding_window_size=sliding_window_size if use_swa[layer_id] else None,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            wqkv_param_init={
+                "weight": make_param_init(wqkv_init_fn_type, wqkv_init_std)
+            },
+            wo_param_init={
+                "weight": make_param_init(wo_init_fn_type, wo_init_std, div_attn)
+            },
+            inner_attention=inner,
             rope=layer_rope if use_rope[layer_id] else None,
-            norm_type=norm_type,
-            norm_eps=norm_eps,
-            residual_div=residual_div_attn,
+            qk_norm=_norm(norm_type, head_dim, norm_eps) if qk_norm else None,
             enable_sp=enable_sp,
         )
-        ffn = dict(
-            dim=dim,
-            residual_div=residual_div_ffn,
-            init_gate_as_residual=init_gate_as_residual,
-        )
+        attention = {f.name: getattr(gqa, f.name) for f in dataclasses.fields(gqa)}
+        if gated_attention_type == "element-wise":
+            attention["gate_proj"] = Linear.Config(
+                in_features=dim,
+                out_features=n_heads * head_dim,
+                param_init={
+                    "weight": make_param_init(
+                        w_gate_init_fn_type, w_gate_init_std, div_attn
+                    )
+                },
+                sharding_config=dense_linear_sharding_config(),
+            )
+        if conv_kernel_size > 0:
+            if conv_streams == "qkv":
+                attention["q_conv"] = conv(n_heads * head_dim)
+            attention["k_conv"] = conv(n_kv_heads * head_dim)
+            attention["v_conv"] = conv(n_kv_heads * head_dim)
+        if attention_sinks:
+            attention["attention_sinks"] = True
+            attention["param_init"] = {
+                "sinks": make_param_init(sinks_init_fn_type, sinks_init_std)
+            }
+            attention["sharding_config"] = attention_sinks_state_sharding(
+                gqa.sharding_config
+            )
+
+        if layer_id < n_dense_layers:
+            feed_forward = _ffn(
+                dim=dim,
+                hidden_dim=dense_hidden_dim,
+                w1_init=make_param_init(w1_init_fn_type, w1_init_std),
+                w2_init=make_param_init(w2_init_fn_type, w2_init_std, div_ffn),
+                w3_init=make_param_init(w3_init_fn_type, w3_init_std, w3_div),
+            )
+        else:
+            router_args = dict(
+                num_experts=num_experts,
+                # fp32 output; "hi_mid_lo": close to fp32 gradients (upstream's
+                # router setting).
+                gate=HiMidLoLinear.Config(
+                    backward_mode="hi_mid_lo",
+                    in_features=dim,
+                    out_features=num_experts,
+                    param_init={
+                        "weight": make_param_init(router_init_fn_type, router_init_std)
+                    },
+                    sharding_config=dense_linear_sharding_config(),
+                ),
+                score_func=_SCORE_FUNCS[score_func](),
+                top_k=top_k,
+                # The top-k weights renormalized to sum 1 (upstream's default
+                # is off).
+                route_norm=True,
+                route_scale=route_scale,
+                aux_loss=(
+                    None
+                    if aux_loss is None
+                    else _aux_loss_config(aux_loss, num_experts)
+                ),
+                sharding_config=router_sharding_config() if enable_ep else None,
+            )
+            expert_sharding = routed_expert_weight_sharding_config(enable_ep=enable_ep)
+            feed_forward = OptMoE.Config(
+                num_experts=num_experts,
+                load_balance_coeff=load_balance_coeff,
+                bias_update_norm_factor=bias_update_norm_factor,
+                track_router_metrics=track_router_metrics,
+                router=(
+                    QuantileBalancedTopKRouter.Config(
+                        **router_args, num_bins=quantile_balance_bins
+                    )
+                    if quantile_balance_bins is not None
+                    else TokenChoiceTopKRouter.Config(**router_args)
+                ),
+                routed_experts=RoutedExperts.Config(
+                    w13=GroupedLinear.Config(
+                        group_size=num_experts,
+                        in_features=dim,
+                        out_features=moe_hidden_dim,
+                        num_linears=2,
+                        param_init=fused_grouped_gate_up_param_init(
+                            {
+                                "w1_EFD": make_expert_param_init(
+                                    w1_init_fn_type,
+                                    w1_init_std,
+                                    slot=0,
+                                    layer_id=layer_id,
+                                ),
+                                "w3_EFD": make_expert_param_init(
+                                    w3_init_fn_type,
+                                    w3_init_std / w3_div,
+                                    slot=2,
+                                    layer_id=layer_id,
+                                ),
+                            }
+                        ),
+                        sharding_config=expert_sharding,
+                    ),
+                    w2=GroupedLinear.Config(
+                        group_size=num_experts,
+                        in_features=moe_hidden_dim,
+                        out_features=dim,
+                        param_init={
+                            "weight": make_expert_param_init(
+                                w2_init_fn_type,
+                                w2_init_std / div_ffn,
+                                slot=1,
+                                layer_id=layer_id,
+                            )
+                        },
+                        sharding_config=expert_sharding,
+                    ),
+                    # All-to-all under EP, local dispatch at EP 1 (no EP mesh).
+                    token_dispatcher=AllToAllTokenDispatcher.Config(
+                        num_experts=num_experts, top_k=top_k
+                    ),
+                    sharding_config=(
+                        routed_experts_sharding_config() if enable_ep else None
+                    ),
+                ),
+                shared_experts=(
+                    _ffn(
+                        dim=dim,
+                        hidden_dim=moe_hidden_dim * num_shared_experts,
+                        w1_init=make_param_init(w1_init_fn_type, w1_init_std),
+                        w2_init=make_param_init(w2_init_fn_type, w2_init_std, div_ffn),
+                        w3_init=make_param_init(w3_init_fn_type, w3_init_std, w3_div),
+                    )
+                    if num_shared_experts > 0
+                    else None
+                ),
+            )
+
         layers.append(
             OPTMoETransformerBlock.Config(
-                attention=attention_cfg,
+                attention=GatedSWAttention.Config(**attention),
                 attention_norm=block_norm(),
                 ffn_norm=block_norm(),
-                feed_forward=(
-                    _feed_forward_config(**feed_forward, **ffn)
-                    if layer_id < n_dense_layers
-                    else make_norm_moe_config(
-                        **moe, **ffn, layer_id=layer_id, enable_ep=enable_ep
-                    )
-                ),
+                feed_forward=feed_forward,
                 block_scale=block_scale,
                 identity_scale=identity_scale,
             )
         )
-    final_norm = _norm(norm_type, dim, norm_eps)
-    final_norm.sharding_config = pre_lm_head_norm_sharding_config(enable_sp=enable_sp)
-    config = OPTMoEModel.Config(
+    return layers
+
+
+def _opt_moe_config(
+    *,
+    seq_len: int,
+    parallelism: ParallelismConfig,
+    rope_length: int | None = None,
+    dim: int,
+    vocab_size: int = 201088,
+    enable_weight_tying: bool = False,
+    norm_type: Literal["rmsnorm", "np_rmsnorm"] = "rmsnorm",
+    norm_eps: float = 1e-30,
+    embedding_init_fn_type: str = "scion_normal_input",
+    embedding_init_std: float = 1.0,
+    lm_head_init_fn_type: str = "scion_normal_output",
+    lm_head_init_std: float = 1.0,
+    rope: dict[str, Any],
+    rope_of_swa: dict[str, Any] | None = None,
+    **layer_settings: Any,
+) -> OPTMoEModel.Config:
+    """The complete, sharded model config: the embedding, the final norm, the
+    head and ``build_opt_moe_layers(**layer_settings)``. ``rope`` /
+    ``rope_of_swa``: ``CosSinRoPE.Config`` fields (partial RoPE when ``dim`` <
+    head_dim), the cache ``max(seq_len, rope_length)`` long; ``norm_type`` /
+    ``norm_eps``: every norm."""
+    flags = layout_flags(parallelism)
+    cache_length = max(seq_len, rope_length or 0)
+    return OPTMoEModel.Config(
         max_context_length=seq_len,
         dim=dim,
         vocab_size=vocab_size,
@@ -584,24 +542,259 @@ def _opt_moe_config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
             param_init={
-                "weight": make_param_init(first_in_init_fn_type, first_in_init_std)
+                "weight": make_param_init(embedding_init_fn_type, embedding_init_std)
             },
-            sharding_config=token_embedding_sharding_config(enable_sp=enable_sp),
+            sharding_config=token_embedding_sharding_config(enable_sp=flags["sp"]),
         ),
-        layers=layers,
-        norm=final_norm,
+        norm=_norm(
+            norm_type,
+            dim,
+            norm_eps,
+            sharding_config=pre_lm_head_norm_sharding_config(enable_sp=flags["sp"]),
+        ),
         lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init={
-                "weight": make_param_init(final_out_init_fn_type, final_out_init_std)
+                "weight": make_param_init(lm_head_init_fn_type, lm_head_init_std)
             },
             sharding_config=lm_head_sharding_config(),
         ),
-        enable_token_mask_for_moe=enable_token_mask_for_moe,
-        built_for=layout_flags(parallelism),
+        layers=build_opt_moe_layers(
+            dim=dim,
+            norm_type=norm_type,
+            norm_eps=norm_eps,
+            rope=CosSinRoPE.Config(**rope, max_context_length=cache_length),
+            rope_of_swa=(
+                None
+                if rope_of_swa is None
+                else CosSinRoPE.Config(**rope_of_swa, max_context_length=cache_length)
+            ),
+            **layer_settings,
+            enable_sp=flags["sp"],
+            enable_ep=flags["ep"],
+            enable_cp=flags["cp"],
+        ),
+        built_for=flags,
     )
-    if cp:  # the CP versions of the flex inner attentions (all-gather KV)
+
+
+# `mis-*`: SSSF hybrid attention (window 128), GQA with qk-norm, one shared
+# expert, top-8 routing.
+_MIS = dict(
+    n_heads=32,
+    n_kv_heads=4,
+    head_dim=128,
+    qk_norm=True,
+    attn_backend="flex",
+    sliding_window_size=128,
+    rope=dict(dim=128, theta=10000.0),
+    top_k=8,
+)
+
+
+def _mis_8b(**overrides: Any) -> OPTMoEModel.Config:
+    return _opt_moe_config(
+        **dict(
+            _MIS,
+            dim=2048,
+            n_layers=24,
+            swa_pattern="SSSF" * 6,
+            rope_pattern="RRRN" * 6,
+            n_dense_layers=0,
+            moe_hidden_dim=640,
+            num_experts=64,
+        )
+        | overrides
+    )
+
+
+def _mis_8b_proxy(**overrides: Any) -> OPTMoEModel.Config:
+    return _opt_moe_config(
+        **dict(
+            _MIS,
+            dim=512,
+            n_layers=24,
+            n_heads=8,
+            n_kv_heads=1,
+            swa_pattern="SSSF" * 6,
+            rope_pattern="RRRN" * 6,
+            n_dense_layers=0,
+            moe_hidden_dim=160,
+            num_experts=64,
+        )
+        | overrides
+    )
+
+
+def _mis_30b_a3b(**overrides: Any) -> OPTMoEModel.Config:
+    return _opt_moe_config(
+        **dict(
+            _MIS,
+            dim=2048,
+            n_layers=40,
+            swa_pattern="SSSF" * 10,
+            n_dense_layers=1,
+            dense_hidden_dim=8192,
+            moe_hidden_dim=512,
+            num_experts=256,
+        )
+        | overrides
+    )
+
+
+def _mis_100b_a5b(**overrides: Any) -> OPTMoEModel.Config:
+    return _opt_moe_config(
+        **dict(
+            _MIS,
+            dim=3072,
+            n_layers=40,
+            swa_pattern="SSSF" * 10,
+            n_dense_layers=1,
+            dense_hidden_dim=8192,
+            moe_hidden_dim=1024,
+            num_experts=256,
+        )
+        | overrides
+    )
+
+
+# `gauge-*`: the optimizer study's dense models (full attention, MHA, head_dim
+# 128, qk-norm).
+def _gauge(
+    *, n_layers: int, dim: int, n_heads: int, dense_hidden_dim: int, **overrides: Any
+) -> OPTMoEModel.Config:
+    return _opt_moe_config(
+        **dict(
+            dim=dim,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            n_kv_heads=n_heads,
+            head_dim=128,
+            qk_norm=True,
+            attn_backend="flex",
+            rope=dict(dim=128, theta=10000.0),
+            n_dense_layers=n_layers,
+            dense_hidden_dim=dense_hidden_dim,
+        )
+        | overrides
+    )
+
+
+# `production-*-336m`: the optimizer study's production recipe at 336M (the
+# gauge-d16-w1024 shape): every hidden matrix scaled-orthogonal at std 4 (the x4
+# in the init), embedding std 0.02.
+_PRODUCTION_336M = dict(
+    dim=1024,
+    n_layers=16,
+    n_heads=16,
+    n_kv_heads=16,
+    head_dim=128,
+    qk_norm=True,
+    attn_backend="flex",
+    rope=dict(dim=128, theta=10000.0),
+    embedding_init_std=0.02,
+    wqkv_init_std=4.0,
+    wo_init_std=4.0,
+    w_gate_init_std=4.0,
+    w1_init_std=4.0,
+    w2_init_std=4.0,
+    w3_init_std=4.0,
+)
+
+
+def _production_dense_336m(**overrides: Any) -> OPTMoEModel.Config:
+    return _opt_moe_config(
+        **dict(_PRODUCTION_336M, n_dense_layers=16, dense_hidden_dim=4096) | overrides
+    )
+
+
+# Every FFN an MoE: 64 routed experts of hidden 448 + 1 shared, top 8; the
+# router gate scaled-orthogonal at std 4.
+def _production_moe_336m(**overrides: Any) -> OPTMoEModel.Config:
+    return _opt_moe_config(
+        **dict(
+            _PRODUCTION_336M,
+            n_dense_layers=0,
+            moe_hidden_dim=448,
+            num_experts=64,
+            top_k=8,
+            router_init_fn_type="scaled_orthogonal",
+            router_init_std=4.0,
+        )
+        | overrides
+    )
+
+
+# Each entry: the flavor's function and its default training context length.
+MODEL_FLAVORS: dict[str, tuple[Callable[..., OPTMoEModel.Config], int]] = {
+    "mis-8b": (_mis_8b, 4096),
+    "mis-8b-proxy": (_mis_8b_proxy, 4096),
+    "mis-8b-proxy-qbalance": (
+        functools.partial(_mis_8b_proxy, quantile_balance_bins=1000),
+        4096,
+    ),
+    "mis-30b-a3b": (_mis_30b_a3b, 4096),
+    "mis-100b-a5b": (_mis_100b_a5b, 4096),
+    "gauge-d8-w256": (
+        functools.partial(
+            _gauge, n_layers=8, dim=256, n_heads=4, dense_hidden_dim=1024
+        ),
+        4096,
+    ),
+    "gauge-d16-w256": (
+        functools.partial(
+            _gauge, n_layers=16, dim=256, n_heads=4, dense_hidden_dim=1024
+        ),
+        4096,
+    ),
+    "gauge-d16-w512": (
+        functools.partial(
+            _gauge, n_layers=16, dim=512, n_heads=8, dense_hidden_dim=2048
+        ),
+        4096,
+    ),
+    "gauge-d16-w1024": (
+        functools.partial(
+            _gauge, n_layers=16, dim=1024, n_heads=16, dense_hidden_dim=4096
+        ),
+        4096,
+    ),
+    "production-dense-336m": (_production_dense_336m, 4096),
+    "production-moe-336m": (_production_moe_336m, 4096),
+}
+
+
+def build_model_config(
+    flavor: str,
+    *,
+    parallelism: ParallelismConfig,
+    seq_len: int | None = None,
+    rope_length: int | None = None,
+    **overrides: Any,
+) -> OPTMoEModel.Config:
+    """The complete, sharded config of ``flavor`` for ``parallelism``, with the
+    recipe's ``overrides`` (they replace the flavor's settings of the same
+    name). ``seq_len``: the training context (default: the flavor's);
+    ``rope_length``: a longer RoPE cache (validation sequences)."""
+    if flavor not in MODEL_FLAVORS:
+        raise ValueError(
+            f"Unknown opt_moe flavor {flavor!r}; available: {', '.join(MODEL_FLAVORS)}"
+        )
+    if parallelism.tensor_parallel_degree > 1:
+        raise NotImplementedError(
+            "OPT MoE has no tensor-parallel plan (its gate, convs, sinks and "
+            "OptMoE are replicated over TP): run with tensor_parallel_degree=1"
+        )
+    get_config, default_seq_len = MODEL_FLAVORS[flavor]
+    config = get_config(
+        seq_len=seq_len or default_seq_len,
+        parallelism=parallelism,
+        rope_length=rope_length,
+        **copy.deepcopy(overrides),
+    )
+    if parallelism.context_parallel_degree > 1:
+        # the CP versions of the flex inner attentions (all-gather KV)
         from torchtitan.config.transform.context_parallel import (
             ContextParallelTransform,
         )
@@ -618,328 +811,6 @@ def _opt_moe_config(
                 ),
             }
         ).transform(config)
-    return config
-
-
-# The builder arguments merged key by key (the rest replace the flavor's).
-_MERGED_ARGS = ("attention", "feed_forward", "moe", "rope", "rope_of_swa")
-
-
-def _build(overrides: dict[str, Any], **flavor_args: Any) -> OPTMoEModel.Config:
-    """A flavor's arguments with the run's ``overrides`` merged in (see the
-    module docstring), built for the ``parallelism``, ``seq_len`` and
-    ``rope_length`` that ``build_model_config`` passes in ``overrides``; the
-    merged arguments are kept in ``config.build_args``."""
-    context = {
-        name: overrides.pop(name) for name in ("parallelism", "seq_len", "rope_length")
-    }
-    args = copy.deepcopy(flavor_args)
-    for name, value in copy.deepcopy(overrides).items():
-        if name in _MERGED_ARGS and value is not None and args.get(name) is not None:
-            args[name] = {**args[name], **value}
-        else:
-            args[name] = value
-    config = _opt_moe_config(**args, **context)
-    config.build_args = args
-    return config
-
-
-# `mis-*`: SSSF hybrid attention (window 128), qk-norm, one shared expert,
-# top-8 routing, no MoE output factor.
-def _mis_8b(**overrides: Any) -> OPTMoEModel.Config:
-    return _build(
-        overrides,
-        n_layers=24,
-        dim=2048,
-        n_dense_layers=0,
-        swa_pattern="SSSF" * 6,
-        sliding_window_size=128,
-        rope_pattern="RRRN" * 6,
-        rope=dict(dim=128, theta=10000.0),
-        attention=dict(
-            n_heads=32, n_kv_heads=4, head_dim=128, qk_norm=True, attn_backend="flex"
-        ),
-        feed_forward=dict(hidden_dim=5120),
-        moe=dict(
-            hidden_dim=640,
-            num_experts=64,
-            num_shared_experts=1,
-            top_k=8,
-            scaling_factor=1.0,
-        ),
-    )
-
-
-def _mis_8b_proxy(
-    *, quantile_balance_bins: int | None = None, **overrides: Any
-) -> OPTMoEModel.Config:
-    """``quantile_balance_bins``: the expert bias solved from the required-bias
-    histogram (upstream's quantile-balanced router) instead of the sign nudge."""
-    return _build(
-        overrides,
-        n_layers=24,
-        dim=512,
-        n_dense_layers=0,
-        swa_pattern="SSSF" * 6,
-        sliding_window_size=128,
-        rope_pattern="RRRN" * 6,
-        rope=dict(dim=128, theta=10000.0),
-        attention=dict(
-            n_heads=8, n_kv_heads=1, head_dim=128, qk_norm=True, attn_backend="flex"
-        ),
-        feed_forward=dict(hidden_dim=1280),
-        moe=dict(
-            hidden_dim=160,
-            num_experts=64,
-            num_shared_experts=1,
-            top_k=8,
-            scaling_factor=1.0,
-            quantile_balance_bins=quantile_balance_bins,
-        ),
-    )
-
-
-def _mis_30b_a3b(**overrides: Any) -> OPTMoEModel.Config:
-    return _build(
-        overrides,
-        n_layers=40,
-        dim=2048,
-        n_dense_layers=1,
-        swa_pattern="SSSF" * 10,
-        sliding_window_size=128,
-        rope=dict(dim=128, theta=10000.0),
-        attention=dict(
-            n_heads=32, n_kv_heads=4, head_dim=128, qk_norm=True, attn_backend="flex"
-        ),
-        feed_forward=dict(hidden_dim=8192),
-        moe=dict(
-            hidden_dim=512,
-            num_experts=256,
-            num_shared_experts=1,
-            top_k=8,
-            scaling_factor=1.0,
-        ),
-    )
-
-
-def _mis_100b_a5b(**overrides: Any) -> OPTMoEModel.Config:
-    return _build(
-        overrides,
-        n_layers=40,
-        dim=3072,
-        n_dense_layers=1,
-        swa_pattern="SSSF" * 10,
-        sliding_window_size=128,
-        rope=dict(dim=128, theta=10000.0),
-        attention=dict(
-            n_heads=32, n_kv_heads=4, head_dim=128, qk_norm=True, attn_backend="flex"
-        ),
-        feed_forward=dict(hidden_dim=8192),
-        moe=dict(
-            hidden_dim=1024,
-            num_experts=256,
-            num_shared_experts=1,
-            top_k=8,
-            scaling_factor=1.0,
-        ),
-    )
-
-
-# `gauge-*`: the optimizer study's dense models (full attention, MHA, head_dim
-# 128, qk-norm).
-def _gauge(
-    *, n_layers: int, dim: int, n_heads: int, hidden_dim: int, **overrides: Any
-) -> OPTMoEModel.Config:
-    return _build(
-        overrides,
-        n_layers=n_layers,
-        dim=dim,
-        n_dense_layers=n_layers,
-        rope=dict(dim=128, theta=10000.0),
-        attention=dict(n_heads=n_heads, n_kv_heads=n_heads, head_dim=128, qk_norm=True),
-        feed_forward=dict(hidden_dim=hidden_dim),
-    )
-
-
-# `production-*-336m`: the optimizer study's production recipe at 336M (dim 1024,
-# 16 layers, MHA, full attention, qk-norm, RMSNorm gains, no depth scaling; every
-# hidden matrix scaled-orthogonal at std 4, the x4 in the init; embedding
-# scion-normal std 0.02, head std 1), every setting written out. norm_eps 1e-30:
-# open (the user decides the production value).
-def _production_dense_336m(**overrides: Any) -> OPTMoEModel.Config:
-    return _build(
-        overrides,
-        dim=1024,
-        n_layers=16,
-        n_dense_layers=16,
-        vocab_size=201088,
-        enable_weight_tying=False,
-        enable_token_mask_for_moe=False,
-        norm_type="rmsnorm",
-        norm_eps=1e-30,
-        prenorm_gain_init=1.0,
-        depth_init="identity",
-        residual_scale="identity",
-        init_gate_as_residual=False,
-        first_in_init_fn_type="scion_normal_input",
-        first_in_init_std=0.02,
-        final_out_init_fn_type="scion_normal_output",
-        final_out_init_std=1.0,
-        sliding_window_size=None,
-        swa_pattern=None,
-        rope_pattern=None,
-        rope=dict(dim=128, theta=10000.0, scaling="none"),
-        rope_of_swa=None,
-        attention=dict(
-            n_heads=16,
-            n_kv_heads=16,
-            head_dim=128,
-            qk_norm=True,
-            attn_backend="flex",
-            gated_attention_type=None,
-            conv_kernel_size=0,
-            attention_sinks=False,
-            wqkv_init_fn_type="scaled_orthogonal",
-            wo_init_fn_type="scaled_orthogonal",
-            w_gate_init_fn_type="scaled_orthogonal",
-            wqkv_init_std=4.0,
-            wo_init_std=4.0,
-            w_gate_init_std=4.0,
-        ),
-        feed_forward=dict(
-            hidden_dim=4096,
-            w1_init_fn_type="scaled_orthogonal",
-            w2_init_fn_type="scaled_orthogonal",
-            w3_init_fn_type="scaled_orthogonal",
-            w1_init_std=4.0,
-            w2_init_std=4.0,
-            w3_init_std=4.0,
-        ),
-        moe=None,
-    )
-
-
-# production-dense-336m with every FFN an MoE: 64 routed experts of hidden 448 + 1
-# shared, top 8, sigmoid scores, no output factor, the sign bias update at 0.001,
-# no aux loss; experts and router gate scaled-orthogonal at std 4.
-def _production_moe_336m(**overrides: Any) -> OPTMoEModel.Config:
-    return _build(
-        overrides,
-        dim=1024,
-        n_layers=16,
-        n_dense_layers=0,
-        vocab_size=201088,
-        enable_weight_tying=False,
-        enable_token_mask_for_moe=False,
-        norm_type="rmsnorm",
-        norm_eps=1e-30,
-        prenorm_gain_init=1.0,
-        depth_init="identity",
-        residual_scale="identity",
-        init_gate_as_residual=False,
-        first_in_init_fn_type="scion_normal_input",
-        first_in_init_std=0.02,
-        final_out_init_fn_type="scion_normal_output",
-        final_out_init_std=1.0,
-        sliding_window_size=None,
-        swa_pattern=None,
-        rope_pattern=None,
-        rope=dict(dim=128, theta=10000.0, scaling="none"),
-        rope_of_swa=None,
-        attention=dict(
-            n_heads=16,
-            n_kv_heads=16,
-            head_dim=128,
-            qk_norm=True,
-            attn_backend="flex",
-            gated_attention_type=None,
-            conv_kernel_size=0,
-            attention_sinks=False,
-            wqkv_init_fn_type="scaled_orthogonal",
-            wo_init_fn_type="scaled_orthogonal",
-            w_gate_init_fn_type="scaled_orthogonal",
-            wqkv_init_std=4.0,
-            wo_init_std=4.0,
-            w_gate_init_std=4.0,
-        ),
-        feed_forward=None,
-        moe=dict(
-            hidden_dim=448,
-            num_experts=64,
-            num_shared_experts=1,
-            top_k=8,
-            scaling_factor=1.0,
-            score_func="sigmoid",
-            load_balance_coeff=0.001,
-            bias_update_norm_factor="sign",
-            aux_loss=None,
-            quantile_balance_bins=None,
-            track_router_metrics=True,
-            w1_init_fn_type="scaled_orthogonal",
-            w2_init_fn_type="scaled_orthogonal",
-            w3_init_fn_type="scaled_orthogonal",
-            w1_init_std=4.0,
-            w2_init_std=4.0,
-            w3_init_std=4.0,
-            router_init_fn_type="scaled_orthogonal",
-            router_init_std=4.0,
-        ),
-    )
-
-
-# Each entry: the flavor's function and its default training context length.
-MODEL_FLAVORS: dict[str, tuple[Callable[..., OPTMoEModel.Config], int]] = {
-    "mis-8b": (_mis_8b, 4096),
-    "mis-8b-proxy": (_mis_8b_proxy, 4096),
-    "mis-8b-proxy-qbalance": (
-        functools.partial(_mis_8b_proxy, quantile_balance_bins=1000),
-        4096,
-    ),
-    "mis-30b-a3b": (_mis_30b_a3b, 4096),
-    "mis-100b-a5b": (_mis_100b_a5b, 4096),
-    "gauge-d8-w256": (
-        functools.partial(_gauge, n_layers=8, dim=256, n_heads=4, hidden_dim=1024),
-        4096,
-    ),
-    "gauge-d16-w256": (
-        functools.partial(_gauge, n_layers=16, dim=256, n_heads=4, hidden_dim=1024),
-        4096,
-    ),
-    "gauge-d16-w512": (
-        functools.partial(_gauge, n_layers=16, dim=512, n_heads=8, hidden_dim=2048),
-        4096,
-    ),
-    "gauge-d16-w1024": (
-        functools.partial(_gauge, n_layers=16, dim=1024, n_heads=16, hidden_dim=4096),
-        4096,
-    ),
-    "production-dense-336m": (_production_dense_336m, 4096),
-    "production-moe-336m": (_production_moe_336m, 4096),
-}
-
-
-def build_model_config(
-    flavor: str,
-    *,
-    parallelism: ParallelismConfig,
-    seq_len: int | None = None,
-    rope_length: int | None = None,
-    **overrides: Any,
-) -> OPTMoEModel.Config:
-    """The complete, sharded config of ``flavor`` with the run's ``overrides``
-    (``_opt_moe_config``'s arguments; see the module docstring), for
-    ``parallelism``. ``seq_len``: the training context (default: the flavor's);
-    ``rope_length``: a longer RoPE cache (validation sequences)."""
-    if flavor not in MODEL_FLAVORS:
-        raise ValueError(
-            f"Unknown opt_moe flavor {flavor!r}; available: {', '.join(MODEL_FLAVORS)}"
-        )
-    get_config, default_seq_len = MODEL_FLAVORS[flavor]
-    config = get_config(
-        parallelism=parallelism,
-        seq_len=seq_len or default_seq_len,
-        rope_length=rope_length,
-        **overrides,
-    )
     config.flavor = flavor
+    config.build_args = copy.deepcopy(overrides)
     return config

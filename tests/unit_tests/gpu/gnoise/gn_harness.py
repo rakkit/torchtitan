@@ -39,7 +39,7 @@ def patch_dense_attention() -> None:
         scale=None,
         enable_gqa=False,
         out_transform=None,
-        **kwargs
+        **kwargs,
     ):
         assert out_transform is None, "the dense test attention has no sinks"
         T, H, Kd = q_THK.shape
@@ -65,7 +65,7 @@ def gauge_config(
     dim: int = 32,
     n_layers: int = 2,
     num_experts: int = 4,
-    gains: bool = True
+    gains: bool = True,
 ) -> dict:
     """gauge-d16-w512 shrunk: QK-norm, MHA, norm eps 1e-30; learnable gains on every
     RMSNorm as the study's GAINS on (cell.py). The flavor (key "flavor") and its
@@ -77,18 +77,21 @@ def gauge_config(
         vocab_size=VOCAB,
         rope=dict(dim=16),
         n_dense_layers=n_layers,
-        feed_forward=dict(hidden_dim=2 * dim),
-        attention=dict(n_heads=2, n_kv_heads=2, head_dim=16),
+        dense_hidden_dim=2 * dim,
+        n_heads=2,
+        n_kv_heads=2,
+        head_dim=16,
     )
     if gains:
         cfg["norm_type"] = "rmsnorm"
     if moe:
-        cfg["moe"] = dict(
-            hidden_dim=16,
+        cfg.update(
+            n_dense_layers=0,
+            moe_hidden_dim=16,
             num_experts=num_experts,
             num_shared_experts=1,
             top_k=2,
-            scaling_factor=1.0,
+            route_scale=1.0,
             score_func="sigmoid",
             load_balance_coeff=1e-3,
             aux_loss=None,
@@ -96,7 +99,6 @@ def gauge_config(
             track_router_metrics=False,
             quantile_balance_bins=None,
         )
-        cfg["n_dense_layers"] = 0
     return cfg
 
 
@@ -111,7 +113,7 @@ def build(
     world=4,
     param_dtype="bfloat16",
     chunks=0,
-    force_balance=False
+    force_balance=False,
 ):
     """The model and container as the training engine builds them; returns (pd, model,
     container, cfg). chunks > 0: the engine's chunked loss over the grouped [norm, lm_head].
@@ -233,9 +235,9 @@ def solo_grads(model, pd, cfg, microbatches, n_den, world, rank):
     call, so scaling the returned loss would not do), and the reduced gradient is
     g_(r, k) bitwise. Returns {(r, k): {name: full fp64 tensor}} and the routed-count
     deltas {(r, k): [per rank: [sum E]]}."""
-    from torchtitan.models.opt_moe.norm_moe import NormMoE
+    from torchtitan.models.opt_moe.moe import OptMoE
 
-    moes = {n: m for n, m in model.named_modules() if isinstance(m, NormMoE)}
+    moes = {n: m for n, m in model.named_modules() if isinstance(m, OptMoE)}
     nd = torch.tensor(n_den, dtype=torch.int64, device=microbatches[0][0].device)
     out, counts = {}, {}
     for r in range(world):

@@ -324,7 +324,7 @@ class GradNoise:
     def _build(self) -> None:
         from torch.distributed.fsdp import FSDPModule
 
-        from torchtitan.models.opt_moe.norm_moe import NormMoE
+        from torchtitan.models.opt_moe.moe import OptMoE
 
         self.params: list[_Param] = []
         self.groups = []
@@ -345,7 +345,7 @@ class GradNoise:
                 hd = getattr(mod, "head_dim", None)
                 if isinstance(hd, int) and hd > 0:
                     heads[clean] = hd
-                if isinstance(mod, NormMoE):
+                if isinstance(mod, OptMoE):
                     self.moes[clean] = mod
             for mod in part.modules():
                 if isinstance(mod, FSDPModule):

@@ -22,7 +22,7 @@ from torch.distributed.tensor import distribute_tensor, DTensor
 from torchtitan.distributed import ParallelismContext
 from torchtitan.models.opt_moe import build_model_config
 from torchtitan.optimizers.container import DiSCOOptimizersContainer
-from torchtitan_recipes.models.opt_moe import moe_template_config
+from torchtitan_recipes.models.opt_moe import opt_moe_mis_8b
 
 # The embedding and the head: row-l2 rules, as the production recipe's.
 # `optimizer.groups` entries (`default` is added by trainer_config); their own rule, so
@@ -69,21 +69,17 @@ def tiny_model_config(
         rope_pattern=("RN" * n_layers)[:n_layers],
         rope=dict(dim=32),
         n_dense_layers=0 if moe else n_layers,
-        feed_forward=dict(hidden_dim=ffn_hidden_dim),
-        moe=dict(
-            hidden_dim=moe_hidden_dim,
-            num_experts=num_experts,
-            num_shared_experts=1,
-            top_k=2,
-        ),
-        attention=dict(
-            n_heads=2,
-            n_kv_heads=1,
-            head_dim=32,
-            conv_kernel_size=conv,
-            conv_init_gain=1.0,  # the harness's references start the conv at gain 1
-            attention_sinks=sinks,
-        ),
+        dense_hidden_dim=ffn_hidden_dim,
+        moe_hidden_dim=moe_hidden_dim,
+        num_experts=num_experts,
+        num_shared_experts=1,
+        top_k=2,
+        n_heads=2,
+        n_kv_heads=1,
+        head_dim=32,
+        conv_kernel_size=conv,
+        conv_init_gain=1.0,  # the harness's references start the conv at gain 1
+        attention_sinks=sinks,
     )
 
 
@@ -114,7 +110,7 @@ def trainer_config(
     """A Trainer.Config whose model is `model_cfg` (`tiny_model_config`: the
     flavor and its overrides) built for its parallelism. `rule` overrides the default group's rule; `rule_args`
     merge over its args, a None value dropping that arg."""
-    config = moe_template_config()
+    config = opt_moe_mis_8b()
     par = config.parallelism
     par.data_parallel_replicate_degree = dp_replicate
     par.data_parallel_shard_degree = dp_shard

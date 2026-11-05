@@ -50,9 +50,9 @@ the data path.
 """
 
 from __future__ import annotations
-import logging
 
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated, Any
@@ -338,7 +338,7 @@ def make_sft_dataloader_config(
 ) -> KeyedMixDataLoader.Config:
     """Dataloader for multi-turn SFT.
 
-    Differs from pretrain in four ways, each forced rather than chosen:
+    Differs from pretrain in three ways, each forced rather than chosen:
 
     1. **first_fit packing, not concat_then_split.** A conversation must not be split
        across rows -- half a dialogue is not a training example. That means padding, and
@@ -353,12 +353,9 @@ def make_sft_dataloader_config(
        (`packing.py:77-79`), so a conversation longer than that is discarded by the
        packer even when it would fit the wider row. Counting against the row width would
        undercount the drops whenever the two differ.
-    4. **The model spec's `enable_token_mask_for_moe` must be True.** first_fit
-       pads, and padding otherwise pollutes the MoE load-balance statistics AND
-       `tokens_per_expert_E`, which drives the expert-bias update
-       (`norm_moe.py:783-793`). Pretrain with concat_then_split has no padding and does
-       not need it. This helper cannot set it -- it lives on the model -- so the config
-       must, and `check_py_config_data_path.py` should verify it.
+
+    The padding first_fit adds is marked in upstream's padding mask, which keeps it
+    out of the MoE load-balance statistics and ``tokens_per_expert_E``.
     """
     # Columns come from the SPEC when it sets them, because the row adapter decides
     # which columns exist: `prompt_response_rows` reads a prompt/response PAIR and has no

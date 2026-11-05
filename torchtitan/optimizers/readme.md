@@ -49,7 +49,7 @@ components/optimizer/averages.py          weight power averages, snapshots, scor
 ## Configuring it
 
 A run states named parameter groups; the production recipe
-(`torchtitan_recipes/models/opt_moe.py`'s `moe_template_config`, lr = the hidden matrices' lr):
+(the recipe `opt_moe_mis_8b` in `torchtitan_recipes/models/opt_moe.py`, lr = the hidden matrices' lr):
 
 ```python
 config.optimizer.groups = {
@@ -99,7 +99,7 @@ config.optimizer.groups = {
   declared units that overlap or misstate their shape; a stateful rule whose
   state shape differs across one expert parameter's units (the others keep one
   state per unit, any shape).
-- `moe_template_config()`'s groups are a valid run on their own: the production
+- `opt_moe_mis_8b()`'s groups are a valid run on their own: the production
   recipe (amphione on the matrices with the router gate's row lengths frozen, a
   sign step on the RMSNorm gains, row-l2 on the embedding and the head).
 - DiSCO groups are written as `optimizer.groups`; upstream's
@@ -365,7 +365,7 @@ is W's; U, g and c are not logged (c's statistics: `log_gain_stats`).
 | hyperball | 49 ms | 138 ms |
 | amphione, the production recipe's groups (GQA, FSDP 4; llm-0.5.4 wave 2, before the E1 / E2 fixes) | - | 136.6 ms |
 
-The last row: synthetic gradients, every group of `moe_template_config()`
+The last row: synthetic gradients, every group of `opt_moe_mis_8b()`
 (amphione on the hidden matrices and experts, sign on the gains, row-l2 on the
 vocabulary matrices); peak 58.6 GiB, optimizer state 6.91 GiB per GPU.
 mis-30b-a3b on 16 GPUs: 146.3 ms, peak 68.7 GiB.

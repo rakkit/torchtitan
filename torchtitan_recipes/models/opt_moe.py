@@ -4,54 +4,60 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""The OPT MoE training template: the production MoE recipe on mis-8b, which
+run configs start from (``config = moe_template_config()``)."""
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim import LRSchedulersContainer
 from torchtitan.config import DebugConfig, PrecisionConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
+from torchtitan.models.opt_moe import build_model_config
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.optimizers.container import DiSCOOptimizersContainer
 from torchtitan.optimizers.optim import DiSCOOptim
 from torchtitan.trainer import Trainer
-from . import build_model_config, model_registry
 
 # The hidden matrices' lr of the recipe (the study's one lr across sizes, batch 128 x 4096).
 _LR = 0.01562
 
 
-def moe_template_spec():
-    """The template's flat model spec; a run config edits it and builds it with
-    `build_model_config` for its parallelism."""
-    # The production MoE recipe, model and optimizer side, on the mis-8b flavor (as
-    # reproduce_cfgs/configs/0.5.4-debug/production-moe-336m.py; a run config still
-    # writes every setting). Model: RMSNorm gains, no depth or residual scaling,
-    # every hidden matrix (attention with its gate, FFN, experts) scaled-orthogonal
-    # at std 4 (amphione has no step-1 rescale: the x4 is in the init), the router
-    # gate too, embedding scion-normal std 0.02, head scion-normal std 1.
-    m = model_registry("mis-8b")
-    m.norm_type = m.layer.norm_type = m.layer.attention.norm_type = "rmsnorm"
-    m.layer.depth_init = "identity"
-    m.layer.residual_scale = "identity"
-    m.layer.init_gate_as_residual = False
-    m.first_in_init_fn_type, m.first_in_init_std = "scion_normal_input", 0.02
-    m.final_out_init_fn_type, m.final_out_init_std = "scion_normal_output", 1.0
-    for module, names in (
-        (m.layer.attention, ("wq", "wk", "wv", "wo", "w_gate")),
-        (m.layer.feed_forward, ("w1", "w2", "w3")),
-        (m.layer.moe, ("w1", "w2", "w3")),
-    ):
+def _production_model_args() -> dict:
+    """The production MoE recipe's model arguments (as
+    reproduce_cfgs/configs/0.5.4-debug/production-moe-336m.py; a run config still
+    writes every setting): RMSNorm gains, no depth or residual scaling, every
+    hidden matrix (attention with its gate, FFN, experts, router gate)
+    scaled-orthogonal at std 4 (amphione has no step-1 rescale: the x4 is in the
+    init), embedding scion-normal std 0.02, head scion-normal std 1."""
+
+    def inits(*names: str) -> dict:
+        out = {}
         for w in names:
-            setattr(module, f"{w}_init_fn_type", "scaled_orthogonal")
-            setattr(module, f"{w}_init_std", 4.0)
-    m.layer.moe.router_init_fn_type = "scaled_orthogonal"
-    m.layer.moe.router_init_std = 4.0
-    return m
+            out[f"{w}_init_fn_type"] = "scaled_orthogonal"
+            out[f"{w}_init_std"] = 4.0
+        return out
+
+    return dict(
+        norm_type="rmsnorm",
+        depth_init="identity",
+        residual_scale="identity",
+        init_gate_as_residual=False,
+        first_in_init_fn_type="scion_normal_input",
+        first_in_init_std=0.02,
+        final_out_init_fn_type="scion_normal_output",
+        final_out_init_std=1.0,
+        attention=inits("wqkv", "wo", "w_gate"),
+        feed_forward=inits("w1", "w2", "w3"),
+        moe=inits("w1", "w2", "w3", "router"),
+    )
 
 
 def moe_template_config() -> Trainer.Config:
     parallelism = ParallelismConfig(data_parallel_shard_degree=-1)
-    model = build_model_config(moe_template_spec(), parallelism=parallelism, seq_len=4096)
+    model = build_model_config(
+        "mis-8b", parallelism=parallelism, seq_len=4096, **_production_model_args()
+    )
     return Trainer.Config(
         hf_assets_path="./assets/hf/gpt-oss-120b",
         metrics=MetricsProcessor.Config(log_freq=1),
@@ -71,53 +77,57 @@ def moe_template_config() -> Trainer.Config:
                 warmup_steps=0, decay_ratio=1.0, decay_type="sqrt", min_lr_factor=0.0
             ),
             optimizer=DiSCOOptimizersContainer.Config(
-            groups={
-                "gains": {
-                    "match": r"(^|\.)(q_norm|k_norm|attention_norm|ffn_norm|norm)\.weight$",
-                    "rule": "sgd",
-                    "args": {"pre": "identity", "compute": "sign", "scale": "one"},
-                    "lr": 0.5 * _LR,
-                    "momentum": 0.95,
-                    "nesterov": True,
-                    "weight_decay": 0.0,
-                },
-                "default": {
-                    "lr": _LR,
-                    "weight_decay": 0.0,
-                    "momentum": 0.95,
-                    "nesterov": True,
-                    "rule": "amphione",
-                    "args": {
-                        "scale_nesterov": False,  # scales: no Nesterov
-                        "compute": "gram_polar_express",
-                        "steps": 6,
-                        "polar_express_safety": 1.05,
-                        "frozen_scale_units": ["moe.router.gate"],
+                groups={
+                    "gains": {
+                        "match": r"(^|\.)(q_norm|k_norm|attention_norm|ffn_norm|norm)\.weight$",
+                        "rule": "sgd",
+                        "args": {"pre": "identity", "compute": "sign", "scale": "one"},
+                        "lr": 0.5 * _LR,
+                        "momentum": 0.95,
+                        "nesterov": True,
+                        "weight_decay": 0.0,
                     },
-                },
-                "embedding": {
-                    "match": r"tok_embeddings\.weight",
-                    "rule": "sgd",
-                    "args": {"compute": "row-l2", "scale": "sqrt_n", "pre": "identity"},
-                    "lr": 0.001953,
-                    "momentum": 0.95,
-                    "nesterov": True,
-                    "weight_decay": 0.0,
-                },
-                "lm_head": {
-                    "match": r"(output|lm_head)\.weight",
-                    "rule": "sgd",
-                    "args": {
-                        "compute": "row-l2",
-                        "scale": "inv_sqrt_n",
-                        "pre": "identity",
+                    "default": {
+                        "lr": _LR,
+                        "weight_decay": 0.0,
+                        "momentum": 0.95,
+                        "nesterov": True,
+                        "rule": "amphione",
+                        "args": {
+                            "scale_nesterov": False,  # scales: no Nesterov
+                            "compute": "gram_polar_express",
+                            "steps": 6,
+                            "polar_express_safety": 1.05,
+                            "frozen_scale_units": ["moe.router.gate"],
+                        },
                     },
-                    "lr": 0.125,
-                    "momentum": 0.99,  # batch 128 x 4096
-                    "nesterov": True,
-                    "weight_decay": 0.0,
-                },
-            }
+                    "embedding": {
+                        "match": r"tok_embeddings\.weight",
+                        "rule": "sgd",
+                        "args": {
+                            "compute": "row-l2",
+                            "scale": "sqrt_n",
+                            "pre": "identity",
+                        },
+                        "lr": 0.001953,
+                        "momentum": 0.95,
+                        "nesterov": True,
+                        "weight_decay": 0.0,
+                    },
+                    "lm_head": {
+                        "match": r"(output|lm_head)\.weight",
+                        "rule": "sgd",
+                        "args": {
+                            "compute": "row-l2",
+                            "scale": "inv_sqrt_n",
+                            "pre": "identity",
+                        },
+                        "lr": 0.125,
+                        "momentum": 0.99,  # batch 128 x 4096
+                        "nesterov": True,
+                        "weight_decay": 0.0,
+                    },
+                }
             ),
         ),
         # Plain chunked cross-entropy. The load-balance term is no longer added

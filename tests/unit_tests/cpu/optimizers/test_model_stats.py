@@ -25,9 +25,10 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 from torch.nn.attention.flex_attention import flex_attention
+from torchtitan.config.parallelism import ParallelismConfig
 
 from torchtitan.models.common.attention import FlexInnerAttention
-from torchtitan.models.opt_moe import model_registry
+from torchtitan.models.opt_moe import build_model_config
 from torchtitan.optimizers.container import DiSCOOptimizersContainer
 
 
@@ -49,13 +50,15 @@ def _causal_sdpa(
 
 
 def _tiny(*, gains: bool = True, seed: int = 0, n_layers: int = 2, sinks: bool = False):
-    cfg = model_registry("gauge-d8-w256")
-    cfg.n_layers, cfg.vocab_size = n_layers, 512
-    cfg.layer.attention.attention_sinks = sinks
-    # learnable gains (rmsnorm, the default) or none (the parameter-free np_rmsnorm)
-    norm = "rmsnorm" if gains else "np_rmsnorm"
-    cfg.layer.norm_type = cfg.layer.attention.norm_type = cfg.norm_type = norm
-    cfg._expand_layers()
+    cfg = build_model_config(
+        "gauge-d8-w256",
+        parallelism=ParallelismConfig(),
+        n_layers=n_layers,
+        vocab_size=512,
+        attention=dict(attention_sinks=sinks),
+        # learnable gains (rmsnorm, the default) or none (the parameter-free np_rmsnorm)
+        norm_type="rmsnorm" if gains else "np_rmsnorm",
+    )
     with torch.device("meta"):
         model = cfg.build()
     model.to_empty(device="cpu")

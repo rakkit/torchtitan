@@ -356,17 +356,16 @@ class GradNoise:
             raise ValueError(
                 "optimizer.gnoise needs the model wrapped by FSDP2 (fully_shard)"
             )
-        # A batch-wise balance loss couples every token of a microbatch: the router's
-        # gradient is no per-token sum there, so its noise is not estimated.
+        # Upstream's balance losses (microbatch-wise, batch-wise) couple every
+        # token of a microbatch: the router's gradient is no per-token sum there,
+        # so its noise is not estimated.
         skip = tuple(
             f"{k}.router."
             for k, mod in self.moes.items()
-            if mod.aux_loss is not None and mod.aux_loss.loss_type == "batch_wise"
+            if mod.router.aux_loss is not None
         )
         if skip:
-            logger.info(
-                f"[gnoise] routers left out (batch-wise balance loss): {list(skip)}"
-            )
+            logger.info(f"[gnoise] routers left out (balance loss): {list(skip)}")
         for g in self.groups:
             for fp in g.fsdp_params:
                 p = fp.sharded_param
@@ -783,7 +782,9 @@ class GradNoise:
         # Groups FSDP skips unsharding in backward (the embedding: its backward
         # needs no weight). The hook reads the unsharded weight, so an armed
         # step unshards them; the other steps keep FSDP's saving.
-        self.backward_unshard_off = [g for g in self.groups if not g.unshard_in_backward]
+        self.backward_unshard_off = [
+            g for g in self.groups if not g.unshard_in_backward
+        ]
         run = torch._dynamo.disable(self._on_post_backward)
         for g in self.groups:
             orig = g.post_backward
@@ -861,7 +862,7 @@ class GradNoise:
             self.a_rows = torch.zeros(2, self.n_rows, dtype=torch.float64, device=dev)
         self.records.append(defaultdict(int))
         for k in self.moe_list:
-            self.moe_snap[k] = self.moes[k].tokens_per_expert_E.detach().clone()
+            self.moe_snap[k] = self.moes[k].router.tokens_per_expert_E.detach().clone()
 
     def _close_moe_delta(self) -> None:
         if self.mb < 0 or not self.moe_list:
@@ -869,7 +870,7 @@ class GradNoise:
         self.moe_delta.append(
             torch.cat(
                 [
-                    self.moes[k].tokens_per_expert_E.detach() - self.moe_snap[k]
+                    self.moes[k].router.tokens_per_expert_E.detach() - self.moe_snap[k]
                     for k in self.moe_list
                 ]
             ).double()

@@ -16,21 +16,24 @@ import re
 import pytest
 import torch
 
-from torchtitan.models.opt_moe import model_registry
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.opt_moe import build_model_config
 
 PRE = re.compile(r"(^|\.)(attention_norm|ffn_norm)\.weight$")
 
 
 def _tiny(*, prenorm_gain_init=None, norm_type="rmsnorm", seed=0, n_layers=3):
-    cfg = model_registry("gauge-d8-w256")
-    cfg.n_layers, cfg.vocab_size = n_layers, 512
-    if norm_type == "rmsnorm":
-        cfg.layer.norm_type = cfg.layer.attention.norm_type = cfg.norm_type = "rmsnorm"
-    else:
-        cfg.layer.norm_type = norm_type
-    if prenorm_gain_init is not None:
-        cfg.layer.prenorm_gain_init = prenorm_gain_init
-    cfg._expand_layers()
+    overrides = (
+        {} if prenorm_gain_init is None else {"prenorm_gain_init": prenorm_gain_init}
+    )
+    cfg = build_model_config(
+        "gauge-d8-w256",
+        parallelism=ParallelismConfig(),
+        n_layers=n_layers,
+        vocab_size=512,
+        norm_type=norm_type,
+        **overrides,
+    )
     with torch.device("meta"):
         model = cfg.build()
     model.to_empty(device="cpu")

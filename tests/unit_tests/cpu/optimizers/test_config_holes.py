@@ -15,8 +15,8 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from torchtitan.models.common.param_layout import ParamLayout
-from torchtitan.models.opt_moe.config_registry import moe_template_config
 from torchtitan.optimizers.container import DiSCOOptimizersContainer
+from torchtitan_recipes.models.opt_moe import moe_template_config
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -76,7 +76,9 @@ class _Decoder(nn.Module):
 def test_the_template_groups_build():
     """The template's groups must be a valid run on their own."""
     cfg = moe_template_config().optim.optimizer
-    DiSCOOptimizersContainer(cfg, model_parts=[_Decoder()], parallelism_context=_NoParallel())
+    DiSCOOptimizersContainer(
+        cfg, model_parts=[_Decoder()], parallelism_context=_NoParallel()
+    )
 
 
 @pytest.mark.parametrize("level", [-1, 4])
@@ -129,7 +131,9 @@ def test_a_named_group_with_only_an_lr_does_not_take_the_defaults_own_args():
     """A named group that sets neither `rule` nor `args` runs the default's rule
     but is not the default group: it must not take the rule's `own` args (here
     the router's frozen row lengths, which name no unit of the group)."""
-    cfg = moe_template_config().optim.optimizer  # its default group freezes moe.router.gate
+    cfg = (
+        moe_template_config().optim.optimizer
+    )  # its default group freezes moe.router.gate
     cfg.groups = {"wq": {"match": r"^wq\.weight$", "lr": 0.003}, **cfg.groups}
     c = DiSCOOptimizersContainer(
         cfg, model_parts=[_Decoder()], parallelism_context=_NoParallel()
@@ -147,7 +151,9 @@ def test_a_named_group_under_the_defaults_rule_keeps_its_other_default_args():
     """Only the rule's `own` args stay with the default group: a named amphione
     group with args of its own still takes the default's polar_express_safety
     (an arg of no preset, so no rule `inherits` it)."""
-    cfg = moe_template_config().optim.optimizer  # its default group freezes moe.router.gate
+    cfg = (
+        moe_template_config().optim.optimizer
+    )  # its default group freezes moe.router.gate
     cfg.groups = {
         "wq": {
             "match": r"^wq\.weight$",

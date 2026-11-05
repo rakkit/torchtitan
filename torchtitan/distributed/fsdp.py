@@ -24,7 +24,7 @@ from torchtitan.distributed.fsdp_lifecycle import complete_fsdp_grouped_forward
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.base.module import Module
 from torchtitan.models.common.linear import GroupedLinear
-from torchtitan.models.common.moe import MoE, RoutedExperts
+from torchtitan.models.common.moe import MoE
 
 __all__ = [
     "apply_fsdp_to_decoder",
@@ -429,16 +429,8 @@ def apply_fsdp_to_decoder(
         #   shard their output features when FSDP degree > num_experts
         # Dense blocks use the default mesh with only stacked-parameter
         # placement overrides.
-        # Upstream's MoE, or any MoE module built on upstream's RoutedExperts
-        # (opt_moe's NormMoE): its experts take the expert placements below.
         moe = next(
-            (
-                m
-                for m in transformer_block.children()
-                if isinstance(m, MoE)
-                or isinstance(getattr(m, "routed_experts", None), RoutedExperts)
-            ),
-            None,
+            (m for m in transformer_block.children() if isinstance(m, MoE)), None
         )
         if moe is not None:
             routed_experts = moe.routed_experts

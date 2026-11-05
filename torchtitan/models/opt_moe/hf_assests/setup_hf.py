@@ -12,10 +12,11 @@ import os
 import shutil
 
 from torchtitan.models.common.activation import SwiGLU
-from torchtitan.models.common.rope import CosSinRoPE
 
-from ..norm_moe import NormRouter, saint_check_scaling_factor
-from ..utils.inits import setup_residual_scale
+from torchtitan.models.common.moe import TokenChoiceTopKRouter
+from torchtitan.models.common.rope import CosSinRoPE
+from ..flavors import calc_gate_scaling_factor
+from ..param_init import setup_residual_scale
 from .configuration_opt_moe import OptMoEConfig
 
 _FILES = ("configuration_opt_moe.py", "modeling_opt_moe.py", "chat_template.jinja")
@@ -62,9 +63,11 @@ def _route_scale(model, moe) -> float:
     """What the routers multiply by. Taken from a built router when there is
     one: without a table entry the native value is a random estimate."""
     for module in model.modules() if hasattr(model, "modules") else ():
-        if isinstance(module, NormRouter):
+        if isinstance(module, TokenChoiceTopKRouter):
             return float(module.route_scale)
-    return saint_check_scaling_factor(moe.num_experts, moe.top_k, moe.scaling_factor)
+    if moe.scaling_factor is not None:
+        return moe.scaling_factor
+    return calc_gate_scaling_factor(moe.num_experts, moe.top_k)
 
 
 def hf_config(model, model_config=None) -> OptMoEConfig:

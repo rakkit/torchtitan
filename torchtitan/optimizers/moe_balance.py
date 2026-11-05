@@ -262,16 +262,16 @@ def register_moe_load_balancing_hook(
         num_experts = 0
 
         for part in model_parts:
-            for block in part.layers.values():
+            for layer_key, block in part.layers.items():
                 if not block.moe_enabled:
                     continue
                 moe = block.moe
                 # Assuming num_experts is the same for all, so we can just grab it once
-                layer_num_experts = moe.tokens_per_expert_E.numel()
+                layer_num_experts = moe.router.tokens_per_expert_E.numel()
                 if num_experts and layer_num_experts != num_experts:
                     raise ValueError(
                         "All MoE layers must have the same expert count: "
-                        f"layer {block.layer_id} has {layer_num_experts}, an "
+                        f"layer {layer_key} has {layer_num_experts}, an "
                         f"earlier layer has {num_experts}. The stats below are "
                         "packed with `.view(num_layers, num_experts)`, which "
                         "would silently mis-attribute them."
@@ -280,17 +280,17 @@ def register_moe_load_balancing_hook(
                 moe_layers_info.append(
                     {
                         "module": moe,
-                        "layer_id": block.layer_id,
+                        "layer_id": int(layer_key),
                     }
                 )
-                tok_buffers.append(moe.tokens_per_expert_E)
+                tok_buffers.append(moe.router.tokens_per_expert_E)
                 ema_buffers.append(moe.tokens_per_expert_cumul)
                 ent_buffers.append(moe.router_entropy)
                 acc_fwd_times_buffers.append(moe.acc_fwd_times)
                 # Per-layer load-balance value: upstream's AuxLoss keeps a
                 # per-instance accumulator, so the `moe_load_balance_loss/L-*`
                 # breakdown survives. Zero scalar when the layer has none.
-                aux = getattr(moe, "aux_loss", None)
+                aux = moe.router.aux_loss
                 load_balance_loss_buffers.append(
                     aux.instance_acc.reshape(1)
                     if aux is not None
@@ -447,8 +447,7 @@ def register_moe_load_balancing_hook(
                     all_bias_std_cpu,
                     num_experts,
                     any(
-                        getattr(x["module"], "aux_loss", None) is not None
-                        for x in moe_layers_info
+                        x["module"].router.aux_loss is not None for x in moe_layers_info
                     ),
                 )
                 publish_moe_metrics(payload)

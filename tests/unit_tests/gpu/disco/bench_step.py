@@ -29,8 +29,6 @@ from torch.distributed.tensor import DTensor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness  # noqa: E402
 
-from torchtitan.models.opt_moe import model_registry  # noqa: E402
-
 
 def _set_grads(model, step: int, device) -> None:
     """Random gradients made on the device, each rank only its own shard: the
@@ -227,7 +225,7 @@ def main() -> None:
         ep=args.ep,
     )
     cfg = harness.trainer_config(
-        model_registry(args.flavor),
+        {"flavor": args.flavor},
         dp_replicate=args.dp_replicate,
         dp_shard=args.dp_shard,
         cp=args.cp,

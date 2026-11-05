@@ -20,7 +20,7 @@ import torch
 
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
-from torchtitan.models.opt_moe import model_registry
+from torchtitan.models.opt_moe import build_model_config
 from torchtitan.optimizers import model_stats
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -30,11 +30,15 @@ VOCAB = 1024
 
 
 def _model(*, dtype: torch.dtype, seed: int = 0, remat: bool = True):
-    cfg = model_registry("gauge-d16-w512")
-    cfg.n_layers, cfg.vocab_size = 2, VOCAB
-    cfg.layer.norm_type = cfg.layer.attention.norm_type = cfg.norm_type = "rmsnorm"
-    cfg.layer.depth_init = "identity"
-    cfg.finalize(parallelism=ParallelismConfig(), max_context_length=4096)
+    cfg = build_model_config(
+        "gauge-d16-w512",
+        parallelism=ParallelismConfig(),
+        seq_len=4096,
+        n_layers=2,
+        vocab_size=VOCAB,
+        norm_type="rmsnorm",
+        depth_init="identity",
+    )
     with torch.device("meta"):
         model = cfg.build()
     model.to_empty(device="cuda")
@@ -66,7 +70,9 @@ def _step(model, tokens, positions, *, armed: bool):
     out = model(tokens, positions, _masks(model, positions))
     loss = torch.nn.functional.cross_entropy(out.float(), torch.roll(tokens, -1))
     loss.backward()
-    stats = model_stats.residual_metrics([model], parallelism_context=None) if armed else {}
+    stats = (
+        model_stats.residual_metrics([model], parallelism_context=None) if armed else {}
+    )
     assert model.residual_capture is None
     grads = {n: p.grad.detach().clone() for n, p in model.named_parameters()}
     model.zero_grad(set_to_none=True)

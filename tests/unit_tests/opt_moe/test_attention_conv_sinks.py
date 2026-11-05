@@ -7,15 +7,14 @@
 """opt_moe attention's optional short conv (Canon: x + conv(x)) and sinks
 (gpt-oss), against references written from their equations."""
 
-from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.models.opt_moe import model_registry
-from torchtitan.models.opt_moe.utils.short_conv import causal_short_conv
+from torchtitan.models.opt_moe import build_model_config
+from torchtitan.models.opt_moe.gated_swa_attention import causal_short_conv
 
 
 def _reference_conv(x, w, positions):
@@ -68,17 +67,24 @@ def test_short_conv_gradients_match_the_reference():
 
 
 def _tiny(conv=4, sinks=True, sinks_init_fn_type=None, sinks_init_std=None, gate=None):
-    cfg = model_registry("mis-8b-proxy")
-    cfg.n_layers, cfg.swa_pattern, cfg.rope_pattern = 2, "SF", None
-    cfg.layer.attention.conv_kernel_size = conv  # the other conv fields: their defaults
-    cfg.layer.attention.attention_sinks = sinks
-    cfg.layer.attention.gated_attention_type = gate
+    attention = dict(
+        conv_kernel_size=conv,  # the other conv arguments: their defaults
+        attention_sinks=sinks,
+        gated_attention_type=gate,
+    )
     if sinks_init_fn_type is not None:
-        cfg.layer.attention.sinks_init_fn_type = sinks_init_fn_type
+        attention["sinks_init_fn_type"] = sinks_init_fn_type
     if sinks_init_std is not None:
-        cfg.layer.attention.sinks_init_std = sinks_init_std
-    cfg.finalize(parallelism=ParallelismConfig(), max_context_length=256)
-    return cfg
+        attention["sinks_init_std"] = sinks_init_std
+    return build_model_config(
+        "mis-8b-proxy",
+        parallelism=ParallelismConfig(),
+        seq_len=256,
+        n_layers=2,
+        swa_pattern="SF",
+        rope_pattern=None,
+        attention=attention,
+    )
 
 
 def test_conv_weights_are_declared_and_disco_takes_them_as_matrices():
@@ -122,7 +128,7 @@ def test_features_off_add_nothing():
 
 def test_sink_rescale_is_the_softmax_with_one_more_logit_on_cpu():
     """out * sigmoid(lse - s) is the softmax over the keys plus one logit s that carries no value."""
-    from torchtitan.models.opt_moe.utils import attention_sinks
+    from torchtitan.models.opt_moe import gated_swa_attention as attention_sinks
 
     torch.manual_seed(0)
     t, h, d = 12, 3, 8
@@ -136,13 +142,6 @@ def test_sink_rescale_is_the_softmax_with_one_more_logit_on_cpu():
     logits = torch.cat([s, sinks[:, None, None].expand(h, t, 1)], dim=-1)
     want = torch.einsum("hqk,khd->qhd", torch.softmax(logits, dim=-1)[..., :t], v)
     torch.testing.assert_close(got, want, rtol=1e-10, atol=1e-10)
-    # opt_moe's attention takes this copy, not gpt_oss's
-    from torchtitan.models.opt_moe import gated_norm_swattention
-
-    assert (
-        gated_norm_swattention.apply_attention_sink_rescale
-        is attention_sinks.apply_attention_sink_rescale
-    )
 
 
 def _init_on_cpu(cfg):
@@ -213,7 +212,7 @@ def test_sinks_are_a_softmax_with_one_more_logit():
     from torch.nn.attention.flex_attention import create_block_mask
 
     from torchtitan.models.common.attention import FlexInnerAttention
-    from torchtitan.models.opt_moe.utils.attention_sinks import (
+    from torchtitan.models.opt_moe.gated_swa_attention import (
         apply_attention_sink_rescale,
     )
 
@@ -244,7 +243,8 @@ def test_sinks_are_a_softmax_with_one_more_logit():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="flex attention needs CUDA")
 def test_model_with_conv_and_sinks_trains_one_step():
-    cfg = _tiny(sinks_init_fn_type="trunc_normal")  # non-zero sinks: their rescale acts
+    # non-zero sinks (their rescale acts): the default std 0.0 would divide by zero
+    cfg = _tiny(sinks_init_fn_type="trunc_normal", sinks_init_std=0.02)
     with torch.device("meta"):
         model = cfg.build()
     model.to_empty(device="cuda")

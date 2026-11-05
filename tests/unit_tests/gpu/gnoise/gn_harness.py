@@ -7,8 +7,6 @@
 """A shrunken gauge model run through real forward / backward passes under FSDP2,
 with the gnoise hooks driven the way the trainer drives them."""
 
-import copy
-import dataclasses
 import os
 import sys
 
@@ -22,8 +20,6 @@ sys.path.insert(
 )
 import harness  # noqa: E402
 
-from torchtitan.models.opt_moe import model_registry  # noqa: E402
-from torchtitan.models.opt_moe.norm_moe import MoE  # noqa: E402
 
 VOCAB, SEQ = 128, 32
 
@@ -70,24 +66,24 @@ def gauge_config(
     n_layers: int = 2,
     num_experts: int = 4,
     gains: bool = True
-):
+) -> dict:
     """gauge-d16-w512 shrunk: QK-norm, MHA, norm eps 1e-30; learnable gains on every
-    RMSNorm as the study's GAINS on (cell.py)."""
-    cfg = copy.deepcopy(
-        model_registry("gauge-d16-w512")
-    )  # the registry's object is shared
+    RMSNorm as the study's GAINS on (cell.py). The flavor (key "flavor") and its
+    build_model_config overrides, as harness.tiny_model_config."""
+    cfg = dict(
+        flavor="gauge-d16-w512",
+        dim=dim,
+        n_layers=n_layers,
+        vocab_size=VOCAB,
+        rope=dict(dim=16),
+        n_dense_layers=n_layers,
+        feed_forward=dict(hidden_dim=2 * dim),
+        attention=dict(n_heads=2, n_kv_heads=2, head_dim=16),
+    )
     if gains:
-        cfg.layer.norm_type = cfg.layer.attention.norm_type = cfg.norm_type = "rmsnorm"
-    cfg.dim, cfg.n_layers, cfg.vocab_size = dim, n_layers, VOCAB
-    cfg.max_context_length = SEQ
-    cfg.rope = dataclasses.replace(cfg.rope, dim=16, max_context_length=SEQ)
-    layer = cfg.layer
-    layer.n_dense_layers = n_layers
-    layer.feed_forward.hidden_dim = 2 * dim
-    attn = layer.attention
-    attn.n_heads, attn.n_kv_heads, attn.head_dim = 2, 2, 16
+        cfg["norm_type"] = "rmsnorm"
     if moe:
-        layer.moe = MoE.Config(
+        cfg["moe"] = dict(
             hidden_dim=16,
             num_experts=num_experts,
             num_shared_experts=1,
@@ -99,9 +95,8 @@ def gauge_config(
             bias_update_norm_factor="sign",
             track_router_metrics=False,
             quantile_balance_bins=None,
-            moe_comm_backend="standard",
         )
-        layer.n_dense_layers = 0
+        cfg["n_dense_layers"] = 0
     return cfg
 
 
@@ -120,15 +115,20 @@ def build(
 ):
     """The model and container as the training engine builds them; returns (pd, model,
     container, cfg). chunks > 0: the engine's chunked loss over the grouped [norm, lm_head].
-    force_balance: round-robin routing (the routers' _debug_force_load_balance), equal EP splits."""
+    force_balance: upstream's round-robin router (exact balance), equal EP splits."""
     pd = harness.parallelism_context(world_size=world, device_type=device.type, **topo)
     cfg = harness.trainer_config(
         model_cfg or gauge_config(moe=moe), log_norm_freq=1, seq_len=SEQ, **topo
     )
     if force_balance:
-        for lc in getattr(cfg.model, "layers", None) or []:
-            if getattr(lc, "moe", None) is not None:
-                lc.moe.router._debug_force_load_balance = True
+        from torchtitan.config.transform.base import convert_config_type
+        from torchtitan.models.common.moe import RoundRobinTokenChoiceTopKRouter
+
+        for lc in cfg.model.layers:
+            if lc.moe is not None:
+                lc.moe.router = convert_config_type(
+                    lc.moe.router, RoundRobinTokenChoiceTopKRouter
+                )
     cfg.precision.param_dtype = param_dtype
     if gnoise is not None:
         for k, v in gnoise.items():
@@ -241,13 +241,15 @@ def solo_grads(model, pd, cfg, microbatches, n_den, world, rank):
     for r in range(world):
         for k, (inp, lab) in enumerate(microbatches):
             model.zero_grad(set_to_none=True)
-            snap = {n: m.tokens_per_expert_E.clone() for n, m in moes.items()}
+            snap = {n: m.router.tokens_per_expert_E.clone() for n, m in moes.items()}
             lab_r = lab if rank == r else torch.full_like(lab, -100)
             loss = forward_loss(model, pd, cfg, inp, lab_r, nd)
             with spmd.no_typecheck():
                 loss.backward()
             delta = (
-                torch.cat([moes[n].tokens_per_expert_E - snap[n] for n in sorted(moes)])
+                torch.cat(
+                    [moes[n].router.tokens_per_expert_E - snap[n] for n in sorted(moes)]
+                )
                 if moes
                 else torch.zeros(0, device=inp.device)
             )

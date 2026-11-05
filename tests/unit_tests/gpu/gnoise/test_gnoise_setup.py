@@ -9,7 +9,6 @@ nothing installed when off (T20), no checkpoint state (T17), the torch pin (T18)
 exactly once under the chunked loss (T22), the entry guard (T23), one owner per key
 (T13), the router modes (T26)."""
 
-import dataclasses
 import inspect
 import os
 import sys
@@ -32,7 +31,6 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gn_harness as H  # noqa: E402
 
-from torchtitan.models.opt_moe.norm_moe import LoadBalanceLoss  # noqa: E402
 from torchtitan.optimizers.gnoise import (  # noqa: E402, F401
     GradNoiseConfig,
     refuse_unsupported,
@@ -118,9 +116,7 @@ def test_torch_api_pin():
     assert "unsharded_param.grad is not None" in take
     assert "return param.unsharded_grad_data" in take
     P = _fsdp_param.FSDPParam
-    assert "self.unsharded_param.grad" in inspect.getsource(
-        P.unsharded_grad_data.fget
-    )
+    assert "self.unsharded_param.grad" in inspect.getsource(P.unsharded_grad_data.fget)
     init = inspect.getsource(P.__init__) + inspect.getsource(P)
     for a in ("self.sharded_param", "self.param_dtype", "self._unsharded_param"):
         assert a in init, a
@@ -295,7 +291,7 @@ class TestSetup(DTensorTestBase):
     def _router(self, aux):
         dev = self._device()
         mcfg = H.gauge_config(moe=True)
-        mcfg.layer.moe = dataclasses.replace(mcfg.layer.moe, aux_loss=aux)
+        mcfg["moe"]["aux_loss"] = aux
         with tempfile.TemporaryDirectory() as tmp:
             pd, model, cont, cfg = H.build(
                 dict(dp_replicate=1, dp_shard=4),
@@ -327,14 +323,8 @@ class TestSetup(DTensorTestBase):
         self._router_covered(None)
 
     @with_comms
-    def test_router_sequence_wise(self):
-        self._router_covered(
-            LoadBalanceLoss.Config(coeff=1e-3, loss_type="sequence_wise")
-        )
-
-    @with_comms
-    def test_router_batch_wise_left_out(self):
-        names, _ = self._router(
-            LoadBalanceLoss.Config(coeff=1e-3, loss_type="batch_wise")
-        )
-        assert not any(".router." in n for n in names)
+    def test_router_left_out_with_a_balance_loss(self):
+        """Upstream's balance losses couple a microbatch's tokens: no per-token sum."""
+        for loss_type in ("microbatch_wise", "batch_wise"):
+            names, _ = self._router(dict(coeff=1e-3, loss_type=loss_type))
+            assert not any(".router." in n for n in names), loss_type

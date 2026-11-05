@@ -29,8 +29,8 @@ from torchtitan.models.opt_moe.hf_assests.setup_hf import (
 from torchtitan.models.opt_moe.model import OPTMoEModel, OPTMoETransformerBlock
 from torchtitan.models.opt_moe.norm_ffn import FeedForward
 from torchtitan.models.opt_moe.norm_moe import MoE
+from torchtitan.models.opt_moe.param_init import setup_residual_scale
 from torchtitan.models.opt_moe.state_dict_adapter import OPTMoEStateDictAdapter
-from torchtitan.models.opt_moe.utils.inits import setup_residual_scale
 
 T = 256
 

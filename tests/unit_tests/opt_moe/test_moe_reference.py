@@ -13,12 +13,12 @@ expert's weights, accumulate. It is far too slow to train with, but it is easy
 to read and check by eye, so agreement between the two is real evidence rather
 than two implementations sharing an assumption.
 
-Run: python tests/unit_tests/opt_moe/test_moe_reference.py
 """
 
+import pytest
 import torch
 
-from torchtitan.models.opt_moe.norm_moe import make_norm_moe_config
+from torchtitan.models.opt_moe.flavors import make_norm_moe_config
 
 
 def reference_moe(moe, x_TD):
@@ -57,7 +57,9 @@ def reference_moe(moe, x_TD):
     return out
 
 
-def run_case(*, num_shared_experts, top_k, label):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the grouped GEMM needs CUDA")
+@pytest.mark.parametrize("num_shared_experts, top_k", [(0, 1), (0, 2), (1, 2), (1, 4)])
+def test_moe_matches_the_naive_reference(num_shared_experts, top_k):
     torch.manual_seed(0)
     cfg = make_norm_moe_config(
         dim=64,
@@ -71,34 +73,10 @@ def run_case(*, num_shared_experts, top_k, label):
     with torch.no_grad():
         moe.init_states(buffer_device=torch.device("cuda"))
     moe.eval()
-
     x = torch.randn(48, 64, device="cuda")
     with torch.no_grad():
         fast = moe(x)
         ref = reference_moe(moe, x)
-
     d = (fast.float() - ref).abs().max().item()
     scale = ref.abs().max().item()
-    ok = d < 5e-2 * scale
-    print(
-        f"  {'OK  ' if ok else 'FAIL'} {label}: max|d|={d:.3e} "
-        f"scale={scale:.3f} rel={d / scale:.2e}"
-    )
-    return not ok
-
-
-def main() -> int:
-    failures = 0
-    for num_shared_experts, top_k in ((0, 1), (0, 2), (1, 2), (1, 4)):
-        failures += run_case(
-            num_shared_experts=num_shared_experts,
-            top_k=top_k,
-            label=f"top_k={top_k}, shared experts {num_shared_experts}",
-        )
-    print()
-    print("MATCHES REFERENCE" if failures == 0 else f"{failures} CASE(S) FAILED")
-    return 1 if failures else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    assert d < 5e-2 * scale, (d, scale)

@@ -180,15 +180,13 @@ def load_training_config(snapshot_path: str | Path) -> LoadedTrainingConfig:
     model_snapshot = _required_mapping(snapshot, "model")
     name = _required_string(model_snapshot, "name")
     flavor = _required_string(model_snapshot, "flavor")
-    model_config = _resolve_model_config(name, flavor)
-    # The saved config is finalized; overlay the run's spec (the `layer`
-    # template, patterns, inits) and leave the derived per-layer configs to
-    # `finalize`, which the runtime calls for the evaluation's parallelism.
-    derived = {"layers", "tok_embeddings", "norm", "lm_head"}
-    _overlay_dataclass(
-        model_config,
-        {k: v for k, v in model_snapshot.items() if k not in derived},
-        "model",
+    # The run's model, rebuilt from its flavor and builder arguments for the
+    # evaluation's parallelism (replicated DP: no TP / CP / EP).
+    model_config = _resolve_model_config(
+        name,
+        flavor,
+        seq_len=model_snapshot["max_context_length"],
+        build_args=_optional_mapping(model_snapshot, "build_args") or {},
     )
 
     config = Trainer.Config(
@@ -263,7 +261,9 @@ def _split_python_spec(config_spec: str) -> tuple[str, str]:
     return path, factory
 
 
-def _resolve_model_config(name: str, flavor: str) -> BaseModel.Config:
+def _resolve_model_config(
+    name: str, flavor: str, *, seq_len: int, build_args: dict[str, Any]
+) -> BaseModel.Config:
     normalized_name = name.replace("/", ".")
     module_candidates = (
         f"torchtitan.models.{normalized_name}",
@@ -276,13 +276,15 @@ def _resolve_model_config(name: str, flavor: str) -> BaseModel.Config:
         except ImportError as error:
             errors.append(f"{module_name}: {error}")
             continue
-        registry: Callable[[str], BaseModel.Config] | None = getattr(
-            module, "model_registry", None
+        build: Callable[..., BaseModel.Config] | None = getattr(
+            module, "build_model_config", None
         )
-        if callable(registry):
-            return registry(flavor)
+        if callable(build):
+            return build(
+                flavor, parallelism=ParallelismConfig(), seq_len=seq_len, **build_args
+            )
     raise EvaluationConfigError(
-        f"could not resolve model registry for model.name={name!r}; "
+        f"could not resolve build_model_config for model.name={name!r}; "
         f"tried {module_candidates}. Import errors: {'; '.join(errors)}"
     )
 

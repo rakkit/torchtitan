@@ -14,16 +14,19 @@ import torch
 import torch.nn.functional as F
 
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.models.opt_moe import model_registry
+from torchtitan.models.opt_moe import build_model_config
 from torchtitan.models.opt_moe.hf_assests.setup_hf import hf_config
-from torchtitan.models.opt_moe.utils.inits import setup_residual_scale
+from torchtitan.models.opt_moe.param_init import setup_residual_scale
 
 
 def _cfg(n_layers: int, residual_scale: str):
-    cfg = model_registry("gauge-d8-w256")
-    cfg.n_layers = n_layers
-    cfg.layer.residual_scale = residual_scale
-    cfg.finalize(parallelism=ParallelismConfig(), max_context_length=64)
+    cfg = build_model_config(
+        "gauge-d8-w256",
+        parallelism=ParallelismConfig(),
+        seq_len=64,
+        n_layers=n_layers,
+        residual_scale=residual_scale,
+    )
     return cfg
 
 
@@ -79,7 +82,10 @@ def test_malformed_base_is_refused(bad):
 
 
 def test_default_stays_identity():
-    assert model_registry("gauge-d16-w256").layer.residual_scale == "identity"
+    cfg = build_model_config("gauge-d16-w256", parallelism=ParallelismConfig())
+    assert all(
+        (layer.block_scale, layer.identity_scale) == (1.0, 1.0) for layer in cfg.layers
+    )
     assert setup_residual_scale("identity", 64) == (1.0, 1.0)
 
 

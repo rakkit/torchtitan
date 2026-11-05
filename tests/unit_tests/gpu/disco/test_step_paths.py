@@ -248,7 +248,7 @@ class TestDiSCOStepPaths(DTensorTestBase):
     @with_comms
     def test_fsdp4_headwise_fp32(self):
         """Head-wise Muon: q, k, v blocked by head rows, wo by head columns."""
-        head_dim = harness.tiny_model_config(moe=True).layer.attention.head_dim
+        head_dim = harness.tiny_model_config(moe=True)["attention"]["head_dim"]
         groups = {
             "qkv": {"match": r"\.wqkv\.", "args": {"block_rows": head_dim}},
             "wo": {"match": r"attention\.wo\.", "args": {"block_cols": head_dim}},

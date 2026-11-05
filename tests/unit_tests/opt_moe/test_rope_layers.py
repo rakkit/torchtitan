@@ -12,25 +12,29 @@ import dataclasses
 import pytest
 import torch
 
-from torchtitan.models.common.attention import SlidingWindowFlexInnerAttention
-
 from torchtitan.config.parallelism import ParallelismConfig
+
+from torchtitan.models.common.attention import SlidingWindowFlexInnerAttention
 from torchtitan.models.common.rope import CosSinRoPE
-from torchtitan.models.opt_moe import model_registry
+from torchtitan.models.opt_moe import build_model_config
 
 HEAD = 128  # gauge-d8-w256's head_dim
 
 
 def _cfg():
-    cfg = model_registry("gauge-d8-w256")
-    cfg.n_layers, cfg.vocab_size = 4, 512
-    cfg.layer.n_dense_layers = 4
-    cfg.layer.attention.sliding_window_size = 16
-    cfg.swa_pattern = "SFSF"  # sliding, full, sliding, full
-    cfg.rope_pattern = "RRNR"  # layer 2 (sliding) is NoPE
-    cfg.rope = dataclasses.replace(cfg.rope, dim=HEAD // 2)  # full layers: partial RoPE
-    cfg.rope_of_swa = CosSinRoPE.Config(dim=HEAD, max_context_length=4096, theta=5000.0)
-    cfg.finalize(parallelism=ParallelismConfig(), max_context_length=256)
+    cfg = build_model_config(
+        "gauge-d8-w256",
+        parallelism=ParallelismConfig(),
+        seq_len=256,
+        n_layers=4,
+        vocab_size=512,
+        n_dense_layers=4,
+        sliding_window_size=16,
+        swa_pattern="SFSF",  # sliding, full, sliding, full
+        rope_pattern="RRNR",  # layer 2 (sliding) is NoPE
+        rope=dict(dim=HEAD // 2),  # full layers: partial RoPE
+        rope_of_swa=dict(dim=HEAD, theta=5000.0),
+    )
     return cfg
 
 
@@ -74,7 +78,8 @@ def test_partial_rope_rotates_the_first_rope_dim_dims_only():
 
 def test_rope_wider_than_the_head_is_refused():
     cfg = _cfg()
-    cfg.layers[1].attention.rope = dataclasses.replace(cfg.rope, dim=2 * HEAD)
+    rope = cfg.layers[1].attention.rope
+    cfg.layers[1].attention.rope = dataclasses.replace(rope, dim=2 * HEAD)
     with pytest.raises(ValueError, match="must be <= head_dim"):
         with torch.device("meta"):
             cfg.layers[1].attention.build()

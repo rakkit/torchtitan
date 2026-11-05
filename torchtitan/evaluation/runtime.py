@@ -146,10 +146,6 @@ class EvaluationRuntime:
         tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
 
         model_config = config.model
-        model_config.finalize(
-            parallelism=config.parallelism,
-            max_context_length=model_config.max_context_length,
-        )
         with (
             torch.device("meta"),
             utils.set_default_dtype(TORCH_DTYPE_MAP[config.precision.dtype]),

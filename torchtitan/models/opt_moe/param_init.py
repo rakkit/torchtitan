@@ -67,48 +67,11 @@ def orthogonal_(
         if not isinstance(tensor.data, DTensor):
             return nn.init.orthogonal_(tensor, gain=gain, generator=generator)
 
-        temp_tensor = torch.empty(tensor.shape, device=tensor.device)  # full shape
-        torch.nn.init.orthogonal_(temp_tensor, gain=gain, generator=generator)
-
-        """
-        Impl-1 uses `distribute_tensor`, which explicitly does
-        communication that distributes the tensor weights from `src=0`
-        to the other ranks.
-        This can make sure that weights across "dp_replicate" are
-        initialized exactly the same.
-        [?is it really? will the communication cause the weights to be
-        different?]
-        Impl-1 works both when the (global) generator doesn't match
-        across ranks and when it does.
-        ---
-        Impl-2 uses `DTensor.from_local`, so that there will be no
-        communication.
-        But it maybe would cause the weights to be different across
-        `dp_replicate` due to indeterministic stuff.
-        Gonna use impl-2 for now to avoid the barrier.
-        # TODO(JSC): We shall do a benchmark later to see which one is
-        #            better.
-        Impl-2 does not works when the (global) generator doesn't match
-        across ranks.
-        """
-
-        # ##########################################
-        # Implementation-1: Use `distribute_tensor`
-        # tensor_data = distribute_tensor(
-        #     temp_tensor, placements=tensor.placements, device_mesh=tensor.device_mesh,
-        # )
-        # tensor.copy_(tensor_data)
-
-        # ##########################################
-        # Implementation-2: Use `DTensor.from_local`
-        chunk = tensor.__create_chunk_list__()[0]  # ChunkStorageMetadata
-        offs, sizes = chunk.offsets, chunk.sizes  # torch.Size objects
-        for dim, (o, s) in enumerate(zip(offs, sizes)):
-            temp_tensor = temp_tensor.narrow(dim, o, s)
-
-        tensor.data.to_local().copy_(temp_tensor)
-
-        return tensor
+        # A sharded parameter: every rank draws the full matrix (the same
+        # generator state on every rank) and keeps its own shard, no communication.
+        full = torch.empty(tensor.shape, device=tensor.device)
+        torch.nn.init.orthogonal_(full, gain=gain, generator=generator)
+        return _copy_full_into(tensor, full)
 
 
 def scaled_orthogonal_(
@@ -251,46 +214,27 @@ def build_init_fn(init_fn_type: str):
         raise NotImplementedError(f"Unknown `init_fn_type`: '{init_fn_type}'")
 
 
-def parse_depth_init(depth_init):
-    if depth_init in ["true", "relative_depth", "relative_depth_R"]:
-        depth_init = "relative_depth_R"
-    elif depth_init in ["relative_depth_N"]:
-        depth_init = "relative_depth_N"
-    elif depth_init in ["false", "total_depth", "total_depth_R"]:
-        depth_init = "total_depth_R"
-    elif depth_init in ["total_depth_N"]:
-        depth_init = "total_depth_N"
-    elif depth_init in ["none", "null", "identity"]:
-        depth_init = None
-    else:
-        raise ValueError(f"Unknown depth_init: {depth_init}")
-    return depth_init
-
-
-def setup_depth_init(depth_init: str | None, layer_id: int, n_layers: int):
-    residual_div_attn = 1.0
-    residual_div_ffn = 1.0
-    # N = number of transformer blocks, or layers
-    # R = 2 * N = actual Residual blocks
+def setup_depth_init(depth_init: str, layer_id: int, n_layers: int):
+    """The depth-init divisors (attention, FFN) of layer ``layer_id`` of
+    ``n_layers``: ``total_depth_{R,N}`` (sqrt of the residual-branch count R =
+    2 N, or of N, for every layer), ``relative_depth_{R,N}`` (by the layer's
+    depth) or ``identity`` (1, no depth scaling)."""
     match depth_init:
         case "relative_depth_R":
-            residual_div_attn = (2 * (layer_id + 1)) ** 0.5
-            residual_div_ffn = (2 * (layer_id + 2)) ** 0.5
+            return (2 * (layer_id + 1)) ** 0.5, (2 * (layer_id + 2)) ** 0.5
         case "relative_depth_N":
-            residual_div_attn = (layer_id + 1) ** 0.5
-            residual_div_ffn = (layer_id + 1) ** 0.5
+            return (layer_id + 1) ** 0.5, (layer_id + 1) ** 0.5
         case "total_depth_R":
-            residual_div_attn = (2 * n_layers) ** 0.5
-            residual_div_ffn = (2 * n_layers) ** 0.5
+            return (2 * n_layers) ** 0.5, (2 * n_layers) ** 0.5
         case "total_depth_N":
-            residual_div_attn = n_layers**0.5
-            residual_div_ffn = n_layers**0.5
-        case None:
-            residual_div_attn = 1.0
-            residual_div_ffn = 1.0
+            return n_layers**0.5, n_layers**0.5
+        case "identity":
+            return 1.0, 1.0
         case _:
-            raise ValueError(f"Invalid depth_init: {depth_init}")
-    return residual_div_attn, residual_div_ffn
+            raise ValueError(
+                "depth_init must be total_depth_R | total_depth_N | relative_depth_R | "
+                f"relative_depth_N | identity, got {depth_init!r}"
+            )
 
 
 def setup_residual_scale(residual_scale: str, n_layers: int):
@@ -389,6 +333,41 @@ def conv_init_fn(kind: str, gain: float) -> "functools.partial":
     if not gain > 0:
         raise ValueError(f"conv_init_gain must be > 0, got {gain!r}")
     return functools.partial(_conv_init, kind=kind, gain=float(gain))
+
+
+def _init_experts_different(init_fn, w, std: float, slot: int, layer_id: int) -> None:
+    """Draw every expert of a stacked ``[E, ...]`` weight from its own seed, a
+    function of (layer, slot, expert): the experts start with equal norms, not
+    equal weights, whatever the sharding over dim 0."""
+    total_experts = w.shape[0]
+    if isinstance(w, DTensor):  # sharded on dim 0 (whole experts per rank)
+        local_tensor = w.to_local()
+        offset = w.__create_chunk_list__()[0].offsets[0]
+    else:
+        local_tensor, offset = w, 0
+    for e in range(local_tensor.shape[0]):
+        # 3 slots per expert: w1, w2, w3
+        seed = layer_id * (3 * total_experts) + slot * total_experts + e + offset
+        rng = None
+        if local_tensor.device.type != "meta":
+            rng = torch.Generator(device=local_tensor.device)
+            rng.manual_seed(seed)
+        # In place through the alias: to_local() shares the DTensor's storage.
+        init_fn(local_tensor[e], mean=0.0, std=std, generator=rng)
+
+
+def make_expert_param_init(
+    init_fn_type: str, std: float, *, slot: int, layer_id: int
+) -> "functools.partial":
+    """Single-argument initializer of a stacked expert weight (``slot``: 0 w1,
+    1 w2, 2 w3) for ``param_init``: every expert drawn with its own seed."""
+    return functools.partial(
+        _init_experts_different,
+        build_init_fn(init_fn_type),
+        std=std,
+        slot=slot,
+        layer_id=layer_id,
+    )
 
 
 def make_param_init(

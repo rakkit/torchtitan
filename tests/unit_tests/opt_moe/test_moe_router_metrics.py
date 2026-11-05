@@ -6,7 +6,7 @@
 
 """Regressions for the MoE router metrics pipeline.
 
-Producer: ``NormMoE``/``NormRouter`` buffers. Consumer:
+Producer: ``NormMoE`` and its router's buffers. Consumer:
 ``optimizers/container.py``'s step pre-hook.
 """
 
@@ -15,8 +15,7 @@ import types
 import torch
 import torch.nn as nn
 
-from torchtitan.models.common.aux_loss import AuxLoss
-from torchtitan.models.opt_moe.norm_moe import LoadBalanceLoss, make_norm_moe_config
+from torchtitan.models.opt_moe.flavors import make_norm_moe_config
 from torchtitan.optimizers.moe_balance import (
     publish_moe_metrics,
     register_moe_load_balancing_hook,
@@ -48,16 +47,14 @@ def _run_bias_hook(gas: int, *, arm: bool = True) -> list:
     import torch.nn as nn
 
     class _Blk(nn.Module):
-        def __init__(self, moe, lid):
+        def __init__(self, moe):
             super().__init__()
-            self.moe, self.moe_enabled, self.layer_id = moe, True, lid
+            self.moe, self.moe_enabled = moe, True
 
     class _Part(nn.Module):
         def __init__(self, moes):
             super().__init__()
-            self.layers = nn.ModuleDict(
-                {str(i): _Blk(m, i) for i, m in enumerate(moes)}
-            )
+            self.layers = nn.ModuleDict({str(i): _Blk(m) for i, m in enumerate(moes)})
 
     class _StubOptimizers:
         def __init__(self):
@@ -79,7 +76,9 @@ def _run_bias_hook(gas: int, *, arm: bool = True) -> list:
                 h()
 
     torch.manual_seed(0)
-    moes = [_moe(aux_loss=LoadBalanceLoss.Config(coeff=1e-3)) for _ in range(2)]
+    moes = [
+        _moe(aux_loss=dict(loss_type="microbatch_wise", coeff=1e-3)) for _ in range(2)
+    ]
     for m in moes:
         m.train()
     opt = _StubOptimizers()
@@ -123,11 +122,6 @@ def test_unarmed_step_updates_the_bias_without_publishing():
     assert any(float(m.expert_bias_E.abs().sum()) > 0 for m in moes)
 
 
-def test_load_balance_loss_reduces_over_cp():
-    """It is weighted by the CP-sharded `loss_mask.sum()`, so dp alone drops cp."""
-    assert LoadBalanceLoss.Config(coeff=1e-3).reduce_mesh == "loss"
-
-
 def test_publish_clears_stale_metrics_when_the_payload_arity_is_wrong():
     """A producer/consumer skew must produce a gap, not last step's numbers."""
     E, L = 4, 2
@@ -156,13 +150,11 @@ def test_publish_clears_stale_metrics_when_the_payload_arity_is_wrong():
         assert i["module"]._log_expert_metrics == {}, "stale metrics republished"
 
 
-def test_track_router_metrics_still_gates_entropy():
-    """The flag reaches the router even though NormMoE no longer stores it."""
+def test_track_router_metrics_gates_entropy():
     for flag, expect_zero in ((True, False), (False, True)):
         moe = _moe(track_router_metrics=flag)
         moe.train()
         moe(torch.randn(128, 32))
-        assert moe.router.track_metrics is flag
         assert (float(moe.router_entropy) == 0.0) is expect_zero
         # the counter must advance either way, or the consumer divides by zero
         assert int(moe.acc_fwd_times) == 1
@@ -175,4 +167,37 @@ def test_loss_mask_marks_valid_tokens_not_padding():
     mask = torch.zeros(128, dtype=torch.bool)
     mask[:30] = True
     moe(torch.randn(128, 32), loss_mask=mask)
-    assert int(moe.tokens_per_expert_E.sum()) == 30 * 2  # valid tokens x top_k
+    assert int(moe.router.tokens_per_expert_E.sum()) == 30 * 2  # valid tokens x top_k
+
+
+def test_activation_recompute_does_not_count_a_forward_twice():
+    """Activation remat replays code outside a saved region in backward; the
+    MoE's forward-only statistics (expert counts, forward counter, entropy) must
+    count each forward once, as without remat."""
+    import torch_remat as remat
+
+    stats = []
+    for recompute in (False, True):
+        torch.manual_seed(0)
+        moe = _moe()
+        moe.train()
+        # the default policy's regions, named as a block names them
+        moe.configure_remat_regions(["*"], ["*routed_experts.w13.*"])
+        x = torch.randn(64, 32, requires_grad=True)
+        forward = (
+            remat.checkpoint(region_name="layers.0", preserve_rng_state=False)(
+                moe.forward
+            )
+            if recompute
+            else moe.forward
+        )
+        forward(x).sum().backward()
+        stats.append(
+            (
+                moe.router.tokens_per_expert_E.clone(),
+                moe.acc_fwd_times.clone(),
+                moe.router_entropy.clone(),
+            )
+        )
+    for plain, replayed in zip(*stats):
+        assert torch.equal(plain, replayed), (plain, replayed)

@@ -29,10 +29,10 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness  # noqa: E402
-
-from torchtitan.models.opt_moe.config_registry import moe_template_config  # noqa: E402
 from torchtitan.optimizers.disco.optimizer import _unit_type  # noqa: E402
 from torchtitan.optimizers.disco.rules import StepCtx  # noqa: E402
+
+from torchtitan_recipes.models.opt_moe import moe_template_config  # noqa: E402
 
 pytestmark = pytest.mark.multi_gpu
 
@@ -95,9 +95,8 @@ class TestRecipePaths(DTensorTestBase):
         model_cfg = harness.tiny_model_config(
             moe=True, conv=4, sinks=True, num_experts=8
         )
-        model_cfg.norm_type = model_cfg.layer.norm_type = "rmsnorm"  # learnable gains
-        model_cfg.layer.attention.norm_type = "rmsnorm"
-        model_cfg.layer.attention.n_kv_heads = n_kv_heads
+        model_cfg["norm_type"] = "rmsnorm"  # learnable gains
+        model_cfg["attention"]["n_kv_heads"] = n_kv_heads
         cfg = harness.trainer_config(model_cfg, **FSDP)
         groups = copy.deepcopy(moe_template_config().optim.optimizer.groups)
         if device.type == "cpu":  # gram_polar_express runs quack's CUDA kernels only

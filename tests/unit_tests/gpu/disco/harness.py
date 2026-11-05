@@ -20,9 +20,9 @@ import torch.distributed as dist
 from torch.distributed.tensor import distribute_tensor, DTensor
 
 from torchtitan.distributed import ParallelismContext
-from torchtitan.models.opt_moe import build_model_config, model_registry
-from torchtitan.models.opt_moe.config_registry import moe_template_config
+from torchtitan.models.opt_moe import build_model_config
 from torchtitan.optimizers.container import DiSCOOptimizersContainer
+from torchtitan_recipes.models.opt_moe import moe_template_config
 
 # The embedding and the head: row-l2 rules, as the production recipe's.
 # `optimizer.groups` entries (`default` is added by trainer_config); their own rule, so
@@ -53,35 +53,38 @@ def tiny_model_config(
     flavor: str = "mis-8b-proxy",
     conv: int = 0,
     sinks: bool = False,
-):
-    """mis-8b-proxy's architecture shrunk until a 4-rank test runs in seconds;
-    `conv` / `sinks`: the attention's short conv width and sinks."""
-    cfg = model_registry(flavor)
-    # parameter-free norms: the references here are written for the matrices alone
-    cfg.norm_type = cfg.layer.norm_type = cfg.layer.attention.norm_type = "np_rmsnorm"
-    cfg.dim = dim
-    cfg.n_layers = n_layers
-    cfg.vocab_size = vocab_size
-    cfg.swa_pattern = ("SF" * n_layers)[:n_layers]
-    cfg.rope_pattern = ("RN" * n_layers)[:n_layers]
-    cfg.max_context_length = 64
-    cfg.rope = dataclasses.replace(cfg.rope, dim=32, max_context_length=64)
-    layer = cfg.layer
-    layer.n_dense_layers = 0 if moe else n_layers
-    layer.feed_forward.hidden_dim = ffn_hidden_dim
-    layer.moe.hidden_dim = moe_hidden_dim
-    layer.moe.num_experts = num_experts
-    layer.moe.num_shared_experts = 1
-    layer.moe.top_k = 2
-    attn = layer.attention
-    attn.n_heads = 2
-    attn.n_kv_heads = 1
-    attn.head_dim = 32
-    attn.sliding_window_size = 16
-    attn.conv_kernel_size = conv
-    attn.conv_init_gain = 1.0  # the harness's references start the conv at gain 1
-    attn.attention_sinks = sinks
-    return cfg
+) -> dict:
+    """mis-8b-proxy's architecture shrunk until a 4-rank test runs in seconds:
+    the flavor (key "flavor") and the build_model_config overrides; `conv` /
+    `sinks`: the attention's short conv width and sinks."""
+    return dict(
+        flavor=flavor,
+        # parameter-free norms: the references here are written for the matrices alone
+        norm_type="np_rmsnorm",
+        dim=dim,
+        n_layers=n_layers,
+        vocab_size=vocab_size,
+        swa_pattern=("SF" * n_layers)[:n_layers],
+        sliding_window_size=16,
+        rope_pattern=("RN" * n_layers)[:n_layers],
+        rope=dict(dim=32),
+        n_dense_layers=0 if moe else n_layers,
+        feed_forward=dict(hidden_dim=ffn_hidden_dim),
+        moe=dict(
+            hidden_dim=moe_hidden_dim,
+            num_experts=num_experts,
+            num_shared_experts=1,
+            top_k=2,
+        ),
+        attention=dict(
+            n_heads=2,
+            n_kv_heads=1,
+            head_dim=32,
+            conv_kernel_size=conv,
+            conv_init_gain=1.0,  # the harness's references start the conv at gain 1
+            attention_sinks=sinks,
+        ),
+    )
 
 
 def trainer_config(
@@ -108,8 +111,8 @@ def trainer_config(
     communication_dtype: str = "float32",
     seq_len: int = 64,
 ):
-    """A Trainer.Config whose model config is `model_cfg` (a flat spec) built
-    for its parallelism. `rule` overrides the default group's rule; `rule_args`
+    """A Trainer.Config whose model is `model_cfg` (`tiny_model_config`: the
+    flavor and its overrides) built for its parallelism. `rule` overrides the default group's rule; `rule_args`
     merge over its args, a None value dropping that arg."""
     config = moe_template_config()
     par = config.parallelism
@@ -117,7 +120,11 @@ def trainer_config(
     par.data_parallel_shard_degree = dp_shard
     par.context_parallel_degree = cp
     par.expert_parallel_degree = ep
-    config.model = build_model_config(model_cfg, parallelism=par, seq_len=seq_len)
+    overrides = dict(model_cfg)
+    flavor = overrides.pop("flavor")
+    config.model = build_model_config(
+        flavor, parallelism=par, seq_len=seq_len, **overrides
+    )
     config.training.num_tokens_per_microbatch_per_dp_rank = 64
     config.training.steps = 10
     config.metrics.log_freq = 1

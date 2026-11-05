@@ -6,7 +6,7 @@
 
 """Residual-stream and RMSNorm-gain statistics, read on the per-unit logging cadence.
 
-Residual: on an armed step the model's eager layer loop (``OPTMoEModel._trunk``,
+Residual: on an armed step the model's eager layer loop (``OPTMoEModel.forward``,
 between the compiled blocks) appends, per forward, the mean squares of every
 block's input and total residual write (output - input) and of the final norm's
 input. The blocks, their compiled graphs and the forward / backward are the same
@@ -69,7 +69,9 @@ def arm_residual_capture(model_parts: list[nn.Module]) -> None:
         part.residual_capture = []
 
 
-def residual_metrics(model_parts: list[nn.Module], parallelism_context) -> dict[str, float]:
+def residual_metrics(
+    model_parts: list[nn.Module], parallelism_context
+) -> dict[str, float]:
     """RMS of every block's input and total write, and of the final norm's input,
     over all of the step's tokens and ranks; disarms the capture."""
     rows = []
@@ -83,7 +85,9 @@ def residual_metrics(model_parts: list[nn.Module], parallelism_context) -> dict[
     stats = torch.stack(rows).sum(0)  # [2L + 1], summed over forwards
     packed = torch.cat([stats, stats.new_tensor([float(len(rows))])])
     mesh = (
-        parallelism_context.get_optional_mesh("loss") if parallelism_context is not None else None
+        parallelism_context.get_optional_mesh("loss")
+        if parallelism_context is not None
+        else None
     )
     if mesh is not None:
         # Every rank's microbatches have the same token count, so summed mean

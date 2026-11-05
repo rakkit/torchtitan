@@ -65,7 +65,7 @@ class OPTMoEStateDictAdapter(StateDictAdapter):
     keep_in_fp32 = ("e_score_correction_bias",)
 
     def _qkv_args(self) -> dict[str, int]:
-        attn = self.model_config.layer.attention
+        attn = self.model_config.layers[0].attention
         n_kv = attn.n_kv_heads or attn.n_heads
         return {
             "head_dim": attn.head_dim or attn.dim // attn.n_heads,

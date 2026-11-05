@@ -229,11 +229,11 @@ MUTANTS = [
         [f"{R}::TestReference::test_moe_fsdp4_ep1"],
     ),
     (
-        "T26-router-in-batch-wise",
+        "T26-router-with-a-balance-loss",
         G,
-        'if mod.aux_loss is not None and mod.aux_loss.loss_type == "batch_wise"',
+        "if mod.router.aux_loss is not None",
         "if False",
-        [f"{S}::TestSetup::test_router_batch_wise_left_out"],
+        [f"{S}::TestSetup::test_router_left_out_with_a_balance_loss"],
     ),
     (
         "T13-every-rank-stores-all",

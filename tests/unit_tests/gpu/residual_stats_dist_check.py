@@ -30,22 +30,21 @@ import torch.distributed as dist
 from torch.distributed.tensor import distribute_tensor, DTensor
 
 from torchtitan.config import ParallelismConfig, TrainingConfig
-from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed import ParallelismContext
-from torchtitan.models.opt_moe import model_registry
-from torchtitan.models.opt_moe.sharding import set_opt_moe_sharding_config
+from torchtitan.models.opt_moe import build_model_config
 from torchtitan.optimizers import model_stats
 
 VOCAB, DOCS = 1024, (640, 384)
 
 
 def config():
-    cfg = model_registry("gauge-d16-w512")
-    cfg.n_layers, cfg.vocab_size = 2, VOCAB
-    cfg.layer.norm_type = cfg.layer.attention.norm_type = cfg.norm_type = "rmsnorm"
-    cfg._expand_layers()
-    set_opt_moe_sharding_config(cfg, enable_sp=False, enable_tp=False, enable_ep=False)
-    return cfg
+    return build_model_config(
+        "gauge-d16-w512",
+        parallelism=ParallelismConfig(),
+        n_layers=2,
+        vocab_size=VOCAB,
+        norm_type="rmsnorm",
+    )
 
 
 def plain_model():
@@ -112,7 +111,10 @@ def forward(model, pd, rep, shard, data):
             data_parallel_replicate_degree=rep, data_parallel_shard_degree=shard
         )
         inputs, _, extra = model.preprocess_inputs(
-            cuda, parallelism_context=pd, parallelism=parallelism, max_context_length=4096
+            cuda,
+            parallelism_context=pd,
+            parallelism=parallelism,
+            max_context_length=4096,
         )
         with pd.activate_spmd():
             model(inputs, **extra)

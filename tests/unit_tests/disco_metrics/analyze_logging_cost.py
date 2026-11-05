@@ -34,7 +34,8 @@ import torch
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
-from torchtitan.models.opt_moe import moe_opt_moe_configs  # noqa: E402
+from torchtitan.config.parallelism import ParallelismConfig  # noqa: E402
+from torchtitan.models.opt_moe import build_model_config  # noqa: E402
 from torchtitan.optimizers.helpers.norm_helper import (  # noqa: E402
     calculate_norm_batched,
     get_norms_to_log,
@@ -66,7 +67,7 @@ def classify(name, shape):
 
 def inventory(flavor, dp_shard):
     with torch.device("meta"):
-        model = moe_opt_moe_configs[flavor].build()
+        model = build_model_config(flavor, parallelism=ParallelismConfig()).build()
     fams = defaultdict(list)
     for n, p in model.named_parameters():
         fams[classify(n, tuple(p.shape))].append(tuple(p.shape))

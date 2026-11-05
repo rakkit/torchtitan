@@ -50,7 +50,7 @@ observability/nanprobe.py                  env-gated NaN probe (debugging)
 ## Configuring it
 
 A run states named parameter groups; the production recipe
-(`opt_moe.config_registry.moe_template_config`, lr = the hidden matrices' lr):
+(`torchtitan_recipes/models/opt_moe.py`'s `moe_template_config`, lr = the hidden matrices' lr):
 
 ```python
 config.optimizer.groups = {

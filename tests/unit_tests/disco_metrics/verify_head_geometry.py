@@ -262,16 +262,12 @@ if dev == "cpu":
     # this CPU; the check is meaningful only on the accelerator anyway.
     print("  SKIP  no accelerator")
 try:
-    from torchtitan.models.opt_moe import model_registry
-    from torchtitan.models.opt_moe.config_registry import moe_template_config
+    from torchtitan.models.opt_moe import build_model_config
+    from torchtitan_recipes.models.opt_moe import moe_template_config
 
-    # The model config is only complete once the trainer config has expanded
-    # it; `build()` on a bare registry entry leaves tok_embeddings unset.
     job = moe_template_config()
-    job.model = model_registry("gauge-d8-w256")
-    job.model.vocab_size = 2048
-    job.model.finalize(
-        parallelism=job.parallelism, max_context_length=job.model.max_context_length
+    job.model = build_model_config(
+        "gauge-d8-w256", parallelism=job.parallelism, vocab_size=2048
     )
     if dev == "cpu":
         raise _Skip()

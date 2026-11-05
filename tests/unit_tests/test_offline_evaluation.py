@@ -43,8 +43,9 @@ from torchtitan.evaluation.runtime import (
     result_row,
     upsert_result,
 )
+from torchtitan.models.opt_moe import build_model_config
+from torchtitan_recipes.models.opt_moe import moe_template_config
 from torchtitan_recipes.tests.models.llama3 import llama3_debugmodel
-from torchtitan.models.opt_moe.config_registry import moe_template_config
 
 
 class DummyTokenizer(BaseTokenizer):
@@ -96,8 +97,15 @@ class TestOfflineEvaluationConfig(unittest.TestCase):
             root = Path(temp_dir)
             original = moe_template_config()
             original.hf_assets_path = "/tmp/tokenizer-assets"
-            original.model.dim = 123
-            original.model.max_context_length = 777
+            original.model = build_model_config(
+                "mis-8b-proxy",
+                parallelism=original.parallelism,
+                seq_len=777,
+                n_layers=4,
+                swa_pattern="SFSF",
+                rope_pattern="RRNR",
+                attention=dict(conv_kernel_size=4),
+            )
 
             older = root / "job_config_20260101-0000.json"
             newest = root / "job_config_20260101-0001.json"
@@ -107,9 +115,12 @@ class TestOfflineEvaluationConfig(unittest.TestCase):
             self.assertEqual(find_latest_job_config(root), newest)
             restored = load_training_config(newest)
             self.assertEqual(restored.config.hf_assets_path, "/tmp/tokenizer-assets")
-            self.assertEqual(restored.config.model.max_context_length, 777)
-            self.assertEqual(restored.config.model.layers, [])  # finalized at runtime
-            self.assertEqual(restored.config.model.dim, 123)
+            model = restored.config.model  # rebuilt from flavor + build_args
+            self.assertEqual(model.max_context_length, 777)
+            self.assertEqual(model.build_args, original.model.build_args)
+            self.assertEqual(len(model.layers), 4)
+            self.assertIsNotNone(model.layers[0].attention.k_conv)
+            self.assertIsNone(model.layers[2].attention.rope)
 
     def test_rejects_model_converter_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_dir:

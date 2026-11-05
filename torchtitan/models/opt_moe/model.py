@@ -19,14 +19,13 @@ from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.models.common.attention import AttentionMetadata, AttentionMetadataMap
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.feed_forward import DenseFeedForward
-from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
+from torchtitan.models.common.moe import MoE, RoutedExperts, TokenChoiceTopKRouter
 from torchtitan.models.common.param_layout import (
     by_rank,
     named,
     ParamLayout,
     stacked_units,
 )
-from .norm_moe import NormMoE
 from .state_dict_adapter import OPTMoEStateDictAdapter
 
 
@@ -43,36 +42,25 @@ def layout_flags(parallelism: ParallelismConfig) -> dict[str, bool]:
 
 class OPTMoETransformerBlock(TransformerBlock):
     """OPT MoE TransformerBlock: pre-norm attention and a dense or MoE
-    feed-forward, ``x = identity_scale * x + block_scale * block(x)`` for each.
+    feed-forward (``feed_forward``, by its config type, as upstream's blocks),
+    ``x = identity_scale * x + block_scale * block(x)`` for each.
 
     Token-flat throughout: ``x`` is ``[T, D]``.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(TransformerBlock.Config):
-        feed_forward: DenseFeedForward.Config | None = None
-        moe: NormMoE.Config | None = None
-        """The layer's feed-forward: dense or MoE, exactly one of the two. The
-        MoE is built as ``self.moe`` (FQNs ``moe.*``)."""
         block_scale: float = 1.0
         identity_scale: float = 1.0
         """The residual scales: ``x = identity_scale * x + block_scale * f(x)``
         for the attention and the feed-forward (1.0: the plain residual)."""
-
-        def __post_init__(self) -> None:
-            if (self.feed_forward is None) == (self.moe is None):
-                raise ValueError("a block has exactly one of feed_forward / moe")
 
     def __init__(self, config: Config):
         super().__init__()
         self.attention = config.attention.build()
         self.attention_norm = config.attention_norm.build()
         self.ffn_norm = config.ffn_norm.build()
-        self.moe_enabled = config.moe is not None
-        if self.moe_enabled:
-            self.moe = config.moe.build()
-        else:
-            self.feed_forward = config.feed_forward.build()
+        self.feed_forward = config.feed_forward.build()
         self.block_scale = config.block_scale
         self.identity_scale = config.identity_scale
         # A unit scale is not multiplied (x * 1.0 == x). Block side: two [T, D]
@@ -89,14 +77,12 @@ class OPTMoETransformerBlock(TransformerBlock):
         x: torch.Tensor,
         attention_metadata: AttentionMetadata | None = None,
         positions: torch.Tensor | None = None,
-        loss_mask: torch.Tensor | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
         aux_loss_denominator: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """``x``: ``[T, D]``; ``loss_mask``: the tokens the MoE counts in its
-        balance statistics (``OPTMoEModel.preprocess_inputs``); ``padding_mask``:
-        upstream's, accepted and ignored (``loss_mask`` is the stricter mask)."""
+        """``x``: ``[T, D]``; ``padding_mask`` (True: not counted): the tokens the
+        MoE leaves out of its balance statistics (``OPTMoEModel.preprocess_inputs``)."""
         _attn_out = self.attention(
             self.attention_norm(x), attention_metadata, positions
         )
@@ -107,9 +93,11 @@ class OPTMoETransformerBlock(TransformerBlock):
         h = lhs + rhs
         h_normed = self.ffn_norm(h)
 
-        if self.moe_enabled:
-            mlp_output = self.moe(
-                h_normed, loss_mask, aux_loss_denominator=aux_loss_denominator
+        if isinstance(self.feed_forward, MoE):
+            mlp_output = self.feed_forward(
+                h_normed,
+                padding_mask_T=padding_mask,
+                aux_loss_denominator=aux_loss_denominator,
             )
         else:
             mlp_output = self.feed_forward(h_normed)
@@ -135,9 +123,13 @@ class OPTMoEModel(Decoder):
     def _register_optimizer_hooks(
         cls, optimizers, model_parts, parallelism_context
     ) -> None:
+        from torchtitan.models.common.aux_loss import register_aux_loss_zero_hook
         from torchtitan.optimizers.moe_balance import register_moe_load_balancing_hook
 
+        # The balance hook reads each aux loss's per-step value before upstream's
+        # zero hook rolls it into the aux-loss metrics and clears it.
         register_moe_load_balancing_hook(optimizers, model_parts, parallelism_context)
+        register_aux_loss_zero_hook(optimizers, model_parts, parallelism_context)
 
     def param_layouts(self) -> dict:
         """What every parameter is, keyed by FQN (see
@@ -270,22 +262,19 @@ class OPTMoEModel(Decoder):
         tokens: torch.Tensor,
         positions: torch.Tensor | None = None,
         attention_metadata: AttentionMetadataMap | None = None,
-        loss_mask: torch.Tensor | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
         aux_loss_denominators: torch.Tensor | None = None,
     ):
-        """Forward pass.
+        """Upstream's ``Decoder.forward`` plus the residual statistics.
 
         Args:
             tokens: Input token indices ``[T]``, or hidden states when this is
                 not the first pipeline stage.
             positions: Position indices ``[T]``.
             attention_metadata: The inner attentions' metadata, by type.
-            loss_mask: Tokens counted in the MoE balance statistics (True:
-                counted); see ``preprocess_inputs``.
-            padding_mask: Accepted and ignored: ``loss_mask`` is the stricter
-                mask (labels ignored, prompt tokens of SFT included).
+            padding_mask: Tokens left out of the MoE balance statistics (True:
+                not counted); see ``preprocess_inputs``.
         """
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
@@ -308,7 +297,7 @@ class OPTMoEModel(Decoder):
                 h,
                 meta,
                 positions,
-                loss_mask,
+                padding_mask=padding_mask,
                 aux_loss_denominator=aux_loss_denominator,
             )
             if rows is not None:
@@ -344,9 +333,11 @@ class OPTMoEModel(Decoder):
         global_routing_token_counts: torch.Tensor | None = None,
         **kwargs: Any,
     ):
-        """Upstream's (masks, CP shards, SPMD types), then the MoE token mask,
-        from the CP-sharded labels so its token layout matches the hidden
-        states the router sees."""
+        """Upstream's (masks, CP shards, SPMD types). With
+        ``enable_token_mask_for_moe`` the MoE's padding mask becomes every token
+        whose label is ignored (padding, and the prompt under SFT), from the
+        CP-sharded labels so its layout matches the hidden states the router
+        sees; the attention masks were built from upstream's padding mask."""
         inputs, labels, model_kwargs, loss_kwargs = super().preprocess_inputs(
             input_dict,
             parallelism_context=parallelism_context,
@@ -358,5 +349,5 @@ class OPTMoEModel(Decoder):
         if self.config.enable_token_mask_for_moe:
             from torchtitan.components.loss import IGNORE_INDEX
 
-            model_kwargs["loss_mask"] = labels != IGNORE_INDEX
+            model_kwargs["padding_mask"] = labels == IGNORE_INDEX
         return inputs, labels, model_kwargs, loss_kwargs

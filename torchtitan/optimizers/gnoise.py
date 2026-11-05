@@ -40,7 +40,7 @@ _LAYER = re.compile(r"layers\.\d+\.")
 _EXPERT = re.compile(r"\.e\d+(?=\.|$)")
 _RESIDUAL_WRITERS = re.compile(
     r"(^tok_embeddings\.weight$|\.attention\.wo\.weight$|\.feed_forward\.w2\.weight$"
-    r"|\.moe\.(routed|shared)_experts\.w2\.weight$)"
+    r"|\.feed_forward\.(routed|shared)_experts\.w2\.weight$)"
 )
 
 

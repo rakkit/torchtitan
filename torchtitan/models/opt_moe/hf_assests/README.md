@@ -56,9 +56,9 @@ MoE models, and are exactly torchtitan's tensors:
 
 | HF | shape | native |
 |---|---|---|
-| `mlp.experts.gate_up_proj` | `[E, 2F, D]` (gate rows, then up rows) | `moe.routed_experts.w13` `[E, 2, F, D]` |
-| `mlp.experts.down_proj` | `[E, D, F]` | `moe.routed_experts.w2` |
-| `mlp.gate.weight` | `[E, D]` | `moe.router.gate.weight` |
+| `mlp.experts.gate_up_proj` | `[E, 2F, D]` (gate rows, then up rows) | `feed_forward.routed_experts.w13` `[E, 2, F, D]` |
+| `mlp.experts.down_proj` | `[E, D, F]` | `feed_forward.routed_experts.w2` |
+| `mlp.gate.weight` | `[E, D]` | `feed_forward.router.gate.weight` |
 
 Expert backends: unset means this model's forward. `experts_implementation=`
 `"grouped_mm"`, `"batched_mm"`, ... select transformers' own; they are

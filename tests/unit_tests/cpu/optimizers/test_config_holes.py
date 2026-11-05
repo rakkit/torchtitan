@@ -53,11 +53,11 @@ class _Decoder(nn.Module):
         super().__init__()
         self.tok_embeddings = nn.Embedding(64, 16)
         self.wq = nn.Linear(16, 16, bias=False)
-        self.moe = (
+        self.feed_forward = (
             nn.Module()
-        )  # the router at the model's path: the template freezes moe.router.gate
-        self.moe.router = nn.Module()
-        self.moe.router.gate = nn.Linear(
+        )  # the router at the model's path: the template freezes feed_forward.router.gate
+        self.feed_forward.router = nn.Module()
+        self.feed_forward.router.gate = nn.Linear(
             16, 8, bias=False
         )  # 8 experts: Gram Polar Express needs dims % 8
         self.norm = nn.RMSNorm(16)  # learnable gains: the template's gains group
@@ -67,7 +67,7 @@ class _Decoder(nn.Module):
         return {
             "tok_embeddings.weight": ParamLayout("embedding"),
             "wq.weight": ParamLayout("matrix"),
-            "moe.router.gate.weight": ParamLayout("router"),
+            "feed_forward.router.gate.weight": ParamLayout("router"),
             "norm.weight": ParamLayout("vector"),
             "lm_head.weight": ParamLayout("unembedding"),
         }
@@ -143,8 +143,10 @@ def test_a_named_group_with_only_an_lr_does_not_take_the_defaults_own_args():
     assert wq["rule"] == "amphione" and wq["lr"] == 0.003
     assert "frozen_scale_units" not in wq["args"]
     assert wq["args"]["polar_express_safety"] == 1.05  # inherited
-    gate = next(g for names, g in groups.items() if "moe.router.gate.weight" in names)
-    assert gate["args"]["frozen_scale_units"] == ["moe.router.gate"]
+    gate = next(
+        g for names, g in groups.items() if "feed_forward.router.gate.weight" in names
+    )
+    assert gate["args"]["frozen_scale_units"] == ["feed_forward.router.gate"]
 
 
 def test_a_named_group_under_the_defaults_rule_keeps_its_other_default_args():

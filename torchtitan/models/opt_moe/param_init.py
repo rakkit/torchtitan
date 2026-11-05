@@ -192,26 +192,14 @@ INIT_FN_MAP = {
 
 
 def build_init_fn(init_fn_type: str):
-    """
-    Builds the specified initialization function based on `init_fn_type`.
-
-    Args:
-        init_fn_type (str): The type of normalization layer to build.
-            Supported types: trunc_normal, normal
-
-    Returns:
-        The built initialization function.
-
-    Raises:
-        NotImplementedError: If an unknown `init_fn_type` is provided.
-    """
-    init_fn_type = init_fn_type.lower()  # Normalize to lowercase
-
-    init_fn = INIT_FN_MAP.get(init_fn_type)
-    if init_fn is not None:
-        return init_fn
-    else:
-        raise NotImplementedError(f"Unknown `init_fn_type`: '{init_fn_type}'")
+    """The initializer ``INIT_FN_MAP[init_fn_type]`` (case-insensitive), called
+    as ``fn(tensor, mean=..., std=..., generator=...)``."""
+    init_fn = INIT_FN_MAP.get(init_fn_type.lower())
+    if init_fn is None:
+        raise NotImplementedError(
+            f"Unknown init_fn_type {init_fn_type!r}; available: {', '.join(INIT_FN_MAP)}"
+        )
+    return init_fn
 
 
 def setup_depth_init(depth_init: str, layer_id: int, n_layers: int):
@@ -375,12 +363,8 @@ def make_param_init(
     std: float,
     residual_div: float = 1.0,
 ) -> "functools.partial":
-    """Build a single-argument initializer for upstream's ``param_init`` dict.
-
-    ``Module._init_param`` calls ``self._param_init[name](param)`` with exactly
-    one positional argument, so the mean/std/residual-scaling that the old
-    ``init_weights(residual_div=...)`` cascade passed at call time has to be
-    bound here instead.
+    """A single-argument initializer for upstream's ``param_init`` dict
+    (``Module._init_param`` calls ``param_init[name](param)``).
 
     Args:
         init_fn_type: Key into ``INIT_FN_MAP`` (e.g. ``"scaled_orthogonal"``).
@@ -390,8 +374,3 @@ def make_param_init(
     """
     init_fn = build_init_fn(init_fn_type)
     return functools.partial(init_fn, mean=0.0, std=std / residual_div)
-
-
-def skip_init(param: "torch.nn.Parameter") -> None:
-    """No-op initializer, for weights restored from a checkpoint."""
-    return None

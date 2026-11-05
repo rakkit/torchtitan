@@ -54,8 +54,8 @@ def _names():
     out = []
     for i in range(LAYERS):
         out += [
-            f"layers.{i}.moe.experts.w13.weight",
-            f"layers.{i}.moe.experts.w2.weight",
+            f"layers.{i}.feed_forward.routed_experts.w13.weight",
+            f"layers.{i}.feed_forward.routed_experts.w2.weight",
         ]
     return out
 

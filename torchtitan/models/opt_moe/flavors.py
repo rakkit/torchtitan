@@ -9,8 +9,9 @@
 ``build_model_config(flavor, *, parallelism, seq_len, **overrides)`` builds the
 complete, sharded ``OPTMoEModel.Config``: ``_opt_moe_config`` loops over the
 layers (SWA / RoPE patterns, depth-init divisors, dense-first layers, residual
-scales) and builds each component with its sharding. A flavor is the builder's
-arguments; a run passes the ones it changes::
+scales) and builds each component with its sharding. A flavor is a function
+that writes out the builder's arguments (``MODEL_FLAVORS``: flavor -> (function,
+default context length)); a run passes the arguments it changes::
 
     build_model_config(
         "gauge-d16-w512", parallelism=parallelism, seq_len=4096,
@@ -31,9 +32,8 @@ rebuilds the same model for another parallelism.
 import copy
 import dataclasses
 import functools
+from collections.abc import Callable
 from typing import Any, Literal
-
-import numpy as np
 
 from torch import nn
 
@@ -104,85 +104,6 @@ __all__ = [
     "make_gated_swa_attention_config",
     "make_norm_moe_config",
 ]
-
-
-# The MoE gate scaling factors (https://arxiv.org/abs/2502.16982), pre-computed per
-# (num_experts, top_k); calc_gate_scaling_factor estimates the others.
-SCALING_FACTORS = {
-    (4, 1): 1.0,
-    (4, 2): 1.3975240382831564,
-    (4, 4): 1.8746839497244312,
-    (8, 1): 1.0,
-    (8, 2): 1.4089312089643131,
-    (8, 4): 1.9716372098310582,
-    (8, 6): 2.3692189889782083,
-    (8, 8): 2.6297724148600703,
-    (16, 1): 1.0,
-    (16, 2): 1.412131787337075,
-    (16, 4): 1.990941161710805,
-    (16, 6): 2.4283171262135257,
-    (16, 8): 2.7879495517358537,
-    (16, 16): 3.7047009687546923,
-    (32, 1): 1.0,
-    (32, 2): 1.4132875875185074,
-    (32, 4): 1.9964881494834583,
-    (32, 6): 2.4419467013356364,
-    (32, 8): 2.8154055554895394,
-    (32, 16): 3.943324881680555,
-    (32, 32): 5.229939776738365,
-    (64, 1): 1.0,
-    (64, 2): 1.4137804787923913,
-    (64, 4): 1.9984419912715523,
-    (64, 6): 2.446338919929975,
-    (64, 8): 2.8232884471713273,
-    (64, 16): 3.981865423254339,
-    (64, 32): 5.5779444133949685,
-    (64, 64): 7.391360398907228,
-    (128, 1): 1.0,
-    (128, 2): 1.4139935847474265,
-    (128, 4): 1.999243359037702,
-    (128, 6): 2.448026924377305,
-    (128, 8): 2.826111482320644,
-    (128, 16): 3.992795051245798,
-    (128, 32): 5.631330086465613,
-    (128, 64): 7.8888558415100025,
-    (128, 128): 10.447601374558701,
-    (192, 1): 1.0,
-    (192, 2): 1.4140596973689825,
-    (192, 4): 1.9994875418633284,
-    (192, 6): 2.448528209376721,
-    (192, 8): 2.8269205350175617,
-    (192, 16): 3.9954948027768986,
-    (192, 32): 5.642154758774243,
-    (192, 64): 7.9448577065669665,
-    (192, 128): 11.03389500669084,
-    (256, 1): 1.0,
-    (256, 2): 1.4140933478999065,
-    (256, 4): 1.9996002066706609,
-    (256, 6): 2.4487450517795386,
-    (256, 8): 2.827297937808976,
-    (256, 16): 3.996711691215216,
-    (256, 32): 5.646620595072715,
-    (256, 64): 7.964034924039261,
-    (256, 128): 11.157350249127516,
-}
-
-
-def calc_gate_scaling_factor(
-    num_experts: int, topk: int, iter_times: int = 10000
-) -> float:
-    """The MoE gate scaling factor: E[1 / ||p||_2] over the top-k sigmoid scores
-    of Gaussian logits, renormalized to sum 1 (the pre-computed table when it has
-    the pair, else a seeded Monte Carlo estimate over ``iter_times`` draws)."""
-    if num_experts < 1 or topk < 1:
-        return 1.0
-    if (num_experts, topk) in SCALING_FACTORS:
-        return SCALING_FACTORS[(num_experts, topk)]
-    # A fixed generator: every rank and every run gets the same route_scale.
-    logits = np.random.default_rng(0).standard_normal((iter_times, num_experts))
-    p = -np.sort(-1 / (1 + np.exp(-logits)), axis=-1)[:, :topk]
-    p = p / p.sum(axis=-1, keepdims=True)
-    return float(np.mean(1.0 / np.sqrt((p**2).sum(axis=-1))))
 
 
 def _norm(
@@ -357,7 +278,7 @@ def make_norm_moe_config(
     num_experts: int,
     top_k: int,
     num_shared_experts: int = 1,
-    scaling_factor: float | None = None,
+    scaling_factor: float = 1.0,
     score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "sigmoid",
     load_balance_coeff: float | None = 1e-3,
     bias_update_norm_factor: str = "sign",
@@ -381,8 +302,8 @@ def make_norm_moe_config(
     experts of ``hidden_dim`` (each drawn with its own seed), upstream's top-k
     router, ``num_shared_experts`` shared experts as one FFN.
 
-    ``scaling_factor`` None: the router's ``route_scale`` from
-    ``calc_gate_scaling_factor``; ``load_balance_coeff``: the expert-bias update
+    ``scaling_factor``: the router's ``route_scale`` (the factor on the
+    renormalized top-k weights); ``load_balance_coeff``: the expert-bias update
     rate (None: no bias); ``quantile_balance_bins``: upstream's quantile-balanced
     router (the bias solved from the required-bias histogram) instead of the
     sign nudge; ``aux_loss``: upstream's auxiliary load-balance loss,
@@ -390,11 +311,6 @@ def make_norm_moe_config(
     The token dispatcher: all-to-all under EP, local dispatch without (DeepEP /
     HybridEP: upstream's ``TokenDispatcherTransform`` on the recipe).
     """
-    route_scale = (
-        scaling_factor
-        if scaling_factor is not None
-        else calc_gate_scaling_factor(num_experts, top_k, iter_times=10_000)
-    )
     aux_loss_cfg = None
     if aux_loss is not None:
         aux_args = dict(aux_loss)
@@ -425,10 +341,9 @@ def make_norm_moe_config(
         ),
         score_func=_SCORE_FUNCS[score_func](),
         top_k=top_k,
-        # calc_gate_scaling_factor calibrates route_scale on top-k weights
-        # normalized to sum 1, so route_norm stays on (upstream's default is off).
+        # The top-k weights renormalized to sum 1 (upstream's default is off).
         route_norm=True,
-        route_scale=route_scale,
+        route_scale=scaling_factor,
         aux_loss=aux_loss_cfg,
         sharding_config=router_sharding_config() if enable_ep else None,
     )
@@ -650,14 +565,9 @@ def _opt_moe_config(
                 feed_forward=(
                     _feed_forward_config(**feed_forward, **ffn)
                     if layer_id < n_dense_layers
-                    else None
-                ),
-                moe=(
-                    make_norm_moe_config(
+                    else make_norm_moe_config(
                         **moe, **ffn, layer_id=layer_id, enable_ep=enable_ep
                     )
-                    if layer_id >= n_dense_layers
-                    else None
                 ),
                 block_scale=block_scale,
                 identity_scale=identity_scale,
@@ -711,195 +621,301 @@ def _opt_moe_config(
     return config
 
 
-# Each entry: the builder's arguments (the rest take the builders' defaults) and
-# the default training context length. `mis-*`: SSSF hybrid attention (window 128),
-# qk-norm, one shared expert, top-8 routing, no MoE output factor. `gauge-*`: the
-# optimizer study's dense models (full attention, MHA, FFN 4 x dim).
-MODEL_FLAVORS: dict[str, tuple[dict[str, Any], int]] = {
-    "mis-8b": (
-        dict(
-            n_layers=24,
-            dim=2048,
-            n_dense_layers=0,
-            swa_pattern="SSSF" * 6,
-            sliding_window_size=128,
-            rope_pattern="RRRN" * 6,
-            rope=dict(dim=128, theta=10000.0),
-            attention=dict(
-                n_heads=32,
-                n_kv_heads=4,
-                head_dim=128,
-                qk_norm=True,
-                attn_backend="flex",
-            ),
-            feed_forward=dict(hidden_dim=5120),
-            moe=dict(
-                hidden_dim=640,
-                num_experts=64,
-                num_shared_experts=1,
-                top_k=8,
-                scaling_factor=1.0,
-            ),
+# The builder arguments merged key by key (the rest replace the flavor's).
+_MERGED_ARGS = ("attention", "feed_forward", "moe", "rope", "rope_of_swa")
+
+
+def _build(overrides: dict[str, Any], **flavor_args: Any) -> OPTMoEModel.Config:
+    """A flavor's arguments with the run's ``overrides`` merged in (see the
+    module docstring), built for the ``parallelism``, ``seq_len`` and
+    ``rope_length`` that ``build_model_config`` passes in ``overrides``; the
+    merged arguments are kept in ``config.build_args``."""
+    context = {
+        name: overrides.pop(name) for name in ("parallelism", "seq_len", "rope_length")
+    }
+    args = copy.deepcopy(flavor_args)
+    for name, value in copy.deepcopy(overrides).items():
+        if name in _MERGED_ARGS and value is not None and args.get(name) is not None:
+            args[name] = {**args[name], **value}
+        else:
+            args[name] = value
+    config = _opt_moe_config(**args, **context)
+    config.build_args = args
+    return config
+
+
+# `mis-*`: SSSF hybrid attention (window 128), qk-norm, one shared expert,
+# top-8 routing, no MoE output factor.
+def _mis_8b(**overrides: Any) -> OPTMoEModel.Config:
+    return _build(
+        overrides,
+        n_layers=24,
+        dim=2048,
+        n_dense_layers=0,
+        swa_pattern="SSSF" * 6,
+        sliding_window_size=128,
+        rope_pattern="RRRN" * 6,
+        rope=dict(dim=128, theta=10000.0),
+        attention=dict(
+            n_heads=32, n_kv_heads=4, head_dim=128, qk_norm=True, attn_backend="flex"
         ),
-        4096,
-    ),
-    "mis-8b-proxy": (
-        dict(
-            n_layers=24,
-            dim=512,
-            n_dense_layers=0,
-            swa_pattern="SSSF" * 6,
-            sliding_window_size=128,
-            rope_pattern="RRRN" * 6,
-            rope=dict(dim=128, theta=10000.0),
-            attention=dict(
-                n_heads=8,
-                n_kv_heads=1,
-                head_dim=128,
-                qk_norm=True,
-                attn_backend="flex",
-            ),
-            feed_forward=dict(hidden_dim=1280),
-            moe=dict(
-                hidden_dim=160,
-                num_experts=64,
-                num_shared_experts=1,
-                top_k=8,
-                scaling_factor=1.0,
-            ),
+        feed_forward=dict(hidden_dim=5120),
+        moe=dict(
+            hidden_dim=640,
+            num_experts=64,
+            num_shared_experts=1,
+            top_k=8,
+            scaling_factor=1.0,
         ),
-        4096,
-    ),
-    # mis-8b-proxy with the expert bias solved from the required-bias histogram
-    # instead of the DeepSeek sign nudge.
+    )
+
+
+def _mis_8b_proxy(
+    *, quantile_balance_bins: int | None = None, **overrides: Any
+) -> OPTMoEModel.Config:
+    """``quantile_balance_bins``: the expert bias solved from the required-bias
+    histogram (upstream's quantile-balanced router) instead of the sign nudge."""
+    return _build(
+        overrides,
+        n_layers=24,
+        dim=512,
+        n_dense_layers=0,
+        swa_pattern="SSSF" * 6,
+        sliding_window_size=128,
+        rope_pattern="RRRN" * 6,
+        rope=dict(dim=128, theta=10000.0),
+        attention=dict(
+            n_heads=8, n_kv_heads=1, head_dim=128, qk_norm=True, attn_backend="flex"
+        ),
+        feed_forward=dict(hidden_dim=1280),
+        moe=dict(
+            hidden_dim=160,
+            num_experts=64,
+            num_shared_experts=1,
+            top_k=8,
+            scaling_factor=1.0,
+            quantile_balance_bins=quantile_balance_bins,
+        ),
+    )
+
+
+def _mis_30b_a3b(**overrides: Any) -> OPTMoEModel.Config:
+    return _build(
+        overrides,
+        n_layers=40,
+        dim=2048,
+        n_dense_layers=1,
+        swa_pattern="SSSF" * 10,
+        sliding_window_size=128,
+        rope=dict(dim=128, theta=10000.0),
+        attention=dict(
+            n_heads=32, n_kv_heads=4, head_dim=128, qk_norm=True, attn_backend="flex"
+        ),
+        feed_forward=dict(hidden_dim=8192),
+        moe=dict(
+            hidden_dim=512,
+            num_experts=256,
+            num_shared_experts=1,
+            top_k=8,
+            scaling_factor=1.0,
+        ),
+    )
+
+
+def _mis_100b_a5b(**overrides: Any) -> OPTMoEModel.Config:
+    return _build(
+        overrides,
+        n_layers=40,
+        dim=3072,
+        n_dense_layers=1,
+        swa_pattern="SSSF" * 10,
+        sliding_window_size=128,
+        rope=dict(dim=128, theta=10000.0),
+        attention=dict(
+            n_heads=32, n_kv_heads=4, head_dim=128, qk_norm=True, attn_backend="flex"
+        ),
+        feed_forward=dict(hidden_dim=8192),
+        moe=dict(
+            hidden_dim=1024,
+            num_experts=256,
+            num_shared_experts=1,
+            top_k=8,
+            scaling_factor=1.0,
+        ),
+    )
+
+
+# `gauge-*`: the optimizer study's dense models (full attention, MHA, head_dim
+# 128, qk-norm).
+def _gauge(
+    *, n_layers: int, dim: int, n_heads: int, hidden_dim: int, **overrides: Any
+) -> OPTMoEModel.Config:
+    return _build(
+        overrides,
+        n_layers=n_layers,
+        dim=dim,
+        n_dense_layers=n_layers,
+        rope=dict(dim=128, theta=10000.0),
+        attention=dict(n_heads=n_heads, n_kv_heads=n_heads, head_dim=128, qk_norm=True),
+        feed_forward=dict(hidden_dim=hidden_dim),
+    )
+
+
+# `production-*-336m`: the optimizer study's production recipe at 336M (dim 1024,
+# 16 layers, MHA, full attention, qk-norm, RMSNorm gains, no depth scaling; every
+# hidden matrix scaled-orthogonal at std 4, the x4 in the init; embedding
+# scion-normal std 0.02, head std 1), every setting written out. norm_eps 1e-30:
+# open (the user decides the production value).
+def _production_dense_336m(**overrides: Any) -> OPTMoEModel.Config:
+    return _build(
+        overrides,
+        dim=1024,
+        n_layers=16,
+        n_dense_layers=16,
+        vocab_size=201088,
+        enable_weight_tying=False,
+        enable_token_mask_for_moe=False,
+        norm_type="rmsnorm",
+        norm_eps=1e-30,
+        prenorm_gain_init=1.0,
+        depth_init="identity",
+        residual_scale="identity",
+        init_gate_as_residual=False,
+        first_in_init_fn_type="scion_normal_input",
+        first_in_init_std=0.02,
+        final_out_init_fn_type="scion_normal_output",
+        final_out_init_std=1.0,
+        sliding_window_size=None,
+        swa_pattern=None,
+        rope_pattern=None,
+        rope=dict(dim=128, theta=10000.0, scaling="none"),
+        rope_of_swa=None,
+        attention=dict(
+            n_heads=16,
+            n_kv_heads=16,
+            head_dim=128,
+            qk_norm=True,
+            attn_backend="flex",
+            gated_attention_type=None,
+            conv_kernel_size=0,
+            attention_sinks=False,
+            wqkv_init_fn_type="scaled_orthogonal",
+            wo_init_fn_type="scaled_orthogonal",
+            w_gate_init_fn_type="scaled_orthogonal",
+            wqkv_init_std=4.0,
+            wo_init_std=4.0,
+            w_gate_init_std=4.0,
+        ),
+        feed_forward=dict(
+            hidden_dim=4096,
+            w1_init_fn_type="scaled_orthogonal",
+            w2_init_fn_type="scaled_orthogonal",
+            w3_init_fn_type="scaled_orthogonal",
+            w1_init_std=4.0,
+            w2_init_std=4.0,
+            w3_init_std=4.0,
+        ),
+        moe=None,
+    )
+
+
+# production-dense-336m with every FFN an MoE: 64 routed experts of hidden 448 + 1
+# shared, top 8, sigmoid scores, no output factor, the sign bias update at 0.001,
+# no aux loss; experts and router gate scaled-orthogonal at std 4.
+def _production_moe_336m(**overrides: Any) -> OPTMoEModel.Config:
+    return _build(
+        overrides,
+        dim=1024,
+        n_layers=16,
+        n_dense_layers=0,
+        vocab_size=201088,
+        enable_weight_tying=False,
+        enable_token_mask_for_moe=False,
+        norm_type="rmsnorm",
+        norm_eps=1e-30,
+        prenorm_gain_init=1.0,
+        depth_init="identity",
+        residual_scale="identity",
+        init_gate_as_residual=False,
+        first_in_init_fn_type="scion_normal_input",
+        first_in_init_std=0.02,
+        final_out_init_fn_type="scion_normal_output",
+        final_out_init_std=1.0,
+        sliding_window_size=None,
+        swa_pattern=None,
+        rope_pattern=None,
+        rope=dict(dim=128, theta=10000.0, scaling="none"),
+        rope_of_swa=None,
+        attention=dict(
+            n_heads=16,
+            n_kv_heads=16,
+            head_dim=128,
+            qk_norm=True,
+            attn_backend="flex",
+            gated_attention_type=None,
+            conv_kernel_size=0,
+            attention_sinks=False,
+            wqkv_init_fn_type="scaled_orthogonal",
+            wo_init_fn_type="scaled_orthogonal",
+            w_gate_init_fn_type="scaled_orthogonal",
+            wqkv_init_std=4.0,
+            wo_init_std=4.0,
+            w_gate_init_std=4.0,
+        ),
+        feed_forward=None,
+        moe=dict(
+            hidden_dim=448,
+            num_experts=64,
+            num_shared_experts=1,
+            top_k=8,
+            scaling_factor=1.0,
+            score_func="sigmoid",
+            load_balance_coeff=0.001,
+            bias_update_norm_factor="sign",
+            aux_loss=None,
+            quantile_balance_bins=None,
+            track_router_metrics=True,
+            w1_init_fn_type="scaled_orthogonal",
+            w2_init_fn_type="scaled_orthogonal",
+            w3_init_fn_type="scaled_orthogonal",
+            w1_init_std=4.0,
+            w2_init_std=4.0,
+            w3_init_std=4.0,
+            router_init_fn_type="scaled_orthogonal",
+            router_init_std=4.0,
+        ),
+    )
+
+
+# Each entry: the flavor's function and its default training context length.
+MODEL_FLAVORS: dict[str, tuple[Callable[..., OPTMoEModel.Config], int]] = {
+    "mis-8b": (_mis_8b, 4096),
+    "mis-8b-proxy": (_mis_8b_proxy, 4096),
     "mis-8b-proxy-qbalance": (
-        dict(
-            n_layers=24,
-            dim=512,
-            n_dense_layers=0,
-            swa_pattern="SSSF" * 6,
-            sliding_window_size=128,
-            rope_pattern="RRRN" * 6,
-            rope=dict(dim=128, theta=10000.0),
-            attention=dict(
-                n_heads=8,
-                n_kv_heads=1,
-                head_dim=128,
-                qk_norm=True,
-                attn_backend="flex",
-            ),
-            feed_forward=dict(hidden_dim=1280),
-            moe=dict(
-                hidden_dim=160,
-                num_experts=64,
-                num_shared_experts=1,
-                top_k=8,
-                scaling_factor=1.0,
-                quantile_balance_bins=1000,
-            ),
-        ),
+        functools.partial(_mis_8b_proxy, quantile_balance_bins=1000),
         4096,
     ),
-    "mis-30b-a3b": (
-        dict(
-            n_layers=40,
-            dim=2048,
-            n_dense_layers=1,
-            swa_pattern="SSSF" * 10,
-            sliding_window_size=128,
-            rope=dict(dim=128, theta=10000.0),
-            attention=dict(
-                n_heads=32,
-                n_kv_heads=4,
-                head_dim=128,
-                qk_norm=True,
-                attn_backend="flex",
-            ),
-            feed_forward=dict(hidden_dim=8192),
-            moe=dict(
-                hidden_dim=512,
-                num_experts=256,
-                num_shared_experts=1,
-                top_k=8,
-                scaling_factor=1.0,
-            ),
-        ),
-        4096,
-    ),
-    "mis-100b-a5b": (
-        dict(
-            n_layers=40,
-            dim=3072,
-            n_dense_layers=1,
-            swa_pattern="SSSF" * 10,
-            sliding_window_size=128,
-            rope=dict(dim=128, theta=10000.0),
-            attention=dict(
-                n_heads=32,
-                n_kv_heads=4,
-                head_dim=128,
-                qk_norm=True,
-                attn_backend="flex",
-            ),
-            feed_forward=dict(hidden_dim=8192),
-            moe=dict(
-                hidden_dim=1024,
-                num_experts=256,
-                num_shared_experts=1,
-                top_k=8,
-                scaling_factor=1.0,
-            ),
-        ),
-        4096,
-    ),
+    "mis-30b-a3b": (_mis_30b_a3b, 4096),
+    "mis-100b-a5b": (_mis_100b_a5b, 4096),
     "gauge-d8-w256": (
-        dict(
-            n_layers=8,
-            dim=256,
-            n_dense_layers=8,
-            rope=dict(dim=128, theta=10000.0),
-            attention=dict(n_heads=4, n_kv_heads=4, head_dim=128, qk_norm=True),
-            feed_forward=dict(hidden_dim=1024),
-        ),
+        functools.partial(_gauge, n_layers=8, dim=256, n_heads=4, hidden_dim=1024),
         4096,
     ),
     "gauge-d16-w256": (
-        dict(
-            n_layers=16,
-            dim=256,
-            n_dense_layers=16,
-            rope=dict(dim=128, theta=10000.0),
-            attention=dict(n_heads=4, n_kv_heads=4, head_dim=128, qk_norm=True),
-            feed_forward=dict(hidden_dim=1024),
-        ),
+        functools.partial(_gauge, n_layers=16, dim=256, n_heads=4, hidden_dim=1024),
         4096,
     ),
     "gauge-d16-w512": (
-        dict(
-            n_layers=16,
-            dim=512,
-            n_dense_layers=16,
-            rope=dict(dim=128, theta=10000.0),
-            attention=dict(n_heads=8, n_kv_heads=8, head_dim=128, qk_norm=True),
-            feed_forward=dict(hidden_dim=2048),
-        ),
+        functools.partial(_gauge, n_layers=16, dim=512, n_heads=8, hidden_dim=2048),
         4096,
     ),
     "gauge-d16-w1024": (
-        dict(
-            n_layers=16,
-            dim=1024,
-            n_dense_layers=16,
-            rope=dict(dim=128, theta=10000.0),
-            attention=dict(n_heads=16, n_kv_heads=16, head_dim=128, qk_norm=True),
-            feed_forward=dict(hidden_dim=4096),
-        ),
+        functools.partial(_gauge, n_layers=16, dim=1024, n_heads=16, hidden_dim=4096),
         4096,
     ),
+    "production-dense-336m": (_production_dense_336m, 4096),
+    "production-moe-336m": (_production_moe_336m, 4096),
 }
-
-# The builder arguments merged key by key (the rest replace the flavor's).
-_MERGED_ARGS = ("attention", "feed_forward", "moe", "rope", "rope_of_swa")
 
 
 def build_model_config(
@@ -918,19 +934,12 @@ def build_model_config(
         raise ValueError(
             f"Unknown opt_moe flavor {flavor!r}; available: {', '.join(MODEL_FLAVORS)}"
         )
-    flavor_args, default_seq_len = MODEL_FLAVORS[flavor]
-    args = copy.deepcopy(flavor_args)
-    for name, value in copy.deepcopy(overrides).items():
-        if name in _MERGED_ARGS and value is not None and args.get(name) is not None:
-            args[name] = {**args[name], **value}
-        else:
-            args[name] = value
-    config = _opt_moe_config(
-        **args,
+    get_config, default_seq_len = MODEL_FLAVORS[flavor]
+    config = get_config(
         parallelism=parallelism,
         seq_len=seq_len or default_seq_len,
         rope_length=rope_length,
+        **overrides,
     )
     config.flavor = flavor
-    config.build_args = args
     return config

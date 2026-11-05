@@ -17,8 +17,10 @@ KV; not with the conv or the sinks). TP is refused at build.
 ## Building a model
 
 `build_model_config(flavor, *, parallelism, seq_len, **overrides)`: a flavor is
-the builder's arguments; a run passes the ones it changes, and the result is the
-complete config for that parallelism (nothing changes it afterwards):
+a function in `flavors.py` that writes out the builder's arguments
+(`MODEL_FLAVORS`: name -> (function, default context length), as upstream's
+models); a run passes the arguments it changes, and the result is the complete
+config for that parallelism (nothing changes it afterwards):
 
 ```python
 from torchtitan.models.opt_moe import build_model_config
@@ -69,15 +71,18 @@ each a dict of `CosSinRoPE.Config` fields (the cache is `seq_len` long, or
   stds (SwiGLU).
 - `moe=dict(...)` (`make_norm_moe_config`, on upstream's routers):
   `num_experts`, `num_shared_experts`, `top_k`, `hidden_dim` (each expert's),
-  `scaling_factor` (None computes it from experts and top-k), `score_func`;
+  `scaling_factor` (the router's `route_scale` on the renormalized top-k
+  weights; 1.0 in every flavor), `score_func`;
   balancing by the expert bias (`load_balance_coeff`,
   `bias_update_norm_factor`), by upstream's quantile-balanced router
-  (`quantile_balance_bins`, sigmoid scores only) or upstream's auxiliary loss
+  (`quantile_balance_bins`, sigmoid scores only) or
+  upstream's auxiliary loss
   (`aux_loss=dict(loss_type="microbatch_wise" | "batch_wise", coeff=...)`);
   the router's and the experts' init types and stds. Tokens go all-to-all under
-  EP (DeepEP / HybridEP: upstream's `TokenDispatcherTransform` on the recipe). `loss_mask` (SFT:
-  `enable_token_mask_for_moe`) keeps prompt and padding tokens out of the
-  balance statistics; the experts still process every token.
+  EP (DeepEP / HybridEP: upstream's `TokenDispatcherTransform` on the recipe).
+  Upstream's padding mask keeps padding tokens out of the balance statistics;
+  with `enable_token_mask_for_moe` (SFT) it is every token whose label is
+  ignored (prompt and padding). The experts still process every token.
 - `n_dense_layers`: the first layers take the dense `feed_forward`, the rest
   the MoE.
 
@@ -91,7 +96,7 @@ each a dict of `CosSinRoPE.Config` fields (the cache is `seq_len` long, or
 | `init_gate_as_residual` | false | the FFN's up projection takes the output projections' depth divisor |
 | `prenorm_gain_init` | 1.0 | a constant init of the attention_norm / ffn_norm gains (`rmsnorm` only) |
 | `first_in_init_*`, `final_out_init_*` | `scion_normal_input` / `scion_normal_output`, 1.0 | the embedding's and the head's init |
-| `enable_token_mask_for_moe` | false | padding (and prompt) tokens, whose labels are ignored, do not count toward MoE balance (SFT with first-fit packing) |
+| `enable_token_mask_for_moe` | false | every token whose label is ignored (prompt and padding) stays out of the MoE balance statistics (SFT); off: upstream's padding mask (padding only) |
 
 Residual statistics: with the optimizer's `log_residual_stats`, the eager
 layer loop records the RMS of every block's input and residual write and of
@@ -102,13 +107,18 @@ the final norm's input; off, nothing runs.
 `mis-8b`, `mis-8b-proxy`, `mis-8b-proxy-qbalance` (quantile balancing, 1000
 bins), `mis-30b-a3b`, `mis-100b-a5b`, and the gauge models `gauge-d8-w256`,
 `gauge-d16-w256`, `gauge-d16-w512` and `gauge-d16-w1024` (the optimizer
-study's 84M and 336M models), used by tests and the study's configs.
+study's 84M and 336M models), used by tests and the study's configs, and
+`production-dense-336m` / `production-moe-336m`: the study's production recipe
+at 336M (dense, and every FFN an MoE of 64 + 1 experts, top 8), every model
+setting written out.
 
 ## Recipes
 
-The optimizer study's production settings, written out as full configs:
-`reproduce_cfgs/configs/0.5.5-debug/production-dense-336m.py` and
-`production-moe-336m.py`, with the gate, sink and conv blocks commented in them.
+The optimizer study's production runs: the flavors `production-dense-336m` /
+`production-moe-336m` (the model) and the configs
+`reproduce_cfgs/configs/0.5.5-debug/production-dense-336m.py` /
+`production-moe-336m.py` (the rest), with the gate, sink and conv blocks
+commented in them as overrides of the flavor.
 In short: qk-norm, `rmsnorm` gains, no depth scaling, every hidden matrix
 `scaled_orthogonal` at std 4, embedding `scion_normal_input` std 0.02, head
 `scion_normal_output` std 1; MoE: 64 routed experts + 1 shared, top 8,

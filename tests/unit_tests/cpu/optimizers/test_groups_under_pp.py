@@ -85,14 +85,14 @@ class _Stage(nn.Module):
         super().__init__()
         self.wq = nn.Linear(8, 8, bias=False)
         if with_router:
-            self.moe = nn.Module()
-            self.moe.router = nn.Module()
-            self.moe.router.gate = nn.Linear(8, 8, bias=False)
+            self.feed_forward = nn.Module()
+            self.feed_forward.router = nn.Module()
+            self.feed_forward.router.gate = nn.Linear(8, 8, bias=False)
 
     def param_layouts(self):
         out = {"wq.weight": ParamLayout("matrix")}
-        if hasattr(self, "moe"):
-            out["moe.router.gate.weight"] = ParamLayout("router")
+        if hasattr(self, "feed_forward"):
+            out["feed_forward.router.gate.weight"] = ParamLayout("router")
         return out
 
 
@@ -105,10 +105,15 @@ def _container(*parts):
             "nesterov": True,
             "weight_decay": 0.0,
             "rule": "amphione",
-            "args": {"compute": "svd", "frozen_scale_units": ["moe.router.gate"]},
+            "args": {
+                "compute": "svd",
+                "frozen_scale_units": ["feed_forward.router.gate"],
+            },
         }
     }
-    return DiSCOOptimizersContainer(cfg, model_parts=list(parts), parallelism_context=_PP())
+    return DiSCOOptimizersContainer(
+        cfg, model_parts=list(parts), parallelism_context=_PP()
+    )
 
 
 def test_a_stage_without_the_frozen_type_builds_and_the_union_is_checked():

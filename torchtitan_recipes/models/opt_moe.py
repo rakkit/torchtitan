@@ -98,7 +98,7 @@ def moe_template_config() -> Trainer.Config:
                             "compute": "gram_polar_express",
                             "steps": 6,
                             "polar_express_safety": 1.05,
-                            "frozen_scale_units": ["moe.router.gate"],
+                            "frozen_scale_units": ["feed_forward.router.gate"],
                         },
                     },
                     "embedding": {
@@ -152,17 +152,18 @@ def moe_template_config() -> Trainer.Config:
             # 4 sequences x 4096 tokens
             num_tokens_per_microbatch_per_dp_rank=4 * 4096,
             steps=100,
-            # CUDA graphs require fixed shapes and no host sync inside the
-            # captured region. OPT MoE's token-choice routing computes
-            # per-expert token counts on the host for the grouped-GEMM offsets,
-            # so the capture is invalid -- upstream notes the same limitation
-            # for EP backends that synchronize during dispatch.
+            # Accelerator graphs need fixed shapes and no host sync inside the
+            # captured region: off for EP with the all-to-all dispatch (it syncs
+            # with the host) and for gnoise (refuses them). Without EP the local
+            # dispatch has no host sync; graphs on there are not measured yet.
             disable_accelerator_graphs=True,
         ),
         checkpointer=CheckpointManager.Config(
             interval=50,
             last_save_model_only=False,
-            export_dtype="float16",
+            # A final model-only save (last_save_model_only) keeps the fp32
+            # master weights.
+            export_dtype="float32",
             # Upstream defaults to "disabled" -- a synchronous save on the
             # training thread. "async" stages to CPU and uploads from a
             # background thread instead. Not the pinned-mem variant: that

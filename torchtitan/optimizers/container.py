@@ -104,9 +104,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         (up to 16%) on real momenta; float16 flushes them (CONFIG_MIGRATION
         section 70)."""
 
-        implementation: Literal[
-            "for-loop", "foreach", "fused"
-        ] = "fused"
+        implementation: Literal["for-loop", "foreach", "fused"] = "fused"
         """
         Specify which optimizer implementation to use:
         - 'fused': Use fused implementation (CUDA only) for best performance.
@@ -350,7 +348,9 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                     names.append(canonical_fqn(name))
                     claimed.add(name)
             if not params:
-                raise ValueError(f"optimizer group pattern {c.pattern!r} matched no parameters")
+                raise ValueError(
+                    f"optimizer group pattern {c.pattern!r} matched no parameters"
+                )
             groups.setdefault(c.optimizer_name, []).append(
                 {"params": params, "param_names": names, **c.optimizer_kwargs}
             )
@@ -418,7 +418,9 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
             by_name, patterns = self._build_param_groups(model, configs)
             for opt_name, groups in by_name.items():
                 cls = self._resolve_optimizer_factory(opt_name)
-                kwargs = self._build_optimizer_kwargs(config, parallelism_context, opt_name)
+                kwargs = self._build_optimizer_kwargs(
+                    config, parallelism_context, opt_name
+                )
                 if issubclass(cls, DiSCO):
                     if "lr" not in kwargs:
                         raise ValueError(
@@ -458,7 +460,9 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         )
         self._gnoise_research_freq = config.gnoise.research_freq
 
-    def _check_unit_types_over_stages(self, parallelism_context: ParallelismContext) -> None:
+    def _check_unit_types_over_stages(
+        self, parallelism_context: ParallelismContext
+    ) -> None:
         """Under PP every listed unit type (frozen_units, col_units) must name a
         unit on some stage: one gather over the PP ranks at build, so every
         stage reaches the same verdict (a raise on one stage would leave the
@@ -674,7 +678,9 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         if not self._model_stats_armed:
             return {}
         self._model_stats_armed = False
-        metrics = model_stats.residual_metrics(self.model_parts, self.parallelism_context)
+        metrics = model_stats.residual_metrics(
+            self.model_parts, self.parallelism_context
+        )
         if self._gains_before is not None:
             metrics.update(
                 model_stats.gain_metrics(
@@ -729,14 +735,10 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         return metrics
 
     def _moe_modules(self) -> Iterator[nn.Module]:
-        for model_part in self.model_parts:
-            layers = getattr(model_part, "layers", None)
-            if layers is None:
-                continue
-            for layer in layers.values():
-                moe = getattr(layer, "moe", None)
-                if moe is not None:
-                    yield moe
+        from torchtitan.optimizers.moe_balance import moe_layers
+
+        for _, moe in moe_layers(self.model_parts):
+            yield moe
 
     def _drop_moe_metrics(self) -> None:
         """Forget the cached per-layer dicts; nothing stale can be logged."""

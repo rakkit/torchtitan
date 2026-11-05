@@ -48,7 +48,7 @@ CASES = {
     "fsdp4_moe_frozen_router": (
         FSDP,
         True,
-        {"frozen_scale_units": ["moe.router.gate"]},
+        {"frozen_scale_units": ["feed_forward.router.gate"]},
     ),
     # the expert rule state on an EP mesh (local experts only) and HSDP steps
     "fsdp4_ep2_moe": (FSDP_EP2, True, {}),
@@ -166,7 +166,7 @@ class TestAmphionePaths(DTensorTestBase):
             rule_args={
                 "pre": None,
                 "scale": None,
-                "frozen_scale_units": ["moe.router.gate"],
+                "frozen_scale_units": ["feed_forward.router.gate"],
             },
             lr=LR,
             momentum=BETA,

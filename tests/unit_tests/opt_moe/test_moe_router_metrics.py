@@ -42,14 +42,22 @@ class _StubExperts(nn.Module):
         return torch.zeros_like(x_TD)
 
 
-def _run_bias_hook(gas: int, *, arm: bool = True) -> list:
-    """Drive the real step pre-hook and return the MoE layers it updated."""
+def _run_bias_hook(
+    gas: int,
+    *,
+    arm: bool = True,
+    moe_kw: dict | None = None,
+    batches: list | None = None,
+    paddings: list | None = None,
+) -> list:
+    """Drive the real step pre-hook over `gas` microbatches (or `batches`,
+    with optional padding masks) and return the MoE layers it updated."""
     import torch.nn as nn
 
     class _Blk(nn.Module):
         def __init__(self, moe):
             super().__init__()
-            self.moe, self.moe_enabled = moe, True
+            self.feed_forward = moe
 
     class _Part(nn.Module):
         def __init__(self, moes):
@@ -76,9 +84,9 @@ def _run_bias_hook(gas: int, *, arm: bool = True) -> list:
                 h()
 
     torch.manual_seed(0)
-    moes = [
-        _moe(aux_loss=dict(loss_type="microbatch_wise", coeff=1e-3)) for _ in range(2)
-    ]
+    if moe_kw is None:
+        moe_kw = dict(aux_loss=dict(loss_type="microbatch_wise", coeff=1e-3))
+    moes = [_moe(**moe_kw) for _ in range(2)]
     for m in moes:
         m.train()
     opt = _StubOptimizers()
@@ -89,11 +97,14 @@ def _run_bias_hook(gas: int, *, arm: bool = True) -> list:
             get_optional_mesh=lambda _n: None, ep_enabled=False, tp=1
         ),
     )
-    batches = [torch.randn(64, 32) for _ in range(gas)]
+    if batches is None:
+        batches = [torch.randn(64, 32) for _ in range(gas)]
+    if paddings is None:
+        paddings = [None] * len(batches)
     den = torch.tensor(float(sum(b.shape[0] for b in batches)))
-    for b in batches:
+    for b, pad in zip(batches, paddings):
         for m in moes:
-            m(b, aux_loss_denominator=den)
+            m(b, padding_mask_T=pad, aux_loss_denominator=den)
     if arm:
         opt.arm_moe_publish()
     opt.fire()
@@ -101,11 +112,8 @@ def _run_bias_hook(gas: int, *, arm: bool = True) -> list:
 
 
 def test_published_load_balance_loss_is_gradient_accumulation_invariant():
-    """`instance_acc` already carries 1/global_valid_tokens for the WHOLE step.
-
-    The consumer therefore must not divide it by `acc_fwd_times`. It used to,
-    which made `moe_load_balance_loss/L-*` scale as exactly 1/gas.
-    """
+    """`instance_acc` already carries 1/global_valid_tokens for the WHOLE step:
+    `moe_load_balance_loss/L-*` must not scale with the microbatch count."""
     seen = {
         gas: _run_bias_hook(gas)[0]._log_expert_metrics["moe_load_balance_loss/L-0"]
         for gas in (1, 2, 4)
@@ -141,6 +149,7 @@ def test_publish_clears_stale_metrics_when_the_payload_arity_is_wrong():
         [0.0] * L,
         E,
         False,
+        True,
     )
     publish_moe_metrics(good)
     assert info[0]["module"]._log_expert_metrics["moe_entropy/L-0"] == 1.0
@@ -156,23 +165,21 @@ def test_track_router_metrics_gates_entropy():
         moe.train()
         moe(torch.randn(128, 32))
         assert (float(moe.router_entropy) == 0.0) is expect_zero
-        # the counter must advance either way, or the consumer divides by zero
-        assert int(moe.acc_fwd_times) == 1
 
 
-def test_loss_mask_marks_valid_tokens_not_padding():
-    """Polarity the docstring used to state backwards."""
+def test_padding_mask_marks_padding_not_valid_tokens():
+    """Upstream's polarity: True = padding, not counted."""
     moe = _moe()
     moe.train()
-    mask = torch.zeros(128, dtype=torch.bool)
-    mask[:30] = True
-    moe(torch.randn(128, 32), loss_mask=mask)
+    padding = torch.ones(128, dtype=torch.bool)
+    padding[:30] = False
+    moe(torch.randn(128, 32), padding_mask_T=padding)
     assert int(moe.router.tokens_per_expert_E.sum()) == 30 * 2  # valid tokens x top_k
 
 
 def test_activation_recompute_does_not_count_a_forward_twice():
     """Activation remat replays code outside a saved region in backward; the
-    MoE's forward-only statistics (expert counts, forward counter, entropy) must
+    MoE's forward-only statistics (expert counts, entropy) must
     count each forward once, as without remat."""
     import torch_remat as remat
 
@@ -195,9 +202,80 @@ def test_activation_recompute_does_not_count_a_forward_twice():
         stats.append(
             (
                 moe.router.tokens_per_expert_E.clone(),
-                moe.acc_fwd_times.clone(),
                 moe.router_entropy.clone(),
             )
         )
     for plain, replayed in zip(*stats):
         assert torch.equal(plain, replayed), (plain, replayed)
+
+
+def _token_entropies(moe, x):
+    """Each token's entropy of its renormalized top-k weights (eval: no stats)."""
+    moe.eval()
+    with torch.no_grad():
+        w, _, _ = moe.router(x, moe.expert_bias_E)
+    moe.train()
+    w = w / moe.router.route_scale
+    return -(w * w.clamp_min(1e-20).log()).sum(dim=-1)
+
+
+def test_published_entropy_is_the_mean_over_counted_tokens():
+    """The step's entropy: the mean over every counted (non-padding) token of all
+    microbatches, whatever their count; padding tokens do not enter."""
+    torch.manual_seed(1)
+    batches = [torch.randn(64, 32) for _ in range(3)]
+    paddings = [torch.arange(64) >= n for n in (64, 40, 10)]
+    # No bias: the reference routes as the training forwards did.
+    moes = _run_bias_hook(
+        3,
+        moe_kw=dict(load_balance_coeff=None),
+        batches=[b.clone() for b in batches],
+        paddings=paddings,
+    )
+    for i, moe in enumerate(moes):
+        ref = torch.cat(
+            [_token_entropies(moe, b)[~p] for b, p in zip(batches, paddings)]
+        ).mean()
+        got = moe._log_expert_metrics[f"moe_entropy/L-{i}"]
+        assert abs(got - float(ref)) < 1e-5, (got, float(ref))
+
+
+def test_published_expert_usage_is_the_share_of_counted_tokens():
+    """moe_ep_usage: each expert's share of the step's counted token-expert
+    pairs (sums to 1 per layer); the counters are reset after the step."""
+    torch.manual_seed(2)
+    batches = [torch.randn(64, 32) for _ in range(2)]
+    paddings = [torch.arange(64) >= 50, None]
+    moes = _run_bias_hook(2, moe_kw={}, batches=batches, paddings=paddings)
+    for i, moe in enumerate(moes):
+        usage = [
+            moe._log_expert_metrics[f"moe_ep_usage/L-{i}_EP-{e}"] for e in range(8)
+        ]
+        assert abs(sum(usage) - 1.0) < 1e-6
+        assert float(moe.router.tokens_per_expert_E.sum()) == 0.0
+        assert float(moe.router_entropy) == 0.0
+
+
+def test_metrics_are_published_without_an_expert_bias():
+    """No bias (load_balance_coeff None): usage, entropy and maxvio still
+    publish; there are no bias metrics; the counters are still reset."""
+    moes = _run_bias_hook(2, moe_kw=dict(load_balance_coeff=None))
+    for i, moe in enumerate(moes):
+        assert moe.expert_bias_E is None
+        m = moe._log_expert_metrics
+        assert f"moe_entropy/L-{i}" in m and f"moe_maxvio_batch/L-{i}" in m
+        assert f"moe_ep_usage/L-{i}_EP-0" in m
+        assert not any(k.startswith(("moe_bias/", "moe_bias_")) for k in m)
+        assert float(moe.router.tokens_per_expert_E.sum()) == 0.0
+
+
+def test_metrics_are_published_with_the_quantile_balance():
+    """The quantile-balanced router: the bias is solved from its histogram, the
+    same statistics publish, and the histogram is reset."""
+    moes = _run_bias_hook(2, moe_kw=dict(quantile_balance_bins=64))
+    for i, moe in enumerate(moes):
+        m = moe._log_expert_metrics
+        assert f"moe_entropy/L-{i}" in m and f"moe_bias/L-{i}_EP-0" in m
+        assert float(moe.expert_bias_E.abs().sum()) > 0
+        hist = moe.router.quantile_balancer.required_bias_histogram_EB
+        assert float(hist.sum()) == 0.0

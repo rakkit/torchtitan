@@ -110,7 +110,7 @@ def forward(model, pd, rep, shard, data):
         parallelism = ParallelismConfig(
             data_parallel_replicate_degree=rep, data_parallel_shard_degree=shard
         )
-        inputs, _, extra = model.preprocess_inputs(
+        inputs, _, extra, _ = model.preprocess_inputs(
             cuda,
             parallelism_context=pd,
             parallelism=parallelism,

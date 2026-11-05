@@ -22,17 +22,17 @@ from torchtitan.models.common.moe import MoE
 class NormMoE(MoE):
     """Upstream's MoE with opt_moe's routing statistics.
 
-    ``loss_mask`` (True: counted) keeps tokens out of the balance statistics:
-    upstream's router counts and auxiliary losses take it as their padding mask
-    (``~loss_mask``). Under SFT it also drops the prompt tokens, whose labels are
-    ignored (``OPTMoEModel.preprocess_inputs``); the experts still process every
-    token (upstream's routed experts ignore the padding mask).
+    ``padding_mask_T`` (True: not counted) keeps tokens out of the router's
+    counts and auxiliary losses, as upstream's; with the model's
+    ``enable_token_mask_for_moe`` it is every token whose label is ignored
+    (``OPTMoEModel.preprocess_inputs``). The experts still process every token
+    (upstream's routed experts ignore the mask).
 
-    The statistics, per forward (not on remat replay): the router's
-    ``tokens_per_expert_E`` (upstream's), the forward count ``acc_fwd_times`` and
-    the summed gate entropy ``router_entropy`` of the top-k weights (before
-    ``route_scale``); ``tokens_per_expert_cumul`` is the balance hook's running
-    count.
+    The statistics, summed over the step's forwards (not on remat replay) and
+    over the counted tokens: the router's ``tokens_per_expert_E`` (upstream's)
+    and the gate entropy ``router_entropy`` of each token's top-k weights
+    (before ``route_scale``); the balance hook divides the entropy by the
+    counted tokens. ``tokens_per_expert_cumul`` is the hook's running count.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -50,9 +50,6 @@ class NormMoE(MoE):
             "router_entropy", torch.zeros(1, dtype=torch.float32), persistent=False
         )
         self.register_buffer(
-            "acc_fwd_times", torch.zeros(1, dtype=torch.int64), persistent=False
-        )
-        self.register_buffer(
             "tokens_per_expert_cumul",
             torch.zeros(config.num_experts, dtype=torch.float32),
             persistent=False,
@@ -63,7 +60,6 @@ class NormMoE(MoE):
         device = buffer_device or self.router.tokens_per_expert_E.device
         with torch.device(device):
             self.router_entropy = torch.zeros(1, dtype=torch.float32)
-            self.acc_fwd_times = torch.zeros(1, dtype=torch.int64)
             self.tokens_per_expert_cumul = torch.zeros(
                 self.num_experts, dtype=torch.float32
             )
@@ -71,13 +67,11 @@ class NormMoE(MoE):
     def forward(
         self,
         x_TD: torch.Tensor,
-        loss_mask: torch.Tensor | None = None,
         *,
+        padding_mask_T: torch.Tensor | None = None,
         aux_loss_denominator: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Upstream's ``MoE.forward`` with ``~loss_mask`` as the router's padding
-        mask, plus the forward count and the gate entropy."""
-        padding_mask_T = None if loss_mask is None else ~loss_mask.reshape(-1)
+        """Upstream's ``MoE.forward`` plus the gate entropy."""
         (
             routed_x_TD,
             routed_padding_mask_T,
@@ -88,16 +82,16 @@ class NormMoE(MoE):
             padding_mask_T=routed_padding_mask_T,
             aux_loss_denominator=aux_loss_denominator,
         )
-        if self.training and not remat.is_recomputing():
+        if self.track_router_metrics and self.training and not remat.is_recomputing():
             with torch.no_grad():
-                self.acc_fwd_times.add_(1)
-                if self.track_router_metrics:
-                    # The renormalized top-k weights: a distribution before
-                    # route_scale, bounded by ln(K).
-                    w_TK = topk_scores_TK.detach() / self.router.route_scale
-                    self.router_entropy.add_(
-                        -(w_TK * w_TK.clamp_min(1e-20).log()).sum(dim=-1).mean()
-                    )
+                # The renormalized top-k weights: a distribution before
+                # route_scale, bounded by ln(K). Summed over the tokens the
+                # router counts, as tokens_per_expert_E.
+                w_TK = topk_scores_TK.detach() / self.router.route_scale
+                entropy_T = -(w_TK * w_TK.clamp_min(1e-20).log()).sum(dim=-1)
+                if routed_padding_mask_T is not None:
+                    entropy_T = entropy_T.masked_fill(routed_padding_mask_T, 0.0)
+                self.router_entropy.add_(entropy_T.sum())
         out_TD = self.routed_experts(
             routed_x_TD,
             topk_scores_TK,

@@ -15,7 +15,6 @@ from torchtitan.models.common.activation import SwiGLU
 
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
 from torchtitan.models.common.rope import CosSinRoPE
-from ..flavors import calc_gate_scaling_factor
 from ..param_init import setup_residual_scale
 from .configuration_opt_moe import OptMoEConfig
 
@@ -60,14 +59,11 @@ def _layer_type(sliding: bool, conv: bool) -> str:
 
 
 def _route_scale(model, moe) -> float:
-    """What the routers multiply by. Taken from a built router when there is
-    one: without a table entry the native value is a random estimate."""
+    """What the routers multiply by (a built router's, else the spec's)."""
     for module in model.modules() if hasattr(model, "modules") else ():
         if isinstance(module, TokenChoiceTopKRouter):
             return float(module.route_scale)
-    if moe.scaling_factor is not None:
-        return moe.scaling_factor
-    return calc_gate_scaling_factor(moe.num_experts, moe.top_k)
+    return moe.scaling_factor
 
 
 def hf_config(model, model_config=None) -> OptMoEConfig:

@@ -695,7 +695,7 @@ def amphione(
       1 x K matrix, whose spectral normalisation is its l2 norm).
 
     `frozen_scale_units`: unit types of the group whose row scales stay at
-    their start (their rows still turn), e.g. `["moe.router.gate"]`. Each type
+    their start (their rows still turn), e.g. `["feed_forward.router.gate"]`. Each type
     must name a unit of the group; a group never inherits it.
     `scale_nesterov`: Nesterov on the row (and column) scales' sign steps.
 
@@ -711,7 +711,7 @@ def amphione(
     g scaled x4 at step 1 by the optimizer, which this rule leaves to the
     init. Its column runs used column_scale_units AMPHIONE_COLUMN_SCALE_UNITS at
     column_scale_lr_mult 0.0625. Its MoE runs froze the router gate's lengths
-    (`moe.router.gate`)."""
+    (`feed_forward.router.gate`)."""
     inner = _whole_unit("amphione", "identity", compute, steps, "one")
     return Rule(
         (),

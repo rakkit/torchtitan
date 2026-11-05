@@ -122,12 +122,12 @@ def build(
     )
     if force_balance:
         from torchtitan.config.transform.base import convert_config_type
-        from torchtitan.models.common.moe import RoundRobinTokenChoiceTopKRouter
+        from torchtitan.models.common.moe import MoE, RoundRobinTokenChoiceTopKRouter
 
         for lc in cfg.model.layers:
-            if lc.moe is not None:
-                lc.moe.router = convert_config_type(
-                    lc.moe.router, RoundRobinTokenChoiceTopKRouter
+            if isinstance(lc.feed_forward, MoE.Config):
+                lc.feed_forward.router = convert_config_type(
+                    lc.feed_forward.router, RoundRobinTokenChoiceTopKRouter
                 )
     cfg.precision.param_dtype = param_dtype
     if gnoise is not None:

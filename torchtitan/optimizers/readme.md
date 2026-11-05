@@ -62,7 +62,7 @@ config.optimizer.groups = {
                 "args": {"scale_nesterov": False,
                          "compute": "gram_polar_express", "steps": 6,
                          "polar_express_safety": 1.05,
-                         "frozen_scale_units": ["moe.router.gate"]}},
+                         "frozen_scale_units": ["feed_forward.router.gate"]}},
     "embedding": {"match": r"tok_embeddings\.weight", "rule": "sgd",
                   "args": {"compute": "row-l2", "scale": "sqrt_n", "pre": "identity"},
                   "lr": 0.001953, "momentum": 0.95, "nesterov": True, "weight_decay": 0.0},
@@ -317,7 +317,7 @@ step is the same. Args:
 | `column_scales` | false | column scales c, `W = Diag(g) U Diag(c)`, on `column_scale_units` |
 | `column_scale_units` | wq, wk, wv, w1, w3 | the unit types that learn c (`AMPHIONE_COLUMN_SCALE_UNITS`) |
 | `column_scale_lr_mult` | 0.0625 | c's sign step is `column_scale_lr_mult * eta_t` |
-| `frozen_scale_units` | () | unit types of the group whose row scales g stay at their start; their rows still turn (the MoE router gate: `["moe.router.gate"]`); each type must name a unit of the group; never inherited from the default group; not with `columns` |
+| `frozen_scale_units` | () | unit types of the group whose row scales g stay at their start; their rows still turn (the MoE router gate: `["feed_forward.router.gate"]`); each type must name a unit of the group; never inherited from the default group; not with `columns` |
 
 The conv group, at the hidden matrices' lr and momentum:
 

@@ -30,16 +30,16 @@ _TO_HF = {
     "layers.{}.feed_forward.w1.weight": "model.layers.{}.mlp.gate_proj.weight",
     "layers.{}.feed_forward.w3.weight": "model.layers.{}.mlp.up_proj.weight",
     "layers.{}.feed_forward.w2.weight": "model.layers.{}.mlp.down_proj.weight",
-    "layers.{}.moe.router.gate.weight": "model.layers.{}.mlp.gate.weight",
-    "layers.{}.moe.expert_bias_E": "model.layers.{}.mlp.gate.e_score_correction_bias",
-    "layers.{}.moe.routed_experts.w13.weight": "model.layers.{}.mlp.experts.gate_up_proj",
-    "layers.{}.moe.routed_experts.w2.weight": "model.layers.{}.mlp.experts.down_proj",
-    "layers.{}.moe.shared_experts.w1.weight": "model.layers.{}.mlp.shared_experts.gate_proj.weight",
-    "layers.{}.moe.shared_experts.w3.weight": "model.layers.{}.mlp.shared_experts.up_proj.weight",
-    "layers.{}.moe.shared_experts.w2.weight": "model.layers.{}.mlp.shared_experts.down_proj.weight",
+    "layers.{}.feed_forward.router.gate.weight": "model.layers.{}.mlp.gate.weight",
+    "layers.{}.feed_forward.expert_bias_E": "model.layers.{}.mlp.gate.e_score_correction_bias",
+    "layers.{}.feed_forward.routed_experts.w13.weight": "model.layers.{}.mlp.experts.gate_up_proj",
+    "layers.{}.feed_forward.routed_experts.w2.weight": "model.layers.{}.mlp.experts.down_proj",
+    "layers.{}.feed_forward.shared_experts.w1.weight": "model.layers.{}.mlp.shared_experts.gate_proj.weight",
+    "layers.{}.feed_forward.shared_experts.w3.weight": "model.layers.{}.mlp.shared_experts.up_proj.weight",
+    "layers.{}.feed_forward.shared_experts.w2.weight": "model.layers.{}.mlp.shared_experts.down_proj.weight",
 }
 _FROM_HF = {v: k for k, v in _TO_HF.items()}
-_ROUTED_W13 = "moe.routed_experts.w13.weight"
+_ROUTED_W13 = "feed_forward.routed_experts.w13.weight"
 
 
 def _rename(state_dict: dict[str, Any], table: dict[str, str]) -> dict[str, Any]:

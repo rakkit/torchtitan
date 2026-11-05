@@ -44,7 +44,6 @@ optimizers/
   export/           spectrum / gram-vector Parquet export (W&B artifacts)
 models/common/param_layout.py   the declaration vocabulary models use (ParamLayout, UnitSpec)
 components/optimizer/averages.py          weight power averages, snapshots, scoring (averages)
-observability/nanprobe.py                  env-gated NaN probe (debugging)
 ```
 
 ## Configuring it
@@ -678,21 +677,6 @@ so existing configs are unchanged) scores every run on sequences of that
 length, so runs with different training context lengths are compared on the
 same sequences. The RoPE caches cover it when it is longer than the training
 context.
-
-## NaN probe (debugging, inert by default)
-
-`torchtitan/observability/nanprobe.py` is gated by environment variables and does nothing
-unless `NAN_PROBE_FROM` (first step) and `NAN_PROBE_DIR` (output folder) are
-set. From that step it writes, per rank, summaries of each tensor (count of
-non-finite entries, largest finite magnitude, RMS, worst row) at the
-microbatch losses, after the backward, after the update, and inside DiSCO
-(effective gradients, every rule call, the updates), plus no_grad forward
-probes of the step's microbatch; a backward probe runs only on a step that
-is already non-finite (the trainer's assert follows). Its hooks sit in
-`training_engine.py`, `trainer.py` and `disco/optimizer.py`. `NAN_PROBE_STOP` (last step),
-`NAN_PROBE_BIG` (the magnitude it flags, default 1e4), `NAN_PROBE_EAGER`
-(default 1) and `NAN_PROBE_FORCE_BAD` (a smoke test of the bad-step path)
-tune it.
 
 ## Tests and benchmarks
 

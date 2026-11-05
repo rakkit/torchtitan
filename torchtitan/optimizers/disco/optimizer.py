@@ -44,7 +44,7 @@ from torch.profiler import record_function
 
 from torchtitan.distributed.utils import fsdp_shard_mesh, metrics_shard_mesh
 
-from torchtitan.observability import nanprobe, structured_logger as sl
+from torchtitan.observability import structured_logger as sl
 from torchtitan.optimizers.disco import gram_input_stats
 
 from ..helpers import gram_helper
@@ -1025,8 +1025,6 @@ class DiSCO(torch.optim.Optimizer):
         with self._span("disco_prepare_grads"):
             eff = self._effective_grads()
             self._phase_pass(eff, "pre")
-        if nanprobe.on():
-            nanprobe.disco_tensors(self, "eff", eff)
         u: dict[int, torch.Tensor] = {}
         self._coef: dict[int, torch.Tensor] = {}  # entry -> alpha per unit
         gram_log = self.log_gram_input and logging_step
@@ -1046,9 +1044,6 @@ class DiSCO(torch.optim.Optimizer):
         if gram_log:
             self._gram_final = self._gram_input_metrics(gram_input_stats.disarm())
         self._phase_pass(u, "post")
-        if nanprobe.on():
-            nanprobe.disco_tensors(self, "update", u)
-            nanprobe.disco_flush()
         if values is not None:
             self._local_metrics(eff, u, values)
             self._flush_metrics(values)
@@ -1275,8 +1270,6 @@ class DiSCO(torch.optim.Optimizer):
                 res.update = res.update.unsqueeze(0)
             else:
                 res = rule.run_whole(st, w, ctx, state)
-        if nanprobe.on():
-            nanprobe.disco_run(self, rule, st, w, state, res, pairs)
         if rule.has_state and view is not None:
             view.copy_(res.state)
         elif rule.has_state:

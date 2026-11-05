@@ -22,7 +22,6 @@ from torchtitan.components.checkpointer import DATALOADER
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
 
-from torchtitan.observability import nanprobe
 from torchtitan.observability.data_consumption import (
     build_data_mix_metrics,
     DataMixMetricsLike,
@@ -44,11 +43,7 @@ def _disco_container(engine: Any) -> DiSCOOptimizersContainer | None:
 
 
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
-from torchtitan.components.validator import (
-    BaseValidator,
-    validation_seq_len,
-    Validator,
-)
+from torchtitan.components.validator import BaseValidator, validation_seq_len, Validator
 from torchtitan.config import (
     apply_overrides,
     Configurable,
@@ -491,7 +486,6 @@ class Trainer(Configurable):
     def train_step(self, data_iterator: Iterator[TrainingMicrobatch]):
         engine = self.engine
         current_step = engine.num_completed_steps + 1
-        nanprobe.set_step(current_step)
         # Always log the final step even when it does not land on a log_freq
         # boundary, so a run ends with a metrics point. This has to be decided
         # here, not at the log site: the loss is only accumulated when
@@ -771,8 +765,6 @@ class Trainer(Configurable):
         logger.info("Training completed")
 
     def should_continue_training(self) -> bool:
-        if nanprobe.should_stop(self.engine.num_completed_steps):
-            return False
         return self.engine.num_completed_steps < self.config.training.steps
 
     def close(self) -> None:

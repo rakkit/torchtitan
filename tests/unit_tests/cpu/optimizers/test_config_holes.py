@@ -130,10 +130,10 @@ def test_a_named_group_with_only_an_lr_does_not_take_the_defaults_own_args():
     groups = {tuple(g["param_names"]): g for o in c.optimizers for g in o.param_groups}
     wq = groups[("wq.weight",)]
     assert wq["rule"] == "amphione" and wq["lr"] == 0.003
-    assert "frozen_length_units" not in wq["args"]
+    assert "frozen_scale_units" not in wq["args"]
     assert wq["args"]["polar_express_safety"] == 1.05  # inherited
     gate = next(g for names, g in groups.items() if "moe.router.gate.weight" in names)
-    assert gate["args"]["frozen_length_units"] == ["moe.router.gate"]
+    assert gate["args"]["frozen_scale_units"] == ["moe.router.gate"]
 
 
 def test_a_named_group_under_the_defaults_rule_keeps_its_other_default_args():
@@ -145,7 +145,7 @@ def test_a_named_group_under_the_defaults_rule_keeps_its_other_default_args():
         "wq": {
             "match": r"^wq\.weight$",
             "rule": "amphione",
-            "args": {"gain_beta": 0.9},
+            "args": {"scale_nesterov": True},
         },
         **cfg.groups,
     }
@@ -158,5 +158,6 @@ def test_a_named_group_under_the_defaults_rule_keeps_its_other_default_args():
         for g in o.param_groups
         if g["param_names"] == ["wq.weight"]
     )
-    assert wq["args"]["polar_express_safety"] == 1.05 and wq["args"]["gain_beta"] == 0.9
-    assert "frozen_length_units" not in wq["args"]
+    assert wq["args"]["polar_express_safety"] == 1.05
+    assert wq["args"]["scale_nesterov"] is True
+    assert "frozen_scale_units" not in wq["args"]

@@ -42,13 +42,14 @@ def disarm() -> dict[str, list[torch.Tensor]]:
 
 
 @contextlib.contextmanager
-def units(keys: list[str]):
-    """The unit keys of the stack the enclosed rule call computes, in stack order."""
+def units(keys: list[str] | None):
+    """The unit keys of the stack the enclosed rule call computes, in stack order
+    (None: nothing is recorded for it)."""
     global _keys
     if not _armed:
         yield
         return
-    prev, _keys = _keys, list(keys)
+    prev, _keys = _keys, None if keys is None else list(keys)
     try:
         yield
     finally:

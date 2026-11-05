@@ -82,18 +82,24 @@ def _per_row_state_probe():
     return Rule((), _PerRowState())
 
 
-def test_units_of_one_parameter_need_one_state_shape():
-    """rule_state is one tensor per parameter, one row per unit."""
+def test_units_of_one_parameter_keep_states_of_their_own_shapes():
+    """The rule state is one tensor per unit (GQA's fused wqkv: q larger than
+    k / v), keyed by the unit's position."""
     w = torch.nn.Parameter(torch.randn(8, 4))
     layout = ParamLayout("matrix", _units(("a", 0, 6, (6, 4)), ("b", 6, 2, (2, 4))))
-    with pytest.raises(ValueError, match="state"):
-        DiSCO(
-            [{"params": [w], "param_names": ["w"]}],
-            parallel_dims=_NoParallel(),
-            lr=0.1,
-            rule="per_row_state_probe",
-            param_layouts={"w": layout},
-        )
+    opt = DiSCO(
+        [{"params": [w], "param_names": ["w"]}],
+        parallel_dims=_NoParallel(),
+        lr=0.1,
+        rule="per_row_state_probe",
+        param_layouts={"w": layout},
+    )
+    rs = opt.state[w]["rule_state"]
+    cm = opt.entries[0].rule.compute
+    assert {k: tuple(v.shape) for k, v in rs.items()} == {
+        "0": tuple(cm.state_shape(6, 4)),
+        "1": tuple(cm.state_shape(2, 4)),
+    }
 
 
 def test_svd_gives_no_direction_below_the_norm_floor():

@@ -94,4 +94,4 @@ def test_the_built_in_presets_register_whatever_is_imported_first(first):
     )
     assert out.returncode == 0, out.stderr[-2000:]
     got = set(out.stdout.strip().splitlines()[-1].split(","))
-    assert {"sgd", "muon", "right_polar", "lm_head", "left_polar", "aus"} <= got
+    assert got == {"sgd", "muon", "hyperball", "amphione"}

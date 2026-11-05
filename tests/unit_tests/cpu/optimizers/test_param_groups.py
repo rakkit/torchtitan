@@ -15,7 +15,7 @@ import torch.distributed as dist
 from torchtitan.models.common.param_layout import ParamLayout
 
 from torchtitan.optimizers.disco.optimizer import DiSCO
-from torchtitan.optimizers.disco.presets import AUSMap, EtaSchedule
+from torchtitan.optimizers.disco.presets import FrobeniusAUS
 from torchtitan.optimizers.disco.rules import rule_of
 
 
@@ -51,11 +51,8 @@ def _groups():
             "params": w[2:],
             "param_names": ["c.weight"],
             "lr": 0.5,
-            "rule": "aus",
-            "args": {
-                "compute": "svd",
-                "eta": {"shape": "inverse_poly", "start": 10, "c": 0.1},
-            },
+            "rule": "hyperball",
+            "args": {"compute": "svd", "tangent": True},
         },
     ]
 
@@ -91,7 +88,8 @@ def test_a_gram_compute_refuses_a_wide_unit():
             [{"params": [w], "param_names": ["w.weight"]}],
             parallel_dims=_NoParallel(),
             lr=0.1,
-            rule="right_polar",
+            rule="muon",
+            args={"compute": "gram_polar", "steps": 5},
             param_layouts={"w.weight": ParamLayout("matrix")},
         )
 
@@ -101,16 +99,12 @@ def test_groups_inherit_the_defaults_and_merge_args():
     g0, g1 = opt.param_groups
     assert (g0["lr"], g0["momentum"], g0["rule"]) == (0.1, 0.95, "muon")
     assert g0["args"] == {"steps": 3}
-    assert (g1["lr"], g1["rule"]) == (0.5, "aus")
-    assert g1["args"] == {
-        "steps": 3,
-        "compute": "svd",
-        "eta": {"shape": "inverse_poly", "start": 10, "c": 0.1},
-    }
+    assert (g1["lr"], g1["rule"]) == (0.5, "hyperball")
+    assert g1["args"] == {"steps": 3, "compute": "svd", "tangent": True}
     rules = {e.name: e.rule for e in opt.entries}
     assert rules["a.weight"] == rule_of({"rule": "muon", "args": {"steps": 3}})
-    aus = rules["c.weight"].compute
-    assert isinstance(aus, AUSMap) and aus.eta == EtaSchedule("inverse_poly", 10, 0.1)
+    hb = rules["c.weight"].compute
+    assert isinstance(hb, FrobeniusAUS) and hb.tangent and hb.inner.compute.steps == 3
 
 
 def test_rule_config_is_not_checkpoint_state():
@@ -282,15 +276,16 @@ def _two_groups(second: dict, **kw):
 
 
 def test_a_group_without_args_takes_only_what_its_rule_inherits():
-    """torch filled a missing `args` with the default dict itself, so a head
-    group written without args ran with the default group's `scale` (448x
-    too large on the real head)."""
+    """torch filled a missing `args` with the default dict itself, so a group
+    of another rule written without args ran with the default group's args
+    (a head took muon's `scale`, 448x too large on the real head)."""
     default = {"compute": "svd", "steps": 3, "scale": "spectral"}
-    opt = _two_groups({"rule": "lm_head"}, rule="muon", args=default)
+    opt = _two_groups({"rule": "hyperball"}, rule="muon", args=default)
     assert opt.param_groups[0]["args"] == default  # same rule: every default
-    assert opt.param_groups[1]["args"] == {"steps": 3}  # lm_head owns `scale`
-    head = next(e.rule for e in opt.entries if e.name == "h.weight")
-    assert head.scale == "inv_sqrt_n"
+    # hyperball has no `scale`: it takes only the args it has
+    assert opt.param_groups[1]["args"] == {"compute": "svd", "steps": 3}
+    hb = next(e.rule for e in opt.entries if e.name == "h.weight").compute
+    assert isinstance(hb, FrobeniusAUS) and hb.inner.compute.steps == 3
 
 
 def test_a_rule_setting_outside_args_is_an_error():
@@ -312,7 +307,7 @@ def test_a_fused_parameter_logs_the_radial_metrics_of_its_split_twin():
     kw = dict(
         parallel_dims=_NoParallel(),
         lr=0.1,
-        momentum=0.1,
+        momentum=0.9,
         args={"compute": "svd", "steps": 0, "scale": "one"},
     )
     opts = [
@@ -356,20 +351,63 @@ def test_a_fused_parameter_logs_the_radial_metrics_of_its_split_twin():
             assert logged[0][k] == pytest.approx(logged[1][k], rel=1e-5, abs=1e-7), k
 
 
-def test_the_weight_decay_pair_comes_from_the_config():
-    """`weight_decay` and `decoupled_wd` are both config-only: a resume never
-    pairs the checkpoint's decay with the config's mode."""
+def test_momentum_and_nesterov_come_from_the_config():
+    """A resume runs the config's `momentum` and `nesterov` (as `weight_decay`):
+    the checkpoint does not carry them, a value it still carries is replaced,
+    and the momentum buffer itself is restored."""
     from torchtitan.optimizers.container import DiSCOOptimizersContainer
 
-    def build(wd, decoupled):
+    def build(beta, nesterov):
+        cfg = DiSCOOptimizersContainer.Config(
+            groups={
+                "default": {
+                    "lr": 0.1,
+                    "momentum": beta,
+                    "nesterov": nesterov,
+                    "rule": "muon",
+                    "args": {"compute": "svd"},
+                }
+            }
+        )
+        model = torch.nn.Sequential(torch.nn.Linear(4, 8, bias=False))
+        model.param_layouts = lambda: {"0.weight": ParamLayout("matrix")}
+        return model, DiSCOOptimizersContainer(
+            cfg, model_parts=[model], parallel_dims=_NoParallel()
+        )
+
+    model, old = build(0.9, False)
+    model[0].weight.grad = torch.ones_like(model[0].weight)
+    old.step()
+    sd = old.state_dict()
+    assert not any(k.endswith((".momentum", ".nesterov")) for k in sd)
+    fqn = old.optimizers[0].param_groups[0]["param_names"][0]
+    sd[f"param_groups.{fqn}.momentum"] = 0.5  # a value a checkpoint still carries
+    saved = old.optimizers[0].state[model[0].weight]["momentum_buffer"].clone()
+    model2, new = build(0.95, True)
+    new.load_state_dict(
+        {k: v.clone() if torch.is_tensor(v) else v for k, v in sd.items()}
+    )
+    g = new.optimizers[0].param_groups[0]
+    assert (g["momentum"], g["nesterov"]) == (0.95, True)
+    assert torch.equal(
+        new.optimizers[0].state[model2[0].weight]["momentum_buffer"], saved
+    )
+
+
+def test_weight_decay_comes_from_the_config():
+    """`weight_decay` is config-only: a resume never takes the checkpoint's.
+    `decoupled_wd` is gone: a group that sets it is refused."""
+    from torchtitan.optimizers.container import DiSCOOptimizersContainer
+
+    def build(wd, **extra):
         cfg = DiSCOOptimizersContainer.Config(
             groups={
                 "default": {
                     "lr": 0.1,
                     "weight_decay": wd,
-                    "decoupled_wd": decoupled,
                     "rule": "muon",
                     "args": {"compute": "svd"},
+                    **extra,
                 }
             }
         )
@@ -379,67 +417,92 @@ def test_the_weight_decay_pair_comes_from_the_config():
             cfg, model_parts=[model], parallel_dims=_NoParallel()
         )
 
-    old = build(0.1, False)
+    old = build(0.1)
     sd = old.state_dict()
-    assert not any(k.endswith((".weight_decay", ".decoupled_wd")) for k in sd)
+    assert not any(k.endswith(".weight_decay") for k in sd)
     # An older checkpoint still carries weight_decay: the config wins.
     fqn = old.optimizers[0].param_groups[0]["param_names"][0]
     sd[f"param_groups.{fqn}.weight_decay"] = 0.1
-    new = build(1e-4, True)
+    new = build(1e-4)
     new.load_state_dict(sd)
     g = new.optimizers[0].param_groups[0]
-    assert (g["weight_decay"], g["decoupled_wd"]) == (1e-4, True)
+    assert g["weight_decay"] == 1e-4 and "decoupled_wd" not in g
+    with pytest.raises(TypeError, match="decoupled_wd"):  # a DiSCO default kwarg
+        build(0.1, decoupled_wd=True)
 
 
-def _table_container(table):
-    """Two DiSCO groups; the second (not the default: its keys are DiSCO's
-    defaults) carries the table."""
-    from torchtitan.optimizers.container import DiSCOOptimizersContainer
-
-    second = {
-        "match": r"^1\.weight$",
-        "lr": 0.2,
-        "rule": "muon",
-        "args": {"compute": "svd"},
-    }
-    if table is not None:
-        second["lr_table"] = table
-    cfg = DiSCOOptimizersContainer.Config(
-        groups={
-            "second": second,
-            "default": {"lr": 0.1, "rule": "muon", "args": {"compute": "svd"}},
-        }
+def test_another_rule_that_inherits_a_polar_express_compute_takes_its_safety():
+    """A bare `{"rule": "muon"}` group under an amphione default inherits the
+    default's gram_polar_express and must run it at the default's safety (it
+    ran at the backend's 1.01)."""
+    names = ["a.weight", "b.weight"]
+    ws = [torch.nn.Parameter(torch.randn(8, 8)) for _ in names]
+    opt = DiSCO(
+        [
+            {"params": [ws[0]], "param_names": [names[0]]},
+            {"params": [ws[1]], "param_names": [names[1]], "rule": "muon", "args": {}},
+        ],
+        parallel_dims=_NoParallel(),
+        lr=0.1,
+        momentum=0.95,
+        nesterov=True,
+        rule="amphione",
+        args={
+            "compute": "gram_polar_express",
+            "steps": 6,
+            "polar_express_safety": 1.05,
+        },
+        param_layouts={n: ParamLayout("matrix") for n in names},
     )
-    model = torch.nn.Sequential(
-        torch.nn.Linear(4, 8, bias=False), torch.nn.Linear(8, 4, bias=False)
-    )
-    model.param_layouts = lambda: {
-        "0.weight": ParamLayout("matrix"),
-        "1.weight": ParamLayout("matrix"),
-    }
-    return model, DiSCOOptimizersContainer(
-        cfg, model_parts=[model], parallel_dims=_NoParallel()
-    )
+    args = opt.param_groups[1]["args"]
+    assert args["compute"] == "gram_polar_express"
+    assert args["polar_express_safety"] == 1.05
+    assert "1.05" in repr({e.name: e.rule for e in opt.entries}["b.weight"])
 
 
-def test_an_lr_table_is_config_not_checkpoint_state():
-    """A group's lr_table stays out of checkpoints; a run with a table loads a
-    checkpoint saved with another table or with none (a branch), and keeps its own."""
-    a, b = [[0, 1.0], [10, 0.5]], [[0, 1.0], [10, 0.0]]
-    for saved_table, live_table in ((a, b), (None, b), (a, None)):
-        model, container = _table_container(saved_table)
-        for m in model:
-            m.weight.grad = torch.ones_like(m.weight)
-        container.step()
-        sd = container.state_dict()
-        assert not any(k.endswith(".lr_table") for k in sd)
-        model, container = _table_container(live_table)
-        container.load_state_dict(
-            {k: v.clone() if torch.is_tensor(v) else v for k, v in sd.items()}
+def test_the_safety_is_inherited_only_where_it_applies():
+    """Under an amphione default with Gram Polar Express at safety 1.05, the
+    conv group (amphione, row-l2 direction) and an sgd row group inherit no
+    safety (their computes have no polar express iteration) and build without
+    stating `polar_express_safety: None`; a group that sets it itself on such
+    a compute is refused."""
+    names = ["a.weight", "b.weight", "c.weight"]
+    ws = [torch.nn.Parameter(torch.randn(8, 8)) for _ in names]
+
+    def build(conv_args):
+        return DiSCO(
+            [
+                {"params": [ws[0]], "param_names": [names[0]]},
+                {
+                    "params": [ws[1]],
+                    "param_names": [names[1]],
+                    "rule": "amphione",
+                    "args": conv_args,
+                },
+                {
+                    "params": [ws[2]],
+                    "param_names": [names[2]],
+                    "rule": "sgd",
+                    "args": {"compute": "row-l2"},
+                },
+            ],
+            parallel_dims=_NoParallel(),
+            lr=0.1,
+            momentum=0.95,
+            nesterov=True,
+            rule="amphione",
+            args={
+                "compute": "gram_polar_express",
+                "steps": 6,
+                "polar_express_safety": 1.05,
+            },
+            param_layouts={n: ParamLayout("matrix") for n in names},
         )
-        (g,) = [
-            g
-            for g in container.optimizers[0].param_groups
-            if g["param_names"] == ["1.weight"]
-        ]
-        assert g.get("lr_table") == live_table
+
+    opt = build({"compute": "row-l2"})
+    rules = {e.name: e.rule for e in opt.entries}
+    assert rules["a.weight"].compute.direction.compute.polar_express_safety == 1.05
+    assert "polar_express_safety" not in opt.param_groups[1]["args"]
+    assert "polar_express_safety" not in opt.param_groups[2]["args"]
+    with pytest.raises(ValueError, match="polar_express_safety"):
+        build({"compute": "row-l2", "polar_express_safety": 1.05})

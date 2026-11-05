@@ -243,14 +243,14 @@ def main() -> None:
                 "match": r"(^|\.)(q_norm|k_norm|attention_norm|ffn_norm|norm)\.weight$",
                 "rule": "sgd",
                 "args": {"pre": "identity", "compute": "sign", "scale": "one"},
-                "momentum": 0.05,
+                "momentum": 0.95,
                 "nesterov": True,
                 "weight_decay": 0.0,
             }
         },
     )
     cfg.optimizer.groups["default"]["rule"] = args.rule
-    if args.rule in ("hyperball", "elr"):  # they normalise the update: no scale
+    if args.rule == "hyperball":  # it normalises the update: no scale
         cfg.optimizer.groups["default"]["args"].pop("scale")
     with tempfile.TemporaryDirectory() as tmp:
         model, container = harness.build_model_and_optimizer(cfg, pd, device, tmp)

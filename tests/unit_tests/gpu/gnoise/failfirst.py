@@ -374,7 +374,7 @@ MUTANTS = [
     (
         "E1-due-ignores-dense-flag",
         G,
-        "        return step % self.interval == 0 or (self.config.e1_dense_phase and dense)\n",
+        "        return step % self.interval == 0 or (self.config.e1_first_and_last_steps and dense)\n",
         "        return step % self.interval == 0 or dense\n",
         [f"{V}::TestVectorized::test_e1_schedule"],
     ),

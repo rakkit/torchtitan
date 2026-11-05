@@ -66,16 +66,26 @@ from .layout import (
     RunList,
 )
 from .metrics import ExpertUnits, MetricSink, pseudo_post_update_weight, UnitValues
-from .presets import Sign
-from .rules import compile_limits, Result, Rule, rule_of, RULES, StepCtx
+from .presets import POLAR_EXPRESS_BACKENDS, Sign
+from .rules import (
+    compile_limits,
+    Result,
+    RowsIdentity,
+    Rule,
+    rule_of,
+    RULES,
+    SCALES,
+    StepCtx,
+)
 from .transport import deal, Exchange, Replicated, Unit, unit_rows
 
 logger = logging.getLogger(__name__)
 
 
-def _momentum(bufs, grads, m: float) -> None:
-    torch._foreach_mul_(bufs, 1.0 - m)
-    torch._foreach_add_(bufs, grads, alpha=m)
+def _momentum(bufs, grads, beta: float) -> None:
+    """buf <- beta buf + (1 - beta) g: `beta` is the memory weight."""
+    torch._foreach_mul_(bufs, beta)
+    torch._foreach_add_(bufs, grads, alpha=1.0 - beta)
 
 
 # One pass over the moments instead of two; bitwise equal to `_momentum`.
@@ -129,7 +139,7 @@ def _check_rule(name: str, p, layout: ParamLayout, fam: Family, rule: Rule) -> N
     if layout.kind in ("embedding", "unembedding") and rule.kind == "unit":
         raise ValueError(
             f"{name} is the model's {layout.kind}: it needs a row or Gram rule "
-            "(compute=row-l2, right_polar, lm_head), not one that gathers all "
+            "(compute=row-l2, sign), not one that gathers all "
             f"its vocabulary rows on one rank ({rule}). A group matching it by "
             "name may have missed it; groups can match by kind instead."
         )
@@ -145,8 +155,12 @@ class DiSCO(torch.optim.Optimizer):
         "rule",
         "args",
         "weight_decay",
-        "decoupled_wd",
-    )  # the run's config, never the checkpoint's: the decay pair stays together
+        "momentum",
+        "nesterov",
+        "lr",
+        "initial_lr",
+    )  # the run's config, never the checkpoint's: a resume may change them (the
+    # lr is set by the scheduler from this run's base lr and schedule)
 
     def __init__(
         self,
@@ -155,7 +169,6 @@ class DiSCO(torch.optim.Optimizer):
         parallel_dims,
         lr,
         weight_decay=0.0,
-        decoupled_wd=False,
         momentum=0.95,
         nesterov=False,
         rule="muon",
@@ -164,13 +177,13 @@ class DiSCO(torch.optim.Optimizer):
         enable_step_tracing=False,
         param_layouts=None,
     ):
-        """`lr, weight_decay, decoupled_wd, momentum, nesterov, rule, args` are
+        """`lr, weight_decay, momentum, nesterov, rule, args` are
         the defaults a param group inherits (torch semantics); a group's own
         `args` merge over the default `args` its rule inherits. `rule` names a
-        preset in `rules.RULES`. `momentum` is the weight of the NEW gradient:
-        `buf <- (1 - momentum) buf + momentum g`. Weight decay scales W by
-        `1 - lr weight_decay` per step, or by `1 - weight_decay` with
-        `decoupled_wd`."""
+        preset in `rules.RULES`. `momentum` is the memory weight beta in
+        [0, 1): `buf <- beta buf + (1 - beta) g`, Nesterov `beta buf + (1 - beta)
+        g`; 0 = the raw gradient. Weight decay scales W by
+        `1 - lr weight_decay` per step."""
         self._span = sl.log_trace_span if enable_step_tracing else nullcontext
         self._trace_scalar = sl.log_trace_scalar if enable_step_tracing else _ignore
         self.communication_dtype = communication_dtype
@@ -202,26 +215,15 @@ class DiSCO(torch.optim.Optimizer):
             dict(
                 lr=lr,
                 weight_decay=weight_decay,
-                decoupled_wd=bool(decoupled_wd),
                 momentum=momentum,
                 nesterov=nesterov,
                 rule=rule,
                 args=None,  # a group's own; the default's are merged below
-                t=0,  # optimizer steps taken; rules with a schedule read it
+                t=0,  # optimizer steps taken (StepCtx.t is t + 1)
             ),
         )
-        # The lr scheduler's per-group keys (lr_scheduler._group_lambdas).
-        scheduler_keys = {
-            "warmup_steps",
-            "decay_ratio",
-            "decay_type",
-            "min_lr_factor",
-            "lr_table",
-        }
         for g, is_named in zip(self.param_groups, named, strict=True):
-            unknown = sorted(
-                set(g) - set(self.defaults) - {"params", "param_names"} - scheduler_keys
-            )
+            unknown = sorted(set(g) - set(self.defaults) - {"params", "param_names"})
             if unknown:
                 raise ValueError(
                     f"DiSCO group {g.get('param_names', [])[:2]}: unknown keys "
@@ -240,7 +242,24 @@ class DiSCO(torch.optim.Optimizer):
             else:
                 known = RULES[g["rule"]].inherits if g["rule"] in RULES else ()
                 base = {k: v for k, v in self._default_args.items() if k in known}
-            g["args"] = {**base, **(g["args"] or {})}
+            mine = g["args"] or {}
+            if is_named and "polar_express_safety" not in mine:
+                # The default's safety reaches a group exactly when the group's
+                # own compute is a polar express backend, whatever its rule (a
+                # muon group that inherits the default's gram_polar_express
+                # runs it at the default's safety); not the conv's row-l2, not sgd.
+                preset = RULES.get(g["rule"])
+                compute = {**base, **mine}.get(
+                    "compute", preset.args.get("compute", "") if preset else ""
+                )
+                base = {k: v for k, v in base.items() if k != "polar_express_safety"}
+                if "polar_express_safety" in self._default_args and any(
+                    c.strip() in POLAR_EXPRESS_BACKENDS for c in str(compute).split("+")
+                ):
+                    base["polar_express_safety"] = self._default_args[
+                        "polar_express_safety"
+                    ]
+            g["args"] = {**base, **mine}
         # Metric arming, set per logging step by the container.
         self.need_to_calculate_norm = False
         self.norms_to_log: list[str] = list(NORM_FUNCTIONS.keys())
@@ -260,9 +279,6 @@ class DiSCO(torch.optim.Optimizer):
         # applied per-entry updates; set by optimizers/gnoise.py when enabled.
         self.update_observer = None
         self.norms_at_current_step: dict[str, torch.Tensor] = {}
-        # group -> (eta(t), lr eta(t)) of the last step, for groups whose
-        # rule has an eta schedule
-        self.eta_used: dict[int, tuple[float, float]] = {}
         # LM-head geometry. `head_probe_h` is the head's input for a few probe
         # tokens; the container sets it for one norm step, step() drops it.
         self.head_probe_h: torch.Tensor | None = None
@@ -305,28 +321,34 @@ class DiSCO(torch.optim.Optimizer):
         norms, self.norms_at_current_step = self.norms_at_current_step, {}
         return norms
 
-    # ---- column gains (angular_muown col_scale): read-only statistics for log_gain_stats
+    # ---- column scales (amphione column_scales): read-only statistics for log_gain_stats
     def _col_entries(self) -> list:
         return [
             e
             for e in self.entries
-            if getattr(e.rule.compute, "col_scale", False)
+            if getattr(e.rule.compute, "has_column_scales", False)
             and e.family is not Family.EXPERT
             and "rule_state" in self.state[e.param]
         ]
 
     def _col_c(self, e: _Entry) -> torch.Tensor:
-        """c of `e`'s units, [units, n]: the state's third row from the bottom; zeros (a unit not stepped yet) read as 1."""
-        c = self.state[e.param]["rule_state"][:, -3, :-3].detach().float()
-        return torch.where(c == 0, torch.ones_like(c), c).clone()
+        """c of `e`'s units, [units, n], from the rule state; zeros (a unit not stepped yet) read as 1."""
+        rs = self.state[e.param]["rule_state"]
+        c = torch.ones(len(e.units), e.units[0].shape[1], device=e.local.device)
+        for un in e.units:
+            if str(un.pos) in rs:
+                c[un.pos] = (
+                    e.rule.compute.column_scales_of(rs[str(un.pos)]).detach().float()
+                )
+        return torch.where(c == 0, torch.ones_like(c), c)
 
-    def col_gain_snapshot(self):
-        """c of every col_scale unit before the step (the base of the logged relative update); None without col_scale."""
+    def col_scale_snapshot(self):
+        """c of every column-scale unit before the step (the base of the logged relative update); None without col_scale."""
         es = self._col_entries()
         return [self._col_c(e) for e in es] if es else None
 
-    def col_gain_metrics(self, before) -> dict[str, float]:
-        """Per col_scale unit, after the step: rms of c, mean log|c|, q10 / q50 / q90 of c and ||c - c_before|| / ||c_before||.
+    def col_scale_metrics(self, before) -> dict[str, float]:
+        """Per column-scale unit, after the step: rms of c, mean log|c|, q10 / q50 / q90 of c and ||c - c_before|| / ||c_before||.
         Read from the rule state; the unit's owner (the rank that advances it) supplies the values, one all-reduce over the metric mesh."""  # noqa: B950
         es = self._col_entries()
         if not es or before is None:
@@ -362,7 +384,7 @@ class DiSCO(torch.optim.Optimizer):
             for name, x in zip(
                 ("rms", "mean_log", "q10", "q50", "q90", "rel_update"), v, strict=True
             ):
-                out[f"col_gain_{name}/{k}"] = x
+                out[f"col_scale_{name}/{k}"] = x
         return out
 
     def _get_cached_zero_scalar(self, device):
@@ -379,10 +401,15 @@ class DiSCO(torch.optim.Optimizer):
         # Expert moments are views into their block's buffer, and DCP's staging
         # cannot copy a DTensor over a view at an offset: hand out copies.
         for i, st in sd["state"].items():
-            buf = st.get("momentum_buffer")
-            local = buf.to_local() if isinstance(buf, DTensor) else buf
-            if local is not None and local.untyped_storage().nbytes() != local.nbytes:
-                sd["state"][i] = {**st, "momentum_buffer": buf.clone()}
+            for key in ("momentum_buffer", "rule_state"):
+                buf = st.get(key)
+                if not isinstance(buf, torch.Tensor):
+                    # None, or per-unit plain tensors (views of the batch buffers:
+                    # DCP's writer copies a plain view itself, one at a time)
+                    continue
+                local = buf.to_local() if isinstance(buf, DTensor) else buf
+                if local.untyped_storage().nbytes() != local.nbytes:
+                    st = sd["state"][i] = {**st, key: buf.clone()}
         # A non-expert unit's radial accumulators advance on its metric owner
         # only, and DCP saves one copy of a plain tensor: every rank saves the
         # owner's values.
@@ -391,10 +418,9 @@ class DiSCO(torch.optim.Optimizer):
         if mesh is not None and mesh.size() > 1 and es:
             names = list(RADIAL_ACCUMULATOR_NAMES)
 
-            def owned(e):  # radial accumulators, then the rule state rows
+            def owned(e):  # the radial accumulators (the rule state is per unit)
                 st = self.state[e.param]
-                ts = [st["radial_state"][n] for n in names]
-                return ts + ([st["rule_state"]] if "rule_state" in st else [])
+                return [st["radial_state"][n] for n in names]
 
             parts = []
             for e in es:
@@ -418,34 +444,36 @@ class DiSCO(torch.optim.Optimizer):
                 i = index[id(e.param)]
                 sd["state"][i] = {
                     **sd["state"][i],
-                    "radial_state": dict(zip(names, got[: len(names)])),
-                    **(
-                        {"rule_state": got[len(names)]} if len(got) > len(names) else {}
-                    ),
+                    "radial_state": dict(zip(names, got)),
                 }
         return sd
 
     def load_state_dict(self, state_dict):
         """The run's config wins over the checkpoint for the rule keys."""
         keep = [
-            {k: g[k] for k in self._CONFIG_ONLY_GROUP_KEYS} for g in self.param_groups
+            {k: g[k] for k in self._CONFIG_ONLY_GROUP_KEYS if k in g}
+            for g in self.param_groups
         ]
         super().load_state_dict(state_dict)
-        for gi, (g, cfg) in enumerate(zip(self.param_groups, keep)):
-            for k, v in cfg.items():
-                if k in g and g[k] != v:
-                    logger.warning(
-                        f"[DiSCO] group {gi}: checkpoint {k}={g[k]!r} != config {v!r}; keeping config"
-                    )
-                g[k] = v
+        for g, cfg in zip(self.param_groups, keep):  # no checkpoint holds them
+            g.update(cfg)
         self._init_state()
         self._plans()
+        self._w_own, self._w_filled = {}, False  # the weights may come with the load
 
     # ------------------------------------------------------------------ build
+    def _averages(self, e: _Entry) -> bool:
+        """DiSCO keeps a momentum buffer for `e`: its group averages (0 < beta
+        < 1) and its rule does not keep its own momentum."""
+        m = float(self.param_groups[e.group_idx]["momentum"])
+        return 0.0 < m < 1.0 and not e.rule.compute.owns_momentum
+
     def _init_state(self) -> None:
         for e in self.entries:
             p, st = e.param, self.state[e.param]
-            if "momentum_buffer" not in st:
+            if not self._averages(e):  # nothing to average (a resume may turn it off)
+                st.pop("momentum_buffer", None)
+            elif "momentum_buffer" not in st:
                 st["momentum_buffer"] = torch.zeros_like(p)
             if "radial_state" not in st:
                 if e.family is Family.EXPERT and isinstance(p, DTensor):
@@ -465,31 +493,58 @@ class DiSCO(torch.optim.Optimizer):
                     else:
                         shape = (len(e.units),) if len(e.units) > 1 else ()
                     st["radial_state"] = new_radial_state(p.device, shape=shape)
-            if e.rule.has_state and "rule_state" not in st:
-                # One row per unit, checkpointed; the first step sees zeros.
+            if not e.rule.has_state:
+                continue
+            if e.family is Family.EXPERT:
+                if "rule_state" in st:
+                    continue
+                # One row per expert unit, sharded as the experts; the first
+                # step sees zeros.
                 shapes = {e.rule.compute.state_shape(*u.shape) for u in e.units}
                 if len(shapes) > 1:
                     raise ValueError(
-                        f"{e.clean}: its rule keeps state of shapes {sorted(shapes)}"
-                        " across the units; one parameter's units need one"
+                        f"{e.clean}: an expert parameter's units keep one state "
+                        f"shape, got {sorted(shapes)}"
                     )
                 shape = e.rule.compute.state_shape(*e.units[0].shape)
-                if e.family is Family.EXPERT and isinstance(p, DTensor):
-                    st["rule_state"] = distribute_tensor(
-                        torch.zeros(*p.shape[:-2], *shape, device=p.device),
-                        p.device_mesh,
-                        p.placements,
+                z = torch.zeros(*p.shape[:-2], *shape, device=p.device)
+                st["rule_state"] = (
+                    distribute_tensor(z, p.device_mesh, p.placements)
+                    if isinstance(p, DTensor)
+                    else z
+                )
+                continue
+            if e.family is Family.LOCAL:  # row rules on the rows a rank holds
+                raise ValueError(f"{e.clean}: a row rule keeps no state")
+            # Every other unit's state lives on its owner only, one tensor per
+            # unit keyed by its position (checkpointed per unit, so a resume on
+            # another GPU count loads each unit on its new owner).
+            have = st.get("rule_state") or {}
+            mine = {str(u.pos): u for u in e.units if (e.i, u.pos) in self._computed}
+            stale = sorted(set(have) - set(mine))
+            if stale:
+                raise ValueError(
+                    f"{e.clean}: rule state of units {stale} not owned here"
+                )
+            dev = e.local.device
+            for k, u in mine.items():
+                shape = e.rule.compute.state_shape(*u.shape)
+                if k not in have:
+                    have[k] = torch.zeros(shape, device=dev)
+                elif tuple(have[k].shape) != tuple(shape):
+                    raise ValueError(
+                        f"{e.clean} unit {k}: rule state {tuple(have[k].shape)}, "
+                        f"the rule keeps {tuple(shape)}"
                     )
-                else:
-                    st["rule_state"] = torch.zeros(
-                        len(e.units), *shape, device=p.device
-                    )
+            st["rule_state"] = have
 
     def _build(self) -> None:
         pd = self.parallel_dims
+        # (field, unit type) the groups list / find here. Under PP a stage holds
+        # only some units: the container checks the union over the stages.
+        self.unit_types_listed: set[tuple[str, str]] = set()
+        self.unit_types_found: set[tuple[str, str]] = set()
         entries: list[_Entry] = []
-        self._eta = []  # per group: its rule's eta schedule, or None
-        self._unit_eta: dict[tuple[int, int], float] = {}  # (entry, unit pos) -> factor
         self._frozen: dict[
             tuple[int, int], bool
         ] = {}  # (entry, unit pos) -> in frozen_units
@@ -498,26 +553,26 @@ class DiSCO(torch.optim.Optimizer):
         ] = {}  # a stack's units -> its mask
         self._col_on: dict[
             tuple[int, int], bool
-        ] = {}  # (entry, unit pos) -> in col_units (learns column gains)
+        ] = {}  # (entry, unit pos) -> in col_units (learns column scales)
         self._col_masks: dict[tuple, torch.Tensor] = {}  # a stack's units -> its mask
         for gi, group in enumerate(self.param_groups):
             rule = rule_of(group)
-            self._eta.append(getattr(rule.compute, "eta", None))
+            if not 0.0 <= float(group["momentum"]) < 1.0:
+                raise ValueError(
+                    f"group {gi} ({group.get('rule')}): momentum "
+                    f"{group['momentum']} is the memory weight beta, in [0, 1) "
+                    "(0 = the raw gradient; 1 would never update)"
+                )
             if rule.compute.keeps_radius and float(group["weight_decay"]) != 0.0:
                 raise ValueError(
                     f"group {gi} ({group.get('rule')}): the rule holds each unit's "
                     "norm, which undoes weight decay exactly; set weight_decay: 0"
                 )
-            if rule.compute.owns_momentum and (
-                float(group["momentum"]) != 1.0
-                or bool(group["nesterov"])
-                or float(group["weight_decay"]) != 0.0
-            ):
+            if rule.compute.owns_momentum and float(group["weight_decay"]) != 0.0:
                 raise ValueError(
                     f"group {gi} ({group.get('rule')}): the rule keeps its own "
-                    "momentum and returns the new weight, so the group passes the "
-                    "raw gradient and decays nothing: set momentum: 1.0, "
-                    "nesterov: false, weight_decay: 0"
+                    "momentum (the group's momentum and nesterov) and returns the "
+                    "new weight, which decays nothing: set weight_decay: 0"
                 )
             for name, p in zip(group["param_names"], group["params"]):
                 if not p.requires_grad:
@@ -575,8 +630,7 @@ class DiSCO(torch.optim.Optimizer):
                 ):
                     raise ValueError(
                         f"{name}: a Gram compute needs tall units (rows >= columns); "
-                        "a wide unit's [n, n] Gram is rank-deficient. Use muon or "
-                        "left_polar for it."
+                        "a wide unit's [n, n] Gram is rank-deficient. Use muon for it."
                     )
                 for u in e.units:
                     try:
@@ -584,10 +638,6 @@ class DiSCO(torch.optim.Optimizer):
                     except ValueError as err:
                         raise ValueError(f"{name}, unit {u.name!r}: {err}") from None
                 entries.append(e)
-            if getattr(rule.compute, "unit_eta", ()):
-                self._check_unit_eta(
-                    gi, group, rule, [e for e in entries if e.group_idx == gi]
-                )
             if getattr(rule.compute, "frozen_units", ()):
                 self._check_frozen_units(
                     gi, rule, [e for e in entries if e.group_idx == gi]
@@ -597,7 +647,6 @@ class DiSCO(torch.optim.Optimizer):
                     gi, rule, [e for e in entries if e.group_idx == gi]
                 )
         self.entries = entries
-        self._init_state()
         fam = {f: [e for e in entries if e.family is f] for f in Family}
         for f in (Family.SHARDED, Family.REPLICATED, Family.LOCAL):
             fam[f].sort(key=lambda e: e.param.numel(), reverse=True)
@@ -622,6 +671,20 @@ class DiSCO(torch.optim.Optimizer):
                 u.index, u.param_index = len(units), i
                 units.append(u)
         self._ex_step = self._ex_row = self._ex_all = self._ex_w = None
+        # The owners' fp32 copies of the weights of the units whose rule needs
+        # them, one [B, m, n] per step batch: kept current by applying the
+        # same update the holders apply, so the weights travel only to fill
+        # them (the first step, after a load) and on logging steps.
+        self._w_own: dict[int, torch.Tensor] = {}
+        self._w_filled = False  # the same on every rank: decides the collectives
+        self._w_every_step = False
+        # Set by the container on its copy-check steps (the same on every rank):
+        # the weights travel to the owners and are compared with their copies;
+        # `copy_drift` lists the units whose copy differs, for the container's
+        # one world-wide check.
+        self.copy_check_now = False
+        # (device flag, unit keys) per compared batch; read on the container's check
+        self.copy_drift: list[tuple[torch.Tensor, list[str]]] = []
         self._ex_vocab: list[Exchange] = []  # one per sharded embedding / head
         self._sh_units = units
         if units:
@@ -678,11 +741,17 @@ class DiSCO(torch.optim.Optimizer):
             )
             self._ex_row = Exchange(row_units, **kw) if row_units else None
             self._ex_w = Exchange(w_units, **kw) if w_units else None
+            # Only a rule returning the new weight has holders that apply
+            # `w - st`, which the owner's copy can repeat; any other rule that
+            # needs the weights (hyperball's coefficients) gets them every step.
+            self._w_every_step = any(
+                sh_entries[u.param_index].rule.output != "weight" for u in w_units
+            )
             self._ex_all = Exchange(rest, **kw) if rest else None
             # Gathered whole onto their owner on logging steps only, one at a
             # time, each straight into its arrival buffer.
             self._ex_vocab = [Exchange([u], **kw) for u in units if u.index in vocab]
-            self._sh_owner, self._sh_world = owner, world
+            self._sh_owner, self._sh_world, self._sh_rank = owner, world, rank
         else:
             self._shard_group = (
                 fsdp_shard_mesh(pd).get_group()
@@ -722,12 +791,13 @@ class DiSCO(torch.optim.Optimizer):
                 self._blocks[-1].append(e)
             else:
                 self._blocks.append([e])
-        self._big: dict[int, torch.Tensor] = {}
+        self._big: dict[int, torch.Tensor] = {}  # per expert block: its moments
+        self._big_state: dict[int, torch.Tensor] = {}  # and its rule states
         self._u_sh: dict[int, torch.Tensor] = {}
         self._u_rep: dict[int, torch.Tensor] = {}
         self._row_units: dict[int, torch.Tensor] = {}  # coefficient entries
-        # (entry, unit position) -> what the compute returned last step; on the
-        # computing rank, not checkpointed.
+        # entry -> the full row and its update of a split 1-D parameter, gathered
+        # on logging steps for the vector metrics (W2.6 (d)).
         self._split_full: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._wsw = None
         # LM-head units in a fixed order, identical on every rank: the packed
@@ -740,6 +810,8 @@ class DiSCO(torch.optim.Optimizer):
         ]
         self._sink = MetricSink(self)
         self._radial_mine = self._radial_owned_units()
+        self._computed = self._computed_units()
+        self._init_state()  # rule state: on the units' owners (needs the owner sets)
         self._sink_ready = False
         self._plans()
         self._check_plan_agreement()
@@ -760,6 +832,31 @@ class DiSCO(torch.optim.Optimizer):
         if self._rep is not None:
             rep = self.fam[Family.REPLICATED]
             mine.update((rep[u.param_index].i, u.pos) for u in self._rep.owned)
+        return mine
+
+    def _computed_units(self) -> set[tuple[int, int]]:
+        """(entry, unit position) of the sharded and replicated units this rank
+        computes: their owner in the exchanges' own rank space. The rule state
+        lives here. The metric owners (`_radial_mine`, the sink's rank space) are
+        the same units today; if the two rank spaces ever differ, fail at build
+        instead of a KeyError on one rank in the middle of a step."""
+        mine = set()
+        for e in self._sh_entries:
+            mine.update(
+                (e.i, u.pos)
+                for u in e.units
+                if self._sh_owner[u.index] == self._sh_rank
+            )
+        if self._rep is not None:
+            rep = self.fam[Family.REPLICATED]
+            mine.update((rep[u.param_index].i, u.pos) for u in self._rep.owned)
+        local = {(e.i, u.pos) for e in self.fam[Family.LOCAL] for u in e.units}
+        differ = (mine - local) ^ (self._radial_mine - local)
+        if differ:
+            raise AssertionError(
+                "[DiSCO] the exchanges' owners and the metric owners differ on "
+                f"{len(differ)} units"
+            )
         return mine
 
     def _release_logging_payloads(self) -> None:
@@ -804,63 +901,103 @@ class DiSCO(torch.optim.Optimizer):
     def _plans(self) -> None:
         """Per-group lists for the foreach passes; rebuilt when state is replaced."""
         self._alias_expert_moments()
-        # The travelling rows are the momentum itself (no pre phase, no
-        # nesterov): the exchange may keep its views of them across steps.
+        self._alias_owner_states()
+        # The travelling rows are the momentum itself (DiSCO averages, no pre
+        # phase, no nesterov): the exchange may keep its views of them across
+        # steps. A rule that owns its momentum is sent the raw gradient.
         self._eff_is_moment = all(
             0.0 < self.param_groups[e.group_idx]["momentum"] < 1.0
             and not self.param_groups[e.group_idx]["nesterov"]
             and not e.rule.pre
+            and not e.rule.compute.owns_momentum
             for e in self.fam[Family.SHARDED]
         )
         by_group: dict[int, list[_Entry]] = {}
         for e in self.entries:
             by_group.setdefault(e.group_idx, []).append(e)
         self._groups = [
-            (gi, es, [self.state[e.param]["momentum_buffer"] for e in es])
+            (gi, es, [self.state[e.param].get("momentum_buffer") for e in es])
             for gi, es in by_group.items()
         ]
         self._bufs_local = {
             e.i: (b.to_local() if isinstance(b, DTensor) else b)
             for _, es, bs in self._groups
             for e, b in zip(es, bs)
+            if b is not None
         }
 
     def _alias_expert_moments(self) -> None:
-        """Each expert block's moments become views of one `[k * n_local, m, n]`
-        buffer, which the block's batched rule call reads without a copy.
-        Redone whenever the state was replaced (a checkpoint load)."""
+        """Each expert block's moments and rule states become views of one
+        buffer per block (`[k * n_local, ...]`), which the block's batched rule
+        calls read and write without a stack or a copy per unit. Redone whenever
+        the state was replaced (a checkpoint load)."""
         for bi, block in enumerate(self._blocks):
-            bufs = [self.state[e.param]["momentum_buffer"] for e in block]
-            locs = [b.to_local() if isinstance(b, DTensor) else b for b in bufs]
-            n_local = locs[0].shape[0]
-            big = self._big.get(bi)
-            if n_local == 0 or (
-                big is not None
-                and all(
-                    x.data_ptr() == big[j * n_local].data_ptr()
-                    for j, x in enumerate(locs)
-                )
-            ):
+            if self._averages(block[0]):  # one group per block
+                self._alias_block(bi, block, "momentum_buffer", self._big)
+            else:
+                self._big.pop(bi, None)
+            if block[0].rule.has_state:
+                self._alias_block(bi, block, "rule_state", self._big_state)
+            else:
+                self._big_state.pop(bi, None)
+
+    def _alias_owner_states(self) -> None:
+        """The owners' per-unit rule states of one step batch (sharded and
+        replicated units) become views of one `[B, ...]` buffer, which the
+        batch's rule call reads and writes whole: no stack, one copy back."""
+        if not hasattr(self, "_batch_state"):
+            self._batch_state: dict[tuple[str, int], torch.Tensor] = {}
+        for tag, ex, es in (
+            ("sh", self._ex_step, self._sh_entries),
+            ("rep", self._rep, self.fam[Family.REPLICATED]),
+        ):
+            if ex is None:
                 continue
-            shape = (len(block) * n_local, *locs[0].shape[1:])
-            if big is None or big.shape != shape:
-                big = torch.empty(shape, dtype=locs[0].dtype, device=locs[0].device)
-            for j, (e, b, x) in enumerate(zip(block, bufs, locs)):
-                view = big[j * n_local : (j + 1) * n_local]
-                view.copy_(x)
-                self.state[e.param]["momentum_buffer"] = (
-                    DTensor.from_local(
-                        view,
-                        b.device_mesh,
-                        b.placements,
-                        run_check=False,
-                        shape=b.shape,
-                        stride=b.stride(),
-                    )
-                    if isinstance(b, DTensor)
-                    else view
+            for bi, us in enumerate(ex.batches):
+                if not es[us[0].param_index].rule.has_state:
+                    continue
+                pairs = [(es[un.param_index], un) for un in us]
+                ts = [self._unit_state(ee, un) for ee, un in pairs]
+                buf = self._batch_state.get((tag, bi))
+                if buf is not None and all(
+                    t.data_ptr() == buf[j].data_ptr() for j, t in enumerate(ts)
+                ):
+                    continue
+                buf = self._batch_state[(tag, bi)] = torch.stack(ts)
+                for j, (ee, un) in enumerate(pairs):
+                    self.state[ee.param]["rule_state"][str(un.pos)] = buf[j]
+
+    def _alias_block(self, bi, block, key: str, store: dict) -> None:
+        bufs = [self.state[e.param][key] for e in block]
+        locs = [b.to_local() if isinstance(b, DTensor) else b for b in bufs]
+        n_local = locs[0].shape[0]
+        big = store.get(bi)
+        if n_local == 0 or (
+            big is not None
+            and all(
+                x.data_ptr() == big[j * n_local].data_ptr() for j, x in enumerate(locs)
+            )
+        ):
+            return
+        shape = (len(block) * n_local, *locs[0].shape[1:])
+        if big is None or big.shape != shape:
+            big = torch.empty(shape, dtype=locs[0].dtype, device=locs[0].device)
+        for j, (e, b, x) in enumerate(zip(block, bufs, locs)):
+            view = big[j * n_local : (j + 1) * n_local]
+            view.copy_(x)
+            self.state[e.param][key] = (
+                DTensor.from_local(
+                    view,
+                    b.device_mesh,
+                    b.placements,
+                    run_check=False,
+                    shape=b.shape,
+                    stride=b.stride(),
                 )
-            self._big[bi] = big
+                if isinstance(b, DTensor)
+                else view
+            )
+        store[bi] = big
 
     # ------------------------------------------------------------------- step
     @record_function("disco.step")
@@ -884,7 +1021,7 @@ class DiSCO(torch.optim.Optimizer):
         if nanprobe.on():
             nanprobe.disco_tensors(self, "eff", eff)
         u: dict[int, torch.Tensor] = {}
-        self._coef: dict[int, torch.Tensor] = {}  # entry -> [alpha; beta] per unit
+        self._coef: dict[int, torch.Tensor] = {}  # entry -> alpha per unit
         gram_log = self.log_gram_input and logging_step and self.spectral_metrics
         if gram_log:
             gram_input_stats.arm()
@@ -892,7 +1029,7 @@ class DiSCO(torch.optim.Optimizer):
         # and apply: out before the local and expert work, back before theirs.
         sent = self._send_sharded(eff, values)
         with self._span("disco_local"):
-            self._step_local(eff, u)
+            self._step_local(eff, u, logging=values is not None)
         with self._span("disco_experts"):
             self._step_experts(eff, u, values)
         with self._span("disco_sharded"):
@@ -915,9 +1052,6 @@ class DiSCO(torch.optim.Optimizer):
         self._apply(u, sharded=True)
         for gi, g in enumerate(self.param_groups):
             g["t"] = int(g["t"]) + 1
-            if self._eta[gi] is not None:
-                s = self._eta[gi](g["t"])
-                self.eta_used[gi] = (s, float(g["lr"]) * s)
         self.need_to_calculate_norm = False
         self.head_probe_h = None
         if self.update_observer is not None:
@@ -930,7 +1064,8 @@ class DiSCO(torch.optim.Optimizer):
             float(g["lr"]),
             float(g["weight_decay"]),
             int(g["t"]) + 1,
-            bool(g["decoupled_wd"]),
+            momentum=float(g["momentum"]),
+            nesterov=bool(g["nesterov"]),
         )
 
     def _lr_decay(self, e: _Entry) -> tuple[float, float]:
@@ -944,6 +1079,10 @@ class DiSCO(torch.optim.Optimizer):
         for gi, es, _ in self._groups:
             g = self.param_groups[gi]
             m, nesterov = float(g["momentum"]), bool(g["nesterov"])
+            if es[
+                0
+            ].rule.compute.owns_momentum:  # the rule averages (one rule per group)
+                m, nesterov = 0.0, False
             grads = []
             for e in es:
                 gr = e.param.grad
@@ -968,8 +1107,8 @@ class DiSCO(torch.optim.Optimizer):
             out = grads
             if 0.0 < m < 1.0:
                 out = [self._bufs_local[e.i] for e in es]
-                if nesterov:
-                    out = torch._foreach_lerp(out, grads, m)
+                if nesterov:  # beta buf + (1 - beta) g
+                    out = torch._foreach_lerp(out, grads, 1.0 - m)
             for e, t in zip(es, out):
                 eff[e.i] = e.rows2d(t)
         return eff
@@ -1042,36 +1181,6 @@ class DiSCO(torch.optim.Optimizer):
                         )
             todo = [(e, phases) for e, phases in todo if phases]
 
-    def _check_unit_eta(self, gi: int, group: dict, rule: Rule, es: list) -> None:
-        """A group's per-unit-type step factors, checked and logged once: only a
-        compute whose update is linear in eta with an eta-free alpha (sso) may
-        be scaled per unit; every unit needs a factor, every factor a unit."""
-        c, unit_etas = rule.compute, dict(rule.compute.unit_eta)
-        if not (getattr(c, "eta_linear", False) and rule.output == "update_coeffs"):
-            raise ValueError(
-                f"group {gi} ({group.get('rule')}): unit_eta needs a compute whose "
-                "update is linear in eta with an eta-free alpha (sso); "
-                f"{type(c).__name__} is not"
-            )
-        used, lines = set(), []
-        for e in es:
-            for un in e.units:
-                t = _unit_type(e, un)
-                if t not in unit_etas:
-                    raise ValueError(
-                        f"group {gi}: {_key(e, un)} (type {t!r}) has no unit_eta factor"
-                    )
-                used.add(t)
-                self._unit_eta[(e.i, un.pos)] = unit_etas[t]
-                lines.append(f"{_key(e, un)} x{unit_etas[t]!r}")
-        if set(unit_etas) - used:
-            raise ValueError(
-                f"group {gi}: unit_eta {sorted(set(unit_etas) - used)} matches no unit of the group"
-            )
-        logger.info(
-            f"[DiSCO] group {gi} unit_eta, {len(lines)} units: {', '.join(lines)}"
-        )
-
     def _check_frozen_units(self, gi: int, rule: Rule, es: list) -> None:
         """A group's frozen unit types, mapped to its units once; every type must name a unit."""
         fu, used, lines = set(rule.compute.frozen_units), set(), []
@@ -1082,16 +1191,18 @@ class DiSCO(torch.optim.Optimizer):
                 if t in fu:
                     used.add(t)
                     lines.append(_key(e, un))
-        if fu - used:
+        self.unit_types_listed.update(("frozen_units", t) for t in fu)
+        self.unit_types_found.update(("frozen_units", t) for t in used)
+        if fu - used and not self.parallel_dims.pp_enabled:
             raise ValueError(
-                f"group {gi}: frozen_units {sorted(fu - used)} match no unit of the group"
+                f"group {gi}: frozen_scale_units {sorted(fu - used)} match no unit of the group"
             )
         logger.info(
             f"[DiSCO] group {gi} frozen lengths, {len(lines)} units: {', '.join(lines)}"
         )
 
     def _check_col_units(self, gi: int, rule: Rule, es: list) -> None:
-        """A group's col_units (the unit types that learn column gains), mapped to its units once; every type must name a unit."""
+        """A group's col_units (the unit types that learn column scales), mapped to its units once; every type must name a unit."""
         cu, used, lines = set(rule.compute.col_units), set(), []
         for e in es:
             for un in e.units:
@@ -1100,16 +1211,18 @@ class DiSCO(torch.optim.Optimizer):
                 if t in cu:
                     used.add(t)
                     lines.append(_key(e, un))
-        if cu - used:
+        self.unit_types_listed.update(("col_units", t) for t in cu)
+        self.unit_types_found.update(("col_units", t) for t in used)
+        if cu - used and not self.parallel_dims.pp_enabled:
             raise ValueError(
-                f"group {gi}: col_units {sorted(cu - used)} match no unit of the group"
+                f"group {gi}: column_scale_units {sorted(cu - used)} match no unit of the group"
             )
         logger.info(
-            f"[DiSCO] group {gi} column gains, {len(lines)} units: {', '.join(lines)}"
+            f"[DiSCO] group {gi} column scales, {len(lines)} units: {', '.join(lines)}"
         )
 
     def _col_mask(self, pairs, device) -> torch.Tensor:
-        """The stack's per-unit column-gain flags, built once per stack."""
+        """The stack's per-unit column-scale flags, built once per stack."""
         key = tuple((ee.i, un.pos) for ee, un in pairs)
         m = self._col_masks.get(key)
         if m is None:
@@ -1126,22 +1239,29 @@ class DiSCO(torch.optim.Optimizer):
             self._frozen_masks[key] = m
         return m
 
-    def _run(self, rule: Rule, st, w, e: _Entry, pairs, *, lone_2d: bool) -> Result:
+    def _run(
+        self, rule: Rule, st, w, e: _Entry, pairs, *, lone_2d: bool, state=None
+    ) -> Result:
         """`rule` on the stack `st` of the units `pairs` [(entry, unit)], all
         whole here. The result's `update` is what the holders apply: the
         update, the coefficient update, or the step `W - W_next`. Keeps the
         coefficients in `self._coef` and the state in `state[p]["rule_state"]`,
         one copy per run of consecutive units of a parameter."""
         runs = _unit_runs(pairs)
-        state = None
-        if rule.has_state:
-            state = torch.cat([self._state_rows(ee, p0, n) for ee, _, p0, n in runs])
+        view = state  # the units' states as one view (expert blocks), or None
+        if rule.has_state and view is None:
+            state = torch.stack([self._unit_state(ee, un) for ee, un in pairs])
         ctx = self._ctx(e)
         if getattr(rule.compute, "frozen_units", ()):
             ctx = ctx._replace(frozen=self._frozen_mask(pairs, st.device))
         if getattr(rule.compute, "col_units", ()):
             ctx = ctx._replace(colmask=self._col_mask(pairs, st.device))
-        with gram_input_stats.units([_key(ee, un) for ee, un in pairs]):
+        keys = (
+            [_key(ee, un) for ee, un in pairs]
+            if gram_input_stats.is_armed() and e.family is not Family.EXPERT
+            else None  # experts are not reported: no keys, nothing recorded
+        )
+        with gram_input_stats.units(keys):
             if lone_2d and rule.output == "update" and len(pairs) == 1:
                 res = rule.run_whole(st[0], None, ctx)
                 res.update = res.update.unsqueeze(0)
@@ -1149,18 +1269,12 @@ class DiSCO(torch.optim.Optimizer):
                 res = rule.run_whole(st, w, ctx, state)
         if nanprobe.on():
             nanprobe.disco_run(self, rule, st, w, state, res, pairs)
-        if getattr(
-            rule.compute, "unit_eta", ()
-        ):  # linear in eta: scale each unit's step
-            f = torch.tensor(
-                [self._unit_eta[(ee.i, un.pos)] for ee, un in pairs],
-                dtype=res.update.dtype,
-                device=res.update.device,
-            )
-            res.update = res.update * f.view(-1, *(1,) * (res.update.ndim - 1))
+        if rule.has_state and view is not None:
+            view.copy_(res.state)
+        elif rule.has_state:
+            for j, (ee, un) in enumerate(pairs):
+                self._unit_state(ee, un).copy_(res.state[j])
         for ee, j0, p0, n in runs:
-            if rule.has_state:
-                self._state_rows(ee, p0, n).copy_(res.state[j0 : j0 + n])
             if rule.output == "update_coeffs":
                 self._coef_of(ee)[p0 : p0 + n].copy_(res.alpha[j0 : j0 + n])
         if rule.output == "weight":
@@ -1174,8 +1288,8 @@ class DiSCO(torch.optim.Optimizer):
 
     def _gram_input_metrics(self, rec: dict) -> dict[str, float]:
         """Every rank's recorded values over all gram units: per unit the first
-        call's sigma_1 / ||X||_F and the max over its calls (SSO: all its msign
-        inputs), and how many units sit in the 1.01 failure band."""
+        call's sigma_1 / ||X||_F and the max over its calls, and how many units
+        sit in the 1.01 failure band."""
         if self._gram_keys is None:
             self._gram_keys = [
                 _key(e, un)
@@ -1194,8 +1308,9 @@ class DiSCO(torch.optim.Optimizer):
                 buf[i] = torch.stack(
                     [vs[0], torch.stack(vs).max(), torch.ones((), device=vs[0].device)]
                 )
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(buf)
+        mesh = self._sink.mesh  # this model part's ranks (a PP stage has its own units)
+        if mesh is not None and mesh.size() > 1:
+            dist.all_reduce(buf, group=mesh.get_group())
         vals = buf.tolist()
         out, lo, hi, n_in, n_seen, top = {}, *gram_input_stats.BAND, 0, 0, 0.0
         for k, (first, mx, n) in zip(keys, vals):
@@ -1210,13 +1325,14 @@ class DiSCO(torch.optim.Optimizer):
         out["gram_input_band/max_s1f"] = top
         return out
 
-    def _state_rows(self, e: _Entry, p0: int, n: int) -> torch.Tensor:
-        """Units `p0 .. p0 + n` of `e`'s rule state, as a view."""
+    def _unit_state(self, e: _Entry, un) -> torch.Tensor:
+        """Unit `un`'s rule state (a view; this rank computes the unit)."""
         t = self.state[e.param]["rule_state"]
+        if isinstance(t, dict):
+            return t[str(un.pos)]
         if isinstance(t, DTensor):  # experts: the rows of the local units
-            l0 = e.local_units.index(p0)
-            return _unit_rows(e, t.to_local())[l0 : l0 + n]
-        return t[p0 : p0 + n]
+            return _unit_rows(e, t.to_local())[e.local_units.index(un.pos)]
+        return _unit_rows(e, t)[un.pos] if e.family is Family.EXPERT else t[un.pos]
 
     def _coef_of(self, e: _Entry) -> torch.Tensor:
         """`e`'s alpha per unit this step; zero until its owner writes."""
@@ -1238,16 +1354,52 @@ class DiSCO(torch.optim.Optimizer):
         return t
 
     # ---- families
-    def _step_local(self, eff, u) -> None:
+    def _step_local(self, eff, u, *, logging: bool = False) -> None:
         """Rows and Gram rules on the rows each rank holds; vectors and scalars
-        whole (a sharded vector's single row is assembled first)."""
+        whole. A sharded vector's single row: an elementwise rule (sign,
+        identity: the RMSNorm gains, the sinks) runs on the rank's slice;
+        another one on the row assembled first."""
         self._step_gram(eff, u)
         self._split_full = {}
+        # The sign of every split elementwise entry in one launch.
+        signs = [
+            e
+            for e in self.fam[Family.LOCAL]
+            if e.split and _elementwise(e.rule) and isinstance(e.rule.compute, Sign)
+        ]
+        signed = dict(
+            zip(
+                (e.i for e in signs),
+                torch._foreach_sign([eff[e.i].reshape(1, -1) for e in signs])
+                if signs
+                else [],
+            )
+        )
         for e in self.fam[Family.LOCAL]:
             r = e.rule
             if r.kind == "gram":
                 continue  # done above
-            if (
+            if e.split and _elementwise(r):  # no gather: the slice is the row's
+                p = e.param
+                y = signed.get(e.i)
+                if y is None:
+                    y = r.compute.core(eff[e.i].reshape(1, -1))
+                if r.scale != "one":  # the scale of the whole row [1, n]
+                    y = y * SCALES[r.scale](1, p.numel())
+                u[e.i] = y.view(-1)
+                if logging:  # the vector metrics read the whole row
+                    full = [
+                        DTensor.from_local(
+                            t.reshape(-1),
+                            p.device_mesh,
+                            p.placements,
+                            shape=p.shape,
+                            stride=p.stride(),
+                        ).full_tensor()
+                        for t in (eff[e.i], u[e.i])
+                    ]
+                    self._split_full[e.i] = (full[0], full[1])
+            elif (
                 e.split
             ):  # one row over ranks: assemble, everyone applies, keep own slice
                 p = e.param
@@ -1305,6 +1457,11 @@ class DiSCO(torch.optim.Optimizer):
                     u[e.i], runs, e.rule.compute.finish(rows, R, e.units[k].shape[0])
                 )
 
+    # One batched rule call covers whole layers of an expert block, up to this
+    # many bytes per fp32 [units, m, n] tensor: a call holds ~9 such
+    # temporaries, so one call over every layer of a 30B MoE held ~45 GB.
+    _EXPERT_CALL_BYTES = 1 << 30
+
     def _step_experts(self, eff, u, values) -> None:
         metric = []
         for bi, block in enumerate(self._blocks):
@@ -1315,36 +1472,49 @@ class DiSCO(torch.optim.Optimizer):
             r = e0.rule
             m, n = e0.units[0].shape
             k, nu = len(block), len(e0.local_units)  # units per rank per entry
-            big = self._big[bi].view(k * nu, m, n)  # the block's moments
-            if any(
+            big = self._big.get(bi)  # the block's moments, if it averages
+            big = None if big is None else big.view(k * nu, m, n)
+            if big is not None and any(
                 eff[e.i].data_ptr() != big[j * nu].data_ptr()
                 for j, e in enumerate(block)
-            ):  # pre phases or nesterov made new tensors
-                big = torch.cat([eff[e.i].view(nu, m, n) for e in block])
-            w = (
-                torch.cat([e.local.view(nu, m, n) for e in block])
-                if r.needs_weight
-                else None
-            )
-            pairs = [(e, e.units[pos]) for e in block for pos in e.local_units]
-            res = self._run(r, big, w, e0, pairs, lone_2d=False)
-            out = res.update.view(k, nu, m, n)
-            for j, e in enumerate(block):
-                u[e.i] = out[j]
-                if values is not None:
-                    a = None if res.alpha is None else res.alpha.view(k, nu)[j]
-                    w_units = e.local.view(nu, m, n)
-                    metric.append(
-                        ExpertUnits(
-                            e.i,
-                            w_units,
-                            big.view(k, nu, m, n)[j],
-                            out[j],
-                            functools.partial(self._terms, e, w_units, out[j], a),
-                            self._exact(e),
-                            self._radial(e),
+            ):  # pre phases / nesterov made new tensors
+                big = None
+            sbig = self._big_state.get(bi)
+            sbig = None if sbig is None else sbig.flatten(0, e0.param.ndim - 3)
+            per_call = max(1, self._EXPERT_CALL_BYTES // (4 * nu * m * n))
+            for c0 in range(0, k, per_call):
+                chunk = block[c0 : c0 + per_call]
+                kc = len(chunk)
+                g = (
+                    big[c0 * nu : (c0 + kc) * nu]
+                    if big is not None
+                    else torch.cat([eff[e.i].view(nu, m, n) for e in chunk])
+                )
+                w = (
+                    torch.cat([e.local.view(nu, m, n) for e in chunk])
+                    if r.needs_weight
+                    else None
+                )
+                state = None if sbig is None else sbig[c0 * nu : (c0 + kc) * nu]
+                pairs = [(e, e.units[pos]) for e in chunk for pos in e.local_units]
+                res = self._run(r, g, w, e0, pairs, lone_2d=False, state=state)
+                out = res.update.view(kc, nu, m, n)
+                for j, e in enumerate(chunk):
+                    u[e.i] = out[j]
+                    if values is not None:
+                        a = None if res.alpha is None else res.alpha.view(kc, nu)[j]
+                        w_units = e.local.view(nu, m, n)
+                        metric.append(
+                            ExpertUnits(
+                                e.i,
+                                w_units,
+                                g.view(kc, nu, m, n)[j],
+                                out[j],
+                                functools.partial(self._terms, e, w_units, out[j], a),
+                                self._exact(e),
+                                self._radial(e),
+                            )
                         )
-                    )
         if metric:
             per = self._sink.expert_block_values(metric)
             for x in metric:
@@ -1370,7 +1540,9 @@ class DiSCO(torch.optim.Optimizer):
                 torch.float32,
                 async_op=True,
             )
-        elif self._ex_w is not None:
+        elif self._ex_w is not None and (
+            self._w_every_step or not self._w_filled or self.copy_check_now
+        ):
             w = self._ex_w.to_owner(
                 {e.sh: e.rows2d(e.local) for e in es if e.rule.needs_weight},
                 "w",
@@ -1401,13 +1573,37 @@ class DiSCO(torch.optim.Optimizer):
         if ex is None:
             return None
         ws = sent[1]()
-        for us, st in zip(ex.batches, ws["stacks"]):
+        fill, drift = not self._w_filled, []
+        for bi, (us, st) in enumerate(zip(ex.batches, ws["stacks"])):
             e = es[us[0].param_index]
             pairs = [(es[un.param_index], un) for un in us]
             w = None
-            if e.rule.needs_weight:
+            if e.rule.needs_weight and e.rule.output != "weight":  # every step
                 w = torch.stack([wsw["full"][un.index] for un in us])
-            res = self._run(e.rule, st, w, e, pairs, lone_2d=True)
+            elif e.rule.needs_weight:
+                if fill:  # the weights travelled: fill the owner's copy
+                    w = self._w_own[bi] = torch.stack(
+                        [wsw["full"][un.index] for un in us]
+                    )
+                else:
+                    w = self._w_own[bi]
+                    if wsw is not None:  # the weights travelled: compare bitwise
+                        differ = torch.stack(
+                            [
+                                (w[j] != wsw["full"][un.index]).any()
+                                for j, un in enumerate(us)
+                            ]
+                        ).any()
+                        drift.append((differ, [_key(ee, un) for ee, un in pairs]))
+            res = self._run(
+                e.rule,
+                st,
+                w,
+                e,
+                pairs,
+                lone_2d=True,
+                state=self._batch_state.get(("sh", bi)),
+            )
             if values is not None:
                 for j, (ee, un) in enumerate(pairs):
                     W = wsw["full"][un.index]
@@ -1415,6 +1611,19 @@ class DiSCO(torch.optim.Optimizer):
                         values, ee, un, W, st[j], res.update[j], _alpha_of(res, j)
                     )
             st.copy_(res.update)
+            if w is not None and e.rule.output == "weight":  # the holders apply st
+                w.sub_(st if st.dtype == w.dtype else st.to(w.dtype))
+        if (
+            (fill or self.copy_check_now)
+            and values is None
+            and self._ex_w is not None
+            and not self._w_every_step
+        ):
+            self._ex_w.release("w", torch.float32)
+        self._w_filled = True
+        # Reported, not raised here: the container checks every rank of every
+        # stage at once (a raise on one rank would leave the others hanging).
+        self.copy_drift = drift
         if not self._u_sh:
             self._u_sh = self._holder_updates(ws["hold"], es, eff)
         back = ex.to_holders(
@@ -1452,7 +1661,7 @@ class DiSCO(torch.optim.Optimizer):
         es = self.fam[Family.REPLICATED]
         device = es[0].param.device
         ws = rep.inputs({e.rep: eff[e.i] for e in es}, device)
-        for us, st in zip(rep.batches, ws["stacks"]):
+        for bi, (us, st) in enumerate(zip(rep.batches, ws["stacks"])):
             e = es[us[0].param_index]
             pairs = [(es[un.param_index], un) for un in us]
             w = None
@@ -1461,7 +1670,13 @@ class DiSCO(torch.optim.Optimizer):
                     [unit_rows(ee.rows2d(ee.local), un) for ee, un in pairs]
                 )
             res = self._run(
-                e.rule, st, w if e.rule.needs_weight else None, e, pairs, lone_2d=True
+                e.rule,
+                st,
+                w if e.rule.needs_weight else None,
+                e,
+                pairs,
+                lone_2d=True,
+                state=self._batch_state.get(("rep", bi)),
             )
             if values is not None:
                 for j, (ee, un) in enumerate(pairs):
@@ -1515,7 +1730,6 @@ class DiSCO(torch.optim.Optimizer):
             ]
             if not es:
                 continue
-            g = self.param_groups[gi]
             lr, decay = self._lr_decay(es[0])
             plain = [e for e in es if e.rule.output == "update"]
             if plain:
@@ -1815,6 +2029,17 @@ def _expert_key(e: _Entry, g: int) -> str:
     """Expert unit `g`: `ep_{expert}/` and the name its split weight would have."""
     expert, _, name = e.units[g].name.partition(".")
     return f"ep_{expert}/{_split_name(e.clean, name)}"
+
+
+def _elementwise(r: Rule) -> bool:
+    """The rule maps each entry on its own (sign or identity, no phases): it
+    gives the same update on any slice of a row."""
+    return (
+        r.kind == "rows"
+        and not r.pre
+        and not r.post
+        and isinstance(r.compute, (Sign, RowsIdentity))
+    )
 
 
 def _unit_rows(e: _Entry, t: torch.Tensor) -> torch.Tensor:

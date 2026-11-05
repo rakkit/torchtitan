@@ -9,7 +9,7 @@
 Groups are the named `optimizer.groups` (`default` required, the others
 matched by `kind` or `match`, first match wins); upstream's
 `optimizer.param_groups` is accepted for other optimizers only. A group's kwargs are DiSCO's
-`lr / weight_decay / decoupled_wd / momentum / nesterov / rule / args`. On
+`lr / weight_decay / momentum / nesterov / rule / args`. On
 top of upstream:
 the MoE load-balance hook, and the arming and collection of the optimizer's
 per-parameter metrics (`log_norm_freq`, `norms_to_log`, `gram_level`,
@@ -47,7 +47,7 @@ from torchtitan.optimizers.helpers import norm_helper
 __all__ = ["DiSCOOptimizersContainer"]
 logger = logging.getLogger(__name__)
 
-_DISCO_ONLY_KEYS = frozenset({"rule", "args", "momentum", "nesterov", "decoupled_wd"})
+_DISCO_ONLY_KEYS = frozenset({"rule", "args", "momentum", "nesterov"})
 _KIND = "\x00kind:"  # a group pattern resolved per model part from its declarations
 
 
@@ -80,9 +80,8 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         or `match` (a regex on the FQN). Entries are tried in order, first
         match wins, the rest go to `default`. Other keys: `optimizer` (default
         "DiSCO"), and that optimizer's kwargs -- for DiSCO `lr`,
-        `weight_decay`, `decoupled_wd` (weight decay `1 - weight_decay` per
-        step instead of `1 - lr weight_decay`), `momentum`, `nesterov`,
-        `rule`, `args` (`args` merge
+        `weight_decay` (W scales by `1 - lr weight_decay` per step),
+        `momentum`, `nesterov`, `rule`, `args` (`args` merge
         over the default's). Every key of a group is a CLI flag:
         `--optimizer.groups.default.lr 0.05`."""
 
@@ -127,10 +126,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         arrive on lcm(log_freq, log_norm_freq) instead of the cadence asked for.
         """
 
-        dense_norm_steps: int = 0
-        """Also log the norms every step up to this one; 0 disables. Needs
-        metrics.dense_log_steps at least as large, which the trainer checks."""
-
         norms_to_log: list[str] = field(default_factory=lambda: ["default"])
         """Which norm families to log. "default" is the curated set; see
         torchtitan.optimizers.helpers.norm_helper.get_norms_to_log."""
@@ -145,7 +140,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         N > 0, a multiple of log_norm_freq: `rms_to_rms`, `stable_rank`,
         `condition_number`, `effective_rank*`, the spectra and the spectral radial
         metrics only on the norm-logging steps divisible by N, step 1 and the final
-        step; the SVD-free norms keep log_norm_freq (dense phase included)."""
+        step; the SVD-free norms keep log_norm_freq."""
 
         gram_level: int = 0
         """Gram-matrix metric depth, on the same cadence as log_norm_freq.
@@ -165,10 +160,10 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
 
         log_gain_stats: bool = False
         """Log each RMSNorm gain's mean, RMS and ||dg|| / ||g|| on the
-        log_norm_freq cadence (optimizers/model_stats.py). With column gains
-        (amphione columns, angular_muown col_scale) it also logs each unit's
-        column gains c (col_gain_*: rms,
-        mean log|c|, q10 / q50 / q90, relative update; DiSCO.col_gain_metrics)."""
+        log_norm_freq cadence (optimizers/model_stats.py). With column scales
+        (amphione column_scales) it also logs each unit's
+        column scales c (col_scale_*: rms,
+        mean log|c|, q10 / q50 / q90, relative update; DiSCO.col_scale_metrics)."""
 
         log_sink_stats: bool = False
         """Log every attention sink value (one logit per head and layer,
@@ -361,7 +356,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         self.optimizers = []
         self.model_parts = model_parts
 
-        self.preserve_lrs_when_loading = False
         # Set from config at build time. They used to be assigned onto the
         # container by the trainer after construction, which meant the object
         # was briefly in a state its own methods did not expect.
@@ -372,7 +366,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         self.spectral_norm_freq: int = config.spectral_norm_freq
         self.gram_level: int = config.gram_level
         self.log_norm_freq: int = config.log_norm_freq
-        self.dense_norm_steps: int = config.dense_norm_steps
         self.head_diag_probes: int = config.head_diag_probes
         self.head_diag_diameter_iters: int = config.head_diag_diameter_iters
         self.parallel_dims = parallel_dims
@@ -381,7 +374,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         self.log_sink_stats: bool = config.log_sink_stats
         self._model_stats_armed: bool = False
         self._gains_before: list[torch.Tensor] | None = None
-        self._col_before: list | None = None  # per optimizer: c of the col_scale units before the step (log_gain_stats)
+        self._col_before: list | None = None  # per optimizer: c of the column-scale units before the step (log_gain_stats)
         self._moe_publish_armed: bool = False
         self._norms_armed: bool = False
         self._head_input: Callable[[], torch.Tensor | None] | None = None
@@ -437,6 +430,8 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
                 "no DiSCO optimizer computes parameter norms."
             )
         self._validate_params(all_params)
+        if parallel_dims is not None and parallel_dims.pp_enabled:
+            self._check_unit_types_over_stages(parallel_dims)
         if config.implementation == "fused_opt_states_bf16":
             self._register_bf16_optimizer_state_hook()
         self._post_init(all_params)
@@ -453,6 +448,29 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         )
         self._gnoise_research_freq = config.gnoise.research_freq
 
+    def _check_unit_types_over_stages(self, parallel_dims: ParallelDims) -> None:
+        """Under PP every listed unit type (frozen_units, col_units) must name a
+        unit on some stage: one gather over the PP ranks at build, so every
+        stage reaches the same verdict (a raise on one stage would leave the
+        others hanging at their first P2P)."""
+        discos = [o for o in self.optimizers if isinstance(o, DiSCO)]
+        listed = set().union(*(o.unit_types_listed for o in discos))
+        found = set().union(*(o.unit_types_found for o in discos))
+        mesh = parallel_dims.get_optional_mesh("pp")
+        if mesh is not None and mesh.size() > 1:
+            got: list = [None] * mesh.size()
+            torch.distributed.all_gather_object(
+                got, (sorted(listed), sorted(found)), group=mesh.get_group()
+            )
+            listed = {tuple(x) for on_rank, _ in got for x in on_rank}
+            found = {tuple(x) for _, on_rank in got for x in on_rank}
+        missing = sorted(listed - found)
+        if missing:
+            raise ValueError(
+                f"[DiSCO] {', '.join(f'{f} {t!r}' for f, t in missing)}: no unit of "
+                "that type on any pipeline stage"
+            )
+
     def __iter__(self) -> Iterator[T]:
         return iter(self.optimizers)
 
@@ -466,62 +484,87 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
             for optimizer in self.optimizers:
                 if isinstance(optimizer, DiSCO):
                     optimizer.head_probe_h = h
+        check = self._copy_check_due()
+        for optimizer in self.optimizers:
+            if isinstance(optimizer, DiSCO):
+                optimizer.copy_check_now, optimizer.copy_drift = check, []
         for optimizer in self.optimizers:
             optimizer.step(*args, **kwargs)
+        if check:
+            self._check_weight_copies()
+
+    # The owners' fp32 copies of the weights (rules returning the new weight) are
+    # compared with the parameters on every norm step and every this many steps:
+    # one weight all-to-all to the owners, as every step did before the copies.
+    _COPY_CHECK_EVERY = 100
+
+    def _copy_check_due(self) -> bool:
+        """The same on every rank of every stage: the step count and the arming."""
+        self._num_steps = getattr(self, "_num_steps", 0) + 1
+        return self._norms_armed or self._num_steps % self._COPY_CHECK_EVERY == 0
+
+    def _check_weight_copies(self) -> None:
+        """One flag, all-reduced over the world, so every rank of every stage
+        raises together when the weights changed outside the optimizer."""
+        flags = [x for o in self.optimizers for x in getattr(o, "copy_drift", [])]
+        device = next(
+            (p.device for m in self.model_parts for p in m.parameters()), None
+        )
+        if device is None:
+            return
+        bad = torch.zeros((), device=device)
+        if flags:
+            bad = torch.stack([f for f, _ in flags]).any().float()
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(bad, op=torch.distributed.ReduceOp.MAX)
+        if bad.item():  # the one host sync of the check
+            drift = [k for f, keys in flags if f.item() for k in keys]
+            raise RuntimeError(self._drift_message(drift))
+
+    @staticmethod
+    def _drift_message(drift: list[str]) -> str:
+        return (
+            "[DiSCO] the owners' copies of the weights differ from the parameters "
+            f"({drift[:4] or 'on another rank'}): the weights changed outside the "
+            "optimizer"
+        )
 
     def zero_grad(self, *args, **kwargs) -> None:
         for optimizer in self.optimizers:
             optimizer.zero_grad(*args, **kwargs)
 
-    # The lr scheduler reads a group's lr_table from the config; checkpoints
-    # leave it out, so a branch may run another table than its source run.
-    _CONFIG_ONLY_SCHEDULER_KEYS = ("lr_table",)
+    # A group's lr (and the scheduler's `initial_lr`) is the run's config for
+    # every optimizer, DiSCO's and the others: no checkpoint holds it, and the
+    # scheduler sets it from this run's base lr and schedule at the loaded step.
+    # Either load order is then right (dcp.load runs lr_scheduler first).
+    _CONFIG_ONLY_KEYS = ("lr", "initial_lr")
 
     def state_dict(self) -> dict[str, Any]:
-        sd = super().state_dict()
-        drop = tuple(f".{k}" for k in self._CONFIG_ONLY_SCHEDULER_KEYS)
         return {
             k: v
-            for k, v in sd.items()
-            if not (k.startswith("param_groups.") and k.endswith(drop))
+            for k, v in super().state_dict().items()
+            if not (
+                k.startswith("param_groups.")
+                and k.rsplit(".", 1)[-1] in self._CONFIG_ONLY_KEYS
+            )
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Load optimizer state, optionally keeping the current learning rates.
-
-        Resuming a run whose LR schedule was changed (e.g. a new decay phase)
-        would otherwise silently restore the checkpoint's learning rates and
-        undo the new schedule.
-        """
-        # DiSCO leaves its rule config out of checkpoints (the run's config
-        # wins); the flat loader wants every live group key, so supply them.
+        """The checkpoint holds no config-only group key (DiSCO's rule keys, every
+        group's lr); the flat loader wants every live group key, so supply them."""
         state_dict = dict(state_dict)
         for optimizer in self.optimizers:
+            keys = {
+                *self._CONFIG_ONLY_KEYS,
+                *getattr(optimizer, "_CONFIG_ONLY_GROUP_KEYS", ()),
+            }
             for group in optimizer.param_groups:
-                for key in getattr(optimizer, "_CONFIG_ONLY_GROUP_KEYS", ()):
+                for key in keys:
+                    if key not in group:
+                        continue
                     for fqn in group.get("param_names", ()):
                         state_dict.setdefault(f"param_groups.{fqn}.{key}", group[key])
-                for key in self._CONFIG_ONLY_SCHEDULER_KEYS:
-                    if key in group:
-                        for fqn in group.get("param_names", ()):
-                            state_dict[f"param_groups.{fqn}.{key}"] = group[key]
-        if not self.preserve_lrs_when_loading:
-            super().load_state_dict(state_dict)
-            return
-
-        prev_lrs = [
-            [group["lr"] for group in optimizer.param_groups]
-            for optimizer in self.optimizers
-        ]
         super().load_state_dict(state_dict)
-        for optimizer, optim_prev_lrs in zip(self.optimizers, prev_lrs):
-            for param_group, prev_lr in zip(optimizer.param_groups, optim_prev_lrs):
-                if param_group["lr"] != prev_lr:
-                    logger.warning(
-                        f"Restoring lr from {param_group['lr']} to {prev_lr} | "
-                        f"for {param_group.get('param_names')}"
-                    )
-                    param_group["lr"] = prev_lr
 
     def wants_norms_at(
         self, step: int, *, should_log: bool, is_final_step: bool
@@ -535,9 +578,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
             return False
         if is_final_step:
             return True
-        return should_log and (
-            step == 1 or step <= self.dense_norm_steps or step % self.log_norm_freq == 0
-        )
+        return should_log and (step == 1 or step % self.log_norm_freq == 0)
 
     def begin_step(
         self,
@@ -567,7 +608,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
             spectral=self._spectral_at(step, is_final_step),
         )
         if self.gnoise is not None and self.gnoise.due(
-            step, dense=step == 1 or step <= self.dense_norm_steps or is_final_step
+            step, first_or_last=step == 1 or is_final_step
         ):
             freq = self._gnoise_research_freq
             self.gnoise.arm(step, research=freq > 0 and step % freq == 0)
@@ -638,7 +679,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         if self.log_gain_stats:
             self._gains_before = model_stats.snapshot_gains(self.model_parts)
             self._col_before = [
-                o.col_gain_snapshot() if isinstance(o, DiSCO) else None
+                o.col_scale_snapshot() if isinstance(o, DiSCO) else None
                 for o in self.optimizers
             ]
 
@@ -658,7 +699,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         if self._col_before is not None:
             for o, before in zip(self.optimizers, self._col_before, strict=True):
                 if before is not None:
-                    metrics.update(o.col_gain_metrics(before))
+                    metrics.update(o.col_scale_metrics(before))
             self._col_before = None
         if self.log_sink_stats:
             sinks = model_stats.sink_metrics(self.model_parts, self.parallel_dims)
@@ -688,11 +729,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         armed, self._norms_armed = self._norms_armed, False
         if armed:
             metrics.update(self.get_parameter_norms(step=step))
-        for optimizer in self.optimizers:
-            if isinstance(optimizer, DiSCO):
-                for gi, (s, eta) in optimizer.eta_used.items():
-                    metrics[f"eta_schedule/DiSCO/{gi}"] = s
-                    metrics[f"eta_used/DiSCO/{gi}"] = eta
         if self.gnoise is not None:
             metrics.update(self.gnoise.collect())
         metrics.update(self.collect_moe_metrics())

@@ -8,8 +8,8 @@
 
 Every parameter is held whole, in fp32, on one device. Per step and parameter:
 
-    buf   <- (1 - m) * buf + m * g                 (momentum, if 0 < m < 1)
-    g_eff <- buf, or lerp(buf, g, m) if nesterov
+    buf   <- b * buf + (1 - b) * g                 (momentum b, if 0 < b < 1)
+    g_eff <- buf, or b * buf + (1 - b) * g if nesterov
     u     <- scale(m, n) * compute(g_eff)           (the group's compute and scale)
     w     <- w * (1 - wd * lr) - lr * u
 
@@ -50,7 +50,7 @@ def scale_factor(scale: str, m: int, n: int) -> float:
 def decay_of(r: dict) -> float:
     """What weight decay scales W by per step."""
     wd = r["weight_decay"]
-    return 1.0 - wd if r.get("decoupled_wd") else 1.0 - wd * r["lr"]
+    return 1.0 - wd * r["lr"]
 
 
 class ReferenceDiSCO:
@@ -60,8 +60,6 @@ class ReferenceDiSCO:
         self.rules = rules
         self.buf = {k: torch.zeros_like(v) for k, v in self.params.items()}
         self.last_update = {}
-        self.aus_v = {}
-        self.sso_v = {}
         self.t = 0
 
     @torch.no_grad()
@@ -91,11 +89,11 @@ class ReferenceDiSCO:
         for name, w in self.params.items():
             r = self.rules[name]
             g = grads[name].to(w.dtype)
-            m = r["momentum"]
-            if 0.0 < m < 1.0:
+            b = r["momentum"]
+            if 0.0 < b < 1.0:
                 buf = self.buf[name]
-                buf.mul_(1.0 - m).add_(g, alpha=m)
-                g_eff = buf if not r["nesterov"] else torch.lerp(buf, g, m)
+                buf.mul_(b).add_(g, alpha=1.0 - b)
+                g_eff = buf if not r["nesterov"] else b * buf + (1.0 - b) * g
             else:
                 g_eff = g
             if w.ndim < 2:  # scalars as they are, a vector as one [1, d] row
@@ -126,91 +124,34 @@ class ReferenceDiSCO:
             self._sphere_one(key, w, g, r, sphere)
             return None
         u = self.lmo(g, r)
-        if r.get("aus"):
-            self.aus_step(key, w, u, r)
-            return u
         if r["weight_decay"] != 0.0:
             w.mul_(decay_of(r))
         w.add_(u, alpha=-r["lr"])
         return u
 
-    @torch.no_grad()
-    def aus_step(self, name, w, u, r) -> None:
-        """The AUS map from its equations, per matrix: sigma(W) by the warm
-        power iteration the rule uses (`top_pair_warm`, iterate kept per
-        name), sigma(U), sigma(B) and R' one iteration from its vector, with
-        B and the decayed W formed here."""
-        from torchtitan.optimizers.helpers.power_iteration import top_pair_warm
-
-        def sigma_max_warm(X, v, k):
-            s, _, v = top_pair_warm(X, v, k)
-            return s, v
-
-        eta, iters = r["aus_eta"], r["aus_sigma_iters"]
-        tiny = torch.finfo(torch.float32).tiny
-        decay = decay_of(r)
-        U = u.float()
-        v = self.aus_v.get(name)
-        R, v = sigma_max_warm(w.float()[None], None if v is None else v[None], iters)
-        R = decay * R
-        W = w.float() * decay
-        sU, _ = sigma_max_warm(U[None], v, 1)
-        B = (
-            W[None]
-            - (eta * R)[:, None, None] * U[None] / sU.clamp_min(tiny)[:, None, None]
-        )
-        sB, _ = sigma_max_warm(B, v, 1)
-        R_new, _ = sigma_max_warm(W[None] - eta * U[None], v, 1)
-        self.aus_v[name] = v[0]
-        w.copy_((B * (R_new / sB.clamp_min(tiny))[:, None, None])[0].to(w.dtype))
-
     def _sphere_one(self, name, w, g, r, c) -> None:
-        """hyperball / elr / sso on one matrix, from their equations. The
-        direction is the group's LMO without its scale."""
-        from torchtitan.optimizers.disco.presets import eta_at, FrobeniusAUS
-        from torchtitan.optimizers.disco.rules import StepCtx
-        from torchtitan.optimizers.helpers.power_iteration import top_pair_warm
-
-        ctx = StepCtx(r["lr"], r["weight_decay"], self.t, r["decoupled_wd"])
-        eta = eta_at(c.eta, ctx)
+        """hyperball on one matrix, from its equation. The direction is the
+        group's LMO without its scale."""
         W, M = w.float(), g.float()
-        if isinstance(c, FrobeniusAUS):
-            rr = W.norm()
-            if c.tangent:
-                M = M - (W * M).sum() / rr**2 * W
-            U = self.lmo(M, {**r, "scale": "one"})
-            U = U / U.norm()
-            d = decay_of(r) if c.radius == "free" else 1.0
-            s = eta
-            if c.exact_angle:
-                cos = (W * U).sum() / rr
-                s = d * math.tan(eta) / ((1 - cos**2).sqrt() + cos * math.tan(eta))
-            B = d * W - s * rr * U
-            w.copy_(rr * B / B.norm() if c.radius == "keep" else B)
-            return
-        # SSO: W+ = (R / sigma) W - lr R orth(M^ + lambda* u v^T), the root
-        # found by the rule's own bracket and bisection on this one matrix.
-        m, n = W.shape
-        R = scale_factor(c.scale, m, n)
-        v = self.sso_v.get(name)
-        sigma, u, v = top_pair_warm(
-            W[None], None if v is None else v[None], c.sigma_iters
-        )
-        phi, _, _ = c.solve((M / M.norm())[None], u, v)
-        self.sso_v[name] = v[0]
-        w.copy_(R / sigma[0] * W - eta * R * phi[0].float())
+        rr = W.norm()
+        if c.tangent:
+            M = M - (W * M).sum() / rr**2 * W
+        U = self.lmo(M, {**r, "scale": "one"})
+        U = U / U.norm()
+        s = r["lr"]
+        if c.exact_angle:
+            cos = (W * U).sum() / rr
+            s = math.tan(s) / ((1 - cos**2).sqrt() + cos * math.tan(s))
+        B = W - s * rr * U
+        w.copy_(rr * B / B.norm())
 
 
 def rules_from_container(container, model) -> dict[str, dict]:
     """Per-parameter hyperparameters as the container's param groups resolved them."""
-    from torchtitan.optimizers.disco.presets import AUSMap, FrobeniusAUS, SpectralSphere
+    from torchtitan.optimizers.disco.presets import FrobeniusAUS
 
     by_id = {}
     for opt in container.optimizers:
-        # The rule an entry actually runs (an `aus` group with row args is a row rule).
-        aus_by_id = {
-            id(e.param): isinstance(e.rule.compute, AUSMap) for e in opt.entries
-        }
         rule_by_id = {id(e.param): e.rule for e in opt.entries}
         units_by_id = {
             id(e.param): [(u.rows.runs, tuple(u.shape)) for u in e.units]
@@ -219,7 +160,7 @@ def rules_from_container(container, model) -> dict[str, dict]:
         sphere_by_id = {
             id(e.param): e.rule.compute
             for e in opt.entries
-            if isinstance(e.rule.compute, (FrobeniusAUS, SpectralSphere))
+            if isinstance(e.rule.compute, FrobeniusAUS)
         }
         for group in opt.param_groups:
             for p in group["params"]:
@@ -229,18 +170,14 @@ def rules_from_container(container, model) -> dict[str, dict]:
                     "momentum": group["momentum"],
                     "nesterov": group["nesterov"],
                     "weight_decay": group["weight_decay"],
-                    "decoupled_wd": group["decoupled_wd"],
                     "eps": 1e-30,
                     "scale": a.get("scale", "one"),
                     "compute": a.get("compute", "identity"),
                     "steps": a.get("steps", 0),
-                    "aus": aus_by_id.get(id(p), False),
                     "sphere": sphere_by_id.get(id(p)),
                     "rule_obj": rule_by_id.get(id(p)),
                     "units": units_by_id.get(id(p)),
                     "block_rows": int(a.get("block_rows", 0)),
                     "block_cols": int(a.get("block_cols", 0)),
-                    "aus_sigma_iters": int(a.get("sigma_iters", 8)),
-                    "aus_eta": 0.0,  # set per step by the test from the rule's schedule
                 }
     return {n: by_id[id(p)] for n, p in model.named_parameters() if p.requires_grad}

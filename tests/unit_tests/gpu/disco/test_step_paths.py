@@ -39,7 +39,7 @@ import harness  # noqa: E402
 from reference import ReferenceDiSCO, rules_from_container  # noqa: E402
 
 from torchtitan.optimizers.disco.presets import Blocks  # noqa: E402
-from torchtitan.optimizers.disco.rules import lmo, StepCtx  # noqa: E402
+from torchtitan.optimizers.disco.rules import lmo  # noqa: E402
 
 pytestmark = pytest.mark.multi_gpu
 
@@ -86,7 +86,8 @@ def _reload_and_check_aliasing(container) -> list[str]:
     getattr(ret, "upload_completion", ret).result()
     for opt in container.optimizers:
         for st in opt.state.values():
-            st["momentum_buffer"].zero_()
+            if "momentum_buffer" in st:  # only where DiSCO averages
+                st["momentum_buffer"].zero_()
     sd = container.state_dict()
     dcp.load(sd, checkpoint_id=path[0])
     container.load_state_dict(sd)
@@ -95,6 +96,8 @@ def _reload_and_check_aliasing(container) -> list[str]:
         for bi, block in enumerate(opt._blocks):
             big = opt._big.get(bi)
             for j, e in enumerate(block):
+                if "momentum_buffer" not in opt.state[e.param]:
+                    continue  # the block averages nothing
                 buf = opt.state[e.param]["momentum_buffer"]
                 local = buf.to_local() if hasattr(buf, "to_local") else buf
                 n = local.shape[0]
@@ -141,7 +144,6 @@ class TestDiSCOStepPaths(DTensorTestBase):
         comm_dtype: torch.dtype,
         moe: bool = True,
         weight_decay=0.0,
-        decoupled_wd: bool = False,
         reload_after: int = 0,
         n_layers: int = 2,
         extra_groups: dict | None = None,
@@ -167,7 +169,6 @@ class TestDiSCOStepPaths(DTensorTestBase):
             compute=backend,
             communication_dtype=str(comm_dtype).removeprefix("torch."),
             weight_decay=weight_decay,
-            decoupled_wd=decoupled_wd,
             extra_groups=extra_groups,
             **topo,
         )
@@ -408,16 +409,6 @@ class TestDiSCOStepPaths(DTensorTestBase):
         )
 
     @with_comms
-    def test_fsdp4_fp32_decoupled_weight_decay(self):
-        """`decoupled_wd`: W scales by 1 - wd per step, not 1 - lr wd."""
-        self._check_topology(
-            TOPOLOGIES["fsdp4"],
-            comm_dtype=torch.float32,
-            weight_decay=0.1,
-            decoupled_wd=True,
-        )
-
-    @with_comms
     def test_fsdp4_ep2_fp32_reload(self):
         """A state-dict round trip mid-run: the experts' moments stay the
         block buffers, and the next steps still match the reference."""
@@ -464,80 +455,6 @@ class TestDiSCOStepPaths(DTensorTestBase):
         harness.set_synthetic_grads(model, 1, device)
         container.step()  # no collective on the update path: must not hang or raise
 
-    # ---- AUS: the coefficient-returning rule on the sharded family ----
-    @with_comms
-    def test_fsdp4_aus_fp32(self):
-        self._check_aus(TOPOLOGIES["fsdp4"], moe=True)
-
-    @with_comms
-    def test_fsdp4_aus_resumes_bitwise(self):
-        """A restart must carry AUS's warm-start iterates: a fresh process
-        started them cold, off the uninterrupted run from the next step."""
-        self._check_aus(TOPOLOGIES["fsdp4"], moe=True, reload_after=1)
-
-    @with_comms
-    def test_ddp4_dense_aus_fp32(self):
-        self._check_aus(TOPOLOGIES["ddp4"], moe=False)
-
-    @with_comms
-    def test_hsdp22_aus_fp32(self):
-        self._check_aus(TOPOLOGIES["hsdp22"], moe=True)
-
-    @with_comms
-    def test_fsdp4_ep2_aus_fp32(self):
-        """Experts over EP and FSDP: the per-run state and coefficient rows."""
-        self._check_aus(TOPOLOGIES["fsdp4_ep2"], moe=True)
-
-    def _check_aus(self, topo, *, moe, reload_after: int = 0):
-        device = self._device()
-        pd = harness.parallel_dims(world_size=4, device_type=device.type, **topo)
-        cfg = harness.trainer_config(
-            harness.tiny_model_config(moe=moe),
-            compute="svd",
-            communication_dtype="float32",
-            aus=True,
-            weight_decay=0.1,  # the decay rides in alpha: cover it
-            extra_groups={"router": {"match": r"\.router\.", "rule": "muon"}}
-            if moe
-            else {},
-            **topo,
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            model, container = harness.build_model_and_optimizer(cfg, pd, device, tmp)
-        params = {
-            n: harness.full_tensor(p).float() for n, p in harness.trainable(model)
-        }
-        ref = _SameLMOReference(params, rules_from_container(container, model))
-        opt = container.optimizers[0]
-        if opt._ex_all is not None:
-            assert opt._ex_w is not None, "an AUS group turns the weights exchange on"
-        failures = []
-        for step in range(1, STEPS + 1):
-            grads = harness.set_synthetic_grads(model, step, device)
-            for n, r in ref.rules.items():
-                if r[
-                    "aus"
-                ]:  # the rule's eta at this step, as the optimizer will see it
-                    rule = next(e.rule for e in opt.entries if e.name == n)
-                    r["aus_eta"] = rule.compute.eta_at(
-                        StepCtx(r["lr"], r["weight_decay"], step)
-                    )
-            container.step()
-            container.zero_grad()
-            ref.step(grads)
-            if step == reload_after:
-                model, container = _restart(model, container, cfg, pd, device)
-                opt = container.optimizers[0]
-            for name, p in harness.trainable(model):
-                got, want = harness.full_tensor(p).float(), ref.params[name]
-                d = (got - want).abs().max().item()
-                if d > 1e-5 * max(1.0, want.abs().max().item()):
-                    failures.append(f"step {step} {name}: max |diff| {d:.3e}")
-        ok = harness.all_ranks_agree(not failures, device)
-        if failures and self.rank == 0:
-            print("\n".join(failures[:40]))
-        self.assertTrue(ok, failures[:3])
-
     # ---- sphere rules: weights on the owner, coefficients back ----
     @with_comms
     def test_fsdp4_hyperball_fp32(self):
@@ -549,58 +466,16 @@ class TestDiSCOStepPaths(DTensorTestBase):
         self._check_sphere(TOPOLOGIES["fsdp4"], "hyperball", args)
 
     @with_comms
-    def test_ddp4_dense_elr_fp32(self):
-        self._check_sphere(
-            TOPOLOGIES["ddp4"], "elr", {"scale": None}, moe=False, weight_decay=0.1
-        )
-
-    @with_comms
-    def test_fsdp4_elr_exact_fp32(self):
-        args = {"scale": None, "exact_angle": True}
-        self._check_sphere(TOPOLOGIES["fsdp4"], "elr", args, weight_decay=0.1)
-
-    @with_comms
-    def test_fsdp4_elr_scheduled_decoupled_fp32(self):
-        """An eta schedule multiplies the angle, and decoupled weight decay sets
-        the decay."""
-        eta = {"shape": "inverse_poly", "start": 1, "c": 0.5}
-        args = {"scale": None, "exact_angle": True, "eta": eta}
-        self._check_sphere(
-            TOPOLOGIES["fsdp4"], "elr", args, weight_decay=0.01, decoupled_wd=True
-        )
-
-    @with_comms
-    def test_fsdp4_sso_fp32(self):
-        self._check_sphere(TOPOLOGIES["fsdp4"], "sso", {})
-
-    @with_comms
-    def test_hsdp22_sso_fp32(self):
-        self._check_sphere(TOPOLOGIES["hsdp22"], "sso", {})
-
-    @with_comms
-    def test_fsdp4_ep2_sso_fp32(self):
-        self._check_sphere(TOPOLOGIES["fsdp4_ep2"], "sso", {})
-
-    @with_comms
     def test_fsdp4_ep2_hyperball_exact_fp32(self):
         args = {"scale": None, "exact_angle": True}
         self._check_sphere(TOPOLOGIES["fsdp4_ep2"], "hyperball", args)
-
-    @with_comms
-    def test_ddp4_dense_sso_fp32(self):
-        self._check_sphere(TOPOLOGIES["ddp4"], "sso", {}, moe=False)
-
-    @with_comms
-    def test_fsdp4_sso_resumes(self):
-        """SSO's warm power-iteration vector survives a restart."""
-        self._check_sphere(TOPOLOGIES["fsdp4"], "sso", {}, restart_after=1)
 
     @with_comms
     def test_sphere_rules_refuse_weight_decay(self):
         device = self._device()
         topo = TOPOLOGIES["fsdp4"]
         pd = harness.parallel_dims(world_size=4, device_type=device.type, **topo)
-        for rule, args in (("hyperball", {"scale": None}), ("sso", {})):
+        for rule, args in (("hyperball", {"scale": None}),):
             cfg = harness.trainer_config(
                 harness.tiny_model_config(moe=False),
                 rule=rule,
@@ -620,7 +495,6 @@ class TestDiSCOStepPaths(DTensorTestBase):
         *,
         moe=True,
         weight_decay=0.0,
-        decoupled_wd=False,
         restart_after=0,
     ):
         device = self._device()
@@ -633,7 +507,6 @@ class TestDiSCOStepPaths(DTensorTestBase):
             rule_args=rule_args,
             lr=0.02,
             weight_decay=weight_decay,
-            decoupled_wd=decoupled_wd,
             **topo,
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -664,29 +537,27 @@ class TestDiSCOStepPaths(DTensorTestBase):
 
     # ---- a reduced-Gram rule on the tall units: one all-reduce, no a2a ----
     @with_comms
-    def test_fsdp4_right_polar_on_embeddings(self):
+    def test_fsdp4_gram_polar_on_embeddings(self):
         device = self._device()
         topo = TOPOLOGIES["fsdp4"]
         pd = harness.parallel_dims(world_size=4, device_type=device.type, **topo)
         groups = {
             "embedding": {
                 "match": r"tok_embeddings\.weight",
-                "rule": "right_polar",
+                "rule": "muon",
                 "args": {
                     "steps": 8,
                     "compute": "gram_polar+row-l2",
                     "scale": "sqrt_n",
-                    "work_dtype": "float32",
                 },
             },
             "lm_head": {
                 "match": r"(output|lm_head)\.weight",
-                "rule": "right_polar",
+                "rule": "muon",
                 "args": {
                     "steps": 8,
                     "compute": "gram_polar+row-l2",
                     "scale": "inv_sqrt_n",
-                    "work_dtype": "float32",
                 },
             },
         }
@@ -708,6 +579,12 @@ class TestDiSCOStepPaths(DTensorTestBase):
             n: harness.full_tensor(p).float() for n, p in harness.trainable(model)
         }
         ref = _SameLMOReference(params, rules_from_container(container, model))
+        GRAM_UNITS = {
+            n
+            for n, _ in harness.trainable(model)
+            if n.endswith(("tok_embeddings.weight", "output.weight", "lm_head.weight"))
+        }
+        assert len(GRAM_UNITS) == 2
         failures = []
         for step in range(1, STEPS + 1):
             grads = harness.set_synthetic_grads(model, step, device)
@@ -717,101 +594,12 @@ class TestDiSCOStepPaths(DTensorTestBase):
             for name, p in harness.trainable(model):
                 got, want = harness.full_tensor(p).float(), ref.params[name]
                 d = (got - want).abs().max().item()
-                if d > 1e-4 * max(1.0, want.abs().max().item()):
-                    failures.append(f"step {step} {name}: max |diff| {d:.3e}")
-        ok = harness.all_ranks_agree(not failures, device)
-        if failures and self.rank == 0:
-            print("\n".join(failures[:12]))
-        self.assertTrue(ok, failures[:3])
-
-    @with_comms
-    def test_fsdp4_lm_head_rule(self):
-        """centre -> Gram polar + rows to unit norm -> centre -> scale on the
-        vocabulary-sharded head:
-        two [1, n] all-reduces and one [n, n], no all-to-all."""
-        device = self._device()
-        topo = TOPOLOGIES["fsdp4"]
-        pd = harness.parallel_dims(world_size=4, device_type=device.type, **topo)
-        groups = {
-            "lm_head": {
-                "match": r"(output|lm_head)\.weight",
-                "rule": "lm_head",
-                "args": {"steps": 8, "work_dtype": "float32"},
-            },
-            "router": {"match": r"\.router\.", "args": {"pre": "col-center"}},
-        }
-        cfg = harness.trainer_config(
-            harness.tiny_model_config(moe=True),
-            compute="svd",
-            communication_dtype="float32",
-            extra_groups=groups,
-            **topo,
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            model, container = harness.build_model_and_optimizer(cfg, pd, device, tmp)
-        opt = container.optimizers[0]
-        head = next(e for e in opt.entries if "lm_head" in e.name or "output" in e.name)
-        assert head.rule.post[-1].reduce and head.family.value == "local"
-        params = {
-            n: harness.full_tensor(p).float() for n, p in harness.trainable(model)
-        }
-        ref = _SameLMOReference(params, rules_from_container(container, model))
-        failures = []
-        for step in range(1, STEPS + 1):
-            grads = harness.set_synthetic_grads(model, step, device)
-            container.step()
-            container.zero_grad()
-            ref.step(grads)
-            for name, p in harness.trainable(model):
-                got, want = harness.full_tensor(p).float(), ref.params[name]
-                d = (got - want).abs().max().item()
-                if d > 1e-4 * max(1.0, want.abs().max().item()):
-                    failures.append(f"step {step} {name}: max |diff| {d:.3e}")
-        ok = harness.all_ranks_agree(not failures, device)
-        if failures and self.rank == 0:
-            print("\n".join(failures[:12]))
-        self.assertTrue(ok, failures[:3])
-
-    @with_comms
-    def test_fsdp4_left_polar_routers(self):
-        """centre -> orthogonalise -> centre -> scale on the router gates: the
-        REDUCE post on a unit the all-to-all carries to an owner."""
-        device = self._device()
-        topo = TOPOLOGIES["fsdp4"]
-        pd = harness.parallel_dims(world_size=4, device_type=device.type, **topo)
-        groups = {
-            "router": {
-                "match": r"\.router\.gate\.weight",
-                "rule": "left_polar",
-                "args": {"compute": "svd", "steps": 5},
-            }
-        }
-        cfg = harness.trainer_config(
-            harness.tiny_model_config(moe=True),
-            compute="svd",
-            communication_dtype="float32",
-            extra_groups=groups,
-            **topo,
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            model, container = harness.build_model_and_optimizer(cfg, pd, device, tmp)
-        opt = container.optimizers[0]
-        gate = next(e for e in opt.entries if "router.gate" in e.name)
-        assert gate.rule.post[-1].reduce and gate.rule.kind == "unit"
-        params = {
-            n: harness.full_tensor(p).float() for n, p in harness.trainable(model)
-        }
-        ref = _SameLMOReference(params, rules_from_container(container, model))
-        failures = []
-        for step in range(1, STEPS + 1):
-            grads = harness.set_synthetic_grads(model, step, device)
-            container.step()
-            container.zero_grad()
-            ref.step(grads)
-            for name, p in harness.trainable(model):
-                got, want = harness.full_tensor(p).float(), ref.params[name]
-                d = (got - want).abs().max().item()
-                if d > 1e-4 * max(1.0, want.abs().max().item()):
+                # the Gram rule iterates in fp16 (GramPolar's work dtype): DiSCO's
+                # all-reduced partial Grams and the reference's one Gram round
+                # apart by ~1e-3 of the step (measured max 8.9e-4 at lr 0.1); a
+                # transport fault moves the whole step (~0.1)
+                tol = 3e-3 if name in GRAM_UNITS else 1e-4
+                if d > tol * max(1.0, want.abs().max().item()):
                     failures.append(f"step {step} {name}: max |diff| {d:.3e}")
         ok = harness.all_ranks_agree(not failures, device)
         if failures and self.rank == 0:

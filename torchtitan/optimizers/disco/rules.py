@@ -40,13 +40,13 @@ How the optimizer runs them each step (`optimizer.py`), per unit:
     unit  : rows --all-to-all--> owner: compute, post, scale --all-to-all--> rows
             (an expert batch is already whole on its rank: one batched call)
     apply : w <- decay w - lr U  |  w <- alpha w - U  |  w <- W_next
-            (decay = 1 - lr wd, or 1 - wd with `decoupled_wd`)
+            (decay = 1 - lr wd)
 
 A preset is a function registered by name whose keyword arguments are its
 args; `optimizer.groups.<g>.rule` picks it, `.args` fills them. The built-in
 phases, computes and presets are in `presets.py`: a new optimizer is a
 `Compute` and a preset there, or in its own module, side by side with muon
-and aus.
+and amphione.
 """
 
 import inspect
@@ -118,17 +118,19 @@ class StepCtx(NamedTuple):
     lr: float
     wd: float
     t: int  # 1-based optimizer step
-    decoupled: bool = False  # weight decay independent of lr
+    momentum: float = (
+        0.0  # the group's memory weight beta (read by owns_momentum rules)
+    )
+    nesterov: bool = False  # the group's nesterov (read by owns_momentum rules)
     frozen: torch.Tensor | None = (
         None  # per stacked unit: in the compute's frozen_units (DiSCO sets it)
     )
-    colmask: torch.Tensor | None = None  # per stacked unit: in the compute's col_units, i.e. learns column gains (DiSCO sets it)
+    colmask: torch.Tensor | None = None  # per stacked unit: in the compute's col_units, i.e. learns column scales (DiSCO sets it)
 
     @property
     def decay(self) -> float:
-        """What weight decay scales W by this step: `1 - wd` when decoupled,
-        else `1 - lr wd`."""
-        return 1.0 - self.wd if self.decoupled else 1.0 - self.lr * self.wd
+        """What weight decay scales W by this step: `1 - lr wd`."""
+        return 1.0 - self.lr * self.wd
 
 
 @dataclass
@@ -151,8 +153,9 @@ class Compute:
     state of shape `state_shape(m, n)`, kept on the computing rank between
     steps and checkpointed; the first step sees zeros. `keeps_radius`: the
     step holds each unit's norm, so weight decay would be undone by it.
-    `owns_momentum`: the compute keeps its own moments in its state, so its
-    group passes the raw gradient (momentum 1, no nesterov) and decays nothing.
+    `owns_momentum`: the compute keeps its own moments in its state, at the
+    group's `momentum` and `nesterov` (from the step context); DiSCO hands it
+    the raw gradient and averages nothing for it. Its group decays nothing.
     `output`: "update", "update_coeffs" or "weight" -- see `Result`.
 
     Rows and unit kinds with output "update" implement `core`, which the rule
@@ -442,33 +445,12 @@ def pick(table: dict, key: str, what: str):
     return table[key]
 
 
-_RENAMED = {
-    "pre_norm": "pre",
-    "backend": "compute",
-    "norm_factor": "scale",
-    "safety": "polar_express_safety",
-}
-_ROW_RENAMES = {"pre_norm", "backend", "norm_factor"}
-
-
 def rule_of(group: dict) -> Rule:
     """The rule a param group configures: `group["rule"]` from `RULES`, called
     with `group["args"]` (the preset's defaults fill the rest)."""
     name = group.get("rule", "muon")
     preset = pick(RULES, name, "rule")
     args = dict(group.get("args") or {})
-    old = sorted(set(args) & set(_RENAMED))
-    if old:
-        raise ValueError(
-            f"{name}: args {old} were renamed: "
-            + ", ".join(f"{k} -> {_RENAMED[k]}" for k in old)
-            + (
-                " (a row normalisation such as embed_sqrt is now compute: row-l2"
-                " with scale: sqrt_n; see CONFIG_MIGRATION section 69)"
-                if set(old) & _ROW_RENAMES
-                else ""
-            )
-        )
     safety = args.pop("polar_express_safety", None)
     unknown = set(args) - set(preset.args)
     if unknown:
@@ -483,7 +465,7 @@ def rule_of(group: dict) -> Rule:
             f"{name}: polar_express_safety must be finite and >= 1, got {safety!r}"
         )
     rule, n = _with_polar_express_safety(rule, float(safety))
-    if not n and rule.kind != "rows":  # a row rule inherits the default group's args
+    if not n:  # (DiSCO passes an inherited safety only to polar express computes)
         raise ValueError(
             f"{name}: polar_express_safety needs a polar express compute in the rule"
         )

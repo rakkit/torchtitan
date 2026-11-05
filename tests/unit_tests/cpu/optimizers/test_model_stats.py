@@ -243,7 +243,7 @@ def _container(
     c.log_residual_stats = log_residual_stats
     c.log_gain_stats = log_gain_stats
     c.log_sink_stats = log_sink_stats
-    c.log_norm_freq, c.dense_norm_steps = 10, 500
+    c.log_norm_freq = 10
     c.optimizers = []
     c._norms_armed = False
     c._model_stats_armed = False

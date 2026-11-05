@@ -4,12 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
+
 """The Gram rules: Q from the Gram alone is the polar factor, and a unit split
 over ranks gives the same update as the whole unit on one rank."""
 
 import torch
 
-from torchtitan.optimizers.disco.presets import Centre, GramPolar
+from torchtitan.optimizers.disco.presets import GramPolar, plain
 from torchtitan.optimizers.disco.rules import rule_of
 from torchtitan.optimizers.kernels.gram_newton_schulz import (
     gram_polar_express,
@@ -59,13 +61,17 @@ def test_gram_polar_factor_matches_the_full_kernel():
     torch.testing.assert_close(q.mT @ q, torch.eye(x.shape[1]), rtol=0, atol=2e-3)
 
 
-def test_right_polar_split_rows_agree_with_the_whole():
-    rule = rule_of(
-        dict(
-            rule="right_polar",
-            args={"steps": 8, "scale": "spectral", "work_dtype": "float32"},
-        )
+def _gram_polar(steps=5, scale="spectral", work_dtype="float16"):
+    """The `gram_polar` compute as a rule (pre identity), as muon / sgd build it;
+    `work_dtype` float32 (not a config option) for exact comparisons."""
+    rule = plain("identity", "gram_polar", steps, scale)
+    return dataclasses.replace(
+        rule, compute=dataclasses.replace(rule.compute, work_dtype=work_dtype)
     )
+
+
+def test_gram_polar_split_rows_agree_with_the_whole():
+    rule = _gram_polar(steps=8, work_dtype="float32")
     assert rule.kind == "gram" and isinstance(rule.compute, GramPolar)
     x = _tall(3)
     torch.testing.assert_close(
@@ -73,84 +79,13 @@ def test_right_polar_split_rows_agree_with_the_whole():
     )
 
 
-def test_centring_and_the_lm_head_rule_agree_on_split_rows():
-    x = _tall(5, 80, 16)
-    # col-center as a pre-norm: reduce over rows, then subtract the mean
-    mu = rule_of(dict(rule="muon", args={"pre": "col-center"}))
-    assert mu.pre == (Centre(),) and mu.pre[0].reduce
-    (whole,) = _phases_on_parts(mu.pre, [x], 80)
-    parts = torch.cat(_phases_on_parts(mu.pre, [x[:30], x[30:]], 80))
-    torch.testing.assert_close(parts, whole, rtol=1e-6, atol=1e-6)
-    assert torch.allclose(whole.mean(0), torch.zeros(16), atol=1e-6)
-    # the LM-head rule, every order: centred in, centred out
-    for spectral, order in (
-        (True, "row_then_polar"),
-        (True, "polar_then_row"),
-        (False, "row_then_polar"),
-    ):
-        args = {
-            "steps": 8,
-            "spectral": spectral,
-            "order": order,
-            "work_dtype": "float32",
-        }
-        rule = rule_of(dict(rule="lm_head", args=args))
-        assert rule.kind == ("gram" if spectral else "rows")
-        assert rule.pre[0] == Centre() and rule.pre[-1] == Centre()
-        assert rule.post[-1] == Centre()
-        whole = rule.reference(x).update
-        assert torch.allclose(whole.mean(0), torch.zeros(16), atol=1e-5)  # re-projected
-        torch.testing.assert_close(_split_run(rule, x, 30), whole, rtol=1e-4, atol=1e-5)
-
-
-def _their_row_then_polar(g, alpha=1.0):
-    """Lau & Su's LM-head hybrid, from their optim/hybrid.py (`row_then_polar`,
-    `center_rows=True`), in float64 with an exact inverse square root."""
-    x = g.double()
-    x = x - x.mean(0)
-    x = x / x.norm(dim=1, keepdim=True)
-    x = x - x.mean(0)
-    evals, evecs = torch.linalg.eigh(x.mT @ x)
-    u = x @ (evecs * evals.rsqrt()) @ evecs.mT
-    u = (x * u).sum() ** alpha * u
-    return u - u.mean(0)
-
-
-def test_lm_head_row_then_polar_is_their_hybrid():
-    """A head-like moment: a shared row, and row norms over three decades."""
-    gen = torch.Generator().manual_seed(7)
-    g = torch.randn(200, 16, generator=gen) + 0.5 * torch.randn(1, 16, generator=gen)
-    g = g * torch.logspace(-3, 0, 200)[:, None]
-    for alpha in (1.0, 0.0):
-        args = {"steps": 8, "alpha": alpha, "scale": "one", "work_dtype": "float32"}
-        got = rule_of(dict(rule="lm_head", args=args)).reference(g).update
-        want = _their_row_then_polar(g, alpha).float()
-        torch.testing.assert_close(
-            got, want, rtol=2e-3, atol=2e-3 * want.abs().max().item()
-        )
-    # the other order is a different map, so the reference can tell them apart
-    args = {
-        "steps": 8,
-        "order": "polar_then_row",
-        "scale": "one",
-        "work_dtype": "float32",
-    }
-    other = rule_of(dict(rule="lm_head", args=args)).reference(g).update
-    want = _their_row_then_polar(g, 0.0).float()
-    assert (other - want).abs().max() > 0.1 * want.abs().max()
-
-
 def test_an_all_zero_unit_gives_a_zero_update_not_nan():
     """`EPS` is 1e-30 and the Gram iteration divides by the squared scale, which
     underflows to 0 in fp32 for an all-zero unit unless it is floored."""
     zero = torch.zeros(96, 24)
-    for group in (
-        {"rule": "right_polar", "args": {"steps": 8, "work_dtype": "float32"}},
-        {"rule": "lm_head", "args": {"steps": 8, "work_dtype": "float32"}},
-    ):
-        u = rule_of(group).reference(zero).update
-        assert torch.isfinite(u).all(), group["rule"]
-        assert torch.equal(u, torch.zeros_like(u)), group["rule"]
+    u = _gram_polar(steps=8, work_dtype="float32").reference(zero).update
+    assert torch.isfinite(u).all()
+    assert torch.equal(u, torch.zeros_like(u))
 
 
 def test_a_decayed_moment_gives_no_blow_up():
@@ -163,16 +98,15 @@ def test_a_decayed_moment_gives_no_blow_up():
     backends = ("newtonschulz5", "polar_express") + (
         ("gram_polar_express",) if cuda else ()
     )
-    groups = [
-        {"rule": "sgd", "args": {"compute": "row-l2", "scale": "sqrt_n"}},
-        {"rule": "right_polar", "args": {"steps": 8, "work_dtype": "float32"}},
-    ] + [
+    groups = [{"rule": "sgd", "args": {"compute": "row-l2", "scale": "sqrt_n"}},] + [
         {"rule": "muon", "args": {"compute": b, "steps": 6, "scale": "spectral"}}
         for b in backends
     ]
+    rules = [(g, rule_of(g)) for g in groups] + [
+        ({"rule": "gram_polar", "args": {}}, _gram_polar(steps=8, work_dtype="float32"))
+    ]
     torch.manual_seed(0)
-    for group in groups:
-        rule = rule_of(group)
+    for group, rule in rules:
         healthy = rule.reference(torch.randn(64, 32, device=device)).update.abs().max()
         for a in (1e-21, 1e-23, 1e-25, 1e-30, 1e-36):
             u = rule.reference(torch.randn(64, 32, device=device) * a).update
@@ -184,7 +118,7 @@ def test_a_rank_one_unit_gives_a_finite_polar_factor():
     """The resets re-formed the Gram from its fp16 copy: on a rank-deficient
     unit the rounding left negative eigenvalues that the polynomial blew up
     to inf (4 of 4 seeds on [512, 64] of rank 1)."""
-    rule = rule_of({"rule": "right_polar", "args": {}})
+    rule = _gram_polar()
     for seed in range(4):
         g = torch.Generator().manual_seed(seed)
         u, v = torch.randn(512, 1, generator=g), torch.randn(1, 64, generator=g)

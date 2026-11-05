@@ -50,10 +50,10 @@ def moe_template_config() -> Trainer.Config:
         # `components/data/mix.make_pretrain_dataloader_config`, and a template default
         # that no run uses is a trap: it decides the shape of anything that forgets to.
         # Optimizer: amphione on every hidden matrix (the experts and the router
-        # included; the router gate's row lengths frozen), a sign step on the RMSNorm
+        # included; the router gate's row scales frozen), a sign step on the RMSNorm
         # gains, row-l2 on the embedding and the head. `momentum` of an sgd / muon
-        # group is the new gradient's weight (0.05 = beta 0.95); amphione keeps its
-        # own momentum (`beta`, `nesterov`).
+        # group is the memory weight beta (buf <- beta buf + (1 - beta) g); amphione
+        # takes its group's momentum and keeps the averages.
         optimizer=DiSCOOptimizersContainer.Config(
             groups={
                 "gains": {
@@ -61,51 +61,45 @@ def moe_template_config() -> Trainer.Config:
                     "rule": "sgd",
                     "args": {"pre": "identity", "compute": "sign", "scale": "one"},
                     "lr": 0.5 * _LR,
-                    "momentum": 0.05,
+                    "momentum": 0.95,
                     "nesterov": True,
                     "weight_decay": 0.0,
-                    "decoupled_wd": False,
                 },
                 "default": {
                     "lr": _LR,
                     "weight_decay": 0.0,
-                    "decoupled_wd": False,
-                    "momentum": 1.0,
-                    "nesterov": False,
+                    "momentum": 0.95,
+                    "nesterov": True,
                     "rule": "amphione",
                     "args": {
-                        "beta": 0.95,
-                        "nesterov": True,
-                        "gain_beta": None,
+                        "scale_nesterov": False,  # scales: no Nesterov
                         "compute": "gram_polar_express",
                         "steps": 6,
                         "polar_express_safety": 1.05,
-                        "frozen_length_units": ["moe.router.gate"],
+                        "frozen_scale_units": ["moe.router.gate"],
                     },
                 },
                 "embedding": {
                     "match": r"tok_embeddings\.weight",
-                    "rule": "muon",
+                    "rule": "sgd",
                     "args": {"compute": "row-l2", "scale": "sqrt_n", "pre": "identity"},
                     "lr": 0.001953,
-                    "momentum": 0.05,
+                    "momentum": 0.95,
                     "nesterov": True,
                     "weight_decay": 0.0,
-                    "decoupled_wd": False,
                 },
                 "lm_head": {
                     "match": r"(output|lm_head)\.weight",
-                    "rule": "muon",
+                    "rule": "sgd",
                     "args": {
                         "compute": "row-l2",
                         "scale": "inv_sqrt_n",
                         "pre": "identity",
                     },
                     "lr": 0.125,
-                    "momentum": 0.01,  # beta 0.99 (batch 128 x 4096)
+                    "momentum": 0.99,  # batch 128 x 4096
                     "nesterov": True,
                     "weight_decay": 0.0,
-                    "decoupled_wd": False,
                 },
             }
         ),

@@ -26,11 +26,10 @@ BASE = zeropower._POLAR_EXPRESS_BASE
 def _fresh_compiled_rules():
     """The spy backend gets traced into the cached compiled rule functions;
     drop them around each test so no other test reuses a spy's graph."""
-    from torchtitan.optimizers.disco import presets as _presets, rules as _rules
+    from torchtitan.optimizers.disco import rules as _rules
 
     def clear():
         _rules._COMPILED.clear()
-        _presets._SHIFTED.clear()
         torch._dynamo.reset()
 
     clear()
@@ -94,7 +93,7 @@ def test_the_default_kernel_is_todays_kernel_to_the_bit():
             },
         },
         {
-            "rule": "angular_muown",
+            "rule": "amphione",
             "args": {
                 "compute": "gram_polar_express",
                 "steps": 7,
@@ -149,7 +148,7 @@ def test_the_safety_reaches_the_kernel(group, monkeypatch):
     w = torch.randn(1, 16, 8)
     from torchtitan.optimizers.disco.rules import StepCtx
 
-    ctx = StepCtx(0.01, 0.0, 5, False)
+    ctx = StepCtx(0.01, 0.0, 5)
     state = torch.zeros(1, *rule.compute.state_shape(16, 8)) if rule.has_state else None
     try:
         rule.run_whole(x, w, ctx, state)
@@ -158,8 +157,8 @@ def test_the_safety_reaches_the_kernel(group, monkeypatch):
     assert seen and all(s == (7, 1.05) for s in seen), seen
 
 
-def test_the_old_key_is_refused_as_renamed():
-    with pytest.raises(ValueError, match="safety -> polar_express_safety"):
+def test_the_old_key_is_refused():
+    with pytest.raises(ValueError, match="unknown args"):
         rule_of(
             {
                 "rule": "muon",
@@ -190,16 +189,18 @@ def test_a_safety_below_one_is_refused(compute):
         )
 
 
-def test_an_inheriting_row_rule_ignores_the_safety():
-    """An embedding group inherits the default group's args: its row-l2 compute has no polar express iteration."""
-    rule = rule_of(
-        {
-            "rule": "muon",
-            "args": {
-                "compute": "row-l2",
-                "scale": "sqrt_n",
-                "polar_express_safety": 1.05,
-            },
-        }
-    )
-    assert rule.kind == "rows"
+def test_a_row_rule_that_sets_the_safety_is_refused():
+    """A group's own safety needs a polar express compute, a row rule's too
+    (inheriting it from the default group is handled by DiSCO: see
+    test_param_groups.test_the_safety_is_inherited_only_where_it_applies)."""
+    with pytest.raises(ValueError, match="polar_express_safety"):
+        rule_of(
+            {
+                "rule": "muon",
+                "args": {
+                    "compute": "row-l2",
+                    "scale": "sqrt_n",
+                    "polar_express_safety": 1.05,
+                },
+            }
+        )

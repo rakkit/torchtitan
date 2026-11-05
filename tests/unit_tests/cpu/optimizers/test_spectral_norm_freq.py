@@ -46,7 +46,7 @@ class _Fake:
         self.kw = {"norms_to_log": norms_to_log, **kw}
 
 
-def _container(monkeypatch, freq, er_freq=0, log_norm_freq=10, dense=500, export=True):
+def _container(monkeypatch, freq, er_freq=0, log_norm_freq=10, export=True):
     import torchtitan.optimizers.container as container_mod
 
     monkeypatch.setattr(container_mod, "DiSCO", _Fake)
@@ -58,7 +58,7 @@ def _container(monkeypatch, freq, er_freq=0, log_norm_freq=10, dense=500, export
         er_freq,
         freq,
     )
-    c.log_norm_freq, c.dense_norm_steps = log_norm_freq, dense
+    c.log_norm_freq = log_norm_freq
     c.gram_level, c.log_metrics_locally = 0, False
     c.spectrum_logging_config = MagicMock(enable_export=export)
     c._head_input, c._model_stats_armed, c.gnoise = None, False, None
@@ -88,7 +88,7 @@ def test_the_default_changes_nothing(monkeypatch):
     c, fake = _container(monkeypatch, 0)
     for step in (1, 2, 499, 500, 510, 515, 600, 700):
         kw = _armed(c, fake, step)
-        if step <= 500 or step % 10 == 0:
+        if step == 1 or step % 10 == 0:
             assert kw["norms_to_log"] == NORMS and kw["spectral"] is True, step
             assert kw["track_spectrum"] is True, step
         else:
@@ -97,12 +97,10 @@ def test_the_default_changes_nothing(monkeypatch):
 
 @pytest.mark.parametrize("freq", [100, 250])
 def test_the_spectral_part_runs_on_its_cadence_only(monkeypatch, freq):
-    c, fake = _container(monkeypatch, freq)
+    c, fake = _container(monkeypatch, freq, log_norm_freq=1)  # every step logs norms
     for step in (1, 2, 50, 99, 100, 101, 250, 499, 500, 510, 520, 600, 1000):
         kw = _armed(c, fake, step)
-        if kw is None:
-            assert step > 500 and step % 10, step
-            continue
+        assert kw is not None, step
         due = step == 1 or step % freq == 0
         assert kw["spectral"] is due, (freq, step)
         assert kw["norms_to_log"] == (NORMS if due else CHEAP), (freq, step)
@@ -115,7 +113,7 @@ def test_the_spectral_part_runs_on_its_cadence_only(monkeypatch, freq):
 
 
 def test_with_the_effective_rank_cadence(monkeypatch):
-    c, fake = _container(monkeypatch, 100, er_freq=200)
+    c, fake = _container(monkeypatch, 100, er_freq=200, log_norm_freq=1)
     assert _armed(c, fake, 100)["norms_to_log"] == [
         n for n in NORMS if n != "effective_rank"
     ]
@@ -169,22 +167,12 @@ RULES = {
     "muon_wd": dict(
         rule="muon",
         args={"compute": "svd"},
-        group=dict(momentum=0.1, nesterov=True, weight_decay=0.1),
+        group=dict(momentum=0.9, nesterov=True, weight_decay=0.1),
     ),
-    "f_mat_row_off": dict(
-        rule="angular_muown",
-        args=dict(
-            compute="svd",
-            scale="one",
-            warmup=0,
-            c=0.0,
-            native_norm=False,
-            sphere="matrix",
-            tangent=False,
-            radius=2.0,
-            magnitude_lr=0.3,
-        ),
-        group=dict(momentum=1.0, nesterov=False, weight_decay=0.0),
+    "amphione": dict(
+        rule="amphione",
+        args=dict(compute="svd"),
+        group=dict(momentum=0.0, nesterov=False, weight_decay=0.0),
     ),
 }
 

@@ -25,15 +25,18 @@ from torchtitan.models.opt_moe import model_registry
 from torchtitan.models.opt_moe.config_registry import moe_template_config
 from torchtitan.optimizers.container import DiSCOOptimizersContainer
 
-# The production rules from cfg-cpswa.py: embeddings, lm_head and router gates
-# use the row-separable rules and never see the LMO.
-EMBED_GROUPS = {  # `optimizer.groups` entries (`default` is added by trainer_config)
+# The embedding and the head: row-l2 rules, as the production recipe's.
+# `optimizer.groups` entries (`default` is added by trainer_config); their own rule, so
+# an amphione or hyperball default does not hand them its rule.
+EMBED_GROUPS = {
     "embedding": {
         "match": r"tok_embeddings\.weight",
+        "rule": "sgd",
         "args": {"compute": "row-l2", "scale": "sqrt_n"},
     },
     "lm_head": {
         "match": r"(output|lm_head)\.weight",
+        "rule": "sgd",
         "args": {"compute": "row-l2", "scale": "inv_sqrt_n"},
     },
 }
@@ -90,15 +93,13 @@ def trainer_config(
     cp: int = 1,
     ep: int = 1,
     lr: float = 0.1,
-    momentum: float = 0.1,
+    momentum: float = 0.9,
     nesterov: bool = False,
     weight_decay: float = 0.0,
-    decoupled_wd: bool = False,
     compute: str = "newtonschulz5",
     steps: int = 5,
     scale: str = "spectral",
     pre: str = "identity",
-    aus: bool = False,
     rule: str | None = None,
     rule_args: dict | None = None,
     extra_groups: dict | None = None,
@@ -126,10 +127,9 @@ def trainer_config(
         "default": {
             "lr": lr,
             "weight_decay": weight_decay,
-            "decoupled_wd": decoupled_wd,
             "momentum": momentum,
             "nesterov": nesterov,
-            "rule": rule or ("aus" if aus else "muon"),
+            "rule": rule or "muon",
             "args": {
                 k: v
                 for k, v in {

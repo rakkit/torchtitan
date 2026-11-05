@@ -188,13 +188,6 @@ class Trainer(Configurable):
 
                 gnoise.validate(log_norm_freq=log_norm_freq)
                 refuse_unsupported(parallelism=self.parallelism, training=self.training)
-            dense = getattr(self.optimizer, "dense_norm_steps", 0)
-            if dense > self.metrics.dense_log_steps:
-                raise ValueError(
-                    f"optimizer.dense_norm_steps ({dense}) needs "
-                    f"metrics.dense_log_steps >= it ({self.metrics.dense_log_steps}): "
-                    "norms are only computed on metric-logging steps."
-                )
             if (
                 self.metrics.save_all_shard_ranks
                 and not self.metrics.save_for_all_ranks

@@ -55,7 +55,6 @@ from torchtitan.tools import filesystem
 from torchtitan.tools.utils import GarbageCollection
 
 from .base import (
-    apply_reconfigure_lrs,
     BaseCheckpointManager,
     DATALOADER,
     EMA,
@@ -280,7 +279,6 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
         self.load_only = config.load_only
         self.exclude_from_loading = config.exclude_from_loading
-        apply_reconfigure_lrs(config.reconfigure_lrs, optimizers)
 
         self.initial_load_path = config.initial_load_path
         self.initial_load_model_only = config.initial_load_model_only

@@ -4,14 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""`amphione` (AmphioneMap, the final recipe) and `onerate` (the study's
-legacy form on angular_muown, kept for ablations).
+"""`amphione` (AmphioneMap, the final recipe).
 
-1. `onerate` with the stored recipe runs' args is the rule those runs used.
-2. `amphione` steps bitwise as `onerate` (weights and state, with and without
-   column gains), on the unit and inside DiSCO on fused parameters.
-3. `amphione`'s step is the one its docstring writes down (a reference from
-   those equations, exact polar in place of Polar Express)."""
+1. Its step is the one its docstring writes down (a reference from those
+   equations, exact polar in place of Polar Express; and the row-l2 direction
+   of the conv group).
+2. Inside DiSCO on fused parameters (q / k / v of one wqkv, w1 / w3 of one w13)
+   it is its compute run on each unit whole, with the masks from their
+   definitions (column scales, frozen row lengths).
+3. What it declares and refuses."""
 
 import dataclasses
 import os
@@ -23,91 +24,53 @@ import torch.distributed as dist
 from torch import nn
 
 from torchtitan.models.common.param_layout import ParamLayout, qkv_units, stacked_units
-from torchtitan.optimizers.disco.optimizer import DiSCO
-from torchtitan.optimizers.disco.presets import AMPHIONE_COLUMN_UNITS, AmphioneMap
+from torchtitan.optimizers.disco.optimizer import _unit_type, DiSCO
+from torchtitan.optimizers.disco.presets import (
+    AMPHIONE_COLUMN_SCALE_UNITS,
+    AmphioneMap,
+    Orthogonalise,
+    RowL2,
+)
 from torchtitan.optimizers.disco.rules import Compute, Rule, rule_of, StepCtx
 
 TABLE = {"shape": "table", "points": [[0, 1.0], [4, 0.5], [8, 0.0]]}
-
-# job_config optimizer.groups.default.args of the stored recipe run
-# v2ps2-f-row-row-off-w512-32x-53.7B-bs.256-...-gains.sign0.5-seed.1-stats (eta table shortened)
-RECIPE = dict(
-    compute="gram_polar_express",
-    steps=6,
-    scale="one",
-    warmup=0,
-    c=0.0,
-    eta=TABLE,
-    native_norm=False,
-    sphere="row",
-    magnitude_shape="row",
-    tangent=False,
-    radius=4.0,
-    magnitude_lr=1.0,
-    magnitude_rule="sign",
-    polar_express_safety=1.05,  # the stored configs spelled it `safety`
-    gain_lr="tied",
-)
-# the stored column run v2ps2-f-row-row-off-w1024-2x-13.4B-bs.128-...-col.on-...-colk.0.0625-cu.in-...
-COLUMNS = dict(
-    col_scale=True, col_gain_lr_mult=0.0625, col_units=list(AMPHIONE_COLUMN_UNITS)
-)
-STUDY = {
-    "eta": TABLE,
-    "radius": 4.0,
-    "polar_express_safety": 1.05,
-}  # onerate's radius default is 4
-STUDY_AMPHIONE = {"polar_express_safety": 1.05, "gain_beta": 0.9}
-# the stepping tests: no quack kernel on CPU (Gram Polar Express), so both rules
-# take the exact SVD polar. amphione has no step-1 rescale: onerate at radius 1.
-# amphione steps at the trainer's lr (no eta schedule): onerate without its eta.
-STEP = {"radius": 1.0, "compute": "svd"}
-STEP_AMPHIONE = {"gain_beta": 0.9, "compute": "svd"}
-# amphione's default gain_beta (None) is beta: onerate's lengths average at 0.95 too
-STEP_DEFAULT = {**STEP, "betas": (0.95, 0.95)}
-STEP_AMPHIONE_DEFAULT = {"compute": "svd"}
+# the stepping tests: no quack kernel on CPU (Gram Polar Express): the exact SVD polar
+STEP_AMPHIONE = {"compute": "svd"}
+LR, BETA = 0.05, 0.95  # the group's momentum: amphione's direction and its scales
 
 
-def _pair(columns, onerate_args, amphione_args):
-    cols = COLUMNS if columns else {}
-    return (
-        rule_of({"rule": "onerate", "args": {**onerate_args, **cols}}),
-        rule_of({"rule": "amphione", "args": {**amphione_args, "columns": columns}}),
+def test_amphione_has_the_recipe_direction():
+    """The production recipe: Gram Polar Express, 6 steps, safety 1.05, no scale."""
+    rule = rule_of({"rule": "amphione", "args": {"polar_express_safety": 1.05}})
+    assert rule.compute.direction == Rule(
+        (), Orthogonalise("gram_polar_express", 6, polar_express_safety=1.05)
     )
-
-
-def _rules(columns):
-    study = rule_of(
-        {"rule": "angular_muown", "args": {**RECIPE, **(COLUMNS if columns else {})}}
-    )
-    return (study, *_pair(columns, STUDY, STUDY_AMPHIONE))
-
-
-@pytest.mark.parametrize("columns", [False, True])
-def test_onerate_is_the_study_recipe(columns):
-    study, onerate, _ = _rules(columns)
-    assert onerate == study
-
-
-@pytest.mark.parametrize("columns", [False, True])
-def test_amphione_has_the_study_direction(columns):
-    study, _, amphione = _rules(columns)
-    assert amphione.compute.direction == study.compute.direction
 
 
 def test_amphione_defaults():
     cm = rule_of({"rule": "amphione"}).compute
     assert isinstance(cm, AmphioneMap)
-    assert (cm.columns, cm.col_units) == (False, ())
-    assert (cm.beta, cm.nesterov, cm.gain_beta) == (0.95, True, None)
-    assert (cm.column_units, cm.column_lr_mult) == (AMPHIONE_COLUMN_UNITS, 0.0625)
+    assert (cm.column_scales, cm.col_units) == (False, ())
+    assert cm.scale_nesterov is False
+    assert (cm.column_scale_units, cm.column_scale_lr_mult) == (
+        AMPHIONE_COLUMN_SCALE_UNITS,
+        0.0625,
+    )
     assert cm.direction.compute.backend == "gram_polar_express"
     assert rule_of(
         {"rule": "amphione", "args": {"polar_express_safety": 1.01}}
     ) == rule_of({"rule": "amphione"})
     assert rule_of(
-        {"rule": "amphione", "args": {"columns": True}}
-    ).compute.col_units == (AMPHIONE_COLUMN_UNITS)
+        {"rule": "amphione", "args": {"column_scales": True}}
+    ).compute.col_units == (AMPHIONE_COLUMN_SCALE_UNITS)
+
+
+@pytest.mark.parametrize("arg", ["beta", "nesterov", "gain_beta"])
+def test_amphione_takes_the_groups_momentum_not_its_own(arg):
+    """One momentum per group: amphione reads the group's `momentum` and
+    `nesterov` from the step context; it has no momentum args of its own."""
+    with pytest.raises(ValueError, match="unknown args"):
+        rule_of({"rule": "amphione", "args": {arg: 0.9}})
 
 
 def test_amphione_has_no_eta_schedule():
@@ -119,74 +82,19 @@ def test_amphione_has_no_eta_schedule():
 
 @pytest.mark.parametrize("compute", ["polar_express", "newtonschulz5", "svd"])
 def test_amphione_takes_any_whole_unit_orthogonaliser(compute):
-    onerate = rule_of({"rule": "onerate", "args": {"compute": compute}})
     amphione = rule_of({"rule": "amphione", "args": {"compute": compute}})
-    assert amphione.compute.direction == onerate.compute.direction
+    assert amphione.compute.direction == Rule((), Orthogonalise(compute, 6))
 
 
-def test_amphione_refuses_a_gram_compute_and_a_row_direction_without_a_row_compute():
+def test_amphione_refuses_a_gram_compute_and_row_direction():
     with pytest.raises(ValueError, match="Gram compute"):
         rule_of({"rule": "amphione", "args": {"compute": "gram_polar"}})
-    with pytest.raises(ValueError, match="row_direction needs a row compute"):
-        rule_of({"rule": "amphione", "args": {"row_direction": True}})
-
-
-# ------------------------------------------------------- row computes: row_direction
-# the stored conv group's args (q, k, v conv weights) of
-# v2ps2-f-row-row-off-w1024-2x-13.4B-bs.128-...-cv.dlncq-cvg.1-gains.sign0.5-seed.1-stats
-CONV_RECIPE = dict(
-    compute="row-l2",
-    steps=6,
-    scale="one",
-    warmup=0,
-    c=0.0,
-    native_norm=False,
-    sphere="row",
-    magnitude_shape="row",
-    tangent=False,
-    radius=4.0,
-    magnitude_lr=1.0,
-    magnitude_rule="sign",
-    gain_lr="tied",
-    row_direction=True,
-)
-
-
-def test_onerate_is_the_study_conv_rule():
-    assert rule_of({"rule": "onerate", "args": dict(CONV_RECIPE)}) == rule_of(
-        {"rule": "angular_muown", "args": dict(CONV_RECIPE)}
-    )
-
-
-@pytest.mark.parametrize("scale", ["one", "sqrt_n", "inv_sqrt_n"])
-def test_a_row_compute_without_row_direction_is_the_plain_row_rule(scale):
-    """An embedding or head group that inherits `rule: amphione` and sets its own
-    row compute gets that row rule, as under hyperball / elr / angular_muown."""
-    args = {"compute": "row-l2", "scale": scale}
-    amphione = rule_of({"rule": "amphione", "args": args})
-    assert amphione.kind == "rows"
-    assert not isinstance(amphione.compute, AmphioneMap)
-    assert amphione == rule_of({"rule": "onerate", "args": args})
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_a_row_direction_steps_bitwise_as_the_study_conv_rule(dtype):
-    """row-l2 as the direction (row_direction) on [C, 4] conv-like units, against
-    onerate with the stored conv group's args at radius 1 (amphione has no step-1
-    rescale) and the same row-length average."""
-    onerate = rule_of({"rule": "onerate", "args": {**CONV_RECIPE, "radius": 1.0}})
-    amphione = rule_of(
-        {
-            "rule": "amphione",
-            "args": {"compute": "row-l2", "row_direction": True, "gain_beta": 0.9},
-        }
-    )
-    assert isinstance(amphione.compute, AmphioneMap)
-    w, grads = _case(units=3, m=16, n=4, dtype=dtype)
-    for (wa, sa), (wb, sb) in zip(
-        _run(amphione.compute, w, grads), _run(onerate.compute, w, grads)
-    ):
-        assert torch.equal(wa, wb) and torch.equal(sa, sb)
+    with pytest.raises(
+        ValueError, match="unknown args"
+    ):  # no flag: a row compute is the row direction
+        rule_of(
+            {"rule": "amphione", "args": {"compute": "row-l2", "row_direction": True}}
+        )
 
 
 def _case(units=3, m=16, n=8, steps=9, seed=0, dtype=torch.float32):
@@ -199,35 +107,21 @@ def _case(units=3, m=16, n=8, steps=9, seed=0, dtype=torch.float32):
     return w, grads
 
 
-def _run(cm, w, grads, colmask=None, lr=0.03):
+def _run(cm, w, grads, colmask=None, lr=0.03, beta=BETA, nesterov=True):
     state = w.new_zeros(w.shape[0], *cm.state_shape(*w.shape[1:]))
     out = []
     for t, G in enumerate(grads, start=1):
-        res = cm.run(G, w, state, StepCtx(lr, 0.0, t, colmask=colmask))
+        ctx = StepCtx(lr, 0.0, t, momentum=beta, nesterov=nesterov, colmask=colmask)
+        res = cm.run(G, w, state, ctx)
         w, state = res.weight, res.state
         out.append((w, state))
     return out
 
 
-@pytest.mark.parametrize("columns", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-@pytest.mark.parametrize(
-    "onerate_args,amphione_args",
-    [(STEP, STEP_AMPHIONE), (STEP_DEFAULT, STEP_AMPHIONE_DEFAULT)],
-    ids=["gain_beta 0.9", "gain_beta default"],
-)
-def test_amphione_steps_bitwise_as_onerate(columns, dtype, onerate_args, amphione_args):
-    onerate, amphione = _pair(columns, onerate_args, amphione_args)
-    w, grads = _case(dtype=dtype)
-    mask = torch.tensor([True, False, True]) if columns else None
-    for (wa, sa), (wb, sb) in zip(
-        _run(amphione.compute, w, grads, mask), _run(onerate.compute, w, grads, mask)
-    ):
-        assert torch.equal(wa, wb) and torch.equal(sa, sb)
-
-
 def test_amphione_columns_need_the_mask():
-    _, amphione = _pair(True, STEP, STEP_AMPHIONE)
+    amphione = rule_of(
+        {"rule": "amphione", "args": {**STEP_AMPHIONE, "column_scales": True}}
+    )
     w, grads = _case()
     with pytest.raises(ValueError, match="mask"):
         _run(amphione.compute, w, grads[:1])
@@ -241,11 +135,22 @@ class _Polar(Compute):
         return u @ vh
 
 
-LR, BETA = 0.05, 0.95  # the lengths average at beta (gain_beta default)
-
-
-def _reference(w, grads, columns):
-    """The docstring's step, unit by unit."""
+def _reference(
+    w,
+    grads,
+    columns,
+    row_direction=False,
+    beta=BETA,
+    nesterov=True,
+    scale_nesterov=False,
+    sum_form=False,
+):
+    """The docstring's step, unit by unit, at the group's momentum `beta`:
+    M <- beta M + (1 - beta) D, O = Orth(beta M + (1 - beta) D) with `nesterov`
+    (else Orth(M)); the row and column scales average at beta, with
+    `scale_nesterov` their sign steps take beta m + (1 - beta) gamma.
+    `row_direction`: O = rowl2(.) of the same input. `sum_form`: the direction
+    as the code before wave 2 ran it, M <- beta M + D, O = Orth(D + beta M)."""
     out = []
     for W0, Gs in zip(w, zip(*grads)):
         g = W0.norm(dim=-1)
@@ -261,42 +166,98 @@ def _reference(w, grads, columns):
                 G = G * c[None, :]
             gamma = (G * U).sum(dim=-1)
             D = g[:, None] * G
-            M = BETA * M + D
-            u, _, vh = torch.linalg.svd(D + BETA * M, full_matrices=False)
-            O = u @ vh
+            if sum_form:
+                M = beta * M + D
+                X = D + beta * M if nesterov else M
+            else:
+                M = beta * M + (1 - beta) * D
+                X = beta * M + (1 - beta) * D if nesterov else M
+            if row_direction:
+                O = X / X.norm(dim=-1, keepdim=True)
+            else:
+                u, _, vh = torch.linalg.svd(X, full_matrices=False)
+                O = u @ vh
             O = O * U.norm() / O.norm()
             V = U - eta_t * O
             U = V / V.norm(dim=-1, keepdim=True)
-            mg = BETA * mg + (1 - BETA) * gamma
-            g = g - eta_t * torch.sign(mg)
+            mg = beta * mg + (1 - beta) * gamma
+            sg = beta * mg + (1 - beta) * gamma if scale_nesterov else mg
+            g = g - eta_t * torch.sign(sg)
             if columns:
-                mc = BETA * mc + (1 - BETA) * gamma_c
-                c = c - eta_t / 16 * torch.sign(mc)
+                mc = beta * mc + (1 - beta) * gamma_c
+                sc = beta * mc + (1 - beta) * gamma_c if scale_nesterov else mc
+                c = c - eta_t / 16 * torch.sign(sc)
             unit.append(g[:, None] * U * c[None, :])
         out.append(unit)
     return [torch.stack(ws) for ws in zip(*out)]
 
 
+def _f64_case(seed=1, units=3, m=12, n=8, steps=6):
+    gen = torch.Generator().manual_seed(seed)
+    w = torch.randn(units, m, n, generator=gen, dtype=torch.float64) / n**0.5
+    grads = [
+        0.1 * torch.randn(units, m, n, generator=gen, dtype=torch.float64)
+        for _ in range(steps)
+    ]
+    return w, grads
+
+
+@pytest.mark.parametrize(
+    "beta,nesterov,scale_nesterov",
+    [(0.95, True, False), (0.9, False, False), (0.95, True, True), (0.0, True, False)],
+)
 @pytest.mark.parametrize("columns", [False, True])
-def test_amphione_step_is_its_equations(columns):
+def test_amphione_step_is_its_equations(columns, beta, nesterov, scale_nesterov):
     rule = rule_of(
         {
             "rule": "amphione",
-            "args": {"columns": columns},
+            "args": {"column_scales": columns, "scale_nesterov": scale_nesterov},
         }
     )
     cm = dataclasses.replace(rule.compute, direction=Rule((), _Polar(), scale="one"))
-    gen = torch.Generator().manual_seed(1)
-    w = torch.randn(3, 12, 8, generator=gen, dtype=torch.float64) / 8**0.5
+    w, grads = _f64_case()
+    mask = torch.ones(3, dtype=torch.bool) if columns else None
+    want = _reference(
+        w,
+        grads,
+        columns,
+        beta=beta,
+        nesterov=nesterov,
+        scale_nesterov=scale_nesterov,
+    )
+    got = _run(cm, w, grads, mask, lr=LR, beta=beta, nesterov=nesterov)
+    for (gw, _), ww in zip(got, want):
+        torch.testing.assert_close(gw, ww, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("nesterov", [True, False])
+@pytest.mark.parametrize("columns", [False, True])
+def test_the_averaged_direction_takes_the_sum_forms_step(columns, nesterov):
+    """The direction's input in the averaged form is (1 - beta) x the one of the
+    sum form the code ran before wave 2; the polar factor and the rescale to
+    ||U||_F drop that factor, so every step is the same (to rounding)."""
+    w, grads = _f64_case(seed=4, steps=8)
+    a = _reference(w, grads, columns, nesterov=nesterov)
+    b = _reference(w, grads, columns, nesterov=nesterov, sum_form=True)
+    for x, y in zip(a, b):
+        torch.testing.assert_close(x, y, rtol=1e-11, atol=1e-13)
+
+
+def test_amphione_with_row_l2_is_its_equations():
+    """The conv group's rule: amphione with each row of D + beta M normalised as
+    the direction (RowL2 runs in fp32, so to ~1e-6)."""
+    cm = rule_of({"rule": "amphione", "args": {"compute": "row-l2"}}).compute
+    assert isinstance(cm.direction.compute, RowL2)
+    gen = torch.Generator().manual_seed(2)
+    w = torch.randn(3, 12, 4, generator=gen, dtype=torch.float64) / 2.0
     grads = [
-        0.1 * torch.randn(3, 12, 8, generator=gen, dtype=torch.float64)
+        0.1 * torch.randn(3, 12, 4, generator=gen, dtype=torch.float64)
         for _ in range(6)
     ]
-    mask = torch.ones(3, dtype=torch.bool) if columns else None
     for (got, _), want in zip(
-        _run(cm, w, grads, mask, lr=LR), _reference(w, grads, columns)
+        _run(cm, w, grads, lr=LR), _reference(w, grads, False, row_direction=True)
     ):
-        torch.testing.assert_close(got, want, rtol=1e-10, atol=1e-12)
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
 
 
 # ------------------------------------------------------- in DiSCO: fused parameters
@@ -329,18 +290,24 @@ class _NoParallel:
 
 
 D, H, KV, HD, FF = 8, 2, 2, 4, 16
+
+
 NAMES = [
     "layers.0.attention.qkv_linear.wqkv.weight",
     "layers.0.attention.wo.weight",
     "layers.0.feed_forward.w13.weight",
     "layers.0.feed_forward.w2.weight",
 ]
+
+
 LAYOUTS = {
     NAMES[0]: ParamLayout("matrix", units=qkv_units(H, KV, HD, D)),
     NAMES[1]: ParamLayout("matrix"),
     NAMES[2]: ParamLayout("matrix", units=stacked_units(("w1", "w3"), FF, D)),
     NAMES[3]: ParamLayout("matrix"),
 }
+
+
 SHAPES = [((H + 2 * KV) * HD, D), (D, H * HD), (2, FF, D), (D, FF)]
 
 
@@ -352,8 +319,8 @@ def _disco(rule, args, seed=0):
             {
                 "params": params,
                 "param_names": NAMES,
-                "momentum": 1.0,
-                "nesterov": False,
+                "momentum": BETA,  # the recipe's: amphione reads it, DiSCO averages nothing
+                "nesterov": True,
                 "weight_decay": 0.0,
             }
         ],
@@ -366,54 +333,90 @@ def _disco(rule, args, seed=0):
     return opt, params
 
 
-@pytest.mark.parametrize("columns", [False, True])
-def test_disco_amphione_is_onerate(one_rank, columns):
-    cols = COLUMNS if columns else {}
-    a, pa = _disco("amphione", {**STEP_AMPHIONE, "columns": columns})
-    b, pb = _disco("onerate", {**STEP, **cols})
-    for s in range(6):
+def _units_step(opt, weights, grads, state, t, lr=0.03):
+    """One step of amphione's compute on every unit DiSCO declared, each whole,
+    the masks from their definitions; returns the new weights."""
+    new = []
+    for e, W, G in zip(opt.entries, weights, grads):
+        cm = e.rule.compute
+        W2, G2 = W.reshape(-1, e.view[1]), G.reshape(-1, e.view[1])
+        out = W2.clone()
+        for k, u in enumerate(e.units):
+            rows = [(a, a + n) for a, n in u.rows.runs]
+            Wu = torch.cat([W2[a:b] for a, b in rows])
+            Gu = torch.cat([G2[a:b] for a, b in rows])
+            ut = _unit_type(e, u)
+            grp = opt.param_groups[e.group_idx]
+            ctx = StepCtx(
+                lr,
+                0.0,
+                t,
+                momentum=float(grp["momentum"]),
+                nesterov=bool(grp["nesterov"]),
+                frozen=torch.tensor([ut in cm.frozen_units])
+                if cm.frozen_units
+                else None,
+                colmask=torch.tensor([ut in cm.col_units]) if cm.col_units else None,
+            )
+            st = state.get((e.i, k))
+            if st is None:
+                st = torch.zeros(1, *cm.state_shape(*u.shape))
+            res = cm.run(Gu[None], Wu[None], st, ctx)
+            state[(e.i, k)] = res.state
+            off = 0
+            for a, b in rows:
+                out[a:b] = res.weight[0][off : off + b - a]
+                off += b - a
+        new.append(out.reshape(W.shape))
+    return new
+
+
+def _check_disco_against_units(opt, params, steps=6):
+    weights = [p.detach().clone() for p in params]
+    state = {}
+    for s in range(steps):
         g = torch.Generator().manual_seed(100 + s)
         grads = [0.1 * torch.randn(*shape, generator=g) for shape in SHAPES]
-        for ps in (pa, pb):
-            for p, gr in zip(ps, grads):
-                p.grad = gr.clone()
-        a.step()
-        b.step()
-        for x, y in zip(pa, pb):
-            assert torch.equal(x, y)
-            assert torch.equal(a.state[x]["rule_state"], b.state[y]["rule_state"])
-        assert a.eta_used == b.eta_used
-    if columns:  # the column-gain logging reads amphione's state as onerate's
-        assert a.col_gain_metrics(a.col_gain_snapshot()) == b.col_gain_metrics(
-            b.col_gain_snapshot()
-        )
+        for p, gr in zip(params, grads):
+            p.grad = gr.clone()
+        opt.step()
+        weights = _units_step(opt, weights, grads, state, s + 1)
+        for p, want in zip(params, weights):
+            torch.testing.assert_close(p.detach(), want, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("columns", [False, True])
+def test_disco_amphione_is_its_compute_unit_by_unit(one_rank, columns):
+    opt, params = _disco("amphione", {**STEP_AMPHIONE, "column_scales": columns})
+    _check_disco_against_units(opt, params)
 
 
 # ------------------------------------------- frozen row lengths (the MoE router gate)
-FROZEN = (AMPHIONE_COLUMN_UNITS[1], AMPHIONE_COLUMN_UNITS[3])  # wk in wqkv, w1 in w13
+FROZEN = (
+    AMPHIONE_COLUMN_SCALE_UNITS[1],
+    AMPHIONE_COLUMN_SCALE_UNITS[3],
+)  # wk in wqkv, w1 in w13
 
 
 def _run_frozen(cm, w, grads, frozen, lr=0.03):
     state = w.new_zeros(w.shape[0], *cm.state_shape(*w.shape[1:]))
     out = []
     for t, G in enumerate(grads, start=1):
-        res = cm.run(G, w, state, StepCtx(lr, 0.0, t, frozen=frozen))
+        ctx = StepCtx(lr, 0.0, t, momentum=BETA, nesterov=True, frozen=frozen)
+        res = cm.run(G, w, state, ctx)
         w, state = res.weight, res.state
         out.append((w, state))
     return out
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_amphione_frozen_lengths_step_bitwise_as_onerate(dtype):
-    onerate = rule_of({"rule": "onerate", "args": {**STEP, "frozen_units": ["u"]}})
+def test_amphione_frozen_lengths_keep_the_start_and_turn_the_rows(dtype):
     amphione = rule_of(
-        {"rule": "amphione", "args": {**STEP_AMPHIONE, "frozen_length_units": ["u"]}}
+        {"rule": "amphione", "args": {**STEP_AMPHIONE, "frozen_scale_units": ["u"]}}
     )
     w, grads = _case(dtype=dtype)
     mask = torch.tensor([True, False, True])
     out = _run_frozen(amphione.compute, w, grads, mask)
-    for (wa, sa), (wb, sb) in zip(out, _run_frozen(onerate.compute, w, grads, mask)):
-        assert torch.equal(wa, wb) and torch.equal(sa, sb)
     n = w.shape[-1]
     start = out[0][1][..., n]  # g after step 1: the frozen units' start lengths
     assert torch.equal(start[0], w[0].norm(dim=-1)) and torch.equal(
@@ -428,9 +431,9 @@ def test_amphione_frozen_lengths_step_bitwise_as_onerate(dtype):
 @pytest.mark.parametrize(
     "args,match",
     [
-        ({"frozen_length_units": ["u", "u"]}, "distinct unit types"),
-        ({"frozen_length_units": [""]}, "distinct unit types"),
-        ({"frozen_length_units": ["u"], "columns": True}, "with columns"),
+        ({"frozen_scale_units": ["u", "u"]}, "distinct unit types"),
+        ({"frozen_scale_units": [""]}, "distinct unit types"),
+        ({"frozen_scale_units": ["u"], "column_scales": True}, "with column_scales"),
     ],
 )
 def test_amphione_frozen_lengths_refusals(args, match):
@@ -440,7 +443,7 @@ def test_amphione_frozen_lengths_refusals(args, match):
 
 def test_amphione_frozen_lengths_need_the_mask():
     amphione = rule_of(
-        {"rule": "amphione", "args": {**STEP_AMPHIONE, "frozen_length_units": ["u"]}}
+        {"rule": "amphione", "args": {**STEP_AMPHIONE, "frozen_scale_units": ["u"]}}
     )
     w, grads = _case()
     with pytest.raises(ValueError, match="needs the stack's mask"):
@@ -450,38 +453,33 @@ def test_amphione_frozen_lengths_need_the_mask():
 def test_amphione_frozen_lengths_are_the_groups_own():
     from torchtitan.optimizers.disco.rules import RULES
 
-    assert "frozen_length_units" not in RULES["amphione"].inherits
-    assert RULES["amphione"].args["frozen_length_units"] == ()
+    assert "frozen_scale_units" not in RULES["amphione"].inherits
+    assert RULES["amphione"].args["frozen_scale_units"] == ()
 
 
-def test_disco_amphione_frozen_lengths_is_onerate(one_rank):
-    a, pa = _disco("amphione", {**STEP_AMPHIONE, "frozen_length_units": list(FROZEN)})
-    b, pb = _disco("onerate", {**STEP, "frozen_units": list(FROZEN)})
-    c, pc = _disco("amphione", STEP_AMPHIONE)  # nothing frozen
+def test_disco_amphione_frozen_lengths_reach_the_rule(one_rank):
+    a, pa = _disco("amphione", {**STEP_AMPHIONE, "frozen_scale_units": list(FROZEN)})
+    _check_disco_against_units(a, pa)
+    c, pc = _disco(
+        "amphione", STEP_AMPHIONE
+    )  # nothing frozen, the same start and gradients
     for s in range(6):
         g = torch.Generator().manual_seed(100 + s)
         grads = [0.1 * torch.randn(*shape, generator=g) for shape in SHAPES]
-        for ps in (pa, pb, pc):
-            for p, gr in zip(ps, grads):
-                p.grad = gr.clone()
-        a.step()
-        b.step()
+        for p, gr in zip(pc, grads):
+            p.grad = gr.clone()
         c.step()
-        for x, y in zip(pa, pb):
-            assert torch.equal(x, y)
-            assert torch.equal(a.state[x]["rule_state"], b.state[y]["rule_state"])
-        assert a.eta_used == b.eta_used
     # the mask reached the rule: the fused wqkv and w13 differ from the unfrozen run, wo and w2 do not
     assert [torch.equal(x, z) for x, z in zip(pa, pc)] == [False, True, False, True]
 
 
 def test_a_same_rule_group_does_not_take_the_defaults_own_args(one_rank):
-    """`own` args (frozen_length_units, scale) are never taken from the default
+    """`own` args (frozen_scale_units) are never taken from the default
     group, also by a group that runs the default's rule: an amphione conv group
     under an MoE default must not inherit the router's frozen lengths."""
     g = torch.Generator().manual_seed(0)
     params = [nn.Parameter(torch.randn(*s, generator=g) * 0.3) for s in SHAPES]
-    plain = {"momentum": 1.0, "nesterov": False, "weight_decay": 0.0}
+    plain = {"momentum": 0.0, "nesterov": False, "weight_decay": 0.0}
     opt = DiSCO(
         [
             {"params": params[:3], "param_names": NAMES[:3], **plain},
@@ -496,10 +494,28 @@ def test_a_same_rule_group_does_not_take_the_defaults_own_args(one_rank):
         parallel_dims=_NoParallel(),
         lr=0.03,
         rule="amphione",
-        args={**STEP_AMPHIONE, "frozen_length_units": [FROZEN[0]]},
+        args={
+            **STEP_AMPHIONE,
+            "frozen_scale_units": [FROZEN[0]],
+            "scale_nesterov": True,
+        },
         param_layouts=LAYOUTS,
     )
     own, same = opt.param_groups[0]["args"], opt.param_groups[1]["args"]
-    assert own["frozen_length_units"] == [FROZEN[0]]
-    assert "frozen_length_units" not in same
-    assert same["compute"] == "svd" and same["gain_beta"] == 0.9  # its own; inherited
+    assert own["frozen_scale_units"] == [FROZEN[0]]
+    assert "frozen_scale_units" not in same
+    assert same["compute"] == "svd" and same["scale_nesterov"] is True  # own; inherited
+
+
+def test_the_checkpointers_state_init_never_steps_disco(one_rank):
+    """Amphione starts its row scales at the row norms on step t = 1 only (later
+    steps skip the norms). The checkpointer's `init_optim_state` takes a
+    zero-lr step when a parameter has no state yet, which would make the real
+    first step t = 2: DiSCO must hold state for every parameter from
+    construction, so that step never happens."""
+    from torchtitan.components.optimizer.utils import init_optim_state
+
+    opt, params = _disco("amphione", {"compute": "svd"})
+    assert all(opt.state.get(p) for p in params)
+    init_optim_state(opt)
+    assert all(int(g["t"]) == 0 for g in opt.param_groups)

@@ -40,11 +40,10 @@ def one_rank():
 def _fresh_compiled_rules():
     """The spy backend gets traced into the cached compiled rule functions;
     drop them around each test so no other test reuses a spy's graph."""
-    from torchtitan.optimizers.disco import presets as _presets, rules as _rules
+    from torchtitan.optimizers.disco import rules as _rules
 
     def clear():
         _rules._COMPILED.clear()
-        _presets._SHIFTED.clear()
         torch._dynamo.reset()
 
     clear()
@@ -68,22 +67,17 @@ RULES = {
     "muon": dict(
         rule="muon",
         args={"compute": "gram_polar_express", "steps": 6},
-        group=dict(momentum=0.1, nesterov=True),
+        group=dict(momentum=0.9, nesterov=True),
     ),
     "hyperball": dict(
         rule="hyperball",
         args={"compute": "gram_polar_express", "steps": 6},
-        group=dict(momentum=0.05, nesterov=True),
+        group=dict(momentum=0.95, nesterov=True),
     ),
-    "angular_muown": dict(
-        rule="angular_muown",
-        args=dict(compute="gram_polar_express", steps=6, scale="one", warmup=0, c=0.0),
-        group=dict(momentum=1.0, nesterov=False, weight_decay=0.0),
-    ),
-    "sso": dict(
-        rule="sso",
-        args={"compute": "gram_polar_express", "steps": 6, "solve_steps": 3},
-        group=dict(momentum=0.05, nesterov=True),
+    "amphione": dict(
+        rule="amphione",
+        args=dict(compute="gram_polar_express", steps=6),
+        group=dict(momentum=0.0, nesterov=False, weight_decay=0.0),
     ),
 }
 UNITS = (

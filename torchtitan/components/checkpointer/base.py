@@ -95,28 +95,6 @@ def _shares_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch._C._is_alias_of(a, b)
 
 
-def apply_reconfigure_lrs(reconfigure_lrs: bool, optimizers: Any) -> None:
-    """Arm "load optimizer state but keep this run's learning rates".
-
-    Only some containers implement it. Setting the attribute on one that does
-    not would accept the flag and silently ignore it -- which is exactly the
-    "resumed with the stale LR schedule" failure it exists to prevent -- so an
-    unsupported container is refused instead.
-
-    Shared by both checkpointers; it used to be a copy of this block in each.
-    """
-    if not reconfigure_lrs:
-        return
-    if not hasattr(optimizers, "preserve_lrs_when_loading"):
-        raise ValueError(
-            "checkpointer.reconfigure_lrs is set, but "
-            f"{type(optimizers).__name__} does not support preserving learning "
-            "rates across a load. Use "
-            "torchtitan.optimizers.container.DiSCOOptimizersContainer."
-        )
-    optimizers.preserve_lrs_when_loading = True
-
-
 class ModelWrapper(Stateful):
     """
     A wrapper for `nn.Module` (or a list of modules) that provides a unified `Stateful`
@@ -601,19 +579,6 @@ class BaseCheckpointManager(Configurable, ABC):
 
         exclude_from_loading: list[str] = field(default_factory=list)
         """Non-model state keys excluded from loading."""
-
-        reconfigure_lrs: bool = False
-        """Keep the learning rates from THIS run's config when loading a checkpoint.
-
-        An optimizer state_dict carries `param_groups[*]["lr"]`, so resuming a run whose
-        LR schedule was changed -- a new decay phase, a different peak -- silently
-        restores the old rates and undoes the new schedule. Set this when starting a new
-        phase from a previous phase's checkpoint.
-
-        Only the optimizer needs it: `LRSchedulersContainer.load_state_dict` restores
-        `last_epoch` only and recomputes rates from each optimizer's `base_lrs`, so the
-        scheduler already follows the new config.
-        """
 
         enable_first_step_checkpoint: bool = False
         """Whether to save immediately after the first training step."""

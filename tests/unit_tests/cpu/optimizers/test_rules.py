@@ -154,8 +154,8 @@ def test_what_a_rule_reduces_comes_from_its_phases():
 
 
 def test_a_chain_is_its_main_computes_kind_then_row_maps():
-    c = compute_of("gram_polar+row-l2", 5, "float32")
-    assert c == Chain(GramPolar(5, "float32"), (RowL2(),)) and c.kind == "gram"
+    c = compute_of("gram_polar+row-l2", 5)
+    assert c == Chain(GramPolar(5), (RowL2(),)) and c.kind == "gram"
     assert compute_of("svd+row-l2").kind == "unit"
     with pytest.raises(ValueError, match="row maps"):
         compute_of("row-l2+svd")
@@ -175,7 +175,7 @@ def test_vector_is_one_row_under_the_row_rule():
     assert torch.equal(sign.view(-1), torch.sign(v) / 64)
 
 
-def test_unknown_and_renamed_names_are_errors():
+def test_unknown_and_old_names_are_errors():
     with pytest.raises(ValueError):
         _rule(pre="diag-l2")
     with pytest.raises(ValueError):
@@ -184,8 +184,8 @@ def test_unknown_and_renamed_names_are_errors():
         _rule(compute="nope")
     with pytest.raises(ValueError):
         rule_of(dict(rule="nope"))
-    for old in ("backend", "norm_factor", "pre_norm"):
-        with pytest.raises(ValueError, match="renamed"):
+    for old in ("backend", "norm_factor", "pre_norm"):  # old spellings: unknown, no BC
+        with pytest.raises(ValueError, match="unknown args"):
             _rule(**{old: "identity"})
 
 
@@ -199,11 +199,14 @@ def test_rule_of_reads_the_group():
         rule_of(dict(args={"backend_steps": 3}))
 
 
-def test_eps_is_a_constant_not_an_arg():
-    """fp32 everywhere, so the division guard is `EPS`, not a hyper-parameter."""
+@pytest.mark.parametrize("rule", ["muon", "sgd"])
+@pytest.mark.parametrize("compute", ["svd", "row-l2"])
+def test_eps_is_a_constant_not_an_arg(rule, compute):
+    """fp32 everywhere, so the division guard is `EPS`, not a hyper-parameter
+    (the row-l2 compute's included: muon's `eps` arg is gone)."""
     assert EPS == 1e-30
-    with pytest.raises(ValueError, match="eps"):
-        rule_of(dict(rule="muon", args=dict(compute="svd", eps=1e-8)))
+    with pytest.raises(ValueError, match=r"unknown args \['eps'\]"):
+        rule_of(dict(rule=rule, args=dict(compute=compute, eps=1e-8)))
 
 
 def test_a_rule_that_breaks_its_contract_fails_at_build():
@@ -242,10 +245,11 @@ def test_a_rule_that_breaks_its_contract_fails_at_build():
         Rule(compute=StatefulUpdate())
 
 
-def test_aus_refuses_a_gram_compute():
-    """It used to fall back to the plain Gram rule without a word."""
+@pytest.mark.parametrize("name", ["amphione", "hyperball"])
+def test_a_whole_unit_rule_refuses_a_gram_compute(name):
+    """Their direction needs the unit whole on its owner, which a Gram compute is not."""
     with pytest.raises(ValueError, match="Gram"):
-        rule_of({"rule": "aus", "args": {"compute": "gram_polar", "steps": 5}})
+        rule_of({"rule": name, "args": {"compute": "gram_polar", "steps": 5}})
 
 
 def test_register_refuses_a_taken_name_and_unknown_own_args():

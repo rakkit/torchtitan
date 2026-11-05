@@ -121,13 +121,16 @@ class TestRuleExtension(DTensorTestBase):
                 if d > 1e-5 * max(1.0, want.abs().max().item()):
                     failures.append(f"step {step} {name}: max |diff| {d:.3e}")
         # every unit this rank computed kept its own state across the steps
-        states = [  # the rows this rank computed moved off zero
+        states = [  # the units this rank computed moved off zero
             float(v)
             for st in opt.state.values()
             if "rule_state" in st
-            for v in getattr(
-                st["rule_state"], "_local_tensor", st["rule_state"]
-            ).flatten()  # one slot per unit: [E, 2] for a fused expert w13
+            for t in (
+                st["rule_state"].values()  # per unit, on its owner only
+                if isinstance(st["rule_state"], dict)
+                else [getattr(st["rule_state"], "_local_tensor", st["rule_state"])]
+            )
+            for v in t.flatten()  # experts: one slot per unit, [E, 2] for w13
             if float(v) != 0.0
         ]
         if not states or any(s != STEPS for s in states):

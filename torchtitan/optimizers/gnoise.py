@@ -52,8 +52,8 @@ class GradNoiseConfig:
     e1_freq: int = 0
     """0: on every norm-logging step. N: on steps divisible by N (a multiple of log_norm_freq)."""
 
-    e1_dense_phase: bool = True
-    """Also on step 1, DiSCO's dense norm-logging steps (`dense_norm_steps`) and the last step."""
+    e1_first_and_last_steps: bool = True
+    """Also on step 1 and on the last step."""
 
     ema_steps: int = 200
     """Time constant, in training steps, of the per-row / head / gain / type EMAs."""
@@ -771,10 +771,13 @@ class GradNoise:
             if store:
                 d[step] = e.rows2d(u[e.i]).detach().clone()
 
-    def due(self, step: int, *, dense: bool) -> bool:
-        """E1 on this norm-logging step: every `e1_freq`-th (0: every one), plus `dense`
-        (step 1, the dense norm-logging phase, the last step) unless `e1_dense_phase` is off."""
-        return step % self.interval == 0 or (self.config.e1_dense_phase and dense)
+    def due(self, step: int, *, first_or_last: bool) -> bool:
+        """E1 on this norm-logging step: every `e1_freq`-th (0: every one), plus
+        step 1 and the last step (`first_or_last`) unless `e1_first_and_last_steps`
+        is off."""
+        return step % self.interval == 0 or (
+            self.config.e1_first_and_last_steps and first_or_last
+        )
 
     def _install(self) -> None:
         run = torch._dynamo.disable(self._on_post_backward)

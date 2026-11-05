@@ -28,7 +28,7 @@ class _Fake:
         self.arm_kwargs = {"norms_to_log": norms_to_log, **kw}
 
 
-def _container(monkeypatch, freq, norms=NORMS, log_norm_freq=10, dense=500):
+def _container(monkeypatch, freq, norms=NORMS, log_norm_freq=10):
     import torchtitan.optimizers.container as container_mod
 
     monkeypatch.setattr(container_mod, "DiSCO", _Fake)
@@ -37,7 +37,7 @@ def _container(monkeypatch, freq, norms=NORMS, log_norm_freq=10, dense=500):
     c.optimizers, c.model_parts = [fake], []
     c.norms_to_log, c.effective_rank_freq, c.spectral_norm_freq = list(norms), freq, 0
     c.gnoise = None  # a container built with gnoise off
-    c.log_norm_freq, c.dense_norm_steps = log_norm_freq, dense
+    c.log_norm_freq = log_norm_freq
     c.gram_level, c.log_metrics_locally = 0, False
     c.spectrum_logging_config = MagicMock(enable_export=False)
     c._head_input = None
@@ -70,7 +70,7 @@ def test_the_default_leaves_every_logged_step_untouched(monkeypatch):
     c, fake = _container(monkeypatch, 0)
     for step in (1, 2, 499, 500, 510, 515, 600):
         got = _armed(c, fake, step)
-        if step <= 500 or step % 10 == 0:
+        if step == 1 or step % 10 == 0:
             assert got == NORMS, step
         else:
             assert got is None, step  # not a norm-logging step
@@ -78,20 +78,20 @@ def test_the_default_leaves_every_logged_step_untouched(monkeypatch):
 
 @pytest.mark.parametrize("freq", [100, 250])
 def test_effective_rank_is_dropped_off_cadence_only(monkeypatch, freq):
-    c, fake = _container(monkeypatch, freq)
+    c, fake = _container(monkeypatch, freq, log_norm_freq=1)  # every step logs norms
     without = [n for n in NORMS if n != "effective_rank"]
     for step in (1, 2, 50, 99, 100, 101, 250, 499, 500, 510, 520, 600, 1000):
         got = _armed(c, fake, step)
-        if got is None:
-            assert step > 500 and step % 10, step
-            continue
+        assert got is not None, step
         due = step == 1 or step % freq == 0
         assert got == (NORMS if due else without), (freq, step)
     assert _armed(c, fake, 777, final=True) == NORMS  # the final step always logs it
 
 
 def test_a_list_without_effective_rank_is_never_changed(monkeypatch):
-    c, fake = _container(monkeypatch, 100, norms=["frobenius_norm", "stable_rank"])
+    c, fake = _container(
+        monkeypatch, 100, norms=["frobenius_norm", "stable_rank"], log_norm_freq=1
+    )
     for step in (1, 7, 100, 101):
         assert _armed(c, fake, step) == ["frobenius_norm", "stable_rank"]
 

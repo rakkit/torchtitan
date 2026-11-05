@@ -169,8 +169,8 @@ class TestVectorized(DTensorTestBase):
 
     @with_comms
     def test_e1_schedule(self):
-        """E1 arms on step % e1_freq == 0, plus step 1 / the dense phase / the last step
-        unless e1_dense_phase is off; the default arms on every norm-logging step."""
+        """E1 arms on step % e1_freq == 0, plus step 1 and the last step unless
+        e1_first_and_last_steps is off; the default arms on every norm-logging step."""
         H.patch_dense_attention()
         with tempfile.TemporaryDirectory() as tmp:
             pd, model, cont, cfg = H.build(
@@ -180,10 +180,13 @@ class TestVectorized(DTensorTestBase):
                 gnoise=dict(enable=True),
             )
             gn = cont.gnoise
-            cont.log_norm_freq, cont.dense_norm_steps = 2, 5
+            cont.log_norm_freq = 2
 
             def armed(e1_freq, dense_phase, last=16):
-                gn.config.e1_freq, gn.config.e1_dense_phase = e1_freq, dense_phase
+                gn.config.e1_freq, gn.config.e1_first_and_last_steps = (
+                    e1_freq,
+                    dense_phase,
+                )
                 gn.interval = e1_freq or cont.log_norm_freq
                 out = []
                 for step in range(1, last + 1):
@@ -193,20 +196,8 @@ class TestVectorized(DTensorTestBase):
                         out.append(step)
                 return out
 
-            assert armed(0, True) == [
-                1,
-                2,
-                3,
-                4,
-                5,
-                6,
-                8,
-                10,
-                12,
-                14,
-                16,
-            ]  # every norm-logging step
-            assert armed(4, True, last=14) == [1, 2, 3, 4, 5, 8, 12, 14]
+            assert armed(0, True) == [1, 2, 4, 6, 8, 10, 12, 14, 16]  # every norm step
+            assert armed(4, True, last=14) == [1, 4, 8, 12, 14]
             assert armed(4, False, last=14) == [4, 8, 12]
             assert armed(0, False) == [2, 4, 6, 8, 10, 12, 14, 16]
 
@@ -215,7 +206,7 @@ def test_e1_knob_rules():
     with pytest.raises(ValueError, match="knobs are set"):
         GradNoiseConfig(e1_freq=100).validate(log_norm_freq=10)
     with pytest.raises(ValueError, match="knobs are set"):
-        GradNoiseConfig(e1_dense_phase=False).validate(log_norm_freq=10)
+        GradNoiseConfig(e1_first_and_last_steps=False).validate(log_norm_freq=10)
     with pytest.raises(ValueError, match="e1_freq"):
         GradNoiseConfig(enable=True, e1_freq=15).validate(log_norm_freq=10)
     with pytest.raises(ValueError, match="e1_freq"):
@@ -232,6 +223,6 @@ def test_e1_knob_rules():
         log_norm_freq=10
     )
     GradNoiseConfig(
-        enable=True, e1_freq=50, e1_dense_phase=False, research_freq=100
+        enable=True, e1_freq=50, e1_first_and_last_steps=False, research_freq=100
     ).validate(log_norm_freq=10)
     GradNoiseConfig(enable=True, research_freq=20).validate(log_norm_freq=10)

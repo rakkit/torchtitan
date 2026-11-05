@@ -128,7 +128,7 @@ class TestUpdateMetrics(DTensorTestBase):
                 most = max([most] + [len(d) for d in gn.dirs.values()])
                 O = {n: W0[n] - _full(params[n]) for n in units}
                 O_hist[t] = O
-                is_e1 = armed(t, dense=t == 1)
+                is_e1 = armed(t, first_or_last=t == 1)
                 lag_step = (
                     is_e1 and t % 8 == 0
                 )  # 8: the smallest multiple of 1 and of 4 >= 8
@@ -246,7 +246,7 @@ class TestUpdateMetrics(DTensorTestBase):
         self._assert(
             self._scenario(
                 dict(dp_replicate=1, dp_shard=4),
-                e1=dict(e1_freq=4, e1_dense_phase=False),
+                e1=dict(e1_freq=4, e1_first_and_last_steps=False),
             )
         )
 
@@ -261,6 +261,6 @@ class TestUpdateMetrics(DTensorTestBase):
             self._scenario(
                 dict(dp_replicate=2, dp_shard=2),
                 param_dtype="bfloat16",
-                e1=dict(e1_freq=4, e1_dense_phase=False),
+                e1=dict(e1_freq=4, e1_first_and_last_steps=False),
             )
         )

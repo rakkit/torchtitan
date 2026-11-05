@@ -339,10 +339,6 @@ class MetricsProcessor(Configurable):
         log_freq: int = 10
         """How often to log metrics to TensorBoard, in iterations"""
 
-        dense_log_steps: int = 0
-        """Also log every step up to this one (early dynamics at full
-        resolution); 0 disables."""
-
         enable_tensorboard: bool = False
         """Whether to log metrics to TensorBoard"""
 
@@ -391,8 +387,6 @@ class MetricsProcessor(Configurable):
         def __post_init__(self) -> None:
             if self.log_freq <= 0:
                 raise ValueError("metrics.log_freq must be greater than 0.")
-            if self.dense_log_steps < 0:
-                raise ValueError("metrics.dense_log_steps must be >= 0.")
 
     config: Config
     logger: BaseLogger
@@ -460,11 +454,7 @@ class MetricsProcessor(Configurable):
     def should_log(self, step: int) -> bool:
         if self.step_last_log is None:
             self.step_last_log = step - 1
-        return (
-            step == 1
-            or step <= self.config.dense_log_steps
-            or step % self.config.log_freq == 0
-        )
+        return step == 1 or step % self.config.log_freq == 0
 
     def _build_metric_logger(
         self,

@@ -187,7 +187,8 @@ def segment_nanquantile(
     xs = x[order]
     cnt = torch.bincount(seg, minlength=n_seg)
     start = torch.cumsum(cnt, 0) - cnt
-    valid = torch.bincount(seg, weights=(~torch.isnan(x)).to(x.dtype), minlength=n_seg)
+    # the non-NaN count per segment; an unweighted bincount is deterministic on CUDA, a weighted one is not
+    valid = torch.bincount(seg[~torch.isnan(x)], minlength=n_seg).to(x.dtype)
     ranks = q.to(x.dtype)[:, None] * (valid - 1.0)[None, :]
     below = ranks.long()
     lo = xs[start[None, :] + below]

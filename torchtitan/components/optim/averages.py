@@ -14,7 +14,6 @@ import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any  # noqa: F401
 
 import torch
 import torch.distributed as dist

@@ -174,13 +174,10 @@ def from_keyed(
 def documents_consumed(keyed_state: dict[str, Any]) -> dict[str, int]:
     """Documents read per dataset, taken straight from the checkpointed cursors.
 
-    Replaces 0.4.0's ``num_docs_sampled`` shared-memory counter (logged as
-    ``data_docs/{alias}``). No separate accumulator is needed: each child streams rows and
-    maintains its own ``next_index``, which IS the number of rows it has emitted --
-    cumulative across epochs, so a corpus seen twice keeps counting up. That makes the
-    metric exact by construction and automatically consistent with resume; the old
-    counter lived in shared memory precisely so a scheduler in another process could
-    read it, which left the main-process copy permanently stale.
+    Logged as ``data_docs/{alias}``. Each child streams rows and keeps its own
+    ``next_index``, the number of rows it has emitted, cumulative across epochs (a
+    corpus seen twice keeps counting up), so the metric is exact and consistent with
+    resume.
 
     Note this counts DOCUMENTS, not tokens. Token counts are deliberately not tracked
     anywhere in this design: a ``token_count`` column is neither guaranteed present nor
@@ -212,11 +209,9 @@ def cursor_position(cursor: Any) -> int:
     Reading a fixed depth would silently break whenever a transform is added or removed,
     so walk the parent chain instead and take the first `next_index` found.
 
-    Raises rather than returning 0 when the chain cannot be followed. Returning 0 is
-    indistinguishable from "this dataset has read nothing", and that is exactly how a
-    whole `data_docs/{alias}` series silently read zero for every run with `shuffle=True`
-    -- `WindowShuffleIterDataset` names its parent key `parent_window_start_state`, the
-    walk fell off the end, and the fallback reported 0 documents forever.
+    Raises rather than returning 0 when the chain cannot be followed: 0 would read as
+    "this dataset has read nothing". `WindowShuffleIterDataset` names its parent key
+    `parent_window_start_state`.
     """
     seen = 0
     while isinstance(cursor, dict) and seen < 32:  # bounded: states are shallow

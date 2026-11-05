@@ -228,8 +228,6 @@ def force_ddp_evaluation_parallelism(config: Trainer.Config, world_size: int) ->
         pipeline_parallel_degree=1,
         context_parallel_degree=1,
         expert_parallel_degree=1,
-        # `expert_tensor_parallel_degree` was removed from ParallelismConfig in
-        # 0.5.0; ETP is expressed through the mesh instead.
     )
 
 

@@ -59,3 +59,7 @@ replace-imports-with-any = [
     "torch_remat",
 ]
 search-path = ["../pytorch"]  # local built pytorch
+
+[tool.ruff.lint]
+# dict(...) with keyword arguments is fine (the same rule .flake8 ignores: C408)
+ignore = ["C408"]

@@ -140,8 +140,8 @@ def opt_moe_mis_8b() -> Trainer.Config:
             steps=100,
             # Accelerator graphs need fixed shapes and no host sync inside the
             # captured region: off for EP with the all-to-all dispatch (it syncs
-            # with the host) and for gnoise (refuses them). Without EP the local
-            # dispatch has no host sync; graphs on there are not measured yet.
+            # with the host). Without EP the local dispatch has no host sync;
+            # graphs on there are not measured yet.
             disable_accelerator_graphs=True,
         ),
         checkpointer=CheckpointManager.Config(

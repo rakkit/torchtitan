@@ -322,11 +322,7 @@ def sharing_factor(manifest: dict[str, Any], dp_world_size: int) -> int:
 
 
 def validate_column(manifest: dict[str, Any], column: str, dataset_dir: Any) -> None:
-    """Fail at startup on a missing column, instead of yielding an empty dataset.
-
-    The legacy loader wrapped sample processing in a bare ``except Exception: continue``,
-    so a mistyped key produced no rows, no counter and no log.
-    """
+    """Fail at startup on a missing column, instead of yielding an empty dataset."""
     columns = manifest.get("columns") or {}
     if column not in columns:
         raise ValueError(

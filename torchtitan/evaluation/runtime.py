@@ -191,10 +191,8 @@ class EvaluationRuntime:
     ) -> tuple[EvaluationTotals, float]:
         """Score one set, reduce its totals, and return rank-identical metrics."""
 
-        # The offline-eval dataloader still packs a [B, S] rectangle, so recover it
-        # from the token fields. `training.seq_len` / `training.local_batch_size` were
-        # a fork-only authoring surface and no longer exist; per-set overrides on
-        # EvaluationDatasetConfig still do, and still win.
+        # The offline-eval dataloader packs a [B, S] rectangle: S the model's
+        # context and B from the microbatch tokens, unless the set overrides them.
         seq_len = dataset.seq_len or self.config.model.max_context_length
         local_batch_size = dataset.local_batch_size or max(
             1,
@@ -236,33 +234,28 @@ class EvaluationRuntime:
             inputs = input_dict["input"].to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
             batch_bytes = batch_bytes.to(self.device, non_blocking=True)
-            # 0.5.0 models are token-flat: [T] in, [T, V] out, with document
-            # boundaries carried by `positions` resetting to 0. The eval packer
-            # emits one independent sequence per row, so each row is its own
-            # document -- flatten [B, S] -> [B*S] and reset positions per row.
-            positions = input_dict.get("positions")
-            if positions is None:
-                if inputs.dim() == 2:
-                    rows, row_len = inputs.shape
-                    positions = torch.arange(
-                        row_len, device=inputs.device, dtype=torch.int64
-                    ).repeat(rows)
-                else:
-                    positions = torch.arange(
-                        inputs.shape[0], device=inputs.device, dtype=torch.int64
-                    )
-            else:
-                positions = positions.to(self.device, non_blocking=True).reshape(-1)
-            inputs = inputs.reshape(-1)
-            labels = labels.reshape(-1)
-            extra_kwargs = self._attention_kwargs(positions)
-            extra_kwargs["positions"] = positions
-
+            # The models are token-flat: [T] in, [T, V] out, documents marked by
+            # `positions` resetting to 0. Each packed row is one sequence, so flatten
+            # [B, S] -> [B * S] with positions restarting per row.
+            rows, row_len = inputs.shape
+            positions = torch.arange(
+                row_len, device=inputs.device, dtype=torch.int64
+            ).repeat(rows)
+            input_dict = {
+                "input": inputs.reshape(-1),
+                "labels": labels.reshape(-1),
+                "positions": positions,
+            }
             try:
                 with self.parallelism_context.activate_spmd():
+                    inputs, labels, model_kwargs, _ = self.model.preprocess_inputs(
+                        input_dict,
+                        parallelism_context=self.parallelism_context,
+                        parallelism=self.config.parallelism,
+                        max_num_documents=rows,
+                    )
                     with self.amp_context:
-                        raw_output = self.model(inputs, **extra_kwargs)
-                        logits = _unwrap_model_output(raw_output)
+                        logits = self.model(inputs, **model_kwargs)
                         nll = dense_token_nll(logits, labels)
             except torch.OutOfMemoryError:
                 if self.device.type == "cuda":
@@ -291,39 +284,6 @@ class EvaluationRuntime:
         )
         return totals, time.monotonic() - begin
 
-    def _attention_kwargs(self, positions: torch.Tensor) -> dict[str, Any]:
-        """Build the model's attention masks for this batch.
-
-        0.5.0's signature is ``get_attention_masks(positions)``. The previous
-        code called the 0.4.0 signature and caught ``TypeError``, which meant a
-        signature mismatch silently produced NO attention mask at all -- the
-        model would then attend across every document boundary in the batch and
-        report a plausible but wrong NLL. Only a model that genuinely has no
-        masks (all-SDPA) may return None; anything else must surface.
-        """
-        masks = cast(BaseModel, self.model).get_attention_masks(positions)
-        return {} if masks is None else {"attention_masks": masks}
-
-
-def _unwrap_model_output(raw_output: Any) -> Any:
-    """Strip the auxiliary load-balance loss some model families always return.
-
-    ``OPTMoEModel.forward`` (and other MoE-capable model families in this repo)
-    unconditionally returns ``(logits, aux_loss)`` or ``{"tokens_list": [...],
-    "load_balance_loss": ...}``, even for purely dense flavors. Normal training
-    strips this via ``components/loss.py::moe_loss`` before the loss function
-    ever sees it; offline evaluation has no equivalent step in the training
-    loop to do this for us, so we mirror that unwrapping here. The aux
-    load-balance loss itself isn't meaningful for offline scoring and is
-    discarded.
-    """
-
-    if isinstance(raw_output, tuple):
-        return raw_output[0]
-    if isinstance(raw_output, dict) and "load_balance_loss" in raw_output:
-        return raw_output["tokens_list"][0]
-    return raw_output
-
 
 def dense_token_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Return summed next-token NLL with TorchTitan's normal ignore-index mask."""
@@ -333,23 +293,15 @@ def dense_token_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
             "offline evaluation v1 supports dense tensor logits only; "
             f"got {type(logits).__name__}"
         )
-    # 0.5.0 models are token-flat and return [T, V]; 0.4.0 returned [B, S, V].
-    # Accept both and reduce to [T, V] / [T].
-    if logits.ndim not in (2, 3):
+    # The models are token-flat: logits [T, V], labels [T].
+    if logits.ndim != 2 or logits.shape[0] != labels.numel():
         raise EvaluationConfigError(
-            "expected dense logits with shape [tokens, vocab] or "
-            f"[batch, seq, vocab], got {tuple(logits.shape)}"
-        )
-    flat_logits = logits.flatten(0, 1) if logits.ndim == 3 else logits
-    flat_labels = labels.reshape(-1)
-    if flat_logits.shape[0] != flat_labels.shape[0]:
-        raise EvaluationConfigError(
-            f"logits/labels token count mismatch: {flat_logits.shape[0]} vs "
-            f"{flat_labels.shape[0]}"
+            f"expected logits [tokens, vocab] for {labels.numel()} labels, "
+            f"got {tuple(logits.shape)}"
         )
     return functional.cross_entropy(
-        flat_logits.float(),
-        flat_labels,
+        logits.float(),
+        labels.reshape(-1),
         reduction="sum",
         ignore_index=IGNORE_INDEX,
     )

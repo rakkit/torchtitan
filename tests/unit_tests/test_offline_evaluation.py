@@ -210,10 +210,9 @@ class TestOfflineEvaluationMetrics(unittest.TestCase):
             sum((labels != -100).sum().item() for _, labels, _ in samples), 4
         )
 
-        logits = torch.zeros(1, 2, 5)
+        logits = torch.zeros(2, 5)
         total_nll = sum(
-            dense_token_nll(logits, labels.unsqueeze(0)).item()
-            for _, labels, _ in samples
+            dense_token_nll(logits, labels).item() for _, labels, _ in samples
         )
         self.assertAlmostEqual(total_nll, 4 * math.log(5), places=6)
 

@@ -122,13 +122,13 @@ def test_eval_wrapper_returns_each_real_run(monkeypatch, num_groups):
     validator.validate([model], step=1)
     assert len(calls) == num_groups
     validator.metrics_processor.log_validation.assert_called_once_with(
-        loss=(num_groups + 1) / 2, step=1
+        loss=(num_groups + 1) / 2, step=1, tag=None
     )
     assert not accelerator_graph_manager.capture_allowed
     validator.validate([model], step=2)
     assert len(calls) == 2 * num_groups
     validator.metrics_processor.log_validation.assert_called_with(
-        loss=(3 * num_groups + 1) / 2, step=2
+        loss=(3 * num_groups + 1) / 2, step=2, tag=None
     )
     torch.testing.assert_close(calls[-1], row.input, rtol=0, atol=0)
     assert model.training

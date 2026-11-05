@@ -708,25 +708,6 @@ def clip_grad_norm_(
     return total_norm
 
 
-def get_param_dtype(module: torch.nn.Module) -> torch.dtype | None:
-    """Return the dtype parameters of ``module`` have during forward.
-
-    Uses the FSDP mixed-precision policy when there is one, otherwise the dtype
-    of the first parameter. Returns ``None`` for a module with no parameters.
-    """
-    fsdp_state_fn = getattr(module, "_get_fsdp_state", None)
-    param_dtype = None
-    if fsdp_state_fn is not None:
-        fsdp_state = fsdp_state_fn()
-        param_dtype = fsdp_state._mp_policy.param_dtype
-    # In the non-FSDP case, or if the mixed-precision policy did not set a
-    # param_dtype, fall back to the model parameters.
-    if param_dtype is None:
-        first_param = next(module.parameters(), None)
-        param_dtype = None if first_param is None else first_param.dtype
-    return param_dtype
-
-
 # ---------------------------------------------------------------------------
 # Per-rank ("shard-local") metrics logging -- shared predicate.
 #
@@ -743,31 +724,10 @@ def get_param_dtype(module: torch.nn.Module) -> torch.dtype | None:
 
 
 def fsdp_shard_mesh(parallelism_context: "ParallelismContext") -> DeviceMesh | None:
-    """The mesh FSDP shards parameters over, under EITHER spmd backend.
-
-    ``parallelism.spmd_backend`` decides how the device mesh is NAMED, not how
-    it is laid out (``distributed/parallelism_context.py``):
-
-    * ``partial_dtensor`` folds ``dp_shard`` and ``cp`` into a single ``fsdp``
-      axis, so ``get_optional_mesh("fsdp")`` works.
-    * ``spmd_types`` keeps them separate -- there IS no ``fsdp`` axis and asking
-      for one raises ``ValueError: Invalid mesh dim: 'fsdp'``. FSDP shards over
-      ``["dp_shard"] (+ ["cp"] when cp > 1)`` there (``distributed/fsdp.py``),
-      which is the SAME device set.
-
-    Verified equivalent at world_size 8: ``fsdp`` is 8 under partial_dtensor for
-    both cp=1 and cp=2; under spmd_types ``dp_shard`` is 8 at cp=1 and
-    ``["dp_shard", "cp"]`` is 8 at cp=2.
-
-    Resolving by backend instead of hard-coding ``"fsdp"`` is what lets DiSCO
-    run under both. It matters beyond Context Parallel: ``partial_dtensor`` is
-    slated for removal upstream (four ``TODO: remove once the partial_dtensor
-    backend is removed`` markers), so hard-coding the name is on borrowed time.
-    """
+    """The mesh FSDP shards parameters over: ``dp_shard``, flattened with ``cp``
+    when CP is on (``distributed/fsdp.py``)."""
     if not parallelism_context.fsdp_enabled:
         return None
-    if getattr(parallelism_context, "spmd_backend", "spmd_types") == "partial_dtensor":
-        return parallelism_context.get_optional_mesh("fsdp")
     if not parallelism_context.cp_enabled:
         return parallelism_context.get_optional_mesh("dp_shard")
     # With CP on, FSDP shards over dp_shard AND cp (distributed/fsdp.py builds

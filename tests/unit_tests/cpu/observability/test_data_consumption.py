@@ -117,17 +117,6 @@ def test_documents_consumed_is_reported_per_dataset(tmp_path: Path):
     assert len(metrics.get_log_dict_at_step(4)) == 2
 
 
-def test_a_mixing_schedule_is_rejected_rather_than_silently_ignored(tmp_path: Path):
-    """Grain fixes mix proportions at build time. Accepting the config and doing nothing
-    would look like a working schedule while training on constant weights."""
-    loader = _loader(tmp_path)
-    try:
-        with pytest.raises(ValueError, match="fixes its mix weights at build time"):
-            build_data_mix_metrics(loader, "some_schedule.json")
-    finally:
-        loader.close()
-
-
 def test_document_counts_are_not_silently_zero_under_a_window_shuffle(tmp_path: Path):
     """An undecodable cursor must RAISE, not report zero documents.
 

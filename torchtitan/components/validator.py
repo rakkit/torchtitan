@@ -43,13 +43,6 @@ from torchtitan.tools import utils
 logger = logging.getLogger(__name__)
 
 
-def validation_seq_len(validator_config: Any, max_context_length: int) -> int:
-    """Sequence length of the validation sequences: the validator's own
-    ``fixed_seq_len`` when set, else the training ``max_context_length``."""
-    fixed = getattr(validator_config, "fixed_seq_len", None)
-    return max_context_length if fixed is None else fixed
-
-
 class BaseValidator(Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
@@ -140,8 +133,8 @@ class Validator(BaseValidator):
 
         fixed_seq_len: int | None = None
         """Sequence length of the validation sequences. None: the training
-        ``max_context_length`` (the trainer passes ``validation_seq_len``). Set it
-        to score runs with different training context lengths on the same
+        ``max_context_length`` (the ``seq_len`` the trainer passes). Set it to
+        score runs with different training context lengths on the same
         sequences."""
 
         def __post_init__(self):
@@ -219,7 +212,7 @@ class Validator(BaseValidator):
                 "positive count so every rank runs the same number of steps, "
                 "or run with data-parallel degree 1."
             )
-        self.seq_len = seq_len
+        self.seq_len = seq_len if config.fixed_seq_len is None else config.fixed_seq_len
         self.num_tokens_per_microbatch = num_tokens_per_microbatch
         self.metrics_processor = metrics_processor
         self.pp_schedule = pp_schedule
@@ -468,11 +461,8 @@ class Validator(BaseValidator):
                 global_loss_sum = float(accumulated_loss.item())
             global_avg_loss = global_loss_sum / num_global_valid_tokens
 
-            # tag only when set: the untagged call is upstream's
             self.metrics_processor.log_validation(
-                loss=global_avg_loss,
-                step=step,
-                **({"tag": tag} if tag is not None else {}),
+                loss=global_avg_loss, step=step, tag=tag
             )
         finally:
             for module, training in modes:

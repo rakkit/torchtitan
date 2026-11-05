@@ -21,9 +21,8 @@ its rule's compute kind (`rules.py`):
 What a rule declares adds traffic only where it is needed: the pre-update
 weight to the owner (`needs_weight`), per-unit coefficients (`update_coeffs`:
 one small all-reduce). A rule returning a new weight sends back `W_next` in the
-update's slot and the holders copy it (exact); under bfloat16 transport, or with
-an update observer (gnoise reads the step), it sends the step `W - W_next`
-instead, which the holders subtract. On a logging step the owners also receive the
+update's slot and the holders copy it (exact); under bfloat16 transport it sends
+the step `W - W_next` instead, which the holders subtract. On a logging step the owners also receive the
 pre-update weights (and, for local units, the moment and the update) over the
 same tables, and every metric is computed after the post phases, from what the
 apply writes -- see `metrics.py`.
@@ -278,9 +277,6 @@ class DiSCO(torch.optim.Optimizer):
         self._gram_final: dict[str, float] = {}
         self._gram_keys: list[str] | None = None
         self.radial_names: list[str] = radial_names()
-        # Called as update_observer(self, u) at the end of `step()`, u the
-        # applied per-entry updates; set by optimizers/gnoise.py when enabled.
-        self.update_observer = None
         self.norms_at_current_step: dict[str, torch.Tensor] = {}
         # LM-head geometry. `head_probe_h` is the head's input for a few probe
         # tokens; the container sets it for one norm step, step() drops it.
@@ -1011,12 +1007,9 @@ class DiSCO(torch.optim.Optimizer):
         logging_step = self.need_to_calculate_norm
         self._trace_scalar({"disco_logging_step": int(logging_step)})
         # A weight rule's slot carries W_next, copied by the holders, when it
-        # travels in fp32 and nothing reads the step afterwards; else the step
-        # W - W_next (bf16 would round the master weights; gnoise's observer
-        # reads the applied step). The same on every rank.
-        self._weight_by_copy = (
-            self.communication_dtype == torch.float32 and self.update_observer is None
-        )
+        # travels in fp32; else the step W - W_next (bf16 would round the
+        # master weights). The same on every rank.
+        self._weight_by_copy = self.communication_dtype == torch.float32
         values: dict[str, UnitValues] | None = {} if logging_step else None
         self._head = {}
         self._wsw = None
@@ -1056,8 +1049,6 @@ class DiSCO(torch.optim.Optimizer):
             g["t"] = int(g["t"]) + 1
         self.need_to_calculate_norm = False
         self.head_probe_h = None
-        if self.update_observer is not None:
-            self.update_observer(self, u)
         return loss
 
     def _ctx(self, e: _Entry) -> StepCtx:

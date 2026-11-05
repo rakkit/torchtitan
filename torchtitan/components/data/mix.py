@@ -6,31 +6,11 @@
 
 """One list of dataset records -> an upstream grain mix.
 
-REPLACES SEVEN INDEX-ALIGNED PARALLEL ARRAYS
---------------------------------------------
-The 0.4.0 config expressed 46 datasets as seven lists that had to stay index-aligned
-(`dataset`, `dataset_path`, `dataset_inner_name`, `dataset_split`, `dataset_key`,
-`dataset_weights`, `dataset_alias`) -- four of which were one value repeated 46 times.
-Length agreement was checked by a single `assert`, which is a no-op under `python -O`,
-names no field, and fires only after a `zip` has already silently truncated. Inserting a
-dataset meant editing seven places or training on a silently wrong mixture.
-
-Here a dataset is one record that carries its own fields, so that entire class of bug
-cannot occur.
-
-`alias` DOES TWO JOBS, DELIBERATELY
------------------------------------
-It labels the metrics (`data_docs/{alias}`, carried from 0.4.0's `dataset_alias`), keys
-per-dataset checkpoint state across stages, AND seeds the dataset's own RNG. An earlier
-draft split the first two into `alias` + `id`, which put two near-identical strings on
-every one of 46 datasets to guard a hazard that is better stated as one rule:
-
-    Renaming an alias restarts that dataset's cursor and changes its shuffle order.
-    Everything else -- reordering the list, moving the corpus to another filesystem --
-    is a no-op.
-
-Neither field exists upstream (`WeightedDataset` carries only `dataset` and `weight`), so
-there was no compatibility reason to keep both.
+A dataset is one ``DatasetSpec`` record carrying its own fields. Its ``alias``
+labels the metrics (``data_docs/{alias}``), keys its checkpoint cursor across
+stages and seeds its RNG: renaming an alias restarts that dataset's cursor and
+changes its shuffle order; reordering the list or moving the corpus to another
+filesystem does not.
 """
 
 from __future__ import annotations
@@ -52,8 +32,8 @@ from torchtitan.components.data.packing import (
     FirstFitPackingConfig,
 )
 from torchtitan.components.data.parquet_stream import ParquetStreamSource
-from torchtitan.components.data.types import DatasetBuildContext, DatasetIterationPolicy
 from torchtitan.components.data.text_datasets import TextProcessor
+from torchtitan.components.data.types import DatasetBuildContext, DatasetIterationPolicy
 
 
 @dataclass(kw_only=True, slots=True)
@@ -69,7 +49,7 @@ class DatasetSpec:
     """Dataset directory: parquet shards plus manifest.json."""
     weight: float = 1.0
     """Relative selection weight. Normalized against the other datasets, so only ratios
-    matter. Selects DOCUMENTS, matching 0.4.0's behaviour."""
+    matter. Selects documents."""
     text_key: str = "text"
     """Column to read. Validated against the manifest at startup."""
     manifest_path: str | None = None
@@ -85,9 +65,7 @@ class DatasetSpec:
 
     Corpora disagree about layout -- a `messages` list vs a prompt/response column pair,
     tools in their own column vs nested in `messages[0]`, everything as JSON strings vs
-    real structs. One adapter per dataset is the only part of the old 937-line SFT loader
-    that was answering a real question; see `data/sft.py` for the shipped adapters.
-    Ignored by pretrain."""
+    real structs; see `data/sft.py` for the shipped adapters. Ignored by pretrain."""
 
     def __post_init__(self) -> None:
         if not self.alias:

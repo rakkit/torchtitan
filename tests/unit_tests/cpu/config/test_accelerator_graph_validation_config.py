@@ -236,6 +236,7 @@ def test_trainer_keeps_scheduled_eval_during_warmup(
         save_checkpoint=save_checkpoint,
         checkpointer=SimpleNamespace(maybe_wait_for_staging=MagicMock()),
         step_profiler=finish_step,
+        averages=None,
     )
     trainer = object.__new__(Trainer)
     trainer.engine = engine

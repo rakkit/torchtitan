@@ -245,7 +245,6 @@ def _container(
     c._norms_armed = False
     c._model_stats_armed = False
     c._gains_before = None
-    c.gnoise = None  # a container built with gnoise off
     c.collect_moe_metrics.return_value = {}
     for name in (
         "begin_step",

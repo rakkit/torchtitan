@@ -19,8 +19,8 @@ class M:
         return self.n
 
     def _flatten(self, name):
-        # `fsdp_shard_mesh` flattens ["dp_shard", "cp"] into one axis under
-        # spmd_types; without this the CP path could not be exercised at all.
+        # `fsdp_shard_mesh` flattens ["dp_shard", "cp"] into one axis; without
+        # this the CP path could not be exercised at all.
         return self
 
 
@@ -37,22 +37,16 @@ class PD:
         rep_n=1,
         tp_n=1,
         cp=False,
-        spmd_backend="partial_dtensor",
     ):
         self.fsdp_enabled, self.dp_replicate_enabled, self.tp_enabled = fsdp, rep, tp
-        # `fsdp_shard_mesh` resolves the shard mesh per spmd backend: the
-        # "fsdp" axis exists only under partial_dtensor, while spmd_types names
-        # the same devices "dp_shard" (+ "cp" when cp > 1). The stub models both
-        # so the predicate is exercised on either backend.
+        # FSDP shards over "dp_shard" (+ "cp" when cp > 1, flattened).
         self.cp_enabled = cp
-        self.spmd_backend = spmd_backend
         self._m = {
-            "fsdp": M(fsdp_r, fsdp_n),
             "dp_shard": M(fsdp_r, fsdp_n),
             "dp_replicate": M(rep_r, rep_n),
             "tp": M(tp_r, tp_n),
         }
-        # Under spmd_types + CP the shard mesh is dp_shard x cp FLATTENED, so it
+        # Under CP the shard mesh is dp_shard x cp FLATTENED, so it
         # is strictly larger than dp_shard alone. Modelling them the same size
         # made this test blind to the cp axis being dropped.
         self._m["dp_shard"] = (
@@ -62,9 +56,7 @@ class PD:
 
     def get_optional_mesh(self, n, **kw):
         if isinstance(n, list):
-            # spmd_types multi-axis lookup. Return the entry for the exact axis
-            # list requested; returning self._m["fsdp"] unconditionally made the
-            # ["dp_shard", "cp"] entry unreachable and the CP branch untested.
+            # Multi-axis lookup: the entry for the exact axis list requested.
             key = ", ".join(n)
             if key in self._m:
                 return self._m[key]
@@ -120,28 +112,14 @@ assert (
 )  # fsdp wins
 assert metrics_shard_mesh(PD(False, True, False, rep_n=4)).size() == 4  # dp_replicate
 print("  fsdp when fsdp_enabled, else dp_replicate. OK")
-print("\n=== spmd_types backend (the stub's claim, now actually exercised) ===")
-# Under spmd_types there is no "fsdp" axis; the shard mesh comes from
-# "dp_shard", or from ["dp_shard", "cp"] flattened when CP is on.
-sp = dict(spmd_backend="spmd_types")
+print("\n=== CP: the shard mesh is dp_shard x cp flattened ===")
 got = [
     f
     for f in range(4)
-    if rank_owns_metrics_shard(PD(True, False, False, fsdp_r=f, fsdp_n=4, **sp))
+    if rank_owns_metrics_shard(PD(True, False, False, fsdp_r=f, fsdp_n=4, cp=True))
 ]
 assert got == [0, 1, 2, 3], got
-assert metrics_shard_mesh(PD(True, False, False, fsdp_n=4, **sp)).size() == 4
-print("  spmd_types, cp=1: all 4 fsdp ranks log, shard mesh size 4. OK")
-
-got = [
-    f
-    for f in range(4)
-    if rank_owns_metrics_shard(
-        PD(True, False, False, fsdp_r=f, fsdp_n=4, cp=True, **sp)
-    )
-]
-assert got == [0, 1, 2, 3], got
-assert metrics_shard_mesh(PD(True, False, False, fsdp_n=4, cp=True, **sp)).size() == 4
-print("  spmd_types, cp=2: same, via the flattened dp_shard+cp axis. OK")
+assert metrics_shard_mesh(PD(True, False, False, fsdp_n=4, cp=True)).size() == 4
+print("  cp=2: all 4 fsdp ranks log, via the flattened dp_shard+cp axis. OK")
 
 print("\nALL PREDICATE CHECKS PASSED")

@@ -15,6 +15,7 @@ Everything else -- rank keying, the DP-degree guard, iteration -- is inherited u
 """
 
 from __future__ import annotations
+
 import logging
 
 from dataclasses import dataclass
@@ -72,9 +73,8 @@ class KeyedMixDataLoader(GrainDataLoader):
     def mixing_weights(self) -> dict[str, float]:
         """Configured weight per dataset, normalized to sum to 1.
 
-        Reported as `data_mixing/{alias}`, matching 0.4.0. These are CONSTANTS on this
-        loader: grain resolves mix proportions at build time, so unlike 0.4.0 there is no
-        step at which they change.
+        Reported as `data_mixing/{alias}`. Constants: grain resolves the mix
+        proportions at build time.
         """
         total = sum(self._dataset_weights)
         if not total:
@@ -87,8 +87,7 @@ class KeyedMixDataLoader(GrainDataLoader):
     def consumption_metrics(self) -> dict[str, int]:
         """Per-dataset documents consumed, ready for the metrics logger.
 
-        Mirrors 0.4.0's `data_docs/{alias}` series. No id->alias translation is needed:
-        the alias is the key.
+        Reported as `data_docs/{alias}`; the alias is the key.
         """
         counts = documents_consumed(
             to_keyed(self._iterator.get_state(), self._dataset_ids)
@@ -106,8 +105,7 @@ class KeyedMixDataLoader(GrainDataLoader):
         if version != KEYED_STATE_VERSION:
             raise ValueError(
                 f"unsupported dataloader state version {version}, expected "
-                f"{KEYED_STATE_VERSION}. A checkpoint written by the legacy loader "
-                "cannot be resumed onto this one; start the stage fresh."
+                f"{KEYED_STATE_VERSION}: start the stage fresh."
             )
         if state_dict["dp_world_size"] != self._dp_world_size:
             raise ValueError(
@@ -140,5 +138,6 @@ class KeyedMixDataLoader(GrainDataLoader):
         except Exception:
             self.close()
             raise
+
 
 logger = logging.getLogger(__name__)

@@ -6,24 +6,11 @@
 
 """Multi-turn SFT: train on every assistant turn, mask everything else.
 
-WHY THIS EXISTS
----------------
-Upstream's ``ChatProcessor`` (``hf_datasets/text_datasets.py:82-98``) rejects multi-turn
-conversations outright::
-
-    # TODO(data-sft-multiturn): Extend validation and loss masking before
-    # accepting multi-turn conversations.
-    if len(messages) != 2:
-        raise ValueError(f"Expected single-turn [user, assistant], got ...")
-
-and masks by prompt PREFIX LENGTH, which only works because there is exactly one
-assistant turn. A real conversation has assistant turns interleaved with user turns, so
-a prefix rule would either train on user text or train on only the last answer.
-
-This processor emits a ``TextSequence`` so upstream's packing and ``TextCollator``
-produce token-flat ``[T]`` batches with ``num_valid_tokens`` -- unlike the fork's
-``experiments/sft/``, which yields ``{"input", "positions"}`` and therefore cannot run on
-0.5.0 at all (``trainer.py`` unconditionally pops ``num_valid_tokens``).
+Upstream's ``ChatProcessor`` takes single-turn conversations only and masks by the
+prompt's prefix length; a multi-turn conversation interleaves assistant turns with user
+turns, so every assistant span is found here. The processor emits a ``TextSequence``, so
+upstream's packing and ``TextCollator`` produce token-flat ``[T]`` batches with
+``num_valid_tokens``.
 
 HOW THE SPANS ARE FOUND
 -----------------------
@@ -37,7 +24,7 @@ each assistant turn by re-rendering prefixes::
 ``add_generation_prompt=True`` renders the prompt THROUGH the assistant header
 (``<|assistant|>`` or equivalent), so the header is excluded from the supervised span by
 construction rather than by a hand-set token count. A template that ignores the flag
-degrades to training on the header, which is what a hand-set count of 0 did anyway.
+trains on the header.
 
 That is ``1 + 2k`` template renders for k assistant turns, versus O(n^2) for a
 pairwise prefix diff.
@@ -103,13 +90,8 @@ def _render(tokenizer: Any, messages: list[dict], **kwargs: Any) -> list[int]:
 # ---------------------------------------------------------------------------
 
 logger = logging.getLogger(__name__)
-# Row adapters: one per corpus LAYOUT, not per corpus.
-#
-# This is the one thing the old 937-line SFT loader was right about. Corpora
-# genuinely disagree about how a conversation is stored, and no single column
-# convention covers them: `DATASET_MESSAGE_BUILDERS` there had five entries.
-# Everything else it carried -- the packing pool, best-fit state, shared-memory
-# counters, a thread pool -- is grain's job now and is gone.
+# Row adapters: one per corpus LAYOUT, not per corpus. Corpora disagree about
+# how a conversation is stored, and no single column convention covers them.
 #
 # An adapter maps one row to `(messages, tools, enable_thinking)`. Attach one per
 # dataset via `DatasetSpec.row_adapter`; the default handles the common layout.

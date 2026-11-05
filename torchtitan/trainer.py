@@ -21,29 +21,8 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.components.checkpointer import DATALOADER
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
-
-from torchtitan.observability.data_consumption import (
-    build_data_mix_metrics,
-    DataMixMetricsLike,
-    NoDataMixMetrics,
-)
-from torchtitan.optimizers.container import DiSCOOptimizersContainer
-
-
-def _disco_container(engine: Any) -> DiSCOOptimizersContainer | None:
-    """The engine's optimizer container if it is DiSCO's, else None.
-
-    A free function so `train_step` needs nothing extra on `self`: upstream
-    tests drive it with a duck-typed stand-in engine (without `optim`).
-    isinstance, not hasattr -- those tests pass MagicMocks, where every hasattr
-    answers True.
-    """
-    optimizers = getattr(getattr(engine, "optim", None), "optimizers", None)
-    return optimizers if isinstance(optimizers, DiSCOOptimizersContainer) else None
-
-
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
-from torchtitan.components.validator import BaseValidator, validation_seq_len, Validator
+from torchtitan.components.validator import BaseValidator, Validator
 from torchtitan.config import (
     apply_overrides,
     Configurable,
@@ -55,11 +34,24 @@ from torchtitan.distributed import utils as dist_utils
 from torchtitan.models.base.model import BaseModel
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
 from torchtitan.observability import structured_logger as sl
+
+from torchtitan.observability.data_consumption import (
+    build_data_mix_metrics,
+    DataMixMetricsLike,
+)
 from torchtitan.observability.metrics import ensure_pp_loss_visible, MetricsProcessor
+from torchtitan.optimizers.container import DiSCOOptimizersContainer
 from torchtitan.training_engine import TrainingEngine
 
 
 logger = logging.getLogger(__name__)
+
+
+def _disco_container(engine: TrainingEngine) -> DiSCOOptimizersContainer | None:
+    """The engine's optimizer container if it is DiSCO's (an AdamW run has
+    upstream's)."""
+    optimizers = engine.optim.optimizers
+    return optimizers if isinstance(optimizers, DiSCOOptimizersContainer) else None
 
 
 def logs_metrics_locally(metrics) -> bool:
@@ -156,11 +148,11 @@ class Trainer(Configurable):
             anything, and means the container is built already correct rather
             than patched afterwards.
 
-            No-op for upstream's container, which has neither field.
+            No-op for upstream's container (an AdamW run).
             """
-            log_norm_freq = getattr(self.optim.optimizer, "log_norm_freq", None)
-            if log_norm_freq is None:
+            if not isinstance(self.optim.optimizer, DiSCOOptimizersContainer.Config):
                 return
+            log_norm_freq = self.optim.optimizer.log_norm_freq
             # Norm logging is gated on `should_log`, so norms would otherwise
             # land on lcm(log_freq, log_norm_freq) rather than the requested
             # cadence: log_freq=100 with log_norm_freq=250 silently gives norms
@@ -179,12 +171,6 @@ class Trainer(Configurable):
                     "lcm(log_freq, log_norm_freq) instead of the cadence you "
                     "asked for."
                 )
-            gnoise = getattr(self.optim.optimizer, "gnoise", None)
-            if gnoise is not None and gnoise.enable:
-                from torchtitan.optimizers.gnoise import refuse_unsupported
-
-                gnoise.validate(log_norm_freq=log_norm_freq)
-                refuse_unsupported(parallelism=self.parallelism, training=self.training)
             if (
                 self.metrics.save_all_shard_ranks
                 and not self.metrics.save_for_all_ranks
@@ -241,9 +227,7 @@ class Trainer(Configurable):
     gradient_accumulation_steps: int
     num_pp_microbatches: int
 
-    data_mix_metrics: DataMixMetricsLike = NoDataMixMetrics()
-    """Replaced per-instance in __init__; a class-level null object so the
-    duck-typed `self` in upstream's tests does not have to carry one."""
+    data_mix_metrics: DataMixMetricsLike
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
@@ -344,9 +328,6 @@ class Trainer(Configurable):
         disco = _disco_container(engine)
         if disco is not None:
             disco.log_metrics_locally = logs_metrics_locally(config.metrics)
-            if disco.gnoise is not None:
-                disco.gnoise.validate_layout(accum=self.gradient_accumulation_steps)
-        self._check_per_rank_metric_logging()
 
         self.data_mix_metrics = build_data_mix_metrics(self.dataloader)
         logger.info(
@@ -385,9 +366,7 @@ class Trainer(Configurable):
                 parallelism_context=parallelism_context,
                 loss_fn=engine.loss_fn,
                 metrics_processor=self.metrics_processor,
-                seq_len=validation_seq_len(
-                    config.validator, config.model.max_context_length
-                ),
+                seq_len=config.model.max_context_length,
                 num_tokens_per_microbatch=num_tokens_per_microbatch,
                 pp_schedule=pp_schedule,
                 pp_has_first_stage=pp_has_first_stage,
@@ -404,54 +383,13 @@ class Trainer(Configurable):
             f"(warmup {config.optim.lr_scheduler.warmup_steps})"
         )
 
-    def _check_per_rank_metric_logging(self) -> None:
-        """Assert the optimizer's and the metrics side's rank predicates agree.
-
-        `log_metrics_locally` is decided from config right before this. This is
-        the half config cannot do: confirming that a rank which owns a disjoint slice of the
-        per-parameter metrics actually has a logger to write it to.
-
-        Inert today -- both sides derive ownership from
-        `rank_owns_metrics_shard`. It exists so a future divergence fails
-        loudly at init instead of silently producing a partial dashboard, which
-        is how the pure-DDP case went unnoticed.
-        """
-        disco = _disco_container(self.engine)
-        if disco is None or not disco.log_metrics_locally:
-            return
-        owns_shard = dist_utils.rank_owns_metrics_shard(self.engine.parallelism_context)
-        # The metrics processor builds its loggers on the ranks that log only.
-        has_logger = len(self.metrics_processor.loggers) > 0
-        # Only the direction that loses data is fatal: this rank owns a slice
-        # nobody else will log and has nowhere to put it. The reverse (a logger
-        # with nothing to log) is harmless, and firing on it would turn a soft
-        # W&B failure into an init-time abort of the whole job.
-        if owns_shard and not has_logger:
-            raise RuntimeError(
-                "per-rank metric logging would silently drop data on this rank: "
-                "it owns a disjoint slice of the per-parameter metrics but has "
-                "no logger to write them to. The optimizer's ownership split "
-                "and metrics._build_metric_logger's rank predicate have "
-                "diverged; both must come from "
-                "distributed.utils.rank_owns_metrics_shard."
-            )
-        if has_logger and not owns_shard:
-            logger.warning(
-                "this rank has a metrics logger but owns no metrics shard; it "
-                "will log global scalars only. Harmless, but it means the two "
-                "rank predicates disagree."
-            )
-
     def _is_final_step(self, current_step: int) -> bool:
         """Whether `current_step` is the run's last.
 
         The final step gets a metrics point (and, with norm logging on, a final
         spectrum snapshot) even when it does not land on a log_freq boundary.
-        getattr, not attribute access: upstream's trainer tests build a fake
-        config carrying no `training.steps`, and hard access made them fail on
-        our addition rather than on anything they were testing.
         """
-        return current_step == getattr(self.config.training, "steps", None)
+        return current_step == self.config.training.steps
 
     def microbatch_generator(
         self, data_iterable: Iterable[TrainingMicrobatch]
@@ -514,7 +452,6 @@ class Trainer(Configurable):
                 head_input=engine.take_head_input_rows,
             )
             engine.keep_head_input_rows(rows, seed=current_step)
-        gnoise = disco.gnoise if disco is not None else None
 
         # All groups form one optimizer step. Each microbatch group forms one
         # complete PP step, or one local forward/backward when PP is disabled.
@@ -563,8 +500,6 @@ class Trainer(Configurable):
         global_routing_token_counts = global_token_counts[num_loss_objectives:].reshape(
             local_routing_token_counts.shape
         )
-        if gnoise is not None:
-            gnoise.set_tokens(global_loss_token_counts)
         forward_backward_result = engine.forward_backward(
             microbatch_groups=microbatch_groups,
             global_loss_token_counts=global_loss_token_counts,
@@ -580,14 +515,6 @@ class Trainer(Configurable):
         # scheduler advances in engine.optim_step().
         lr_metrics = engine.optim.lr_schedulers.get_metrics() if should_log else {}
         grad_norm = engine.optim_step()
-        if gnoise is not None and gnoise.curvature_due:  # curvature steps log
-            gnoise.curvature(
-                engine,
-                microbatch_groups,
-                global_loss_token_counts=global_loss_token_counts,
-                global_routing_token_counts=global_routing_token_counts,
-                local_loss=forward_backward_result.loss,
-            )
         self._local_num_flops_since_last_log += forward_backward_result.num_flops
 
         # log metrics
@@ -684,11 +611,11 @@ class Trainer(Configurable):
         # After checkpoint load, this is the restored number of completed updates.
         loaded_step = engine.num_completed_steps
 
-        averages = getattr(engine, "averages", None)
+        averages = engine.averages
         if (
             averages is not None
             and averages.config.start_from_gamma is not None
-            and getattr(engine.checkpointer, "loaded_from_initial_path", False)
+            and engine.checkpointer.loaded_from_initial_path
         ):
             # angular WSD: the branch starts from the renormalised average of the
             # loaded checkpoint, with its raw optimizer state
@@ -735,7 +662,7 @@ class Trainer(Configurable):
                         self.validator.validate(
                             engine.model_parts, engine.num_completed_steps
                         )
-                        if getattr(engine, "averages", None) is not None:
+                        if engine.averages is not None:
                             engine.averages.validate(
                                 self.validator, engine.num_completed_steps
                             )

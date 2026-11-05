@@ -49,11 +49,8 @@ def _svdvals(W: torch.Tensor, sigma_only: bool = False) -> torch.Tensor:
     accurate driver if the approximate one fails to converge, so a pathological
     parameter degrades to "slower" rather than "crashes training".
 
-    `driver=` is only accepted for CUDA inputs -- passing it on a CPU tensor
-    raises outright, which is why every 2-D norm in this module used to be
-    CPU-unusable. Selecting it by device here makes the module work on CPU
-    (needed for unit tests) with no change to
-    CUDA behaviour.
+    `driver=` is only accepted for CUDA inputs (a CPU tensor raises), so it is
+    selected by device: the module also runs on CPU (unit tests).
     """
     if not W.is_cuda:
         return torch.linalg.svdvals(W)
@@ -843,14 +840,10 @@ def calculate_norm(
     we expect the weights to be [D_out, D_in], otherwise, we need to set `transpose` to True
 
     `want_spectrum` controls whether the full singular-value vector is returned
-    under the "spectrum" key. It used to be injected unconditionally, but the
-    only consumer (export/spectrum_logging.py) pops every `track_spectrum_*`
-    entry and discards it unless `enable_spectrum_export` is set, which it is
-    not by default. Since the metric sink
-    packs, all-gathers and moves those vectors to CPU on the way there, and
-    they are ~99% of that gather's payload, the flag is threaded from the
-    optimizer config rather than assumed. When it is False AND no requested
-    norm needs singular values, the SVD is skipped entirely.
+    under the "spectrum" key: only with `enable_spectrum_export` (its one
+    consumer, export/spectrum_logging.py), since the vectors are ~99% of the
+    metric gather's payload. When it is False AND no requested norm needs
+    singular values, the SVD is skipped entirely.
 
     Note that callers must use `norms.pop("spectrum", None)` -- the key is
     absent, not None, when `want_spectrum=False`.

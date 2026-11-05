@@ -23,6 +23,7 @@ from torchtitan.components.optim import GradientClipper, Optim
 from torchtitan.distributed.accelerator_graph import wrap_with_accelerator_graph
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainingEngine
 from torchtitan.models.common.aux_loss import AuxLoss
+from torchtitan.observability.data_consumption import NoDataMixMetrics
 from torchtitan.observability.metrics import compute_training_performance_metrics
 from torchtitan.observability.profiler import CuspyProfilerConfig, Profiler
 from torchtitan.observability.sdc_replayer import SDCReplayMismatch
@@ -127,6 +128,14 @@ def _training_loop(trainer: TrainingEngine) -> SimpleNamespace:
         trainer.optim_step = lambda: TrainingEngine.optim_step(trainer)
     if not hasattr(trainer.config, "model"):
         trainer.config.model = SimpleNamespace(traverse=lambda _: iter(()))
+    # What our train_step additions read: no DiSCO container, no step count, no
+    # weight averages.
+    if not hasattr(trainer, "averages"):
+        trainer.averages = None
+    if not hasattr(trainer.optim, "optimizers"):
+        trainer.optim.optimizers = None
+    if not hasattr(trainer.config.training, "steps"):
+        trainer.config.training.steps = None
 
     fake_trainer = SimpleNamespace(
         engine=trainer,
@@ -136,11 +145,8 @@ def _training_loop(trainer: TrainingEngine) -> SimpleNamespace:
         metrics_processor=trainer.metrics_processor,
         _local_num_flops_since_last_log=0,
     )
-    # Same idiom as the attributes patched onto `trainer` above: a duck-typed
-    # `self` still has to carry what `train_step` reads off it. A
-    # SimpleNamespace does not inherit Trainer's class-level
-    # `data_mix_metrics` null object, so it needs one of its own.
-    fake_trainer.data_mix_metrics = Trainer.data_mix_metrics
+    # A duck-typed `self` carries what `train_step` reads off it.
+    fake_trainer.data_mix_metrics = NoDataMixMetrics()
     fake_trainer._is_final_step = lambda step: Trainer._is_final_step(
         fake_trainer, step
     )
@@ -937,6 +943,7 @@ def test_optim_step_waits_for_checkpoint() -> None:
                 maybe_wait_for_staging=lambda: events.append("checkpoint")
             ),
             optim=optim,
+            averages=None,
         ),
     )
 

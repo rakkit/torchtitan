@@ -94,7 +94,7 @@ def main() -> None:
 
     capture = _LossCapture()
     world, rank = dist.get_world_size(), dist.get_rank()
-    seq_len = config.training.max_context_length
+    seq_len = config.model.max_context_length
     validator = Validator.Config(
         freq=1,
         steps=args.val_steps,

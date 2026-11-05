@@ -27,7 +27,6 @@ optimizers/
   container.py      DiSCOOptimizersContainer: config, param groups, arming, metrics hand-off
   moe_balance.py    MoE load-balance bias hook; router metrics on logging steps
   model_stats.py    residual, RMSNorm-gain and sink statistics (log_*_stats)
-  gnoise.py         gradient-noise logging; gnoise_research.py, gnoise_math.py
   utils.py          FQN cleanup, the DiSCO kwargs the container passes
   disco/
     optimizer.py    DiSCO: build (families, exchanges, metric registry), step(), state
@@ -730,95 +729,3 @@ CPU test on an explicit CPU mesh.
   start and validation swap (before step 1 / restored bitwise), EMA and the MoE
   bias hook (no parameter writes). A new writer must rebuild the copies
   (`load_state_dict` does) or run before the first step.
-
-## Gradient-noise logging (`optimizer.gnoise`, off by default)
-
-`optimizers/gnoise.py` (E1), `gnoise_research.py` (research mode), `gnoise_math.py` (the
-estimators). Off by default; when off nothing is installed and nothing runs.
-
-**When.** E1 runs on DiSCO's norm-logging steps: by default every one (step 1, every
-`log_norm_freq`-th step, the last step). `e1_freq` N (a multiple
-of `log_norm_freq`) keeps the steps divisible by N; `e1_first_and_last_steps` false drops step 1 and the
-last step. `research_freq` and the curvature frequencies must be multiples
-of the E1 interval (`e1_freq`, or `log_norm_freq` when 0). The finalisation is vectorised over
-all units, rows, heads and types (static index maps); metrics are kept as vector families and
-gathered by owner with one sync.
-
-**Small batch.** One (rank, microbatch): torchtitan reduces the gradient after every
-microbatch, so that is the smallest gradient that exists. For a routed expert it is one
-(expert copy, microbatch): EP 1, the rank; EP > 1, its EP group. K = dp ranks x accumulation;
-K_e = (efsdp x dp_replicate) x accumulation. K < 2 is refused at set-up.
-
-**Where it reads.** A per-instance wrapper on every `FSDPParamGroup.post_backward`, at its
-entry: the group still holds the unsharded weight the forward used and this small batch's
-gradient, before FSDP reshards and reduces (torch `_fsdp_param_group.py`, pinned by a test).
-The reduced gradient G is read before the clip. One small batch per (param, microbatch),
-counted exactly once; a group still sharded at the entry, or a skipped reduce outside the
-chunked loss's chunks, raises.
-
-**Estimators.** With n_b valid tokens, g_b the gradient of sum(loss) / N_den, ghat_b =
-(N_den / n_b) g_b, N = sum n_b, Ghat = (N_den / N) sum_b g_b, for a projection P fixed with
-respect to the batch: A = mean_b ||P ghat_b||^2, F = ||P Ghat||^2, H = mean_b 1 / n_b,
-tr = (A - F) / (H - 1/N), S = (F H - A / N) / (H - 1/N). Small batches with no token are left
-out; a component with fewer than two is not estimable (NaN). P is built from the compute
-copy of W (the fp32 master cast to FSDP's param_dtype on the F side, bitwise the same values).
-A basis from G_t or M_t is not offered: the unbiasedness needs P independent of the batch.
-
-**Caveats.**
-- Sampling: the loader packs documents (concat_then_split, no shuffle), so the estimate is
-  the noise per rank-microbatch. It scales to tokens only as far as microbatches are
-  independent draws; the accumulation test (mb 32 vs 16 x 2) measures the gap.
-- Experts: unbiased conditional on the routing, treating the tokens routed to an expert as
-  draws from its routed-token distribution; n_b,e is the routed count (every routed token, a
-  masked label included), N_e = sum_b n_b,e, Ghat_e = (N_den / N_e) G_e. B_simple is in routed
-  tokens and, x N / N_e, in total tokens. Small batches with fewer routed tokens than min(m, n) are rank-deficient
-  (counted per step: `gnoise_ex_lowtok`).
-- Per-step SE: the delete-one jackknife needs <P ghat_b, P Ghat> per b. E1 has it for rank-1
-  components (Frobenius / spectral radial); research mode for every component.
-- Router: covered with no aux loss or the sequence-wise one; left out under the batch-wise one
-  (its gradient is no per-token sum). The expert bias is a buffer, not covered.
-
-**Research mode** (`research_freq` > 0). Every rank copies its small batch's gradient of the
-covered units (bf16) into a send buffer laid out by owner; one all-to-all over the dp world
-moves them (a dense matrix whole to one owner, a vocabulary matrix by row blocks, an expert
-unit only among the ranks holding that expert). The owner then has all K small batches and W:
-exact jackknife SEs, the spectral radial (u1 v1^T of W_t), top-k shares (W_t's top-k on the
-smaller side; A1 predicts k / min(m, n)), and the LMO agreement a_s = mean over disjoint pairs
-of <O_S, O_S'> / min(m, n) at every s dividing K with s <= K / 2 (one partition per size from a
-private generator seeded by the step, three at the half, all three pairings at K = 4).
-- Exact polar = the eigendecomposition of the fp64 Gram; singular values below 1e-6 sigma_max
-  map to 0 (resolvable to about 1e-8 sigma_max). It is the exact polar, not the training
-  backend's Polar-Express LMO, and it is the same for every training rule: research reads no
-  optimizer state (vectors: sign, embedding / head / router rows: row-l2, matrices: polar).
-- E a_s = kappa(s n_b)^2 under the linear-drift model (two independent halves); reading the
-  momentum step's kappa from it assumes the noise-dominated law kappa ~ sqrt(P B).
-- Memory on a research step: about 4 B x (P_dense + P_experts / EP) x accumulation per rank
-  (snapshot + received), freed after the step.
-
-**Curvature** (`curvature_model_freq`, `curvature_matrix_freq`; research runs): same-batch,
-after the optimizer step: c = 2 (L(W_{t+1}) - L(W_t) - <G_t, Delta>) / ||Delta||^2 from one
-forward, and per unit <Delta_k, G'_k - G_k> / ||Delta_k||^2 from a second forward and backward.
-All model buffers (MoE counts, aux-loss accumulators) and the RNG are restored and the
-gradients cleared.
-
-**Update metrics** (hidden matrices: layout kind `matrix`, no experts). DiSCO calls
-`update_observer` at the end of `step()` with the update u it applied (W <- decay W -
-lr u, alpha W - u, or W - u for rules that return weights); O_t = u. On every E1 step
-`gnoise_psi/<unit>` = <O_t, G_t> / (|O_t| |G_t|), G_t the reduced gradient (read after
-the clip, a common scalar). On the E1 steps divisible by L, the smallest multiple of the
-E1 interval >= 8, `gnoise_lag<h>/<unit>` = <O_t, O_{t-h}> / (|O_t| |O_{t-h}|) for h = 1,
-2, 4, 8; the local rows of O are copied only on the steps L - h before (at most four
-copies per parameter, dropped once read; NaN after a resume until refilled). Research
-steps add `gnoise_psi_half` / `gnoise_psi_quarter` (G from the subset sums of the groups
-{b : b mod g = a}, g = 2 / 4, b the rank-major small-batch index; mean over a; the
-small-batch gradients are kept on their owner through the optimizer step and O is
-gathered whole), and per matrix unit `gnoise_ntop<k>` (k = 1, 2, 3, k <= K - 1: the
-top-k eigenvalue share of the K x K Gram of sqrt(n_b) d_b, d_b = ghat_b - Ghat, i.e. of
-the per-token noise covariance; an isotropic noise gives about k / (K - 1)) and, when K
->= 8 (else one startup line), `gnoise_bs1` = `gnoise_bs1_noise` / `gnoise_bs1_grad` =
-||C_row^(1/2)||_S1^2 / ||Ghat||_S1^2, C_row = sum_b n_b d_b d_b^T / (K - 1) over the
-unit's rows (Naganuma et al. 2602.03001 Eq. 17; ||Ghat||_S1 includes the noise's
-upward bias).
-
-**Refused (raise at config time, only when enabled):** TP, CP or PP > 1; CUDA graphs;
-CPU offload; compiled autograd.

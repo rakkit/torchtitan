@@ -6,11 +6,10 @@
 
 """`Optim` for DiSCO: upstream's update (clip, finite checks, step, lr
 schedule, EMA) with DiSCO's container, which needs the parallelism context and
-the run's output folder, and the gradient-noise read before the clip."""
+the run's output folder."""
 
 from dataclasses import dataclass, field
 
-import torch
 import torch.nn as nn
 
 from torchtitan.components.optim import Optim
@@ -51,10 +50,3 @@ class DiSCOOptim(Optim):
             parallelism_context=self.parallelism_context,
             output_dir=self.output_dir,
         )
-
-    def _update(self, loss: torch.Tensor) -> torch.Tensor:
-        gnoise = self.optimizers.gnoise
-        if gnoise is not None:  # reads G before the clip on its armed steps
-            gnoise.before_clip()
-        return super()._update(loss)
-

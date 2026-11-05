@@ -469,20 +469,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self._output_is_head_input = False
         self._head_input_rows, self._head_input_seed = 0, 0
         self._head_input: torch.Tensor | None = None
-        # A loss may wrap the chunked one, so walk `.inner` down to a fixed
-        # point rather than probing exactly one level: two nested wrappers would
-        # otherwise leave lm_head unset, and the failure is silent until the
-        # first chunked forward.
-        chunked_loss_fn = self.loss_fn
-        seen: set[int] = set()
-        while (
-            not isinstance(chunked_loss_fn, ChunkedLossWrapper)
-            and id(chunked_loss_fn) not in seen
-            and getattr(chunked_loss_fn, "inner", None) is not None
-        ):
-            seen.add(id(chunked_loss_fn))
-            chunked_loss_fn = chunked_loss_fn.inner
-        if isinstance(chunked_loss_fn, ChunkedLossWrapper) and (
+        if isinstance(self.loss_fn, ChunkedLossWrapper) and (
             not self.parallelism_context.pp_enabled or self.pp_has_last_stage
         ):
             if self.parallelism_context.pp_enabled:
@@ -496,7 +483,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             model_with_lm_head = cast(Any, model)
             lm_head = model_with_lm_head.lm_head
             assert lm_head is not None, error_message
-            chunked_loss_fn.set_lm_head(lm_head)
+            self.loss_fn.set_lm_head(lm_head)
             model_with_lm_head._skip_lm_head = True
             self._output_is_head_input = not self.parallelism_context.pp_enabled
 
@@ -525,12 +512,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.optim.optimizers,
             self.model_parts,
             self.parallelism_context,
-        )
-        # DiSCO's gradient-noise statistics (off by default), read per microbatch.
-        self._gnoise = (
-            self.optim.optimizers.gnoise
-            if isinstance(self.optim.optimizers, DiSCOOptimizersContainer)
-            else None
         )
         self.averages = (
             self.config.averages.build(
@@ -847,14 +828,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         accumulated_loss: torch.Tensor | None = None
         loss_metrics: list[list[dict[str, torch.Tensor]]] = []
         num_accumulation_steps = len(microbatch_groups)
-        # DiSCO's gradient-noise statistics split the gradient by microbatch
-        # (off by default; not with an accelerator graph).
-        gnoise = getattr(self, "_gnoise", None)
         for accumulation_index, microbatch_group in enumerate(microbatch_groups):
-            if gnoise is not None:
-                gnoise.begin_microbatch(
-                    sum(mb.loss_token_counts.reshape(-1)[0] for mb in microbatch_group)
-                )
             is_last_accumulation_step = accumulation_index == num_accumulation_steps - 1
             prepared_inputs = microbatch_group
             if preprocess_microbatch_groups_lazily:
@@ -1004,9 +978,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.loss,
             current_step=current_step,
         )
-        averages = getattr(self, "averages", None)
-        if averages is not None:
-            averages.step(current_step)
+        if self.averages is not None:
+            self.averages.step(current_step)
         self.num_completed_steps = current_step
         return grad_norm
 

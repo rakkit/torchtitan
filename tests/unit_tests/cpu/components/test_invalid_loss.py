@@ -12,6 +12,7 @@ import torch
 from torchtitan.components.data.types import TokenizedTrainingMicrobatch
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.optim import GradientClipper, Optim
+from torchtitan.observability.data_consumption import NoDataMixMetrics
 from torchtitan.trainer import Trainer
 from torchtitan.training_engine import TrainingEngine
 
@@ -75,6 +76,7 @@ class TestInvalidLoss(unittest.TestCase):
         optim.ema = None
         optim._run_update = optim._update
         trainer.optim = optim
+        trainer.averages = None
 
         loop.engine = trainer
         loop._local_num_flops_since_last_log = 0
@@ -83,6 +85,7 @@ class TestInvalidLoss(unittest.TestCase):
         loop.num_pp_microbatches = 1
         loop.metrics_processor = MagicMock()
         loop.metrics_processor.should_log.return_value = should_log
+        loop.data_mix_metrics = NoDataMixMetrics()
 
         trainer._run_forward_backward = MagicMock(
             return_value=(torch.tensor(loss_value), [[{}]])

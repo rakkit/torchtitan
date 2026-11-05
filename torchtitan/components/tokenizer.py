@@ -594,18 +594,3 @@ class MultiModalTokenizer(HuggingFaceTokenizer):
                 )
             setattr(self, f"{name}_token", token_str)
             setattr(self, f"{name}_id", token_to_id[token_str])
-
-
-class HuggingFaceByteTokenizer(HuggingFaceTokenizer):
-    """Byte-level tokenizer that splits special tokens when encoding.
-
-    Used by scripts/create_byte_tokenizer.py. The base loader leaves
-    ``encode_special_tokens`` off, so special-token strings in the corpus would
-    be encoded as literal bytes instead of their ids.
-    """
-
-    def _load_tokenizer_from_path(self, *args, **kwargs) -> Tokenizer:
-        tokenizer = super()._load_tokenizer_from_path(*args, **kwargs)
-        # Re-set after loading: the base implementation resets it.
-        tokenizer.encode_special_tokens = True
-        return tokenizer

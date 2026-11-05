@@ -178,8 +178,7 @@ def _axis_reductions(
     """Per-row (`dim=1`) or per-column (`dim=0`) squared norms and cross dots.
 
     Returns `(sq_W, sq_U, dot_WU)`, which feed the radiality metric for that
-    axis. (These also used to feed an expanded form of the aus norm; see
-    `_axis_aus_direct` for why that was removed.)
+    axis.
     """
     return (W * W).sum(dim), (U * U).sum(dim), (W * U).sum(dim)
 
@@ -191,10 +190,7 @@ def _axis_radiality(
     largest row/column, which is where that induced norm's norming covector
     concentrates.
 
-    Returns the radiality only. (It used to also return the two axis maxima,
-    for an `_axis_aus` that derived the aus norm from these same reductions;
-    that expansion was removed because it cancels catastrophically now that aus
-    compares the two weights rather than the weight and the update.)
+    Returns the radiality only.
 
     The induced norms' dimension factors (`sqrt(d_in)` for rms->inf,
     `1/sqrt(d_out)` for l1->rms) appear in both `N(W)` and `N(U)` and cancel in

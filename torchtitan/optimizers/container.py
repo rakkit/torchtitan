@@ -43,7 +43,6 @@ from torchtitan.optimizers.export.gram_vector_logging import (
     process_gram_vectors_for_logging,
 )
 from torchtitan.optimizers.export.spectrum_logging import process_norms_for_logging
-from torchtitan.optimizers.gnoise import GradNoise, GradNoiseConfig
 from torchtitan.optimizers.helpers import norm_helper
 
 __all__ = ["DiSCOOptimizersContainer"]
@@ -76,10 +75,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
     ``begin_step`` arms it, ``collect_metrics`` reads back. Also accepts
     Adam/AdamW.
     """
-
-    gnoise: "GradNoise | None" = (
-        None  # built in __init__ only when optimizer.gnoise.enable
-    )
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseOptimizersContainer.Config):
@@ -178,9 +173,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         tensor each gram_polar_express call receives, per unit
         (gram_input_s1f/<unit>, its max over the unit's calls, and the count
         of units in the 1.01 failure band [0.94, 0.955])."""
-
-        gnoise: GradNoiseConfig = field(default_factory=GradNoiseConfig)
-        """Gradient-noise statistics (optimizers/gnoise.py); off by default."""
 
         enable_spectrum_export: bool = False
         """
@@ -371,9 +363,7 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         self.optimizers = []
         self.model_parts = model_parts
 
-        # Set from config at build time. They used to be assigned onto the
-        # container by the trainer after construction, which meant the object
-        # was briefly in a state its own methods did not expect.
+        # Set from config at build time.
         self.norms_to_log: list[str] | None = norm_helper.get_norms_to_log(
             config.norms_to_log
         )
@@ -447,18 +437,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         if parallelism_context is not None and parallelism_context.pp_enabled:
             self._check_unit_types_over_stages(parallelism_context)
         self._post_init(all_params)
-        config.gnoise.validate(log_norm_freq=config.log_norm_freq)
-        self.gnoise: GradNoise | None = (
-            GradNoise(
-                config.gnoise,
-                model_parts=self.model_parts,
-                parallelism_context=parallelism_context,
-                container=self,
-            )
-            if config.gnoise.enable
-            else None
-        )
-        self._gnoise_research_freq = config.gnoise.research_freq
 
     def _check_unit_types_over_stages(
         self, parallelism_context: ParallelismContext
@@ -608,8 +586,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         takes from `head_input` and hands to DiSCO for that step only.
         """
         self._head_input = None
-        if self.gnoise is not None:
-            self.gnoise.note_step(step)
         if should_log:
             self.arm_moe_publish()
         self._arm_model_stats(step, should_log=should_log, is_final_step=is_final_step)
@@ -618,11 +594,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         ):
             return 0
         self.arm_norm_computation()
-        if self.gnoise is not None and self.gnoise.due(
-            step, first_or_last=step == 1 or is_final_step
-        ):
-            freq = self._gnoise_research_freq
-            self.gnoise.arm(step, research=freq > 0 and step % freq == 0)
         discos = [o for o in self.optimizers if isinstance(o, DiSCO)]
         if head_input is None or not any(o.has_head_geometry for o in discos):
             return 0
@@ -721,8 +692,6 @@ class DiSCOOptimizersContainer(BaseOptimizersContainer, Generic[T]):
         armed, self._norms_armed = self._norms_armed, False
         if armed:
             metrics.update(self.get_parameter_norms(step=step))
-        if self.gnoise is not None:
-            metrics.update(self.gnoise.collect())
         metrics.update(self.collect_moe_metrics())
         metrics.update(self._collect_model_stats())
         return metrics

@@ -86,6 +86,43 @@ def test_short_conv_gradients_match_the_reference():
     torch.testing.assert_close(wa.grad.double(), wb.grad, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the conv kernel needs CUDA")
+def test_short_conv_at_the_production_width_in_bf16():
+    """The fused q / k / v conv of the 30B shapes (32 q + 2 x 4 KV heads of 128:
+    5120 channels), bf16 as in training, over a 32768-token row of packed
+    documents (1 to 3000 tokens): the output and both gradients are the fp64
+    reference's within bf16 rounding. The kernel accumulates in fp32 and rounds
+    twice, as training does (conv(x) to bf16, then the bf16 add x + conv(x)),
+    so the bound is in the two terms' sizes: 2^-7 (|x| + |conv(x)|)."""
+    g = torch.Generator().manual_seed(0)
+    lengths, left = [], 32768
+    while left > 0:
+        lengths.append(min(left, int(torch.randint(1, 3001, (1,), generator=g))))
+        left -= lengths[-1]
+    x, w, positions = _docs(lengths, c=5120)
+    x, w = x.bfloat16(), (0.5 * w).bfloat16()
+    xa, wa = x.clone().requires_grad_(), w.clone().requires_grad_()
+    xb, wb = x.double().requires_grad_(), w.double().requires_grad_()
+    out = _conv(xa, wa, positions)
+    want = _reference_conv(xb, wb, positions)
+    grad = torch.randn(x.shape, device="cuda").bfloat16()
+    (out * grad).sum().backward()
+    (want * grad.double()).sum().backward()
+    assert out.dtype == torch.bfloat16
+
+    def within_two_roundings(got, want, residual):
+        bound = 2**-7 * (residual.abs() + (want - residual).abs()) + 1e-6
+        assert ((got.double() - want).abs() <= bound).all()
+
+    within_two_roundings(out, want.detach(), xb.detach())
+    within_two_roundings(xa.grad, xb.grad, grad.double())
+    # the weight gradient: fp32 sums over the row, one bf16 rounding
+    scale = wb.grad.abs().max()
+    torch.testing.assert_close(
+        wa.grad.double() / scale, wb.grad / scale, rtol=8e-3, atol=1e-3
+    )
+
+
 def _tiny(conv=4, sinks=True, sinks_init_fn_type=None, sinks_init_std=None, gate=None):
     attention = dict(
         conv_kernel_size=conv,  # the other conv arguments: their defaults

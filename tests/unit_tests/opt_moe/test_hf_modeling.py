@@ -296,6 +296,42 @@ def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
         assert torch.equal(got[key], value), key
 
 
+def test_a_bf16_export_keeps_the_router_bias_exact(tmp_path):
+    """The router bias picks the top-k experts and training keeps it in fp32:
+    a bf16 export must carry the exact fp32 values (HF and vLLM read them in
+    fp32), not bf16-rounded ones that change expert choices."""
+    import torch.distributed.checkpoint as dcp
+    from safetensors.torch import load_file
+
+    from scripts.checkpoint_conversion.convert_opt_moe_to_hf import (
+        convert_opt_moe_to_hf,
+    )
+
+    run, model = _pretrain_run(tmp_path)
+    with torch.no_grad():
+        biases = [b for n, b in model.named_buffers() if n.endswith("expert_bias_E")]
+        assert biases
+        for bias in biases:
+            bias.copy_(0.05 * torch.randn_like(bias))
+    dcp.save(model.state_dict(), checkpoint_id=str(tmp_path / "step-1"))
+    convert_opt_moe_to_hf(
+        tmp_path / "step-1",
+        tmp_path / "job_config.json",
+        tmp_path / "hf",
+        "bfloat16",
+        read_threads=4,
+    )
+    got = {}
+    for f in (tmp_path / "hf").glob("*.safetensors"):
+        got |= load_file(f)
+    want = OPTMoEStateDictAdapter(run.model, None).to_hf(model.state_dict())
+    keys = [k for k in want if k.endswith("e_score_correction_bias")]
+    assert keys
+    for key in keys:
+        assert got[key].dtype == torch.float32, key
+        torch.testing.assert_close(got[key], want[key], rtol=0, atol=0, msg=key)
+
+
 def test_an_ema_copy_converts_in_place_of_the_trained_weights(tmp_path):
     """convert_opt_moe_ema_to_hf: a checkpoint laid out as CheckpointManager
     writes it (the model at the top level, two EMA copies under "ema") exports

@@ -6,8 +6,8 @@
 
 """An opt_moe run's DCP checkpoint -> a complete HF folder (``trust_remote_code``).
 
-Upstream's ``convert_to_hf.py`` (DCP load, ``export_state_dict``, the adapter's
-``to_hf``, ``HuggingFaceStorageWriter``), plus what an opt_moe run needs:
+Upstream's ``convert_to_hf.py`` (DCP load, the adapter's ``to_hf``, the export
+dtype, ``HuggingFaceStorageWriter``), plus what an opt_moe run needs:
 
 1. The run's own model, rebuilt from its ``job_config.json`` (flavor and the
    recipe's overrides, as offline evaluation), not a flavor name.
@@ -51,7 +51,7 @@ from torch.distributed.checkpoint.planner import (
 )
 from torch.futures import Future
 
-from torchtitan.components.checkpointer import export_state_dict, ModelWrapper
+from torchtitan.components.checkpointer import ModelWrapper
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.evaluation.config import load_training_config
@@ -188,18 +188,20 @@ def load_run_model(job_config: Path):
     return run, model
 
 
-def save_hf_folder(run, model, state_dict, output_dir: Path, export_dtype: str) -> None:
+def save_hf_folder(run, state_dict, output_dir: Path, export_dtype: str) -> None:
     """``state_dict`` (native names) as a complete HF folder: the weights in
     ``export_dtype`` (the adapter's fp32 tensors kept fp32), the config, the
     modeling and tokenizer files, a generation config and a chat template."""
-    state_dict = export_state_dict(
-        state_dict, dtype=TORCH_DTYPE_MAP[export_dtype], model_parts=[model]
-    )
+    # Cast after the HF mapping: the adapter's fp32 tensors (the router bias, an
+    # fp32 buffer in training that steers top-k) keep their exact values; a
+    # cast first would round them before the fp32 copy.
     adapter = OPTMoEStateDictAdapter(run.model, None)
     hf_state_dict = adapter.to_hf(state_dict)
-    for key in hf_state_dict:
-        if key.endswith(adapter.keep_in_fp32):
-            hf_state_dict[key] = hf_state_dict[key].float()
+    dtype = TORCH_DTYPE_MAP[export_dtype]
+    for key, value in hf_state_dict.items():
+        if value.is_floating_point():
+            fp32 = key.endswith(adapter.keep_in_fp32)
+            hf_state_dict[key] = value.float() if fp32 else value.to(dtype)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     # One process holds the full tensors: the writer's rank-0 mode writes the
@@ -232,7 +234,7 @@ def convert_opt_moe_to_hf(
             checkpoint_dir, thread_count=read_threads
         ),
     )
-    save_hf_folder(run, model, state_dict, output_dir, export_dtype)
+    save_hf_folder(run, state_dict, output_dir, export_dtype)
 
 
 if __name__ == "__main__":

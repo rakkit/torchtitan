@@ -118,7 +118,7 @@ def convert_opt_moe_ema_to_hf(
             f"{sorted(ema_fqns ^ set(averaged) | set(averaged) - set(state_dict))[:5]}"
         )
     state_dict.update(averaged)
-    save_hf_folder(run, model, state_dict, output_dir, export_dtype)
+    save_hf_folder(run, state_dict, output_dir, export_dtype)
 
 
 if __name__ == "__main__":

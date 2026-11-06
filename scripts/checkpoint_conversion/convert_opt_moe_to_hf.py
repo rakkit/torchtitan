@@ -145,12 +145,8 @@ def _write_hf_files(
 ) -> None:
     """config.json (with the tokenizer's bos / eos ids), the modeling files, the
     tokenizer files, a generation config and a chat template."""
-    token_ids = {}
-    if (hf_assets_path / "tokenizer.json").is_file():
-        tokenizer = HuggingFaceTokenizer.Config().build(
-            tokenizer_path=str(hf_assets_path)
-        )
-        token_ids = {"bos_token_id": tokenizer.bos_id, "eos_token_id": tokenizer.eos_id}
+    tokenizer = HuggingFaceTokenizer.Config().build(tokenizer_path=str(hf_assets_path))
+    token_ids = {"bos_token_id": tokenizer.bos_id, "eos_token_id": tokenizer.eos_id}
     config = OptMoeConfig(
         **hf_config(model_config), torch_dtype=export_dtype, **token_ids
     )
@@ -172,7 +168,7 @@ def _write_hf_files(
         shutil.copy(hf_dir / "chat_template.jinja", output_dir / "chat_template.jinja")
     # A pretrain run's assets carry no generation config: without its eos id,
     # HF and vLLM generation would never stop.
-    if token_ids and not (output_dir / "generation_config.json").is_file():
+    if not (output_dir / "generation_config.json").is_file():
         GenerationConfig(**token_ids).save_pretrained(output_dir)
 
 
@@ -210,6 +206,13 @@ def save_hf_folder(run, state_dict, output_dir: Path, export_dtype: str) -> None
     """``state_dict`` (native names) as a complete HF folder: the weights in
     ``export_dtype`` (the adapter's fp32 tensors kept fp32), the config, the
     modeling and tokenizer files, a generation config and a chat template."""
+    if not (Path(run.hf_assets_path) / "tokenizer.json").is_file():
+        # without it the folder has no tokenizer and no bos / eos ids: generation
+        # would never stop
+        raise ValueError(
+            f"{run.hf_assets_path} has no tokenizer.json: point the run's "
+            "hf_assets_path at its tokenizer"
+        )
     # Cast after the HF mapping: the adapter's fp32 tensors (the router bias, an
     # fp32 buffer in training that steers top-k) keep their exact values; a
     # cast first would round them before the fp32 copy.

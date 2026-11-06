@@ -131,6 +131,21 @@ class OptMoeConfig(PretrainedConfig):
                 f"layer_types {sorted(set(self.layer_types))}: with conv_kernel_size "
                 f"{conv_kernel_size} each layer is one of {sorted(allowed)}"
             )
+        # what the HF and vLLM models implement; anything else would be ignored
+        if attention_gate not in (None, "element-wise"):
+            raise ValueError(
+                f"attention_gate {attention_gate!r}: None or 'element-wise'"
+            )
+        if conv_kernel_size and conv_streams not in ("qkv", "kv"):
+            raise ValueError(
+                f"conv_streams {conv_streams!r}: 'qkv' or 'kv' with a conv"
+            )
+        if sliding_window is None and any(
+            t in ("sliding_attention", "hybrid_sliding") for t in self.layer_types
+        ):
+            raise ValueError("sliding-window layers need sliding_window")
+        if hidden_act != "silu":
+            raise ValueError(f"hidden_act {hidden_act!r}: the FFNs are SwiGLU ('silu')")
         for name in (
             "layer_types",
             "rope_layers",

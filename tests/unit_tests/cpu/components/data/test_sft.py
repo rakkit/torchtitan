@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import grain.python as grain
 import numpy as np
-import pytest
 
 from torchtitan.components.data.sft import MultiTurnChatProcessor
 from torchtitan.components.data.types import DatasetBuildContext
@@ -147,6 +146,51 @@ def test_oversized_conversations_are_dropped_and_counted():
     assert processor.num_dropped == 1, "a kept sample must not increment the counter"
 
 
+def test_the_length_limit_is_on_the_training_sequence():
+    """The training sequence is the render minus one token (next-token shift), so a
+    render of max + 1 tokens fits a max-token context and must be kept."""
+    sample = _conversation("q", "a")  # "U:q|A:a|": 8 tokens, a 7-token sequence
+    assert (
+        _processor(drop_if_longer_than=7)(sample, np.random.default_rng(0)) is not None
+    )
+    assert _processor(drop_if_longer_than=6)(sample, np.random.default_rng(0)) is None
+
+
+def test_a_generation_prompt_unlike_the_history_turn_starts_the_loss_where_they_differ():
+    """Qwen3-style thinking templates end the generation prompt with an open block
+    ('<think>\\n') but render a history turn without reasoning as a closed one
+    ('<think></think>'). Starting the span at the generation prompt's LENGTH masks the
+    closing tag and starts one token late; the span must start where the two renders
+    stop agreeing, so the model learns to close the block."""
+
+    class OpenThinkTemplate(CharTokenizer):
+        def apply_chat_template(self, messages, add_generation_prompt=False, **kwargs):
+            text = "".join(
+                f"A:{{}}{m['content']}|"
+                if m["role"] == "assistant"
+                else f"U:{m['content']}|"
+                for m in messages
+            )
+            # "{~" as '<think>\n': open, and not a prefix of the history's "{}".
+            return text + ("A:{~" if add_generation_prompt else "")
+
+    processor = MultiTurnChatProcessor(
+        MultiTurnChatProcessor.Config(),
+        context=DatasetBuildContext(
+            tokenizer=OpenThinkTemplate(),
+            max_context_length=256,
+            num_tokens_per_microbatch=256,
+            read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=1),
+        ),
+    )
+    sequence = processor(
+        _conversation("q1", "ONE", "q2", "TWO"), np.random.default_rng(0)
+    )
+
+    assert _supervised_text(sequence) == "}ONE|}TWO|"
+    assert processor.num_prompt_mismatches == 2
+
+
 def test_output_feeds_upstream_packing_and_collation():
     """The reason experiments/sft cannot run on 0.5.0: it never produced a TextSequence."""
     from torchtitan.components.data.collators import TextCollator
@@ -162,7 +206,9 @@ def test_output_feeds_upstream_packing_and_collation():
     labels = batch.labels
 
     assert batch.input.numel() == CONTEXT.num_tokens_per_microbatch
-    n_loss = int(batch.loss_token_counts.sum())  # upstream's field (was num_valid_tokens)
+    n_loss = int(
+        batch.loss_token_counts.sum()
+    )  # upstream's field (was num_valid_tokens)
     assert n_loss > 0
     assert (labels != IGNORE_INDEX).sum() == n_loss
 

@@ -17,14 +17,24 @@ HOW THE SPANS ARE FOUND
 Tokenize the whole conversation ONCE -- those are the authoritative ids -- then locate
 each assistant turn by re-rendering prefixes::
 
-    start = len(tokenize(messages[:i], add_generation_prompt=True))
-    stop  = len(tokenize(messages[:i+1]))
+    full  = tokenize(messages)
+    start = common_prefix(tokenize(messages[:i], add_generation_prompt=True), full)
+    stop  = common_prefix(tokenize(messages[:i+1]), full)
     train on [start, stop)
 
 ``add_generation_prompt=True`` renders the prompt THROUGH the assistant header
 (``<|assistant|>`` or equivalent), so the header is excluded from the supervised span by
 construction rather than by a hand-set token count. A template that ignores the flag
 trains on the header.
+
+The span starts where the generation prompt stops agreeing with the full render, not at
+the generation prompt's length: the two differ whenever the template renders a new turn's
+header differently from the same turn in history. Qwen3-style thinking templates do: the
+generation prompt ends ``<think>\\n`` (open, for the model to fill) while a history turn
+without reasoning renders ``<think></think>\\n`` (measured on sft-v2-64k: 168 of 1,476
+assistant turns in 300 conversations). The prompt's length would start the span one token
+late and mask ``</think>``; the common prefix trains the model to close the block. Such
+turns are counted (``num_prompt_mismatches``) and logged.
 
 That is ``1 + 2k`` template renders for k assistant turns, versus O(n^2) for a
 pairwise prefix diff.
@@ -73,6 +83,13 @@ def _as_list(value: Any) -> list:
             return []
         return json.loads(text)
     return list(value)
+
+
+def _common_prefix_length(prefix: list[int], full: np.ndarray) -> int:
+    """The number of leading tokens ``prefix`` and ``full`` share."""
+    n = min(len(prefix), len(full))
+    differ = np.flatnonzero(np.asarray(prefix[:n], dtype=full.dtype) != full[:n])
+    return int(differ[0]) if differ.size else n
 
 
 def _render(tokenizer: Any, messages: list[dict], **kwargs: Any) -> list[int]:
@@ -208,11 +225,12 @@ class MultiTurnChatProcessor(SampleProcessor):
         render -- without it the per-turn spans are computed against different text and
         the loss mask silently lands in the wrong place."""
         drop_if_longer_than: int | None = None
-        """Skip conversations longer than this many tokens. They cannot be truncated
-        without corrupting the turn structure. Set it to the model's `max_context_length`:
-        that is what `FirstFitPackingConfig` filters on (`packing.py:77-79`), so anything
-        longer is discarded by the packer regardless -- doing it here makes the loss
-        countable instead of invisible."""
+        """Skip conversations whose training sequence (the rendered tokens minus one:
+        inputs predict the next token) is longer than this. They cannot be truncated
+        without corrupting the turn structure. Set it to the model's
+        `max_context_length`: `FirstFitPackingConfig` SPLITS longer sequences into
+        `max_context_length` pieces (`_SplitTextSequenceDocuments`), so without this
+        drop a long conversation would be trained as unrelated fragments."""
 
     def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
         self._tokenizer = context.tokenizer
@@ -221,17 +239,24 @@ class MultiTurnChatProcessor(SampleProcessor):
         self._drop_if_longer_than = config.drop_if_longer_than
         self._num_dropped = 0
         self._num_seen = 0
+        self._num_prompt_mismatches = 0
 
     @property
     def num_dropped(self) -> int:
         """Conversations skipped for length."""
         return self._num_dropped
 
+    @property
+    def num_prompt_mismatches(self) -> int:
+        """Assistant turns whose generation-prompt render is not a token prefix of the
+        full render (the span starts at their common prefix)."""
+        return self._num_prompt_mismatches
+
     def _tokenize(self, messages: list[dict], extra: dict[str, Any]) -> list[int]:
         return _render(self._tokenizer, messages, **{**self._template_kwargs, **extra})
 
     def _assistant_spans(
-        self, messages: list[dict], total: int, extra: dict[str, Any]
+        self, messages: list[dict], input_ids: np.ndarray, extra: dict[str, Any]
     ) -> list[tuple[int, int]]:
         spans: list[tuple[int, int]] = []
         for index, message in enumerate(messages):
@@ -240,16 +265,29 @@ class MultiTurnChatProcessor(SampleProcessor):
             # The generation prompt is the assistant header. Rendering the prefix WITH it
             # puts `start` after the header, so the header stays masked without anyone
             # having to count its tokens.
-            start = len(
-                self._tokenize(
-                    messages[:index], {**extra, "add_generation_prompt": True}
-                )
+            prompt = self._tokenize(
+                messages[:index], {**extra, "add_generation_prompt": True}
             )
-            stop = len(self._tokenize(messages[: index + 1], extra))
-            start, stop = min(start, total), min(stop, total)
+            start = _common_prefix_length(prompt, input_ids)
+            if start < len(prompt):
+                self._record_prompt_mismatch()
+            stop = _common_prefix_length(
+                self._tokenize(messages[: index + 1], extra), input_ids
+            )
             if stop > start:
                 spans.append((start, stop))
         return spans
+
+    def _record_prompt_mismatch(self) -> None:
+        self._num_prompt_mismatches += 1
+        if self._num_prompt_mismatches == 1 or self._num_prompt_mismatches % 1000 == 0:
+            logger.warning(
+                "SFT: %d assistant turns so far whose generation prompt the chat template "
+                "renders differently from the same turn in the full conversation (e.g. "
+                "'<think>\\n' vs '<think></think>'); their loss starts where the two "
+                "renders stop agreeing.",
+                self._num_prompt_mismatches,
+            )
 
     def _record_drop(self, num_tokens: int) -> None:
         """Report dropped conversations. They are otherwise invisible: the packer would
@@ -288,16 +326,17 @@ class MultiTurnChatProcessor(SampleProcessor):
         token_ids = self._tokenize(messages, extra)
         if len(token_ids) < 2:
             return None
+        # The training sequence is one token shorter than the render (next-token shift).
         if (
             self._drop_if_longer_than is not None
-            and len(token_ids) > self._drop_if_longer_than
+            and len(token_ids) - 1 > self._drop_if_longer_than
         ):
-            self._record_drop(len(token_ids))
+            self._record_drop(len(token_ids) - 1)
             return None
 
         input_ids = np.asarray(token_ids, dtype=np.int64)
         trainable = np.zeros(len(input_ids), dtype=bool)
-        for start, stop in self._assistant_spans(messages, len(input_ids), extra):
+        for start, stop in self._assistant_spans(messages, input_ids, extra):
             trainable[start:stop] = True
 
         if not trainable.any():
@@ -331,10 +370,9 @@ def make_sft_dataloader_config(
        and everything after it is shared. See the adapters above.
     3. **Oversized conversations are dropped, and logged.** The threshold MUST be
        the model's `max_context_length`, not `num_tokens_per_microbatch_per_dp_rank`:
-       `FirstFitPackingConfig.build` filters on `context.max_context_length`
-       (`packing.py:77-79`), so a conversation longer than that is discarded by the
-       packer even when it would fit the wider row. Counting against the row width would
-       undercount the drops whenever the two differ.
+       `FirstFitPackingConfig.build` splits every sequence longer than
+       `context.max_context_length` into pieces (`_SplitTextSequenceDocuments`), even
+       when it would fit the wider row, so only this drop keeps a conversation whole.
 
     The padding first_fit adds is marked in upstream's padding mask, which keeps it
     out of the MoE load-balance statistics and ``tokens_per_expert_E``.

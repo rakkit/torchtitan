@@ -351,6 +351,10 @@ class OptMoeExperts(nn.Module):
 
 
 class OptMoeSparseMoe(nn.Module):
+    """torchtitan's MoE, bitwise: the experts run in bf16 ``torch._grouped_mm``
+    (CUDA only) whatever the model's dtype, and the combine is a deterministic
+    scatter-add (every forward, generation included)."""
+
     def __init__(self, config: OptMoeConfig):
         super().__init__()
         self.top_k = config.num_experts_per_tok

@@ -25,6 +25,7 @@ normalise in fp32, the Newton-Schulz and polar-express backends the norm of thei
 bf16 operand.
 """
 
+import dataclasses
 import logging
 import math
 from collections.abc import Callable
@@ -33,10 +34,7 @@ from dataclasses import dataclass
 import torch
 
 from ..kernels.floors import SUMSQ_FLOOR
-from ..kernels.gram_newton_schulz import (
-    gram_polar_factor,
-    resolve_gram_polar_express_kernels,
-)
+from ..kernels.gram_newton_schulz import gram_polar_factor
 from ..kernels.zeropower import POLAR_EXPRESS_SAFETY_DEFAULT, zeropower_backends
 from .rules import (
     call_compiled,
@@ -169,13 +167,6 @@ class Orthogonalise(Compute):
     def __post_init__(self):
         if self.backend not in zeropower_backends or self.backend == "identity":
             raise ValueError(f"unknown backend {self.backend!r}")
-        if self.backend == "gram_polar_express" and torch.cuda.is_available():
-            # Import quack's GEMM now, at optimizer build: importing it registers
-            # a pytree node type, and doing that at the first optimizer step
-            # (after the model's first forward compiled) fails every compiled
-            # graph's pytree-registry guard, so FlexAttention recompiled and
-            # re-autotuned at step 2.
-            resolve_gram_polar_express_kernels()
         if (
             self.polar_express_safety != POLAR_EXPRESS_SAFETY_DEFAULT
             and self.backend not in POLAR_EXPRESS_BACKENDS
@@ -202,6 +193,21 @@ class Orthogonalise(Compute):
                 x, steps=self.steps, eps=EPS, safety=self.polar_express_safety
             )
         return zeropower_backends[self.backend](x, steps=self.steps, eps=EPS)
+
+
+def uses_gram_polar_express(obj) -> bool:
+    """Whether a rule or compute runs Gram Polar Express anywhere inside it
+    (e.g. amphione's direction rule)."""
+    if isinstance(obj, Orthogonalise):
+        return obj.backend == "gram_polar_express"
+    if isinstance(obj, tuple):
+        return any(uses_gram_polar_express(x) for x in obj)
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return any(
+            uses_gram_polar_express(getattr(obj, f.name))
+            for f in dataclasses.fields(obj)
+        )
+    return False
 
 
 @dataclass(frozen=True)

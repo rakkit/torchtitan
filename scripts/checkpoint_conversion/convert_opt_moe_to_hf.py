@@ -77,11 +77,11 @@ _TOKENIZER_FILES = (
 class ParallelFileSystemReader(FileSystemReader):
     """``FileSystemReader`` reading the checkpoint's shard files on a thread pool.
 
-    TODO: torch's ``FileSystemReader.read_data`` reads the files one after
-    another in the calling thread, which serializes an I/O-bound load of
-    hundreds of shard files (one per training rank). This runs its per-file
-    body (torch 2.16) on ``thread_count`` threads; each file's items are read
-    and committed independently.
+    TODO (no upstream issue yet): torch's ``FileSystemReader.read_data``
+    reads the files one after another in the calling thread, which serializes
+    an I/O-bound load of hundreds of shard files (one per training rank). This
+    runs its per-file body (copied from torch 2.16) on ``thread_count``
+    threads; each file's items are read and committed independently.
     """
 
     def __init__(self, path: str | Path, *, thread_count: int) -> None:
@@ -93,7 +93,6 @@ class ParallelFileSystemReader(FileSystemReader):
         for item in plan.items:
             path = self.storage_data[item.storage_index].relative_path
             per_file.setdefault(path, []).append(item)
-        # No more threads than files (more has been seen to hang).
         workers = max(1, min(self.thread_count, len(per_file)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(lambda kv: self._read_file(*kv, planner), per_file.items()))

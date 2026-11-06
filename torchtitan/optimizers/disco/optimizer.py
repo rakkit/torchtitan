@@ -54,6 +54,7 @@ from ..helpers.radial_helper import (
     RADIAL_ACCUMULATOR_NAMES,
     radial_names,
 )
+from ..kernels.gram_newton_schulz import resolve_gram_polar_express_kernels
 from ..utils import remove_orig_mod_and_weight_for_p_name
 from .layout import (
     _sharded_axes,
@@ -67,7 +68,7 @@ from .layout import (
     RunList,
 )
 from .metrics import ExpertUnits, MetricSink, pseudo_post_update_weight, UnitValues
-from .presets import POLAR_EXPRESS_BACKENDS, Sign
+from .presets import POLAR_EXPRESS_BACKENDS, Sign, uses_gram_polar_express
 from .rules import (
     compile_limits,
     Result,
@@ -634,6 +635,14 @@ class DiSCO(torch.optim.Optimizer):
                     except ValueError as err:
                         raise ValueError(f"{name}, unit {u.name!r}: {err}") from None
                 entries.append(e)
+            if uses_gram_polar_express(rule) and any(
+                e.param.is_cuda for e in entries if e.group_idx == gi
+            ):
+                # TODO (no upstream issue yet): importing quack registers a pytree
+                # node type, which fails the pytree-registry guard of every graph
+                # compiled before it (FlexAttention recompiled and re-autotuned at
+                # step 2): import its GEMM here, before the model's first compile.
+                resolve_gram_polar_express_kernels()
             if getattr(rule.compute, "frozen_units", ()):
                 self._check_frozen_units(
                     gi, rule, [e for e in entries if e.group_idx == gi]

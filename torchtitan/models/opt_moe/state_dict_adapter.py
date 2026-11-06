@@ -230,7 +230,11 @@ class OPTMoEStateDictAdapter(StateDictAdapter):
             sd[key] = sd[key].unflatten(1, (2, -1))
         return sd
 
-    def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def to_hf(
+        self, state_dict: dict[str, Any], *, to_quantized_layout: bool = False
+    ) -> dict[str, Any]:
+        if to_quantized_layout:
+            raise ValueError("opt_moe has no quantized HF checkpoint layout")
         n = len(self.model_config.layers)
         sd = _renumber(
             state_dict,
@@ -239,7 +243,11 @@ class OPTMoEStateDictAdapter(StateDictAdapter):
         )
         return _rename(self._unfuse(sd), _TO_HF)
 
-    def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+    def from_hf(
+        self, hf_state_dict: dict[str, Any], *, is_quantized_layout: bool = False
+    ) -> dict[str, Any]:
+        if is_quantized_layout:
+            raise ValueError("opt_moe has no quantized HF checkpoint layout")
         n = len(self.model_config.layers)
         sd = self._fuse(_rename(hf_state_dict, _FROM_HF))
         return _renumber(

@@ -297,8 +297,8 @@ class OPTMoEModel(Decoder):
             torch._dynamo.config.capture_scalar_outputs = True
             torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
             for block in self.layers.values():
-                # a traced backward cannot add a WGRAD into .grad in place; one
-                # microbatch per step leaves nothing to accumulate in a block
+                # a traced backward cannot add a WGRAD into .grad in place in
+                # the GEMM epilogue (AccumulateGrad still accumulates it)
                 for module in block.modules():
                     if hasattr(module, "inplace_wgrad_accum"):
                         module.inplace_wgrad_accum = False

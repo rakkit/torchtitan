@@ -45,6 +45,7 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.layer import FusedMoEFactory
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -161,13 +162,16 @@ def opt_moe_short_conv(
     short_conv op takes them."""
     context = get_forward_context()
     metadata = context.attn_metadata
-    if not isinstance(metadata, dict):  # memory profiling: no state
+    if metadata is None:  # vLLM's profiling / dummy runs: no state yet
         return x_TC.clone()
-    m = metadata.get(layer_name)
     owner = context.no_compile_layers[layer_name]
-    if m is None or owner.kv_cache.numel() == 0:
-        return x_TC.clone()
-    assert isinstance(m, InklingSconvMetadata)
+    m = metadata.get(layer_name) if isinstance(metadata, dict) else None
+    if not isinstance(m, InklingSconvMetadata) or owner.kv_cache.numel() == 0:
+        # never run without the conv (the model would be wrong, not slow)
+        raise RuntimeError(
+            f"vLLM opt_moe: no conv state for {layer_name} in this forward "
+            f"(metadata {type(m).__name__}, cache bound: {owner.kv_cache.numel() > 0})"
+        )
     offset, width = owner.stream_ranges[stream]
     return fused_sconv(
         x_TC,
@@ -343,7 +347,9 @@ class OptMoeSparseMoe(nn.Module):
                 f"vLLM opt_moe: scoring_func {config.scoring_func}"
             )
         d, e = config.hidden_size, config.n_routed_experts
-        self.gate = nn.Linear(d, e, bias=False, dtype=torch.float32)
+        # bf16 weight x bf16 input, fp32 logits (cuBLAS / CuTe tiers): the
+        # router's math in training, without an fp32 GEMM on CUDA cores
+        self.gate = GateLinear(d, e, out_dtype=torch.float32, prefix=f"{prefix}.gate")
         self.gate.e_score_correction_bias = (
             nn.Parameter(torch.zeros(e, dtype=torch.float32))
             if config.router_bias
@@ -379,7 +385,7 @@ class OptMoeSparseMoe(nn.Module):
         )
 
     def forward(self, x_TD: torch.Tensor) -> torch.Tensor:
-        logits_TE = self.gate(x_TD.to(torch.float32))
+        logits_TE, _ = self.gate(x_TD)
         return self.experts(hidden_states=x_TD, router_logits=logits_TE)
 
 
@@ -464,7 +470,10 @@ class OptMoeModel(nn.Module):
 
 
 class OptMoeForCausalLM(nn.Module):
-    packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -528,6 +537,8 @@ class OptMoeForCausalLM(nn.Module):
                         loaded.add(key)
                         break
                 else:
+                    if name == "lm_head.weight" and self.config.tie_word_embeddings:
+                        continue  # the embedding's (one parameter, loaded once)
                     if name.endswith(".self_attn.sinks"):
                         w = w.chunk(tp)[rank]
                     param = params[name]

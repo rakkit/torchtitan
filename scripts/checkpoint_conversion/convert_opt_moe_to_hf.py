@@ -147,9 +147,7 @@ def _write_hf_files(
     tokenizer files, a generation config and a chat template."""
     tokenizer = HuggingFaceTokenizer.Config().build(tokenizer_path=str(hf_assets_path))
     token_ids = {"bos_token_id": tokenizer.bos_id, "eos_token_id": tokenizer.eos_id}
-    config = OptMoeConfig(
-        **hf_config(model_config), torch_dtype=export_dtype, **token_ids
-    )
+    config = OptMoeConfig(**hf_config(model_config), dtype=export_dtype, **token_ids)
     config.save_pretrained(output_dir)
     if OptMoeConfig.from_pretrained(output_dir).to_dict() != config.to_dict():
         raise RuntimeError(f"{output_dir}/config.json does not read back as written")

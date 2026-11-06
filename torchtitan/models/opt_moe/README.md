@@ -134,8 +134,9 @@ GPU at steps 20 / 30 / 40; the 0.5.4 tree, which compiled every block: 16.7k /
 16.8k / 16.6k):
 
 - `compile_blocks=True` (model config): `torch.compile` on every block (the
-  MTP blocks too), after the activation remat and before FSDP, with only the
-  `loss` region left in `local_compile.regions`. 16.7k / 16.9k / 16.5k. The
+  MTP blocks too), after the activation remat and before FSDP; set
+  `local_compile.regions` to `["loss"]` with it (the recipes do; nothing checks
+  it). 16.7k / 16.9k / 16.5k. The
   blocks' linears run without in-place WGRAD accumulation (a traced backward
   cannot add into `.grad`); the compiled gather / scatter backwards use atomic
   adds, so repeats are not bitwise without `debug.deterministic`. With EP the
@@ -173,8 +174,8 @@ A run's checkpoint becomes an HF folder with
     python scripts/checkpoint_conversion/convert_opt_moe_to_hf.py \
         <dump>/checkpoint/step-N <dump>/job_config.json <out> --export_dtype bfloat16
 
-(the model rebuilt from `job_config.json`; config, HF files, tokenizer files,
-safetensors). The run's EMA weights instead (an EMA copy, `--ema_key` when the
+(the model rebuilt from `job_config.json`; config, HF files, tokenizer files, a
+chat template, a generation config, safetensors files of at most 5 GB). The run's EMA weights instead (an EMA copy, `--ema_key` when the
 run kept several): `convert_opt_moe_ema_to_hf.py`, same arguments.
 
 ## What the optimizer study measured (13.4B tokens, batch 128, run learning rates)

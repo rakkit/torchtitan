@@ -5,7 +5,7 @@ without torchtitan.
 
 ```bash
 pip install ./vllm_plugins/opt_moe
-vllm serve <an opt_moe HF folder> --trust-remote-code
+vllm serve <an opt_moe HF folder> --trust-remote-code --dtype bfloat16
 ```
 
 The HF folder (written by torchtitan's
@@ -51,7 +51,11 @@ trtllm backend there, and the first forward hangs.
 - `conv_streams: kv` (the conv on k and v only), other `scoring_func`s than
   sigmoid;
 - tensor parallelism above the KV head count;
-- the MTP depths (not loaded; speculative decoding with them is a later step).
+- the MTP depths (ignored, not refused: not loaded; speculative decoding with
+  them is a later step).
+
+Untested: partial RoPE (`rope.dim < head_dim`). `max_position_embeddings` is the
+training context (`seq_len`) and caps vLLM's `max_model_len`.
 
 ## Checks
 

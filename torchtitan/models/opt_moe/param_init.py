@@ -64,12 +64,14 @@ def orthogonal_(
     generator: torch.Generator | None = None,
 ):
     with torch.no_grad():
-        if not isinstance(tensor.data, DTensor):
+        if not isinstance(tensor.data, DTensor) and tensor.dtype == torch.float32:
             return nn.init.orthogonal_(tensor, gain=gain, generator=generator)
 
         # A sharded parameter: every rank draws the full matrix (the same
         # generator state on every rank) and keeps its own shard, no communication.
-        full = torch.empty(tensor.shape, device=tensor.device)
+        # Drawn in fp32 (QR has no bf16 kernel: an inference engine builds the
+        # model under a bf16 default dtype).
+        full = torch.empty(tensor.shape, device=tensor.device, dtype=torch.float32)
         torch.nn.init.orthogonal_(full, gain=gain, generator=generator)
         return _copy_full_into(tensor, full)
 

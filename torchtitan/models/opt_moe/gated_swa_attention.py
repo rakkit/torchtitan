@@ -98,6 +98,10 @@ class CanonShortConv(Module):
     so that an inference engine can swap in a version that keeps each
     sequence's last ``W - 1`` inputs (TitanRL's generator)."""
 
+    needs_document_offsets = True
+    """Packed documents restart the conv at the offsets of ``conv_metadata``
+    (False: the implementation tracks each sequence itself)."""
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         pass
@@ -213,7 +217,12 @@ class GatedSWAttention(GQAttention):
     ) -> torch.Tensor:
         """``conv_metadata``: the short conv's document offsets (the model's
         ``ShortConvDocuments`` entry)."""
-        if self.k_conv is not None and conv_metadata is None and positions is not None:
+        if (
+            self.short_conv is not None
+            and self.short_conv.needs_document_offsets
+            and conv_metadata is None
+            and positions is not None
+        ):
             # Packed documents without their offsets: the conv would run across them.
             raise ValueError(
                 "the short conv needs its document offsets (the model's "

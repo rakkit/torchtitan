@@ -50,6 +50,9 @@ class VLLMCanonShortConv(CanonShortConv, MambaBase):
     tensor parallelism (the fused k / v channels are grouped per KV head).
     Speculative decoding is not supported (one state slot per sequence)."""
 
+    # Each sequence's conv state is vLLM's: no document offsets.
+    needs_document_offsets = False
+
     @dataclass(kw_only=True, slots=True)
     class Config(CanonShortConv.Config):
         layer_idx: int

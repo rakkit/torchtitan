@@ -26,7 +26,7 @@ from torchtitan.distributed.utils import fsdp_shard_mesh
 from torchtitan.models.common.moe import MoE
 
 if TYPE_CHECKING:
-    from torchtitan.optimizers.container import DiSCOOptimizersContainer
+    from torchtitan.components.optim import OptimizersContainer
 
 __all__ = ["moe_layers", "publish_moe_metrics", "register_moe_load_balancing_hook"]
 
@@ -219,10 +219,10 @@ def _quantile_update_expert_bias(
 
 
 def register_moe_load_balancing_hook(
-    optimizers: "DiSCOOptimizersContainer",
+    optimizers: "OptimizersContainer",
     model_parts: list[nn.Module],
     parallelism_context: ParallelismContext,
-) -> "DiSCOOptimizersContainer":
+) -> "OptimizersContainer":
     def lmo_for_moe_bias(
         g,
         norm_factor="sign",
@@ -271,7 +271,11 @@ def register_moe_load_balancing_hook(
         )
         # The metrics ride one D2H copy, so they are produced only on steps the
         # container will collect; every other step only updates and resets.
-        should_publish = optimizers.consume_moe_publish_arm() and is_dp_rank_0
+        # A container that collects them arms the publish (DiSCO's); another
+        # one (AdamW: TitanRL's trainer) gets the statistics and the bias
+        # update only. TODO: router metrics with the other containers.
+        consume_arm = getattr(optimizers, "consume_moe_publish_arm", None)
+        should_publish = consume_arm is not None and consume_arm() and is_dp_rank_0
         # TODO: Currently this sync is blocking (thus exposed) and happens on the
         # default compute stream. Need to assess if this is OK performance-wise.
 

@@ -36,7 +36,13 @@ more sliding-window KV cache per layer (window = block = the conv width), the
 three streams packed per KV head, read and written by vLLM's Inkling
 `fused_sconv` kernel (insert + conv in one launch, the same path for prefill,
 decode and speculative tokens, CUDA-graph safe), as vLLM's Inkling model keeps
-its conv state. bf16 only.
+its conv state. Weights in bf16; `--quantization fp8` quantizes the linears and
+experts online (the router and the convs stay as they are). No `torch.compile`
+(vLLM then captures full CUDA graphs for decoding only, as for Inkling).
+
+Tensor parallelism on nodes without NVSwitch (e.g. 4 x GH200) needs
+`VLLM_ALLREDUCE_USE_FLASHINFER=0`: FlashInfer's all-reduce falls back to its
+trtllm backend there, and the first forward hangs.
 
 ## Not yet supported
 
@@ -53,4 +59,24 @@ and a NoPE layer, a dense and MoE layers with the router bias and a shared
 expert), bf16, eager, TP 1 (11-06): teacher-forced logprobs of 41 / 64 / 100
 tokens and of 40 decoded tokens past the window, |vLLM - HF fp32| mean 0.0002 /
 0.0003, max <= 0.0012, equal to the HF bf16 model's own (the bf16 floor); with
-the conv broken to the identity 0.006 - 0.0075 (the check sees the conv).
+the conv broken to the identity 0.006 - 0.0075 (the check sees the conv). With
+2 KV heads (11-06), prefill / decode mean: TP 1 0.0002 / 0.0004, with CUDA
+graphs 0.0003 / 0.0004, TP 2 (custom all-reduce, CUDA graphs) 0.0003 / 0.0003,
+all at the floor; FP8 0.0009 / 0.0007 (max 0.0028).
+
+## Speed of the conv
+
+FP8 (online, from the bf16 folder), TP 1, one GH200, CUDA graphs, a 41.4B /
+3.05B-active shape (40 layers, d 2048, 32 q / 4 kv heads, 256 experts top-6 of
+width 640, SWA 512 at 5:1) with vs without the q / k / v conv, random weights,
+1,024-token prompts, 256 decoded tokens, 3 fresh processes each (11-06):
+
+| batch | decode ms / step, conv / no conv | prefill ms, conv / no conv |
+|---|---|---|
+| 1 | 8.05 / 7.55 (+6.6%) | 124 / 110 (+13%) |
+| 16 | 13.89 / 13.09 (+6.1%) | 137 / 118 (+16%) |
+| 64 | 20.44 / 19.59 (+4.3%) | 192 / 143 (+33%) |
+| 256 | 30.25 / 29.25 (+3.4%) | 491 / 260 (+88%) |
+
+Not profiled yet: in prefill the conv state is written for every prompt token,
+the three streams padded to a power-of-two width, by three launches per layer.

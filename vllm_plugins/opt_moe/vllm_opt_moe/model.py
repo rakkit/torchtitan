@@ -34,6 +34,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import get_current_vllm_config, VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -64,6 +65,7 @@ from vllm.models.inkling.nvidia.sconv_swa_attn import (
     InklingSconvBackend,
     InklingSconvMetadata,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec
 
 
@@ -138,29 +140,67 @@ class OptMoeShortConv(nn.Module):
         param.data.copy_(loaded)
 
     def forward(self, x_TC: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        metadata = get_forward_context().attn_metadata
-        if not isinstance(metadata, dict):  # memory profiling: no state
-            return x_TC
-        m = metadata.get(self.owner.prefix)
-        if m is None or self.owner.kv_cache.numel() == 0:
-            return x_TC
-        assert isinstance(m, InklingSconvMetadata)
-        offset, width = self.owner.stream_ranges[self.stream]
-        return fused_sconv(
+        return torch.ops.vllm.opt_moe_short_conv(
             x_TC.contiguous(),
             self.weight.squeeze(1),
-            self.owner.kv_cache,
             positions,
-            m.block_table,
-            m.seq_idx,
-            m.slot_mapping,
-            m.query_start,
-            offset,
-            width,
-            self.owner.block_size,
-            activation=None,
-            use_residual=True,
+            self.owner.prefix,
+            self.stream,
         )
+
+
+def opt_moe_short_conv(
+    x_TC: torch.Tensor,
+    weight_CW: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    stream: int,
+) -> torch.Tensor:
+    """One stream's conv as a custom op, so torch.compile sees one opaque call:
+    the conv state and its metadata come from the forward context, as vLLM's
+    short_conv op takes them."""
+    context = get_forward_context()
+    metadata = context.attn_metadata
+    if not isinstance(metadata, dict):  # memory profiling: no state
+        return x_TC.clone()
+    m = metadata.get(layer_name)
+    owner = context.no_compile_layers[layer_name]
+    if m is None or owner.kv_cache.numel() == 0:
+        return x_TC.clone()
+    assert isinstance(m, InklingSconvMetadata)
+    offset, width = owner.stream_ranges[stream]
+    return fused_sconv(
+        x_TC,
+        weight_CW,
+        owner.kv_cache,
+        positions,
+        m.block_table,
+        m.seq_idx,
+        m.slot_mapping,
+        m.query_start,
+        offset,
+        width,
+        owner.block_size,
+        activation=None,
+        use_residual=True,
+    )
+
+
+def _opt_moe_short_conv_fake(
+    x_TC: torch.Tensor,
+    weight_CW: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    stream: int,
+) -> torch.Tensor:
+    return torch.empty_like(x_TC)
+
+
+direct_register_custom_op(
+    op_name="opt_moe_short_conv",
+    op_func=opt_moe_short_conv,
+    fake_impl=_opt_moe_short_conv_fake,
+)
 
 
 class OptMoeAttention(nn.Module):
@@ -379,6 +419,7 @@ class OptMoeDecoderLayer(nn.Module):
         return self._residual(h, self.mlp(self.post_attention_layernorm(h)))
 
 
+@support_torch_compile
 class OptMoeModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -409,7 +450,13 @@ class OptMoeModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def forward(self, input_ids, positions, inputs_embeds=None):
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         h = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         for layer in self.layers:
             h = layer(positions, h)
@@ -440,7 +487,7 @@ class OptMoeForCausalLM(nn.Module):
         inputs_embeds=None,
         **kwargs,
     ):
-        return self.model(input_ids, positions, inputs_embeds)
+        return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states)

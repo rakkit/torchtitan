@@ -37,8 +37,10 @@ three streams packed per KV head, read and written by vLLM's Inkling
 `fused_sconv` kernel (insert + conv in one launch, the same path for prefill,
 decode and speculative tokens, CUDA-graph safe), as vLLM's Inkling model keeps
 its conv state. Weights in bf16; `--quantization fp8` quantizes the linears and
-experts online (the router and the convs stay as they are). No `torch.compile`
-(vLLM then captures full CUDA graphs for decoding only, as for Inkling).
+experts online (the router and the convs stay as they are). The model runs
+under vLLM's `torch.compile` (each conv is the custom op
+`vllm::opt_moe_short_conv`, which reads its state from the forward context) with
+piecewise CUDA graphs for prefill and full ones for decoding.
 
 Tensor parallelism on nodes without NVSwitch (e.g. 4 x GH200) needs
 `VLLM_ALLREDUCE_USE_FLASHINFER=0`: FlashInfer's all-reduce falls back to its

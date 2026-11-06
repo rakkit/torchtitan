@@ -7,20 +7,20 @@
 """An opt_moe run's EMA weights -> a complete HF folder (``trust_remote_code``).
 
 ``convert_opt_moe_to_hf.py`` (the run's model from its ``job_config.json``, no
-init, the threaded DCP read, the complete HF folder) with upstream's
-``convert_ema_to_hf.py`` way of reading the EMA: CheckpointManager keeps the EMA
-container under the ``ema`` key (DCP: ``ema.state.<fqn>.ema_params.<ema_key>``,
-one copy per decay / half-life fraction); the container is rebuilt for the one
-copy exported (``--ema_key``, or the checkpoint's only one) and loaded with the
-trained weights, which the parameters EMA does not track (frozen ones) and the
-buffers it does not average keep.
+init, the threaded DCP read, the complete HF folder) for the EMA weights:
+CheckpointManager keeps the EMA container under the ``ema`` key (DCP:
+``ema.state.<fqn>.ema_params.<ema_key>``, one copy per decay / half-life
+fraction). The copy exported (``--ema_key``, or the checkpoint's only one) is read
+straight into the model's tensors under those keys, the tensors it does not
+cover (frozen parameters, buffers it does not average) from the trained weights:
+one fp32 copy of the model in memory (upstream's ``convert_ema_to_hf.py``
+rebuilds the container next to the model, about 2.5x that).
 
     python scripts/checkpoint_conversion/convert_opt_moe_ema_to_hf.py \\
         <dump>/checkpoint/step-N <dump>/job_config.json <out> --export_dtype bfloat16
 """
 
 import argparse
-import re
 from pathlib import Path
 
 import torch
@@ -28,8 +28,6 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import FileSystemReader
 
 from torchtitan.components.checkpointer import EMA, ModelWrapper
-from torchtitan.components.optim import EMA as EMAContainer  # noqa: N811
-from torchtitan.components.optim.ema import parse_ema_key
 
 if __package__:
     from scripts.checkpoint_conversion.convert_opt_moe_to_hf import (
@@ -84,40 +82,26 @@ def convert_opt_moe_ema_to_hf(
 ) -> None:
     run, model = load_run_model(job_config)
     ema_key, ema_fqns = _ema_copy(checkpoint_dir, ema_key)
-    # The container tracks the parameters the copy covers (the others frozen:
-    # they export their trained weights) and the buffers it averaged.
-    params = {name for name, _ in model.named_parameters()}
-    for name, param in model.named_parameters():
-        param.requires_grad_(name in ema_fqns)
-    is_decay, value = parse_ema_key(ema_key)
-    ema = EMAContainer.Config(
-        decays=[value] if is_decay else [],
-        half_life_fractions=[] if is_decay else [value],
-        buffer_patterns=[f"^{re.escape(f)}$" for f in sorted(ema_fqns - params)],
-    ).build(model_parts=[model])
-
     state_dict = ModelWrapper(model)._get_state_dict()
+    # An EMA tensor without its state-dict key would export the trained
+    # weights in its place.
+    missing = sorted(ema_fqns - set(state_dict))
+    if missing:
+        raise ValueError(
+            f"the EMA copy does not map onto the model's state dict: {missing[:5]}"
+        )
+    # One fp32 copy of the model: the tensors the EMA copy covers are read from
+    # their EMA entries into the model's own tensors, the rest (frozen
+    # parameters, buffers the EMA does not average) from the trained weights.
     dcp.load(
-        {EMA: ema, **state_dict},
+        {
+            f"{_EMA_PREFIX}{fqn}{_EMA_INFIX}{ema_key}" if fqn in ema_fqns else fqn: t
+            for fqn, t in state_dict.items()
+        },
         storage_reader=ParallelFileSystemReader(
             checkpoint_dir, thread_count=read_threads
         ),
     )
-    averaged = {
-        name: opt.state[tensor]["ema_params"][ema_key]
-        for opt in ema.optimizers
-        for group in opt.param_groups
-        for name, tensor in zip(group["param_names"], group["params"], strict=True)
-        if tensor in opt.state
-    }
-    # An EMA tensor without its state-dict key (or the reverse) would export
-    # the trained weights in its place.
-    if set(averaged) != ema_fqns or not set(averaged) <= set(state_dict):
-        raise ValueError(
-            "the EMA copy does not map onto the model's state dict: "
-            f"{sorted(ema_fqns ^ set(averaged) | set(averaged) - set(state_dict))[:5]}"
-        )
-    state_dict.update(averaged)
     save_hf_folder(run, state_dict, output_dir, export_dtype)
 
 

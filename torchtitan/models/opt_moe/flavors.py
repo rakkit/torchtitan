@@ -48,16 +48,27 @@ from torchtitan.models.common.config_utils import (
     fused_grouped_gate_up_param_init,
     get_attention_config,
     make_gqa_config,
+    make_shared_expert_down_proj_config,
 )
 from torchtitan.models.common.decoder_sharding import (
+    feed_forward_sharding_config,
     lm_head_sharding_config,
     norm_sharding_config,
     pre_lm_head_norm_sharding_config,
+    replicated_input_colwise_sharding_config,
+    residual_activation_placement,
+    rowwise_sharding_config,
+    stacked_colwise_sharding_config,
     token_embedding_sharding_config,
 )
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import DenseFeedForward
-from torchtitan.models.common.linear import GroupedLinear, Linear
+from torchtitan.models.common.linear import (
+    ColumnParallelLinear,
+    GroupedLinear,
+    Linear,
+    RowParallelLinear,
+)
 from torchtitan.models.common.linear.hi_mid_lo_linear import HiMidLoLinear
 from torchtitan.models.common.moe import (
     BatchWiseLoadBalanceLoss,
@@ -67,8 +78,11 @@ from torchtitan.models.common.moe import (
     TokenChoiceTopKRouter,
 )
 from torchtitan.models.common.moe.sharding import (
+    routed_expert_linear_sharding_config,
     routed_experts_sharding_config,
+    router_gate_sharding_config,
     router_sharding_config,
+    shared_experts_sharding_config,
 )
 from torchtitan.models.common.moe.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.common.nn_modules import Conv1d, RMSNorm
@@ -85,9 +99,11 @@ from .param_init import (
     setup_residual_scale,
 )
 from .sharding import (
-    attention_sinks_state_sharding,
-    dense_linear_sharding_config,
-    routed_expert_weight_sharding_config,
+    attention_sharding_config,
+    conv_weight_sharding_config,
+    mtp_block_sharding_config,
+    mtp_projection_sharding_config,
+    opt_moe_sharding_config,
 )
 
 __all__ = ["MODEL_FLAVORS", "build_model_config", "build_opt_moe_layers"]
@@ -124,26 +140,42 @@ def _ffn(
     w1_init: Callable,
     w2_init: Callable,
     w3_init: Callable,
+    shared_experts: bool,
+    enable_sp: bool,
 ) -> DenseFeedForward.Config:
     """A SwiGLU FFN (upstream's ``DenseFeedForward``, gate and up in one
-    ``[2, F, D]`` ``w13``) with one initializer per projection."""
-    sharding = dense_linear_sharding_config()
-    return DenseFeedForward.Config(
-        w13=Linear.Config(
-            in_features=dim,
-            out_features=hidden_dim,
-            num_linears=2,
-            param_init=fused_gate_up_param_init(
-                {"weight": w1_init}, {"weight": w3_init}
+    ``[2, F, D]`` ``w13``) with one initializer per projection, sharded as
+    upstream's ``make_ffn_config`` / ``make_shared_expert_ffn_config``
+    (``shared_experts``: an MoE's shared experts, whose output the MoE reduces
+    with the routed one)."""
+    x_layout = residual_activation_placement(enable_sp=enable_sp)
+    w13 = ColumnParallelLinear.Config(
+        in_features=dim,
+        out_features=hidden_dim,
+        num_linears=2,
+        param_init=fused_gate_up_param_init({"weight": w1_init}, {"weight": w3_init}),
+        sharding_config=stacked_colwise_sharding_config(input_layout=x_layout),
+    )
+    if shared_experts:
+        return DenseFeedForward.Config(
+            w13=w13,
+            w2=make_shared_expert_down_proj_config(
+                in_features=hidden_dim,
+                out_features=dim,
+                param_init={"weight": w2_init},
+                enable_sp=enable_sp,
             ),
-            sharding_config=sharding,
-        ),
-        w2=Linear.Config(
+            sharding_config=shared_experts_sharding_config(enable_sp=enable_sp),
+        )
+    return DenseFeedForward.Config(
+        w13=w13,
+        w2=RowParallelLinear.Config(
             in_features=hidden_dim,
             out_features=dim,
             param_init={"weight": w2_init},
-            sharding_config=sharding,
+            sharding_config=rowwise_sharding_config(output_layout=x_layout),
         ),
+        sharding_config=feed_forward_sharding_config(enable_sp=enable_sp),
     )
 
 
@@ -318,7 +350,7 @@ def build_opt_moe_layers(
             groups=channels,
             bias=False,
             param_init={"weight": conv_init_fn(conv_init_fn_type, conv_init_gain)},
-            sharding_config=dense_linear_sharding_config(),
+            sharding_config=conv_weight_sharding_config(),
         )
 
     if num_mtp_layers > 0 and use_swa[-1]:
@@ -371,6 +403,25 @@ def build_opt_moe_layers(
             enable_sp=enable_sp,
         )
         attention = {f.name: getattr(gqa, f.name) for f in dataclasses.fields(gqa)}
+        # The attention gathers its input once for wqkv and the gate (TP): both
+        # are plain Linears on the gathered input (a ColumnParallelLinear would
+        # gather again: twice the tokens under SP, its backward all-reduce twice
+        # without).
+        wqkv = gqa.qkv_linear.wqkv
+        attention["qkv_linear"] = dataclasses.replace(
+            gqa.qkv_linear,
+            wqkv=Linear.Config(
+                **{
+                    f.name: getattr(wqkv, f.name)
+                    for f in dataclasses.fields(Linear.Config)
+                    if f.name != "sharding_config"
+                },
+                sharding_config=replicated_input_colwise_sharding_config(),
+            ),
+        )
+        attention["sharding_config"] = attention_sharding_config(
+            enable_sp=enable_sp, sinks=attention_sinks
+        )
         if gated_attention_type == "element-wise":
             attention["gate_proj"] = Linear.Config(
                 in_features=dim,
@@ -380,7 +431,7 @@ def build_opt_moe_layers(
                         w_gate_init_fn_type, w_gate_init_std, div_attn
                     )
                 },
-                sharding_config=dense_linear_sharding_config(),
+                sharding_config=replicated_input_colwise_sharding_config(),
             )
         if conv_kernel_size > 0:
             attention["k_conv"] = conv(n_kv_heads * head_dim)
@@ -390,9 +441,6 @@ def build_opt_moe_layers(
             attention["param_init"] = {
                 "sinks": make_param_init(sinks_init_fn_type, sinks_init_std)
             }
-            attention["sharding_config"] = attention_sinks_state_sharding(
-                gqa.sharding_config
-            )
 
         if mirror < n_dense_layers:
             feed_forward = _ffn(
@@ -401,6 +449,8 @@ def build_opt_moe_layers(
                 w1_init=make_param_init(w1_init_fn_type, w1_init_std),
                 w2_init=make_param_init(w2_init_fn_type, w2_init_std, div_ffn),
                 w3_init=make_param_init(w3_init_fn_type, w3_init_std, w3_div),
+                shared_experts=False,
+                enable_sp=enable_sp,
             )
         else:
             router_args = dict(
@@ -414,7 +464,7 @@ def build_opt_moe_layers(
                     param_init={
                         "weight": make_param_init(router_init_fn_type, router_init_std)
                     },
-                    sharding_config=dense_linear_sharding_config(),
+                    sharding_config=router_gate_sharding_config(),
                 ),
                 score_func=_SCORE_FUNCS[score_func](),
                 top_k=top_k,
@@ -427,9 +477,9 @@ def build_opt_moe_layers(
                     if aux_loss is None
                     else _aux_loss_config(aux_loss, num_experts)
                 ),
-                sharding_config=router_sharding_config() if enable_ep else None,
+                sharding_config=router_sharding_config(),
             )
-            expert_sharding = routed_expert_weight_sharding_config(enable_ep=enable_ep)
+            expert_sharding = routed_expert_linear_sharding_config(enable_ep=enable_ep)
             feed_forward = OptMoE.Config(
                 num_experts=num_experts,
                 load_balance_coeff=load_balance_coeff,
@@ -484,9 +534,7 @@ def build_opt_moe_layers(
                     token_dispatcher=AllToAllTokenDispatcher.Config(
                         num_experts=num_experts, top_k=top_k
                     ),
-                    sharding_config=(
-                        routed_experts_sharding_config() if enable_ep else None
-                    ),
+                    sharding_config=routed_experts_sharding_config(),
                 ),
                 shared_experts=(
                     _ffn(
@@ -495,10 +543,13 @@ def build_opt_moe_layers(
                         w1_init=make_param_init(w1_init_fn_type, w1_init_std),
                         w2_init=make_param_init(w2_init_fn_type, w2_init_std, div_ffn),
                         w3_init=make_param_init(w3_init_fn_type, w3_init_std, w3_div),
+                        shared_experts=True,
+                        enable_sp=enable_sp,
                     )
                     if num_shared_experts > 0
                     else None
                 ),
+                sharding_config=opt_moe_sharding_config(enable_sp=enable_sp),
             )
 
         layers.append(
@@ -572,7 +623,11 @@ def _opt_moe_config(
     block_norm_sharding = norm_sharding_config(enable_sp=flags["sp"])
     mtp_layers = [
         OPTMoEMTPBlock.Config(
-            **{f.name: getattr(block, f.name) for f in dataclasses.fields(block)},
+            **{
+                f.name: getattr(block, f.name)
+                for f in dataclasses.fields(block)
+                if f.name != "sharding_config"
+            },
             enorm=_norm(norm_type, dim, norm_eps, sharding_config=block_norm_sharding),
             hnorm=_norm(norm_type, dim, norm_eps, sharding_config=block_norm_sharding),
             eh_proj=Linear.Config(
@@ -581,7 +636,7 @@ def _opt_moe_config(
                 param_init={
                     "weight": make_param_init(eh_proj_init_fn_type, eh_proj_init_std)
                 },
-                sharding_config=dense_linear_sharding_config(),
+                sharding_config=mtp_projection_sharding_config(enable_sp=flags["sp"]),
             ),
             mtp_norm=_norm(
                 norm_type,
@@ -589,6 +644,7 @@ def _opt_moe_config(
                 norm_eps,
                 sharding_config=pre_lm_head_norm_sharding_config(enable_sp=flags["sp"]),
             ),
+            sharding_config=mtp_block_sharding_config(enable_sp=flags["sp"]),
         )
         for block in blocks[n_layers:]
     ]
@@ -829,11 +885,6 @@ def build_model_config(
     if flavor not in MODEL_FLAVORS:
         raise ValueError(
             f"Unknown opt_moe flavor {flavor!r}; available: {', '.join(MODEL_FLAVORS)}"
-        )
-    if parallelism.tensor_parallel_degree > 1:
-        raise ValueError(
-            "OPT MoE has no tensor-parallel plan (its gate, convs, sinks and "
-            "OptMoE are replicated over TP): run with tensor_parallel_degree=1"
         )
     get_config, default_seq_len = MODEL_FLAVORS[flavor]
     config = get_config(

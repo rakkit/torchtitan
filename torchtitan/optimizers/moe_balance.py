@@ -129,7 +129,16 @@ def fused_hier_reduce_loss_stats(
     all_load_balance_losses: torch.Tensor,
 ):
     loss_mesh = parallelism_context.get_optional_mesh("loss")
-    if loss_mesh is None:
+    # With EP the router is token-sharded on the dense TP axis (upstream's MoE
+    # under TP), which the `loss` mesh excludes: the counts and entropies are
+    # summed over TP first. The load-balance loss is already TP-invariant (the
+    # aux loss reduces its counts over TP).
+    tp_group = (
+        parallelism_context.get_dense_tp_mesh().get_group()
+        if parallelism_context.ep_enabled and parallelism_context.tp > 1
+        else None
+    )
+    if loss_mesh is None and tp_group is None:
         return
 
     # 1. Determine Topology
@@ -151,12 +160,16 @@ def fused_hier_reduce_loss_stats(
     buf = torch.cat([t0, t1, t2])
 
     # 3. Perform Reduction
-    if use_hierarchical:
+    if tp_group is not None:
+        dist.all_reduce(
+            buf[: t0.numel() + t1.numel()], op=dist.ReduceOp.SUM, group=tp_group
+        )
+    if loss_mesh is not None and use_hierarchical:
         # Hierarchical: FSDP (Intra-node) -> DP (Inter-node)
         # Using SUM for all, we will normalize averaging later
         dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=fsdp_mesh.get_group())
         dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=dp_mesh.get_group())
-    else:
+    elif loss_mesh is not None:
         # Fallback: Flat all-reduce on the global loss mesh
         dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=loss_mesh.get_group())
 
@@ -327,10 +340,9 @@ def register_moe_load_balancing_hook(
         # counts: no per-forward normalisation; the bias update and the ratios
         # below do not depend on the scale). AuxLoss.instance_acc already
         # carries `raw_sum / global_valid_tokens` for the whole step.
-        if loss_mesh is not None:
-            fused_hier_reduce_loss_stats(
-                parallelism_context, all_tokens, all_entropies, all_load_balance_losses
-            )
+        fused_hier_reduce_loss_stats(
+            parallelism_context, all_tokens, all_entropies, all_load_balance_losses
+        )
 
         layer_sums = all_tokens.sum(dim=1, keepdim=True)  # [L, 1]
         layer_means = layer_sums / num_experts  # [L, 1]
@@ -486,18 +498,6 @@ def register_moe_load_balancing_hook(
                 "MoE load_balance_coeff must be configured consistently "
                 "across all MoE layers. Either set it for every MoE layer "
                 "or leave it unset for all MoE layers."
-            )
-        # This container reduces over the `loss` mesh only, which excludes tp,
-        # so under EP+TP each rank would see its own shard's counts --
-        # silently wrong. Refuse rather than train on it; inert at tp=1.
-        if parallelism_context.ep_enabled and parallelism_context.tp > 1:
-            raise NotImplementedError(
-                "MoE load-balancing statistics are not implemented for "
-                f"EP + TP (ep={parallelism_context.ep}, tp={parallelism_context.tp}): the "
-                "expert token counts are reduced over the 'loss' mesh only, "
-                "which excludes the tp axis, so each rank would see just its "
-                "own tp shard's counts. Run with tensor_parallel_degree=1, or "
-                "add the dense-tp all_reduce that upstream performs."
             )
         optimizers.register_step_pre_hook(
             lambda *args, **kwargs: _update_expert_bias(

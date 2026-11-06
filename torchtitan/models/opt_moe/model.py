@@ -16,7 +16,12 @@ from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.local_compile import LocalCompileConfig
-from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+from torchtitan.distributed.parallelism_context import MeshAxisName
+from torchtitan.distributed.spmd_types import (
+    annotate_input_spmd_types,
+    spmd_dense_sp_enabled,
+    spmd_mesh_group,
+)
 from torchtitan.models.base.model import FlopsEstimator
 from torchtitan.models.base.module import Module, ModuleList
 
@@ -177,6 +182,17 @@ class OPTMoEMTPBlock(OPTMoETransformerBlock):
         mtp_padding_mask_T = ~mtp_input_valid_mask_T
         if padding_mask is not None:
             mtp_padding_mask_T = mtp_padding_mask_T | padding_mask
+        # The MoE shards its padding mask itself; the hidden state arrives
+        # sequence-sharded under SP, so its mask is sharded here.
+        tp_group = spmd_mesh_group(MeshAxisName.TP)
+        if spmd_dense_sp_enabled() and tp_group is not None:
+            mtp_input_valid_mask_T = spmd.redistribute(
+                mtp_input_valid_mask_T,
+                tp_group,
+                src=spmd.R,
+                dst=spmd.S(0),
+                backward_options={"op_dtype": mtp_input_valid_mask_T.dtype},
+            )
         prev_hidden_TD = prev_hidden_TD * mtp_input_valid_mask_T.unsqueeze(-1).to(
             prev_hidden_TD.dtype
         )
@@ -577,7 +593,11 @@ class OPTMoEModel(Decoder):
         # In eval mode (validation, offline evaluation: they score the main
         # prediction) the MTP depths do not run.
         run_mtp = self.mtp_layers is not None and self.training
-        if run_mtp:
+        if run_mtp and spmd_dense_sp_enabled():
+            # SP scatters the embedding's output by token: one call per
+            # objective, each sequence-sharded as the residual stream.
+            h, *mtp_embeds = (self.tok_embeddings(t) for t in (tokens, *mtp_tokens))
+        elif run_mtp:
             # One embedding call for the main and the MTP tokens: FSDP gathers
             # the embedding once.
             embedded = self.tok_embeddings(torch.cat([tokens, *mtp_tokens]))

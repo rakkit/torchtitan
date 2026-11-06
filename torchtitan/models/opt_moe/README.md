@@ -10,11 +10,17 @@ modules and their Configs; `flavors.py` builds the complete, sharded config;
 `sharding.py` holds the sharding constructors it uses. The optimizer side
 (`amphione` and the other DiSCO rules) is `torchtitan/optimizers/readme.md`.
 
-Parallelism: FSDP / HSDP, EP (upstream's dispatchers) and CP (all-gather K/V,
-flex or varlen, with the conv, the sinks and the gate; the conv's first
-`W - 1` taps of each rank's fragments come from the ranks that hold those
-tokens; `tests/unit_tests/opt_moe/test_context_parallel.py`). TP is refused at
-build.
+Parallelism: FSDP / HSDP, TP (with or without SP), EP (upstream's dispatchers) and
+CP (all-gather K/V, flex or varlen, with the conv, the sinks and the gate; the
+conv's first `W - 1` taps of each rank's fragments come from the ranks that hold
+those tokens; `tests/unit_tests/opt_moe/test_context_parallel.py`). TP on
+upstream's helpers: each rank holds whole KV groups (their q heads, k, v, k / v
+conv channels, gate rows and sinks; `n_kv_heads % TP == 0`), the input gathered
+once for wqkv and the gate, wo row-parallel; the dense and shared-expert FFNs
+column / row; the MoE as upstream's (EP >= TP: it sequence-shards its tokens
+over TP); `tests/unit_tests/opt_moe/test_tensor_parallel.py` (TP 2 x EP 2 vs one
+rank, each attention case, with and without SP). DiSCO refuses TP: TP runs train
+with AdamW.
 
 ## Building a model
 

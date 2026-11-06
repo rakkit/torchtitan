@@ -6,6 +6,7 @@
 
 from dataclasses import dataclass, field
 
+import spmd_types as spmd
 import torch
 import torch_remat as remat
 from torch import nn
@@ -17,6 +18,7 @@ from torchtitan.models.base.module import Module
 from torchtitan.models.common.attention import (
     FlexAttentionMetadata,
     GQAttention,
+    local_head_split,
     VarlenAttentionMetadata,
 )
 from torchtitan.models.common.attention.cp_attention import CPInnerAttention
@@ -31,7 +33,7 @@ from torchtitan.models.common.attn_gym import (
     ContextParallelRouting,
     require_attn_gym,
 )
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear import Linear, maybe_gather_tp_input
 from torchtitan.models.common.nn_modules import Conv1d
 from torchtitan.models.common.param_layout import named, ParamLayout, qkv_units
 
@@ -141,7 +143,9 @@ class GatedSWAttention(GQAttention):
     (``rope=None``) follow from ``rope``.
 
     Token-flat: inputs are ``[T, D]``, q / k / v ``[T, H, K]``; document
-    boundaries travel in ``positions`` and the attention metadata.
+    boundaries travel in ``positions`` and the attention metadata. Under TP
+    each rank holds whole KV groups (their q heads, k, v, conv channels, gate
+    rows and sinks); the input is gathered once for wqkv and the gate.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -228,13 +232,19 @@ class GatedSWAttention(GQAttention):
                 "the short conv needs its document offsets (the model's "
                 "_get_attention_metadata) when positions are given"
             )
+        # wqkv and the gate read one input: gathered once (TP; a no-op without).
+        x_TD = maybe_gather_tp_input(self, x_TD)
         # The Canon short conv on k and v, the QK norm (before RoPE, per Qwen3),
         # then RoPE (partial, or none for NoPE).
         if self.k_conv is not None:
             xq, xk, xv = self._qkv_with_kv_conv(x_TD, conv_metadata)
         else:
             xq, xk, xv = self.qkv_linear(x_TD)
-        gate = self.gate_proj(x_TD) if self.gate_proj is not None else None
+        gate = (
+            local_head_split(self.gate_proj(x_TD), self.head_dim, cp_shard_dim=0)
+            if self.gate_proj is not None
+            else None
+        )
         # The q / k / v preparation reads the projection's outputs with bare ops.
         remat.recompute_needs_tensor(xq, xk, xv)
         if self.q_norm is not None:
@@ -263,6 +273,16 @@ class GatedSWAttention(GQAttention):
         # Not in the compiled region: wo declares its own remat regions.
         return self.wo(self._flatten_attention_output(output, gate))
 
+    # QKVLinear.forward's output contract: [T, H, K] sharded on heads over TP.
+    @spmd.local_map(
+        out_types=(
+            (
+                {"dp": spmd.V, "cp": spmd.V, "tp": spmd.V},
+                spmd.PartitionSpec(("dp", "cp"), "tp", None),
+            ),
+        )
+        * 3
+    )
     def _qkv_with_kv_conv(
         self,
         x_TD: torch.Tensor,
@@ -274,24 +294,25 @@ class GatedSWAttention(GQAttention):
         is depthwise, so this is the two per-stream convs; its weight is the k /
         v conv weights interleaved per KV group, built at forward from the two
         parameters (the state dict, the HF format and the optimizer groups stay
-        per stream). Bypasses ``QKVLinear.forward`` (its spmd ``local_map``
-        declares TP placements, and opt_moe refuses TP); returns q / k / v
+        per stream). In place of ``QKVLinear.forward``, with its output types;
+        under TP the rank's KV groups (local shapes); returns q / k / v
         contiguous, as it does."""
         qkv_TC = self.qkv_linear.wqkv(x_TD)
         # The split and the conv read the wqkv projection output with bare ops.
         remat.recompute_needs_tensor(qkv_TC)
         T = qkv_TC.shape[0]
-        G, K, R = self.n_kv_heads, self.head_dim, self.qkv_linear.heads_per_kv
+        K, R = self.head_dim, self.qkv_linear.heads_per_kv
         W = self.k_conv.weight.shape[-1]
-        qkv_TGRK = qkv_TC.view(T, G, R + 2, K)
+        # G: this rank's KV groups (all of them without TP)
+        qkv_TGRK = qkv_TC.view(T, -1, R + 2, K)
         weight_C1W = torch.stack(
-            [self.k_conv.weight.view(G, K, W), self.v_conv.weight.view(G, K, W)],
+            [self.k_conv.weight.view(-1, K, W), self.v_conv.weight.view(-1, K, W)],
             dim=1,
         ).view(-1, 1, W)
         kv_TC = self.short_conv(
             qkv_TGRK[:, :, R:].reshape(T, -1), weight_C1W, conv_metadata
         )
-        kv_TG2K = kv_TC.view(T, G, 2, K)
+        kv_TG2K = kv_TC.view(T, -1, 2, K)
         return (
             qkv_TGRK[:, :, :R].reshape(T, -1, K),
             kv_TG2K[:, :, 0].contiguous(),
@@ -319,13 +340,12 @@ class GatedSWAttention(GQAttention):
 
     @local_compile("opt_moe_attention_output", batch_invariant=True)
     def _flatten_attention_output(
-        self, output_THK: torch.Tensor, gate_TF: torch.Tensor | None
+        self, output_THK: torch.Tensor, gate_THK: torch.Tensor | None
     ) -> torch.Tensor:
         """Flatten the heads, applying the element-wise gate (in float32, cast
         back) when configured."""
-        output_TF = output_THK.contiguous().reshape(output_THK.shape[0], -1)
-        if gate_TF is not None:
-            output_TF = (output_TF.float() * torch.sigmoid(gate_TF.float())).to(
-                output_TF.dtype
+        if gate_THK is not None:
+            output_THK = (output_THK.float() * torch.sigmoid(gate_THK.float())).to(
+                output_THK.dtype
             )
-        return output_TF
+        return output_THK.contiguous().reshape(output_THK.shape[0], -1)

@@ -274,6 +274,8 @@ def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
         read_threads=4,
     )
     out = tmp_path / "hf"
+    # the HF files only: no staged copy of the tensors left next to them
+    assert not (out / "sharded").exists()
     placeholder = Path(hf_files.__file__).parent / "chat_template.jinja"
     assert (out / "chat_template.jinja").read_text() == placeholder.read_text()
     tokenizer = AutoTokenizer.from_pretrained(out)

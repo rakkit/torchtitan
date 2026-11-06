@@ -202,14 +202,14 @@ def save_hf_folder(run, model, state_dict, output_dir: Path, export_dtype: str) 
             hf_state_dict[key] = hf_state_dict[key].float()
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    # One process holds the full tensors: the writer's rank-0 mode writes the
+    # HF files and index directly (the distributed mode stages a copy in
+    # output_dir/sharded, consolidates it and leaves it: twice the disk).
     dcp.save(
         hf_state_dict,
         storage_writer=HuggingFaceStorageWriter(
             path=str(output_dir),
-            save_distributed=True,
             fqn_to_index_mapping=adapter.fqn_to_index_mapping_for_save(hf_state_dict),
-            enable_consolidation=True,
-            thread_count_consolidation=5,
         ),
     )
     _write_hf_files(run.model, Path(run.hf_assets_path), output_dir, export_dtype)

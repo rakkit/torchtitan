@@ -78,12 +78,21 @@ def _torchtitan_model(**overrides):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="flex / conv need CUDA")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_hf_forward_is_torchtitan_forward_bitwise(dtype):
+@pytest.mark.parametrize(
+    "variant",
+    [
+        {},
+        {"rope_of_swa": {"dim": 64, "theta": 10000.0}},
+        {"conv_streams": "kv"},
+    ],
+    ids=["every-feature", "partial-rope-on-swa", "conv-on-kv"],
+)
+def test_hf_forward_is_torchtitan_forward_bitwise(dtype, variant):
     # Both models' FlexAttention compile from the same state: what compiled
     # before (other shapes, kernels autotuned under other load) can give one
     # of them a different kernel, which rounds differently.
     torch._dynamo.reset()
-    cfg, tt = _torchtitan_model()
+    cfg, tt = _torchtitan_model(**variant)
     hf = OptMoeForCausalLM(OptMoeConfig(**hf_config(cfg))).cuda()
     hf.load_state_dict(OPTMoEStateDictAdapter(cfg, None).to_hf(tt.state_dict()))
     # The parameters in `dtype`, as FSDP's param_dtype: buffers (torchtitan's

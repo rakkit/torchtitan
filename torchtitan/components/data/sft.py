@@ -240,11 +240,18 @@ class MultiTurnChatProcessor(SampleProcessor):
         self._num_dropped = 0
         self._num_seen = 0
         self._num_prompt_mismatches = 0
+        self._num_turn_mismatches = 0
 
     @property
     def num_dropped(self) -> int:
         """Conversations skipped for length."""
         return self._num_dropped
+
+    @property
+    def num_turn_mismatches(self) -> int:
+        """Assistant turns whose own render is not a token prefix of the full
+        render (the span stops at their common prefix)."""
+        return self._num_turn_mismatches
 
     @property
     def num_prompt_mismatches(self) -> int:
@@ -271,12 +278,33 @@ class MultiTurnChatProcessor(SampleProcessor):
             start = _common_prefix_length(prompt, input_ids)
             if start < len(prompt):
                 self._record_prompt_mismatch()
-            stop = _common_prefix_length(
-                self._tokenize(messages[: index + 1], extra), input_ids
-            )
-            if stop > start:
-                spans.append((start, stop))
+            turn = self._tokenize(messages[: index + 1], extra)
+            stop = _common_prefix_length(turn, input_ids)
+            if stop <= start:
+                # The turn's own render and the full conversation stop agreeing
+                # before its content: the template renders an earlier message
+                # differently once the conversation goes on.
+                raise ValueError(
+                    f"SFT: assistant turn {index} has no tokens to train on: the "
+                    "chat template renders an earlier message differently once "
+                    "the conversation continues (e.g. template kwargs that change "
+                    "messages before the last user turn, such as low_effort or "
+                    "truncate_history_thinking=True), so the span cannot be found"
+                )
+            if stop < len(turn):
+                self._record_turn_mismatch()
+            spans.append((start, stop))
         return spans
+
+    def _record_turn_mismatch(self) -> None:
+        self._num_turn_mismatches += 1
+        if self._num_turn_mismatches == 1 or self._num_turn_mismatches % 1000 == 0:
+            logger.warning(
+                "SFT: %d assistant turns so far whose own render is not a prefix of "
+                "the full conversation; their loss stops where the two renders stop "
+                "agreeing.",
+                self._num_turn_mismatches,
+            )
 
     def _record_prompt_mismatch(self) -> None:
         self._num_prompt_mismatches += 1

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import grain.python as grain
 import numpy as np
+import pytest
 
 from torchtitan.components.data.sft import MultiTurnChatProcessor
 from torchtitan.components.data.types import DatasetBuildContext
@@ -189,6 +190,36 @@ def test_a_generation_prompt_unlike_the_history_turn_starts_the_loss_where_they_
 
     assert _supervised_text(sequence) == "}ONE|}TWO|"
     assert processor.num_prompt_mismatches == 2
+    assert processor.num_turn_mismatches == 0
+
+
+def test_a_template_that_rewrites_earlier_messages_is_refused():
+    """A template that renders a message differently depending on where the
+    conversation ends (e.g. the user's low_effort suffix on the last user message,
+    or reasoning truncated in turns before it) makes a turn's own render and the
+    full conversation diverge before that turn's content: its span would be empty
+    and the turn silently left out of the loss. The processor raises instead."""
+
+    class LastUserSuffixTemplate(CharTokenizer):
+        def apply_chat_template(self, messages, add_generation_prompt=False, **kwargs):
+            last_user = max(i for i, m in enumerate(messages) if m["role"] == "user")
+            text = "".join(
+                f"{m['role'][0].upper()}:{m['content']}{'!' * (i == last_user)}|"
+                for i, m in enumerate(messages)
+            )
+            return text + ("A:" if add_generation_prompt else "")
+
+    processor = MultiTurnChatProcessor(
+        MultiTurnChatProcessor.Config(),
+        context=DatasetBuildContext(
+            tokenizer=LastUserSuffixTemplate(),
+            max_context_length=256,
+            num_tokens_per_microbatch=256,
+            read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=1),
+        ),
+    )
+    with pytest.raises(ValueError, match="no tokens to train on"):
+        processor(_conversation("q1", "ONE", "q2", "TWO"), np.random.default_rng(0))
 
 
 def test_output_feeds_upstream_packing_and_collation():

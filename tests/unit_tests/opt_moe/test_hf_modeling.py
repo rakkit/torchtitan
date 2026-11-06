@@ -36,10 +36,7 @@ VOCAB = 512
 
 
 def _torchtitan_model(**overrides):
-    cfg = build_model_config(
-        "mis-8b-proxy",
-        parallelism=ParallelismConfig(),
-        seq_len=256,
+    every_feature = dict(
         n_layers=3,
         swa_pattern="SSF",
         rope_pattern="RRN",
@@ -52,7 +49,12 @@ def _torchtitan_model(**overrides):
         gated_attention_type="element-wise",
         num_mtp_layers=1,
         vocab_size=VOCAB,
-        **overrides,
+    )
+    cfg = build_model_config(
+        "mis-8b-proxy",
+        parallelism=ParallelismConfig(),
+        seq_len=256,
+        **every_feature | overrides,
     )
     with torch.device("meta"):
         model = cfg.build()
@@ -125,12 +127,20 @@ def _hf_model(dtype=torch.float32, **overrides):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="grouped GEMMs need CUDA")
-def test_cached_decode_gives_the_full_forward():
+@pytest.mark.parametrize(
+    "arch",
+    [
+        {"sliding_window_size": 16},
+        {"swa_pattern": "FFF", "conv_kernel_size": 0},
+    ],
+    ids=["swa16-conv", "full-attention-no-conv"],
+)
+def test_cached_decode_gives_the_full_forward(arch):
     """A 21-token prefill, then 19 one-token steps through the DynamicCache
-    (its K / V, its sliding-window layers past their 16-token window, its conv
-    states): every position's logits are the full forward's (fp32, the same
-    math over other shapes)."""
-    hf = _hf_model(sliding_window_size=16)
+    (its K / V, the sliding-window layers past their 16-token window and the
+    conv states; or full attention only, plain KV layers): every position's
+    logits are the full forward's (fp32, the same math over other shapes)."""
+    hf = _hf_model(**arch)
     torch.manual_seed(2)
     tokens = torch.randint(0, VOCAB, (1, 40), device="cuda")
     with torch.no_grad():

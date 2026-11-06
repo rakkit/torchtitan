@@ -9,41 +9,26 @@
 weights:
 
 - ``packed_forward``: torchtitan's packed token rows (``position_ids`` restart
-  at 0 at every document). It does torchtitan's ops in torchtitan's order and
-  dtypes, so it reproduces torchtitan's forward bitwise (torchtitan without its
-  local_compile regions, which only fuse the same element-wise ops): q / k / v
-  as one GEMM in torchtitan's fused layout, the gate / up projections as one
-  GEMM, nn.RMSNorm, the cos / sin RoPE cache, FlexAttention compiled with
-  torchtitan's options and masks, attn_gym's short conv, the router GEMM in
-  fp32 accumulation, the experts as bf16 grouped GEMMs over the stably
-  expert-sorted tokens and a deterministic scatter-add. The MTP depths run
-  only here.
-- ``forward`` (what ``generate`` calls), the transformers way: ``[B, T]`` rows
-  with left padding (``attention_mask``), a ``DynamicCache`` built from
-  ``layer_types`` (a ``hybrid`` / ``hybrid_sliding`` layer keeps the K / V and
-  each conv stream's last ``conv_kernel_size`` inputs), masks from
-  ``masking_utils``, eager attention in fp32 with the sinks as one more softmax
-  logit (gpt_oss), the conv a depthwise torch conv in fp32 over the cached and
-  the new inputs (Inkling's short conv) rounded as attn_gym's before the
-  residual add. Same weights and ops, different kernels: it rounds differently
-  from ``packed_forward``. Serving speed is vLLM's, not this.
-
-Training-only parts (load balancing, aux losses) are not here.
+  at 0 per document) with torchtitan's ops in torchtitan's order and dtypes
+  (FlexAttention, attn_gym's conv, bf16 grouped GEMMs, a deterministic
+  scatter-add): torchtitan's forward bitwise, MTP depths included.
+- ``forward`` (``generate``): ``[B, T]`` rows with left padding, a
+  ``DynamicCache`` from ``layer_types`` (a ``hybrid`` layer keeps K / V and
+  each conv stream's last inputs), ``masking_utils`` masks, eager fp32
+  attention with the sinks as one more softmax logit (gpt_oss), a torch conv
+  (Inkling). Other kernels, so other rounding; serving speed is vLLM's.
 
 Tensor suffixes: ``B`` rows, ``T`` tokens, ``S`` cached + new tokens, ``D``
 model dim, ``H`` heads, ``G`` KV heads, ``K`` head dim, ``C`` conv channels,
 ``E`` experts, ``F`` FFN dim, ``N`` routed (token, expert) pairs."""
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention.flex_attention import (
-    and_masks,
     AuxRequest,
-    BlockMask,
     create_block_mask,
     flex_attention,
 )
@@ -71,60 +56,26 @@ _FLEX_OPTIONS = {
 }
 _compiled_flex = torch.compile(flex_attention, fullgraph=True, options=_FLEX_OPTIONS)
 _compiled_create_block_mask = torch.compile(create_block_mask)
-_BLOCK_SIZE = 128
-
-
-def _causal(b, h, q_idx, kv_idx):
-    return q_idx >= kv_idx
-
-
-def _packed_document(positions_T: torch.Tensor) -> Callable:
-    """torchtitan's ``get_efficient_causal_mask_mod_for_packed_document``."""
-    seq_len = positions_T.shape[0]
-    starts = positions_T == 0
-    document_id = torch.cumsum(starts.int(), dim=0).to(torch.int32) - 1
-    token_idx = torch.arange(seq_len, device=positions_T.device, dtype=torch.int32)
-    offsets = torch.full(
-        ((seq_len + 1 + 127) // 128 * 128,),
-        seq_len,
-        device=positions_T.device,
-        dtype=torch.int32,
-    )
-    offsets.scatter_(
-        0,
-        torch.where(starts, document_id, torch.full_like(document_id, seq_len)).to(
-            torch.int64
-        ),
-        torch.where(starts, token_idx, torch.full_like(token_idx, seq_len)),
-    )
-
-    def packed_document_mask(b, h, q_idx, kv_idx):
-        return kv_idx >= offsets[document_id[q_idx]]
-
-    return packed_document_mask
-
-
-def _sliding_window(window: int) -> Callable:
-    def sliding_window_mod(b, h, q_idx, kv_idx):
-        return (kv_idx <= q_idx) & (q_idx - kv_idx < window)
-
-    sliding_window_mod.__name__ = f"sliding_window_mod_window_size_{window}"
-    return sliding_window_mod
 
 
 def _block_mask(positions_T: torch.Tensor, window: int | None):
-    mods = [_causal, _packed_document(positions_T)]
-    if window is not None:
-        mods.append(_sliding_window(window))
+    """torchtitan's FlexAttention mask of a packed row: causal within each
+    document, and within ``window`` tokens on a sliding-window layer."""
+    document_T = torch.cumsum(positions_T == 0, dim=0)
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        allowed = (document_T[q_idx] == document_T[kv_idx]) & (kv_idx <= q_idx)
+        return allowed if window is None else allowed & (q_idx - kv_idx < window)
+
     seq_len = positions_T.shape[0]
     return _compiled_create_block_mask(
-        and_masks(*mods),
+        mask_mod,
         1,
         None,
         seq_len,
         seq_len,
         device=positions_T.device,
-        BLOCK_SIZE=_BLOCK_SIZE,
+        BLOCK_SIZE=128,
         separate_full_blocks=True,
     )
 
@@ -148,26 +99,18 @@ def _canon_conv(x_TC: torch.Tensor, conv: nn.Conv1d, cu_seqlens: torch.Tensor):
     return out_1TC.squeeze(0) + x_TC
 
 
-def _cached_canon_conv(
-    x_BTC: torch.Tensor,
-    conv: nn.Conv1d,
-    cache: Cache | None,
-    conv_mask_BT: torch.Tensor | None,
-    layer_idx: int,
-    state_idx: int,
-) -> torch.Tensor:
+def _cached_canon_conv(x_BTC, conv: nn.Conv1d, rows: "_Rows", layer_idx, state_idx):
     """``x + conv(x)`` continuing the cache's conv state: the depthwise causal
-    conv in fp32 over the cached inputs and the new ones (Inkling's short conv),
+    conv in fp32 over the cached and the new inputs (Inkling's short conv),
     rounded to x's dtype before the residual add as attn_gym's conv. Padding
-    inputs (``conv_mask_BT`` 0) enter as zeros: a left-padded row sees the zero
-    history a row alone starts from."""
+    enters as zeros: a left-padded row sees the zero history of a row alone."""
     t, w = x_BTC.shape[1], conv.kernel_size[0]
     inputs_BTC = x_BTC
-    if conv_mask_BT is not None:
-        inputs_BTC = x_BTC * conv_mask_BT[:, :, None].to(x_BTC.dtype)
+    if rows.conv_mask is not None:
+        inputs_BTC = x_BTC * rows.conv_mask[:, :, None].to(x_BTC.dtype)
     inputs_BCS = inputs_BTC.transpose(1, 2)
-    if cache is not None:
-        inputs_BCS = cache.update_conv_state(
+    if rows.cache is not None:
+        inputs_BCS = rows.cache.update_conv_state(
             inputs_BCS, layer_idx, state_idx=state_idx, conv_kernel_size=w
         )
     s = inputs_BCS.shape[-1]
@@ -180,67 +123,52 @@ def _cached_canon_conv(
     return out_BCS[..., -t:].transpose(1, 2).to(x_BTC.dtype) + x_BTC
 
 
-@dataclass
-class _PackedRows:
-    """torchtitan's packed token rows (``packed_forward``)."""
-
-    positions: torch.Tensor  # [T], restarting at 0 at every document
-    block_masks: dict[int | None, BlockMask]  # per sliding window (None: full)
-    cu_seqlens: torch.Tensor | None  # the documents' offsets, for the conv
+def _rms_norm(config: OptMoeConfig, dim: int) -> nn.RMSNorm:
+    return nn.RMSNorm(
+        dim, eps=config.rms_norm_eps, elementwise_affine=config.norm_has_weight
+    )
 
 
 @dataclass
-class _CachedRows:
-    """``[B, T]`` rows that continue a cache (``forward``)."""
+class _Rows:
+    """What a layer needs besides its input. ``packed``: torchtitan's packed
+    row (``masks`` FlexAttention block masks, ``cu_seqlens`` the documents for
+    the conv); else ``[B, T]`` rows continuing ``cache`` (``masks`` additive
+    ``[B, 1, T, S]`` masks, ``conv_mask`` 0 on padding). ``masks`` is keyed by
+    the sliding window (None: full attention)."""
 
-    positions: torch.Tensor  # [B or 1, T]
-    masks: dict[str, torch.Tensor]  # additive [B, 1, T, S] per attention type
-    conv_mask: torch.Tensor | None  # [B, T], 0 on padding; None: no padding
-    cache: Cache | None
+    packed: bool
+    positions: torch.Tensor
+    masks: dict
+    cu_seqlens: torch.Tensor | None = None
+    conv_mask: torch.Tensor | None = None
+    cache: Cache | None = None
 
 
 class OptMoeRotary(nn.Module):
-    """torchtitan's CosSinRoPE (rotate-half) over the first ``dim`` dims; the
-    cos / sin cache is computed on the device that uses it, as torchtitan's."""
+    """torchtitan's CosSinRoPE (rotate-half) over the first ``dim`` dims: the
+    angles ``position x inv_freq`` in fp32 on the input's device, the values of
+    torchtitan's cos / sin cache."""
 
-    def __init__(self, dim: int, theta: float, max_positions: int):
+    def __init__(self, dim: int, theta: float):
         super().__init__()
-        self.dim, self.theta, self.max_positions = dim, theta, max_positions
-        self._caches: dict[torch.device, torch.Tensor] = {}
-
-    def _cache(self, device: torch.device) -> torch.Tensor:
-        if device not in self._caches:
-            with torch.device(device):
-                d = self.dim
-                inv_freq = 1.0 / (
-                    self.theta ** (torch.arange(0, d, 2)[: d // 2].float() / d)
-                )
-                t = torch.arange(self.max_positions, dtype=inv_freq.dtype)
-                freqs = torch.outer(t, inv_freq).float()
-                angles = torch.cat([freqs, freqs], dim=-1)
-                self._caches[device] = torch.cat([angles.cos(), angles.sin()], dim=-1)
-        return self._caches[device]
-
-    @staticmethod
-    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-
-    def _rotate(self, x_THK: torch.Tensor, cache_T1C: torch.Tensor) -> torch.Tensor:
-        cos, sin = cache_T1C[..., : self.dim], cache_T1C[..., self.dim :]
-        x = x_THK.float()
-        return ((x * cos) + (self._rotate_half(x) * sin)).type_as(x_THK)
+        self.dim, self.theta = dim, theta
 
     def forward(self, q_THK, k_THK, positions_T):
         """``q`` / ``k`` ``[..., T, heads, K]``, ``positions`` ``[..., T]``."""
-        cache_T1C = self._cache(q_THK.device)[positions_T].unsqueeze(-2)
         d = self.dim
-        if d == q_THK.shape[-1]:
-            return self._rotate(q_THK, cache_T1C), self._rotate(k_THK, cache_T1C)
-        return (
-            torch.cat([self._rotate(q_THK[..., :d], cache_T1C), q_THK[..., d:]], -1),
-            torch.cat([self._rotate(k_THK[..., :d], cache_T1C), k_THK[..., d:]], -1),
-        )
+        exponents = torch.arange(0, d, 2, device=q_THK.device)[: d // 2].float() / d
+        freqs_TC = positions_T.float().unsqueeze(-1) * (1.0 / self.theta**exponents)
+        angles_T1C = torch.cat([freqs_TC, freqs_TC], dim=-1).unsqueeze(-2)
+        cos, sin = angles_T1C.cos(), angles_T1C.sin()
+
+        def rotate(x_THK):
+            x = x_THK[..., :d].float()
+            x1, x2 = x.chunk(2, dim=-1)
+            out = ((x * cos) + (torch.cat((-x2, x1), dim=-1) * sin)).type_as(x_THK)
+            return out if d == x_THK.shape[-1] else torch.cat([out, x_THK[..., d:]], -1)
+
+        return rotate(q_THK), rotate(k_THK)
 
 
 class OptMoeAttention(nn.Module):
@@ -258,17 +186,8 @@ class OptMoeAttention(nn.Module):
         self.k_proj = nn.Linear(d, kv * k, bias=False)
         self.v_proj = nn.Linear(d, kv * k, bias=False)
         self.o_proj = nn.Linear(h * k, d, bias=False)
-        affine = config.norm_has_weight
-        self.q_norm = (
-            nn.RMSNorm(k, eps=config.rms_norm_eps, elementwise_affine=affine)
-            if config.qk_norm
-            else None
-        )
-        self.k_norm = (
-            nn.RMSNorm(k, eps=config.rms_norm_eps, elementwise_affine=affine)
-            if config.qk_norm
-            else None
-        )
+        self.q_norm = _rms_norm(config, k) if config.qk_norm else None
+        self.k_norm = _rms_norm(config, k) if config.qk_norm else None
         self.gate_proj = (
             nn.Linear(d, h * k, bias=False)
             if config.attention_gate == "element-wise"
@@ -285,13 +204,7 @@ class OptMoeAttention(nn.Module):
         self.v_conv = conv(kv * k) if w > 0 else None
         self.sinks = nn.Parameter(torch.zeros(h)) if config.attention_sinks else None
         rope = config.rope_layers[layer_idx]
-        self.rope = (
-            None
-            if rope is None
-            else OptMoeRotary(
-                rope["dim"], rope["theta"], config.max_position_embeddings
-            )
-        )
+        self.rope = None if rope is None else OptMoeRotary(rope["dim"], rope["theta"])
         self.window = (
             config.sliding_window
             if config.layer_types[layer_idx] in ("sliding_attention", "hybrid_sliding")
@@ -312,7 +225,7 @@ class OptMoeAttention(nn.Module):
         ).reshape(-1, d)
 
     def forward(self, x_TD, rows):
-        """``x`` ``[T, D]`` (``_PackedRows``) or ``[B, T, D]`` (``_CachedRows``)."""
+        """``x`` ``[T, D]`` (packed rows) or ``[B, T, D]``."""
         lead = x_TD.shape[:-1]
         qkv = F.linear(x_TD, self._fused_qkv_weight())
         qkv = qkv.view(*lead, -1, self.n_heads // self.n_kv_heads + 2, self.head_dim)
@@ -332,8 +245,8 @@ class OptMoeAttention(nn.Module):
             xq, xk = self.q_norm(xq), self.k_norm(xk)
         if self.rope is not None:
             xq, xk = self.rope(xq, xk, rows.positions)
-        if isinstance(rows, _PackedRows):
-            out_THK = self._flex(xq, xk, xv, rows.block_masks[self.window])
+        if rows.packed:
+            out_THK = self._flex(xq, xk, xv, rows.masks[self.window])
         else:
             out_THK = self._eager(xq, xk, xv, rows)
         out_TF = out_THK.contiguous().reshape(*lead, -1)
@@ -342,17 +255,11 @@ class OptMoeAttention(nn.Module):
         return self.o_proj(out_TF)
 
     def _conv(self, x_THK, conv, rows, state_idx):
-        if isinstance(rows, _PackedRows):
-            out_TC = _canon_conv(x_THK.flatten(-2), conv, rows.cu_seqlens)
+        x_TC = x_THK.flatten(-2)
+        if rows.packed:
+            out_TC = _canon_conv(x_TC, conv, rows.cu_seqlens)
         else:
-            out_TC = _cached_canon_conv(
-                x_THK.flatten(-2),
-                conv,
-                rows.cache,
-                rows.conv_mask,
-                self.layer_idx,
-                state_idx,
-            )
+            out_TC = _cached_canon_conv(x_TC, conv, rows, self.layer_idx, state_idx)
         return out_TC.view_as(x_THK)
 
     def _flex(self, xq_THK, xk_TGK, xv_TGK, block_mask):
@@ -389,9 +296,7 @@ class OptMoeAttention(nn.Module):
         v_BHSK = v_BGSK.repeat_interleave(groups, dim=1).float()
         scores = torch.matmul(q_BHTK.float(), k_BHSK.transpose(-2, -1))
         scores = scores * self.head_dim**-0.5
-        mask = rows.masks[
-            "full_attention" if self.window is None else "sliding_attention"
-        ]
+        mask = rows.masks[self.window]
         if mask is not None:
             scores = scores + mask[..., : k_BHSK.shape[-2]]
         if self.sinks is not None:
@@ -489,14 +394,7 @@ class OptMoeSparseMoe(nn.Module):
             )
         topk_TK = topk_TK * self.routed_scaling_factor
 
-        num_experts = self.gate.weight.shape[0]
-        counts_E = (
-            torch.zeros(
-                x_TD.shape[0], num_experts, dtype=torch.bool, device=x_TD.device
-            )
-            .scatter_(-1, ids_TK, True)
-            .sum(dim=0)
-        )
+        counts_E = torch.bincount(ids_TK.view(-1), minlength=w.shape[0])
         order_N = torch.argsort(ids_TK.view(-1), stable=True)
         scores_N = topk_TK.view(-1)[order_N]
         tokens_N = order_N // self.top_k
@@ -531,12 +429,10 @@ class OptMoeSparseMoe(nn.Module):
 class OptMoeDecoderLayer(nn.Module):
     def __init__(self, config: OptMoeConfig, layer_idx: int):
         super().__init__()
-        affine, eps, d = config.norm_has_weight, config.rms_norm_eps, config.hidden_size
+        d = config.hidden_size
         self.self_attn = OptMoeAttention(config, layer_idx)
-        self.input_layernorm = nn.RMSNorm(d, eps=eps, elementwise_affine=affine)
-        self.post_attention_layernorm = nn.RMSNorm(
-            d, eps=eps, elementwise_affine=affine
-        )
+        self.input_layernorm = _rms_norm(config, d)
+        self.post_attention_layernorm = _rms_norm(config, d)
         self.mlp = (
             OptMoeMLP(d, config.intermediate_size)
             if layer_idx < config.first_k_dense_replace
@@ -562,12 +458,11 @@ class OptMoeMTPLayer(OptMoeDecoderLayer):
 
     def __init__(self, config: OptMoeConfig, layer_idx: int):
         super().__init__(config, config.num_hidden_layers - 1)
-        affine, eps, d = config.norm_has_weight, config.rms_norm_eps, config.hidden_size
-        self.enorm = nn.RMSNorm(d, eps=eps, elementwise_affine=affine)
-        self.hnorm = nn.RMSNorm(d, eps=eps, elementwise_affine=affine)
+        d = config.hidden_size
+        self.enorm, self.hnorm = _rms_norm(config, d), _rms_norm(config, d)
         self.eh_proj = nn.Linear(2 * d, d, bias=False)
         self.shared_head = nn.Module()
-        self.shared_head.norm = nn.RMSNorm(d, eps=eps, elementwise_affine=affine)
+        self.shared_head.norm = _rms_norm(config, d)
 
     def forward(self, embed_TD, prev_TD, valid_T, rows):
         prev_TD = prev_TD * valid_T.unsqueeze(-1).to(prev_TD.dtype)
@@ -601,11 +496,7 @@ class OptMoeModel(OptMoePreTrainedModel):
                 for i in range(config.num_nextn_predict_layers)
             ]
         )
-        self.norm = nn.RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            elementwise_affine=config.norm_has_weight,
-        )
+        self.norm = _rms_norm(config, config.hidden_size)
         self.post_init()
 
     def packed_forward(
@@ -617,9 +508,10 @@ class OptMoeModel(OptMoePreTrainedModel):
         depths' hidden states."""
         n = self.config.num_hidden_layers
         windows = {layer.self_attn.window for layer in self.layers[:n]}
-        rows = _PackedRows(
+        rows = _Rows(
+            packed=True,
             positions=positions_T,
-            block_masks={w: _block_mask(positions_T, w) for w in windows},
+            masks={w: _block_mask(positions_T, w) for w in windows},
             cu_seqlens=(
                 _document_offsets(positions_T) if self.config.conv_kernel_size else None
             ),
@@ -667,12 +559,15 @@ class OptMoeModel(OptMoePreTrainedModel):
             "position_ids": position_ids,
         }
         n = self.config.num_hidden_layers
-        masks = {"full_attention": create_causal_mask(**mask_kwargs)}
-        if any(layer.self_attn.window is not None for layer in self.layers[:n]):
-            masks["sliding_attention"] = create_sliding_window_causal_mask(
+        windows = {layer.self_attn.window for layer in self.layers[:n]}
+        masks = {
+            w: (create_causal_mask if w is None else create_sliding_window_causal_mask)(
                 **mask_kwargs
             )
-        rows = _CachedRows(
+            for w in windows
+        }
+        rows = _Rows(
+            packed=False,
             positions=position_ids,
             masks=masks,
             conv_mask=(
@@ -741,25 +636,17 @@ class OptMoeForCausalLM(OptMoePreTrainedModel, GenerationMixin):
             loss=loss, logits=logits, past_key_values=out.past_key_values
         )
 
-    def packed_forward(self, input_ids, position_ids=None, labels=None):
+    def packed_forward(self, input_ids, position_ids=None):
         """torchtitan's forward, bitwise: ``input_ids`` ``[B, T]`` packed rows,
         flattened into one token stream (``position_ids`` restart at 0 per
-        document; default: one document per row). Returns the main
-        prediction's logits ``[B, T, V]`` (and with ``labels``, the targets as
-        torchtitan's: already the next tokens, the cross-entropy)."""
+        document; default: one document per row); the main logits."""
         b, t = input_ids.shape
         if position_ids is None:
             position_ids = torch.arange(t, device=input_ids.device).expand(b, t)
         hidden = self.model.packed_forward(
             input_ids.reshape(-1), position_ids.reshape(-1)
         )[0]
-        logits = self.lm_head(hidden).view(b, t, -1)
-        loss = None
-        if labels is not None:
-            loss = F.cross_entropy(
-                logits.float().flatten(0, 1), labels.reshape(-1), ignore_index=-100
-            )
-        return CausalLMOutput(loss=loss, logits=logits)
+        return CausalLMOutput(logits=self.lm_head(hidden).view(b, t, -1))
 
 
 __all__ = ["OptMoeForCausalLM", "OptMoeModel", "OptMoePreTrainedModel"]

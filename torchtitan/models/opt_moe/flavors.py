@@ -198,7 +198,6 @@ def build_opt_moe_layers(
     swa_pattern: str | None = None,
     gated_attention_type: Literal["element-wise"] | None = None,
     conv_kernel_size: int = 0,
-    conv_streams: Literal["qkv", "kv"] = "qkv",
     attention_sinks: bool = False,
     wqkv_init_fn_type: str = "scaled_orthogonal",
     wqkv_init_std: float = 1.0,
@@ -255,10 +254,10 @@ def build_opt_moe_layers(
     each layer's; sliding-window layers take ``rope_of_swa`` when set.
     ``gated_attention_type`` "element-wise": the output times
     ``sigmoid(gate_proj(x))``; ``conv_kernel_size`` > 0: the Canon short conv
-    ``x + conv(x)`` on q, k and v (``conv_streams`` "qkv") or k and v ("kv"),
-    each channel initialized by ``conv_init_fn_type`` ("delay",
+    ``x + conv(x)`` on k and v, each channel initialized by ``conv_init_fn_type`` ("delay",
     "random_opnorm", "torch_default") at ``conv_init_gain``;
-    ``attention_sinks``: one learned logit per head in the softmax.
+    ``attention_sinks``: one learned logit per head in the softmax (the gate or
+    sinks: one or neither).
 
     Feed-forward: layers ``< n_dense_layers`` a dense SwiGLU FFN of
     ``dense_hidden_dim``, the rest an ``OptMoE``: ``num_experts`` routed experts
@@ -282,8 +281,6 @@ def build_opt_moe_layers(
             "gated_attention_type must be None (no gate) or 'element-wise', "
             f"got {gated_attention_type!r}"
         )
-    if conv_kernel_size > 0 and conv_streams not in ("qkv", "kv"):
-        raise ValueError(f"conv_streams must be qkv | kv, got {conv_streams!r}")
     use_swa = _layer_pattern(
         swa_pattern, n_layers, "S", "F", default=sliding_window_size is not None
     )
@@ -386,8 +383,6 @@ def build_opt_moe_layers(
                 sharding_config=dense_linear_sharding_config(),
             )
         if conv_kernel_size > 0:
-            if conv_streams == "qkv":
-                attention["q_conv"] = conv(n_heads * head_dim)
             attention["k_conv"] = conv(n_kv_heads * head_dim)
             attention["v_conv"] = conv(n_kv_heads * head_dim)
         if attention_sinks:

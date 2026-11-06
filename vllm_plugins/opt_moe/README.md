@@ -21,7 +21,7 @@ Per decoder layer, two caches:
 
 ```
 x -> RMSNorm -> qkv_proj -> [q|k|v] -> x + conv(x)   <- conv state: the last W - 1 raw
-                                                        q / k / v (or k / v) of each sequence
+                                     on k and v         k / v of each sequence
                             -> qk-norm -> RoPE (none on NoPE layers, partial RoPE)
                             -> Attention              <- KV cache (sinks, per-layer
                                                         sliding window)
@@ -33,8 +33,8 @@ x -> RMSNorm -> qkv_proj -> [q|k|v] -> x + conv(x)   <- conv state: the last W -
 The KV cache holds k and v after the conv, qk-norm and RoPE, and q is not
 cached, so the raw inputs the next step's conv needs are kept separately: as one
 more sliding-window KV cache per layer (window = block = the conv width), the
-streams (q / k / v, or k / v for `conv_streams: kv`) packed per KV head, read
-and written by vLLM's Inkling
+k and v heads as the cache's heads (one launch over the projection's
+`[k | v]` slice), read and written by vLLM's Inkling
 `fused_sconv` kernel (insert + conv in one launch, the same path for prefill,
 decode and speculative tokens, CUDA-graph safe), as vLLM's Inkling model keeps
 its conv state. Weights in bf16; `--quantization fp8` quantizes the linears and

@@ -35,6 +35,15 @@ DOCS = [70, 1, 185]
 VOCAB = 512
 
 
+# sinks in place of the gate (one or neither)
+_SINKS = dict(
+    gated_attention_type=None,
+    attention_sinks=True,
+    sinks_init_fn_type="trunc_normal",
+    sinks_init_std=0.5,
+)
+
+
 def _torchtitan_model(**overrides):
     every_feature = dict(
         n_layers=3,
@@ -43,9 +52,6 @@ def _torchtitan_model(**overrides):
         n_dense_layers=1,
         dense_hidden_dim=256,
         conv_kernel_size=4,
-        attention_sinks=True,
-        sinks_init_fn_type="trunc_normal",
-        sinks_init_std=0.5,
         gated_attention_type="element-wise",
         num_mtp_layers=1,
         vocab_size=VOCAB,
@@ -82,10 +88,11 @@ def _torchtitan_model(**overrides):
     "variant",
     [
         {},
+        _SINKS,
+        {"gated_attention_type": None},
         {"rope_of_swa": {"dim": 64, "theta": 10000.0}},
-        {"conv_streams": "kv"},
     ],
-    ids=["every-feature", "partial-rope-on-swa", "conv-on-kv"],
+    ids=["every-feature-gate", "sinks", "neither", "partial-rope-on-swa"],
 )
 def test_hf_forward_is_torchtitan_forward_bitwise(dtype, variant):
     # Both models' FlexAttention compile from the same state: what compiled
@@ -142,9 +149,10 @@ def _hf_model(dtype=torch.float32, **overrides):
     "arch",
     [
         {"sliding_window_size": 16},
+        {"sliding_window_size": 16, **_SINKS},
         {"swa_pattern": "FFF", "conv_kernel_size": 0},
     ],
-    ids=["swa16-conv", "full-attention-no-conv"],
+    ids=["swa16-conv-gate", "swa16-conv-sinks", "full-attention-no-conv"],
 )
 def test_cached_decode_gives_the_full_forward(arch):
     """A 21-token prefill, then 19 one-token steps through the DynamicCache

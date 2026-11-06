@@ -11,13 +11,13 @@
 ``vllm.general_plugins`` entry point). No torchtitan import.
 
 Each decoder layer holds two caches: the attention's KV cache (``Attention``
-with the sinks, the layer's sliding window) and the q / k / v short conv's
-state, the last ``conv_kernel_size`` raw inputs per sequence, kept as one more
+with the sinks, the layer's sliding window) and the k / v short conv's
+state, the last ``conv_kernel_size`` raw k / v per sequence, kept as one more
 sliding-window KV cache (window = block = the conv width) as vLLM's Inkling
 model keeps its conv state (``OptMoeConvState``; vLLM's Inkling sconv backend
 and ``fused_sconv`` kernel: insert + conv in one launch, positions addressed,
 the same path for prefill / decode / speculative tokens, CUDA-graph safe). The ops follow the HF model's
-transformers forward: q / k / v -> x + conv(x) -> qk-norm -> RoPE (none on
+transformers forward: q / k / v -> x + conv(x) on k / v -> qk-norm -> RoPE (none on
 NoPE layers, partial when ``dim`` < head_dim) -> attention -> the element-wise
 gate sigmoid(gate_proj(x)) -> o_proj; RMSNorm blocks with the per-layer
 residual scales; the first ``first_k_dense_replace`` layers a SwiGLU FFN, the
@@ -25,7 +25,7 @@ rest a sigmoid-routed MoE with the score-correction bias for the choice and a
 shared expert. The MTP depths are not served (``num_nextn_predict_layers`` is
 ignored here).
 
-Tensor suffixes: ``T`` tokens, ``D`` model dim, ``C`` conv channels (q, k, v of
+Tensor suffixes: ``T`` tokens, ``D`` model dim, ``C`` conv channels (k, v of
 this TP rank), ``W`` conv width, ``H`` / ``G`` this rank's query / KV heads,
 ``K`` head dim, ``E`` experts, ``F`` expert FFN dim."""
 
@@ -76,12 +76,12 @@ def _sliding(config, layer_idx: int) -> bool:
 
 
 class OptMoeConvState(nn.Module, AttentionLayerBase):
-    """A layer's conv state: one sliding-window KV cache (window = block = the
-    conv width) holding, per KV head of this rank, its q heads' (``conv_streams``
-    qkv) / k / v raw inputs packed head-major into one width (padded to a power
-    of two, as Inkling's, so every layer's page is the same size). The convs read and
-    write it out of band (``OptMoeShortConv``); vLLM's Inkling sconv backend
-    builds the block table / slot metadata."""
+    """A layer's conv state: one sliding-window KV cache (window = the conv
+    width) holding the last raw k and v of each sequence, as ``2 G`` heads of
+    ``head_dim`` (this rank's k heads, then its v heads: the channel order of
+    the qkv projection's ``[k | v]`` slice). The conv reads and writes it out
+    of band (``opt_moe_short_conv``); vLLM's Inkling sconv backend builds the
+    block table / slot metadata."""
 
     def __init__(self, config, *, prefix: str) -> None:
         super().__init__()
@@ -90,17 +90,9 @@ class OptMoeConvState(nn.Module, AttentionLayerBase):
         tp = get_tensor_model_parallel_world_size()
         if tp > config.num_key_value_heads:
             raise NotImplementedError("vLLM opt_moe: TP above the KV head count")
-        k = config.head_dim
-        q_width = (
-            config.num_attention_heads // config.num_key_value_heads * k
-            if config.conv_streams == "qkv"
-            else 0
-        )
         self.num_kv_heads = config.num_key_value_heads // tp
-        self.head_size = 1 << (q_width + 2 * k - 1).bit_length()
+        self.head_size = config.head_dim
         self.sliding_window = self.block_size = config.conv_kernel_size
-        # per KV head: (offset, width) of q (its group's heads; none for kv), k, v
-        self.stream_ranges = ((0, q_width), (q_width, k), (q_width + k, k))
         vllm_config = get_current_vllm_config()
         self._dtype = vllm_config.model_config.dtype
         if self._dtype != torch.bfloat16:
@@ -119,39 +111,11 @@ class OptMoeConvState(nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return SlidingWindowSpec(
             block_size=self.block_size,
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=2 * self.num_kv_heads,  # k heads, then v heads
             head_size=self.head_size,
-            head_size_v=0,  # the streams packed into head_size
+            head_size_v=0,  # one stream per head
             dtype=self._dtype,
             sliding_window=self.sliding_window,
-        )
-
-
-class OptMoeShortConv(nn.Module):
-    """``x + conv(x)`` for one stream (q, k or v) of this rank: the depthwise
-    causal conv over each sequence's last ``W`` inputs, read from / written to
-    the layer's ``OptMoeConvState``."""
-
-    def __init__(self, channels: int, width: int, owner: OptMoeConvState, stream: int):
-        super().__init__()
-        self.owner, self.stream = owner, stream
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.weight = nn.Parameter(torch.empty(channels, 1, width), requires_grad=False)
-        set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
-
-    def weight_loader(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
-        if loaded.shape[0] != param.shape[0]:  # this rank's heads' channels
-            n = param.shape[0]
-            loaded = loaded.narrow(0, self.tp_rank * n, n)
-        param.data.copy_(loaded)
-
-    def forward(self, x_TC: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        return torch.ops.vllm.opt_moe_short_conv(
-            x_TC.contiguous(),
-            self.weight.squeeze(1),
-            positions,
-            self.owner.prefix,
-            self.stream,
         )
 
 
@@ -160,11 +124,10 @@ def opt_moe_short_conv(
     weight_CW: torch.Tensor,
     positions: torch.Tensor,
     layer_name: str,
-    stream: int,
 ) -> torch.Tensor:
-    """One stream's conv as a custom op, so torch.compile sees one opaque call:
-    the conv state and its metadata come from the forward context, as vLLM's
-    short_conv op takes them."""
+    """``x + conv(x)`` on this rank's ``[k | v]`` channels as a custom op, so
+    torch.compile sees one opaque call: the conv state and its metadata come
+    from the forward context, as vLLM's short_conv op takes them."""
     context = get_forward_context()
     metadata = context.attn_metadata
     if metadata is None:  # vLLM's profiling / dummy runs: no state yet
@@ -177,7 +140,6 @@ def opt_moe_short_conv(
             f"vLLM opt_moe: no conv state for {layer_name} in this forward "
             f"(metadata {type(m).__name__}, cache bound: {owner.kv_cache.numel() > 0})"
         )
-    offset, width = owner.stream_ranges[stream]
     return fused_sconv(
         x_TC,
         weight_CW,
@@ -187,11 +149,11 @@ def opt_moe_short_conv(
         m.seq_idx,
         m.slot_mapping,
         m.query_start,
-        offset,
-        width,
+        0,  # one stream per cache head: channel c is head c // head_size
+        owner.head_size,
         # the cache's block size ([blocks, H, N, D]): vLLM enlarges the
         # requested one (the conv width) when this page is smaller than the
-        # attention page (unify_kv_cache_spec_page_size), e.g. conv_streams kv
+        # attention page (unify_kv_cache_spec_page_size)
         owner.kv_cache.shape[2],
         activation=None,
         use_residual=True,
@@ -203,7 +165,6 @@ def _opt_moe_short_conv_fake(
     weight_CW: torch.Tensor,
     positions: torch.Tensor,
     layer_name: str,
-    stream: int,
 ) -> torch.Tensor:
     return torch.empty_like(x_TC)
 
@@ -242,15 +203,14 @@ class OptMoeAttention(nn.Module):
         )
         self.conv_state = None
         if config.conv_kernel_size:
-            w = config.conv_kernel_size
             self.conv_state = OptMoeConvState(config, prefix=f"{prefix}.conv_state")
-            self.q_conv = (
-                OptMoeShortConv(self.q_size, w, self.conv_state, 0)
-                if config.conv_streams == "qkv"
-                else None
+            # this rank's k conv rows, then its v conv rows (the HF k_conv /
+            # v_conv weights): one parameter, no per-forward concatenation
+            self.conv_weight = nn.Parameter(
+                torch.empty(2 * self.kv_size, config.conv_kernel_size),
+                requires_grad=False,
             )
-            self.k_conv = OptMoeShortConv(self.kv_size, w, self.conv_state, 1)
-            self.v_conv = OptMoeShortConv(self.kv_size, w, self.conv_state, 2)
+            set_weight_attrs(self.conv_weight, {"weight_loader": self._load_conv})
         affine, eps = config.norm_has_weight, config.rms_norm_eps
         self.q_norm = RMSNorm(k, eps=eps, has_weight=affine) if config.qk_norm else None
         self.k_norm = RMSNorm(k, eps=eps, has_weight=affine) if config.qk_norm else None
@@ -298,14 +258,26 @@ class OptMoeAttention(nn.Module):
             sinks=self.sinks,
         )
 
+    def _load_conv(self, param: nn.Parameter, loaded: torch.Tensor, shard: int):
+        """An HF ``k_conv`` (shard 0) / ``v_conv`` (1) weight ``[G K, 1, W]``:
+        this rank's heads' rows into its half of ``conv_weight``."""
+        rows = loaded.squeeze(1)
+        n = self.kv_size
+        if rows.shape[0] != n:
+            rows = rows.narrow(0, get_tensor_model_parallel_rank() * n, n)
+        param.data[shard * n : (shard + 1) * n].copy_(rows)
+
     def forward(self, positions: torch.Tensor, x_TD: torch.Tensor) -> torch.Tensor:
         qkv, _ = self.qkv_proj(x_TD)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.conv_state is not None:
-            if self.q_conv is not None:
-                q = self.q_conv(q, positions)
-            k = self.k_conv(k, positions)
-            v = self.v_conv(v, positions)
+            kv = torch.ops.vllm.opt_moe_short_conv(
+                qkv[:, self.q_size :].contiguous(),
+                self.conv_weight,
+                positions,
+                self.conv_state.prefix,
+            )
+            k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
         if self.q_norm is not None:
             t = q.shape[0]
             q = self.q_norm(q.reshape(t, -1, self.head_dim)).reshape(t, -1)
@@ -613,8 +585,8 @@ def _load_weights(model: nn.Module, weights, *, keep) -> set[str]:
     """Our HF names (``hf/modeling_opt_moe.py``) onto ``model``'s parameters,
     the checkpoint tensors ``keep`` picks: q / k / v into qkv_proj, gate / up
     into gate_up_proj, the 3-D expert stacks one expert at a time into
-    FusedMoE; the q / k / v convs (same names) take their rank's channels in
-    their own loader."""
+    FusedMoE; the k / v convs into the attention's conv_weight (their rank's
+    channels)."""
     params = dict(model.named_parameters())
     tp, rank = (
         get_tensor_model_parallel_world_size(),
@@ -623,6 +595,11 @@ def _load_weights(model: nn.Module, weights, *, keep) -> set[str]:
     loaded = set()
     for name, w in weights:
         if not keep(name):
+            continue
+        if name.endswith((".self_attn.k_conv.weight", ".self_attn.v_conv.weight")):
+            key = name.rsplit(".", 2)[0] + ".conv_weight"
+            params[key].weight_loader(params[key], w, int(".v_conv." in name))
+            loaded.add(key)
             continue
         for shard, src in (("q", "q_proj"), ("k", "k_proj"), ("v", "v_proj")):
             if f".self_attn.{src}." in name:

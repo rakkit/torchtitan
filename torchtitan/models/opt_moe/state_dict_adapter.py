@@ -34,7 +34,6 @@ _TO_HF = {
     "layers.{}.attention.q_norm.weight": "model.layers.{}.self_attn.q_norm.weight",
     "layers.{}.attention.k_norm.weight": "model.layers.{}.self_attn.k_norm.weight",
     "layers.{}.attention.gate_proj.weight": "model.layers.{}.self_attn.gate_proj.weight",
-    "layers.{}.attention.q_conv.weight": "model.layers.{}.self_attn.q_conv.weight",
     "layers.{}.attention.k_conv.weight": "model.layers.{}.self_attn.k_conv.weight",
     "layers.{}.attention.v_conv.weight": "model.layers.{}.self_attn.v_conv.weight",
     "layers.{}.attention.sinks": "model.layers.{}.self_attn.sinks",
@@ -160,9 +159,6 @@ def hf_config(model_config: Any) -> dict[str, Any]:
         "attention_gate": "element-wise" if attn.gate_proj is not None else None,
         "attention_sinks": attn.attention_sinks,
         "conv_kernel_size": 0 if conv is None else conv.kernel_size,
-        "conv_streams": None
-        if conv is None
-        else ("qkv" if attn.q_conv is not None else "kv"),
         "first_k_dense_replace": n_dense,
         "intermediate_size": dense[0].w2.in_features if dense else None,
         "moe_intermediate_size": None if m is None else m.routed_experts.w2.in_features,

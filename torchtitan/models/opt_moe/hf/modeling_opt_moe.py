@@ -194,12 +194,10 @@ class OptMoeAttention(nn.Module):
             else None
         )
         w = config.conv_kernel_size
-        conv_q = w > 0 and config.conv_streams == "qkv"
 
         def conv(channels):
             return nn.Conv1d(channels, channels, w, groups=channels, bias=False)
 
-        self.q_conv = conv(h * k) if conv_q else None
         self.k_conv = conv(kv * k) if w > 0 else None
         self.v_conv = conv(kv * k) if w > 0 else None
         self.sinks = nn.Parameter(torch.zeros(h)) if config.attention_sinks else None
@@ -235,12 +233,9 @@ class OptMoeAttention(nn.Module):
         xv = xv.reshape(*lead, -1, self.head_dim).contiguous()
         gate = self.gate_proj(x_TD) if self.gate_proj is not None else None
         if self.k_conv is not None:
-            # the cache's conv states: q 0, k 1, v 2 (or k 0, v 1)
-            k_state = 0 if self.q_conv is None else 1
-            if self.q_conv is not None:
-                xq = self._conv(xq, self.q_conv, rows, 0)
-            xk = self._conv(xk, self.k_conv, rows, k_state)
-            xv = self._conv(xv, self.v_conv, rows, k_state + 1)
+            # the cache's conv states: k 0, v 1
+            xk = self._conv(xk, self.k_conv, rows, 0)
+            xv = self._conv(xv, self.v_conv, rows, 1)
         if self.q_norm is not None:
             xq, xk = self.q_norm(xq), self.k_norm(xk)
         if self.rope is not None:

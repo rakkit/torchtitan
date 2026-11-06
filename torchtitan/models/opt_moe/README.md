@@ -49,10 +49,9 @@ MoE recipe on `mis-8b`.
 | `n_heads`, `n_kv_heads`, `head_dim` | - | GQA shape |
 | `qk_norm` | - | a norm of the model's `norm_type` on each q and k head, before RoPE |
 | `gated_attention_type` | None | None: no gate; `element-wise`: `gate_proj` `[n_heads * head_dim, dim]`, the attention output multiplied by `sigmoid(gate_proj(x))` (fp32) before `wo`. Any other value is refused |
-| `attention_sinks` | false | one learned logit per head in the softmax denominator (gpt-oss): `out * sigmoid(lse - s)` |
+| `attention_sinks` | false | one learned logit per head in the softmax denominator (gpt-oss): `out * sigmoid(lse - s)`. The gate or the sinks: one or neither (both together are refused) |
 | `sinks_init_fn_type`, `sinks_init_std` | `zeros`, 0.0 | the sinks' init, any init type of `param_init.py`; `zeros` ignores the std |
-| `conv_kernel_size` | 0 | the Canon short conv: `x + conv(x)`, a depthwise causal conv of this width on the streams below, after the projection (attn_gym's CUDA `causal_conv1d`); it restarts at every packed document. 0: no conv, and the conv arguments below do nothing |
-| `conv_streams` | `qkv` | `qkv` (q, k and v) or `kv` (q passes through and has no `q_conv`) |
+| `conv_kernel_size` | 0 | the Canon short conv: `x + conv(x)`, a depthwise causal conv of this width on k and v (`k_conv`, `v_conv`; one call over both), after the projection (attn_gym's CUDA `causal_conv1d`); it restarts at every packed document. Only k and v: the KV cache's inputs, so generation keeps the last `W - 1` raw k / v per sequence, never q's state (8 times wider at 32 q / 4 KV heads). 0: no conv, and the conv arguments below do nothing |
 | `conv_init_fn_type`, `conv_init_gain` | `delay`, 4.0 | `delay` (one tap of +-gain per channel), `random_opnorm` (a random filter with operator norm gain) or `torch_default` (gain x the `nn.Conv1d` draw); 4.0 is the recipe's x4 in the init (never run: the study ran 1.0 with its optimizer's step-1 x4) |
 | `attn_backend` | - | `flex`, `flex_flash` or `varlen` (upstream's configs, sliding-window variants included); masks are always per document (block causal) |
 | `w{qkv,o,_gate}_init_fn_type`, `..._init_std` | `scaled_orthogonal`, 1.0 | the projections' init (q, k and v: one fused `wqkv`) |
@@ -163,7 +162,7 @@ weights (`tests/unit_tests/opt_moe/test_hf_modeling.py`):
   torchtitan without its local_compile regions).
 - `forward`, what `generate` calls: `[B, T]` rows with left padding, a
   `DynamicCache` from the config's `layer_types` (a conv layer is `hybrid` /
-  `hybrid_sliding`: K / V plus each conv stream's last inputs), eager attention
+  `hybrid_sliding`: K / V plus the k / v conv's last inputs), eager attention
   in fp32 with the sinks as one more softmax logit, a torch conv. It rounds
   differently from `packed_forward` (other kernels); a cached decode gives the
   full forward's logits and a left-padded batch each row's tokens. Serving

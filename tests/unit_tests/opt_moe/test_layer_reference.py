@@ -10,11 +10,12 @@ backward, on packed documents with the real flex attention:
 
     h   = a x + b Attn(RMSNorm_1(x)),      out = a h + b FFN(RMSNorm_2(h))
     Attn(u): [q | k | v] = Wqkv u (rows per KV group: its q heads, k, v);
-             g = Wg u; q, k, v <- x + conv(x) (Canon, causal, per document);
+             g = Wg u; k, v <- x + conv(x) (Canon, causal, per document);
              q, k <- RMSNorm per head; q, k <- RoPE on the first rope.dim
              dims (or none); softmax(q k^T / sqrt(d)) over the same document,
              causal, within the window, with one value-less logit s_h per
-             head (sinks); o <- o * sigmoid(g); Wo o
+             head (sinks) or o <- o * sigmoid(g) (the gate; one or neither);
+             Wo o
     FFN: SwiGLU, or the MoE (sigmoid scores, top-k on score + bias, weights
          the raw scores renormalized x route_scale, plus the shared expert).
 
@@ -37,25 +38,30 @@ DOCS = (100, 3, 153)
 
 # Each variant: (layer 0 dense, layer 1 MoE) settings.
 VARIANTS = {
-    "all-on": dict(
+    "all-on-gate": dict(
         swa_pattern="SF",
         rope_pattern="RN",
         rope_dim=16,  # partial RoPE on layer 0, NoPE on layer 1
+        attention=dict(conv_kernel_size=4, gated_attention_type="element-wise"),
+        residual_scale="depth_scale_N",  # a = b = 1/2 at 2 layers
+    ),
+    "all-on-sinks": dict(
+        swa_pattern="SF",
+        rope_pattern="RN",
+        rope_dim=16,
         attention=dict(
             conv_kernel_size=4,
-            conv_streams="qkv",
-            gated_attention_type="element-wise",
             attention_sinks=True,
             sinks_init_fn_type="trunc_normal",
             sinks_init_std=0.5,
         ),
-        residual_scale="depth_scale_N",  # a = b = 1/2 at 2 layers
+        residual_scale="depth_scale_N",
     ),
-    "kv-conv-full-rope": dict(
+    "conv-full-rope": dict(
         swa_pattern="FS",
         rope_pattern="NR",
         rope_dim=HEAD_DIM,
-        attention=dict(conv_kernel_size=4, conv_streams="kv"),
+        attention=dict(conv_kernel_size=4),
         residual_scale="complete_p_base1",  # a = 1, b = 1/2
     ),
     "plain": dict(

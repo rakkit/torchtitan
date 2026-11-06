@@ -29,10 +29,13 @@ _ALL_FEATURES = dict(
     n_dense_layers=1,
     dense_hidden_dim=256,
     conv_kernel_size=4,
-    attention_sinks=True,
     gated_attention_type="element-wise",
     num_mtp_layers=1,
     vocab_size=512,
+)
+# sinks in place of the gate (one or neither)
+_ALL_FEATURES_SINKS = _ALL_FEATURES | dict(
+    gated_attention_type=None, attention_sinks=True
 )
 
 
@@ -42,7 +45,8 @@ def _config(flavor, **overrides):
 
 @pytest.mark.parametrize(
     "flavor, overrides",
-    [(f, {}) for f in MODEL_FLAVORS] + [("mis-8b-proxy", _ALL_FEATURES)],
+    [(f, {}) for f in MODEL_FLAVORS]
+    + [("mis-8b-proxy", _ALL_FEATURES), ("mis-8b-proxy", _ALL_FEATURES_SINKS)],
 )
 def test_every_tensor_maps_to_hf_and_back(flavor, overrides):
     cfg = _config(flavor, **overrides)
@@ -63,8 +67,9 @@ def test_every_tensor_maps_to_hf_and_back(flavor, overrides):
     assert json.loads(config.to_json_string())["model_type"] == "opt_moe"
 
 
-def test_values_come_back_unchanged():
-    cfg = _config("mis-8b-proxy", **_ALL_FEATURES)
+@pytest.mark.parametrize("features", [_ALL_FEATURES, _ALL_FEATURES_SINKS])
+def test_values_come_back_unchanged(features):
+    cfg = _config("mis-8b-proxy", **features)
     model = cfg.build()
     torch.manual_seed(0)
     with torch.no_grad():
@@ -80,11 +85,21 @@ def test_values_come_back_unchanged():
 def test_hf_config_states_the_architecture():
     cfg = _config("mis-8b-proxy", **_ALL_FEATURES)
     c = OptMoeConfig(**hf_config(cfg))
-    # with the conv: transformers' hybrid cache layers (K / V + the q / k / v conv states)
+    # with the conv: transformers' hybrid cache layers (K / V + the k / v conv states)
     assert c.layer_types == ["hybrid_sliding", "hybrid_sliding", "hybrid"]
-    assert c.number_of_conv_states == 3
+    assert c.number_of_conv_states == 2
     assert c.rope_layers[2] is None and c.rope_layers[0]["dim"] == 128
     assert (c.first_k_dense_replace, c.intermediate_size) == (1, 256)
-    assert (c.conv_kernel_size, c.conv_streams) == (4, "qkv")
-    assert c.attention_sinks and c.attention_gate == "element-wise"
+    assert c.conv_kernel_size == 4
+    assert not c.attention_sinks and c.attention_gate == "element-wise"
     assert c.num_nextn_predict_layers == 1 and c.n_routed_experts == 64
+
+
+def test_the_gate_and_sinks_together_are_refused():
+    """One or neither: the HF and vLLM models are checked for each alone."""
+    both = _ALL_FEATURES | dict(attention_sinks=True)
+    with pytest.raises(ValueError, match="one or neither"):
+        _config("mis-8b-proxy", **both)
+    config = hf_config(_config("mis-8b-proxy", **_ALL_FEATURES))
+    with pytest.raises(ValueError, match="one or neither"):
+        OptMoeConfig(**config | {"attention_sinks": True})

@@ -132,7 +132,7 @@ class GatedSWAttention(GQAttention):
     """Gated sliding-window attention: upstream's GQAttention (fused Q/K/V, wo,
     RoPE, QK norm, inner attention; full or sliding-window by the inner
     attention's type), plus three optional pieces upstream has no equivalent
-    for: the element-wise output gate, the Canon short conv on q / k / v, and
+    for: the element-wise output gate, the Canon short conv on k and v, and
     attention sinks. Partial RoPE (``rope.dim < head_dim``) and NoPE
     (``rope=None``) follow from ``rope``.
 
@@ -145,23 +145,24 @@ class GatedSWAttention(GQAttention):
         gate_proj: Linear.Config | None = None
         """The element-wise output gate ``sigmoid(gate_proj(x))`` over the
         attention output (None: no gate)."""
-        q_conv: Conv1d.Config | None = None
         k_conv: Conv1d.Config | None = None
         v_conv: Conv1d.Config | None = None
-        """The Canon short conv ``x + conv(x)`` on q, k and v (k and v together;
-        q optional; None: no conv)."""
+        """The Canon short conv ``x + conv(x)`` on k and v (both or None: no
+        conv). Only k and v: the KV cache's inputs, so generation keeps the
+        last ``W - 1`` raw k / v per sequence, never q's much wider state."""
         short_conv: CanonShortConv.Config = field(default_factory=CanonShortConv.Config)
         """The conv's computation (with the convs above)."""
         attention_sinks: bool = False
         """A learned logit per head in the softmax denominator (gpt-oss), the
-        parameter ``sinks``, initialized from ``param_init["sinks"]``."""
+        parameter ``sinks``, initialized from ``param_init["sinks"]``; not with
+        ``gate_proj``."""
 
         def __post_init__(self) -> None:
             GQAttention.Config.__post_init__(self)
             if (self.k_conv is None) != (self.v_conv is None):
                 raise ValueError("k_conv and v_conv come together")
-            if self.q_conv is not None and self.k_conv is None:
-                raise ValueError("q_conv needs k_conv and v_conv")
+            if self.gate_proj is not None and self.attention_sinks:
+                raise ValueError("the output gate and attention sinks: one or neither")
             if self.attention_sinks and "sinks" not in (self.param_init or {}):
                 raise ValueError('attention sinks need param_init["sinks"]')
 
@@ -179,7 +180,6 @@ class GatedSWAttention(GQAttention):
         self.gate_proj = (
             config.gate_proj.build() if config.gate_proj is not None else None
         )
-        self.q_conv = config.q_conv.build() if config.q_conv is not None else None
         self.k_conv = config.k_conv.build() if config.k_conv is not None else None
         self.v_conv = config.v_conv.build() if config.v_conv is not None else None
         self.short_conv = (
@@ -198,7 +198,7 @@ class GatedSWAttention(GQAttention):
         w = self.qkv_linear.wqkv.weight
         units = qkv_units(self.n_heads, self.n_kv_heads, self.head_dim, w.shape[-1])
         layouts = {named(self, w): ParamLayout("matrix", units=units)}
-        for conv in (self.q_conv, self.k_conv, self.v_conv):
+        for conv in (self.k_conv, self.v_conv):
             if conv is not None:
                 layouts[named(self, conv.weight)] = ParamLayout("conv")
         return layouts
@@ -219,26 +219,15 @@ class GatedSWAttention(GQAttention):
                 "the short conv needs its document offsets (the model's "
                 "_get_attention_metadata) when positions are given"
             )
-        # The Canon short conv (on q, k and v, or k and v only), the QK norm
-        # (before RoPE, per Qwen3), then RoPE (partial, or none for NoPE).
-        if self.q_conv is not None:
-            xq, xk, xv = self._qkv_with_conv(x_TD, conv_metadata)
+        # The Canon short conv on k and v, the QK norm (before RoPE, per Qwen3),
+        # then RoPE (partial, or none for NoPE).
+        if self.k_conv is not None:
+            xq, xk, xv = self._qkv_with_kv_conv(x_TD, conv_metadata)
         else:
             xq, xk, xv = self.qkv_linear(x_TD)
         gate = self.gate_proj(x_TD) if self.gate_proj is not None else None
         # The q / k / v preparation reads the projection's outputs with bare ops.
         remat.recompute_needs_tensor(xq, xk, xv)
-        if self.k_conv is not None and self.q_conv is None:
-            # k and v in one call (the conv is depthwise): one conv state in
-            # generation, as the q / k / v call
-            kv_TC = self.short_conv(
-                torch.cat([xk.flatten(-2), xv.flatten(-2)], dim=-1),
-                torch.cat([self.k_conv.weight, self.v_conv.weight]),
-                conv_metadata,
-            )
-            k_TC, v_TC = kv_TC.chunk(2, dim=-1)
-            xk = k_TC.reshape(xk.shape).contiguous()
-            xv = v_TC.reshape(xv.shape).contiguous()
         if self.q_norm is not None:
             xq = self.q_norm(xq)
         if self.k_norm is not None:
@@ -265,40 +254,39 @@ class GatedSWAttention(GQAttention):
         # Not in the compiled region: wo declares its own remat regions.
         return self.wo(self._flatten_attention_output(output, gate))
 
-    def _qkv_with_conv(
+    def _qkv_with_kv_conv(
         self,
         x_TD: torch.Tensor,
         conv_metadata: LinearAttentionMetadata | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """q, k and v with the Canon short conv in ONE call: wqkv, the conv over
-        its whole output, then QKVLinear's split. The conv is depthwise, so this
-        is the three per-stream convs; its weight is the q / k / v conv weights
-        interleaved per KV group as wqkv's rows (each group: its q heads, its k,
-        its v), built at forward from the three parameters, which keeps the
-        state dict, the HF format and the optimizer groups per stream. Bypasses
-        ``QKVLinear.forward`` (its spmd ``local_map`` declares TP placements,
-        and opt_moe refuses TP)."""
+        """q, k and v with the Canon short conv on k and v in ONE call: wqkv,
+        then the conv over each KV group's k and v rows (adjacent in wqkv's
+        output: per group its q heads, its k, its v), copied out once. The conv
+        is depthwise, so this is the two per-stream convs; its weight is the k /
+        v conv weights interleaved per KV group, built at forward from the two
+        parameters (the state dict, the HF format and the optimizer groups stay
+        per stream). Bypasses ``QKVLinear.forward`` (its spmd ``local_map``
+        declares TP placements, and opt_moe refuses TP); returns q / k / v
+        contiguous, as it does."""
         qkv_TC = self.qkv_linear.wqkv(x_TD)
-        # The conv reads the wqkv projection output with bare ops.
+        # The split and the conv read the wqkv projection output with bare ops.
         remat.recompute_needs_tensor(qkv_TC)
-        G, K = self.n_kv_heads, self.head_dim
+        T = qkv_TC.shape[0]
+        G, K, R = self.n_kv_heads, self.head_dim, self.qkv_linear.heads_per_kv
         W = self.k_conv.weight.shape[-1]
-        weight_C1W = torch.cat(
-            [
-                self.q_conv.weight.view(G, -1, W),
-                self.k_conv.weight.view(G, K, W),
-                self.v_conv.weight.view(G, K, W),
-            ],
+        qkv_TGRK = qkv_TC.view(T, G, R + 2, K)
+        weight_C1W = torch.stack(
+            [self.k_conv.weight.view(G, K, W), self.v_conv.weight.view(G, K, W)],
             dim=1,
         ).view(-1, 1, W)
-        qkv_TC = self.short_conv(qkv_TC, weight_C1W, conv_metadata)
-        T = qkv_TC.shape[0]
-        qkv_TGRK = qkv_TC.view(T, G, -1, K)
-        xq, xk, xv = torch.split(qkv_TGRK, [self.qkv_linear.heads_per_kv, 1, 1], dim=-2)
+        kv_TC = self.short_conv(
+            qkv_TGRK[:, :, R:].reshape(T, -1), weight_C1W, conv_metadata
+        )
+        kv_TG2K = kv_TC.view(T, G, 2, K)
         return (
-            xq.reshape(T, -1, K).contiguous(),
-            xk.reshape(T, -1, K).contiguous(),
-            xv.reshape(T, -1, K).contiguous(),
+            qkv_TGRK[:, :, :R].reshape(T, -1, K),
+            kv_TG2K[:, :, 0].contiguous(),
+            kv_TG2K[:, :, 1].contiguous(),
         )
 
     def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:

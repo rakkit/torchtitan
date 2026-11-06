@@ -6,7 +6,7 @@
 
 """vLLM generation for opt_moe's Canon short conv (``CanonShortConv``).
 
-``x + conv(x)`` over the attention's fused q / k / v (or k / v) channels, with each
+``x + conv(x)`` over the attention's fused k / v channels, with each
 sequence's last ``W - 1`` inputs in vLLM's paged convolution state, on Attention
 Gym's paging-aware kernels: the convolution half of ``VLLMInnerKDA`` /
 ``VLLMInnerGDN``, without activation and recurrence. The attention owns the conv
@@ -47,14 +47,14 @@ from torchtitan.rl.generator.vllm.attention.linear_attention import (
 
 class VLLMCanonShortConv(CanonShortConv, MambaBase):
     """Paged-state Canon short conv. Head-sharded with the attention under
-    tensor parallelism (the fused q / k / v channels are grouped per KV head).
+    tensor parallelism (the fused k / v channels are grouped per KV head).
     Speculative decoding is not supported (one state slot per sequence)."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(CanonShortConv.Config):
         layer_idx: int
         num_channels: int
-        """The fused q / k / v (or k / v) width over all tensor-parallel ranks."""
+        """The fused k / v width over all tensor-parallel ranks."""
         conv_kernel_size: int
 
     def __init__(self, config: Config) -> None:
@@ -164,11 +164,10 @@ class VLLMCanonShortConv(CanonShortConv, MambaBase):
 
 
 def _short_conv_shape(attention_cfg: GatedSWAttention.Config) -> tuple[int, int]:
-    """(channels of the one conv call: q / k / v or k / v, kernel width) of an
+    """(the k / v channels of the conv's one call, kernel width) of an
     attention's Canon conv."""
-    convs = (attention_cfg.q_conv, attention_cfg.k_conv, attention_cfg.v_conv)
-    channels = sum(conv.out_channels for conv in convs if conv is not None)
-    return channels, attention_cfg.k_conv.kernel_size
+    k_conv, v_conv = attention_cfg.k_conv, attention_cfg.v_conv
+    return k_conv.out_channels + v_conv.out_channels, k_conv.kernel_size
 
 
 def generation_short_conv_config(

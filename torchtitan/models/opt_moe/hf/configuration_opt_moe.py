@@ -30,8 +30,8 @@ class OptMoeConfig(PretrainedConfig):
     ``rope_layers`` (``{"dim", "theta"}``, None: NoPE; ``dim`` < ``head_dim``:
     partial RoPE); ``attention_gate`` (None | ``element-wise``:
     ``sigmoid(gate_proj(x))`` on the output); ``attention_sinks`` (one logit
-    per head in the softmax); ``conv_kernel_size`` / ``conv_streams`` (the
-    Canon short conv ``x + conv(x)`` on q / k / v or k / v, 0: none).
+    per head in the softmax; not with the gate); ``conv_kernel_size`` (the
+    Canon short conv ``x + conv(x)`` on k and v, 0: none).
 
     Feed-forward: the first ``first_k_dense_replace`` layers a SwiGLU FFN of
     ``intermediate_size``, the rest MoE: ``n_routed_experts`` of
@@ -69,7 +69,6 @@ class OptMoeConfig(PretrainedConfig):
         attention_gate: str | None = None,
         attention_sinks: bool = False,
         conv_kernel_size: int = 0,
-        conv_streams: str | None = None,
         first_k_dense_replace: int = 0,
         intermediate_size: int | None = None,
         moe_intermediate_size: int | None = None,
@@ -106,7 +105,6 @@ class OptMoeConfig(PretrainedConfig):
         self.attention_gate = attention_gate
         self.attention_sinks = attention_sinks
         self.conv_kernel_size = conv_kernel_size
-        self.conv_streams = conv_streams
         self.first_k_dense_replace = first_k_dense_replace
         self.intermediate_size = intermediate_size
         self.moe_intermediate_size = moe_intermediate_size
@@ -136,10 +134,8 @@ class OptMoeConfig(PretrainedConfig):
             raise ValueError(
                 f"attention_gate {attention_gate!r}: None or 'element-wise'"
             )
-        if conv_kernel_size and conv_streams not in ("qkv", "kv"):
-            raise ValueError(
-                f"conv_streams {conv_streams!r}: 'qkv' or 'kv' with a conv"
-            )
+        if attention_gate is not None and attention_sinks:
+            raise ValueError("attention_gate and attention_sinks: one or neither")
         if sliding_window is None and any(
             t in ("sliding_attention", "hybrid_sliding") for t in self.layer_types
         ):
@@ -161,8 +157,8 @@ class OptMoeConfig(PretrainedConfig):
     @property
     def number_of_conv_states(self) -> int:
         """The conv states a ``hybrid`` cache layer keeps (transformers'
-        ``DynamicCache`` reads it): one per conv stream, q / k / v or k / v."""
-        return 3 if self.conv_streams == "qkv" else 2
+        ``DynamicCache`` reads it): k and v."""
+        return 2
 
 
 __all__ = ["OptMoeConfig"]

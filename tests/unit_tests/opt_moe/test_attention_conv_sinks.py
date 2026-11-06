@@ -88,8 +88,8 @@ def test_short_conv_gradients_match_the_reference():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the conv kernel needs CUDA")
 def test_short_conv_at_the_production_width_in_bf16():
-    """The fused q / k / v conv of the 30B shapes (32 q + 2 x 4 KV heads of 128:
-    5120 channels), bf16 as in training, over a 32768-token row of packed
+    """The fused k / v conv of the 30B shapes (2 x 4 KV heads of 128: 1024
+    channels), bf16 as in training, over a 32768-token row of packed
     documents (1 to 3000 tokens): the output and both gradients are the fp64
     reference's within bf16 rounding. The kernel accumulates in fp32 and rounds
     twice, as training does (conv(x) to bf16, then the bf16 add x + conv(x)),
@@ -99,7 +99,7 @@ def test_short_conv_at_the_production_width_in_bf16():
     while left > 0:
         lengths.append(min(left, int(torch.randint(1, 3001, (1,), generator=g))))
         left -= lengths[-1]
-    x, w, positions = _docs(lengths, c=5120)
+    x, w, positions = _docs(lengths, c=1024)
     x, w = x.bfloat16(), (0.5 * w).bfloat16()
     xa, wa = x.clone().requires_grad_(), w.clone().requires_grad_()
     xb, wb = x.double().requires_grad_(), w.double().requires_grad_()
@@ -151,8 +151,8 @@ def test_conv_weights_are_declared_and_disco_takes_them_as_matrices():
         model = _tiny().build()
     layouts = model.param_layouts()
     convs = [n for n, l in layouts.items() if l.kind == "conv"]
-    assert len(convs) == 6 and all(
-        n.endswith(("q_conv.weight", "k_conv.weight", "v_conv.weight")) for n in convs
+    assert len(convs) == 4 and all(
+        n.endswith(("k_conv.weight", "v_conv.weight")) for n in convs
     )
     assert layouts["layers.0.attention.sinks"].kind == "vector"
     p = dict(model.named_parameters())[convs[0]]
@@ -319,7 +319,7 @@ def test_model_with_conv_and_sinks_trains_one_step():
     )
     F.cross_entropy(logits.float(), tokens.roll(-1)).backward()
     attn = model.layers["0"].attention
-    for p in (attn.q_conv.weight, attn.v_conv.weight, attn.sinks):
+    for p in (attn.k_conv.weight, attn.v_conv.weight, attn.sinks):
         assert (
             p.grad is not None
             and torch.isfinite(p.grad).all()

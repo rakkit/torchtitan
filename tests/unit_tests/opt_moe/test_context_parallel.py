@@ -64,7 +64,7 @@ def _model(parallelism: ParallelismConfig, backend: str, dtype: torch.dtype):
         attention_sinks=True,
         sinks_init_fn_type="trunc_normal",
         sinks_init_std=0.5,
-        gated_attention_type="element-wise",
+        # sinks, not the gate (one or neither): the sinks need the full lse
         num_mtp_layers=1,
     )
     with torch.device("meta"):

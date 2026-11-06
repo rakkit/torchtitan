@@ -84,12 +84,15 @@ class TestRecipePaths(DTensorTestBase):
             return torch.device("cpu")
         return torch.device(self.device_type, self.rank)
 
-    def _check(self, n_kv_heads: int, *, log_steps=(), gains_scale=None):
+    def _check(
+        self, n_kv_heads: int, *, log_steps=(), gains_scale=None, update_tol=None
+    ):
         """`log_steps`: the steps armed for the norms (the owners' weight copies
         fill on step 1 from the logging gather, as in production). Every other
         step must gather nothing whole (the split gains step on their slice).
         `gains_scale`: the gains group's scale (the split slices must scale by
-        the whole row's size)."""
+        the whole row's size). `update_tol`: keep the recipe's orthogonaliser
+        (gram_polar_express) and allow that fraction of the step's update."""
         device = self._device()
         pd = harness.parallelism_context(world_size=4, device_type=device.type, **FSDP)
         model_cfg = harness.tiny_model_config(
@@ -106,9 +109,10 @@ class TestRecipePaths(DTensorTestBase):
         # which is the kernel's precision, not the path. svd is batch-invariant,
         # so this checks the path exactly; the kernel's own accuracy is
         # test_gram_polar_express_rank's.
-        args = groups["default"]["args"]
-        args["compute"] = "svd"
-        args.pop("polar_express_safety")
+        if update_tol is None:
+            args = groups["default"]["args"]
+            args["compute"] = "svd"
+            args.pop("polar_express_safety")
         if gains_scale is not None:
             groups["gains"]["args"]["scale"] = gains_scale
         cfg.optim.optimizer.groups = {**copy.deepcopy(CONV_AND_SINKS), **groups}
@@ -135,7 +139,9 @@ class TestRecipePaths(DTensorTestBase):
             gathers.append(1)
             return real_full(self_, *a, **k)
 
+        worst = 0.0  # the largest |diff| / |update| (update_tol)
         for step in range(1, STEPS + 1):
+            before = {n: w.clone() for n, w in ref.items()}
             grads = harness.set_synthetic_grads(model, step, device)
             if step in log_steps:
                 container.arm_norm_computation()
@@ -209,8 +215,18 @@ class TestRecipePaths(DTensorTestBase):
                 name = names[id(e.param)]
                 got, want = harness.full_tensor(e.param).float(), ref[name]
                 d = (got - want).abs().max().item()
-                if d > TOL * max(1.0, want.abs().max().item()):
+                bound = TOL * max(1.0, want.abs().max().item())
+                if update_tol is not None:
+                    update = (want - before[name]).abs().max().item()
+                    bound += update_tol * update
+                    worst = max(worst, d / max(update, 1e-30))
+                    # the next step's reference starts from the model's
+                    # weights: each step's rounding is checked alone
+                    ref[name] = got
+                if d > bound:
                     failures.append(f"step {step} {name}: max |diff| {d:.3e}")
+        if update_tol is not None and self.rank == 0:
+            print(f"largest |diff| / |update|: {worst:.2e}", flush=True)
         ok = harness.all_ranks_agree(not failures, device)
         self.assertTrue(ok, "; ".join(failures[:5]))
 
@@ -229,6 +245,17 @@ class TestRecipePaths(DTensorTestBase):
         """Production's step 1 logs: the owner copies fill from the logging
         gather; step 3 logs again and checks them."""
         self._check(n_kv_heads=1, log_steps=(1, 3))
+
+    @with_comms
+    def test_fsdp4_moe_with_the_recipes_gram_polar_express(self):
+        """The production orthogonaliser in its stacked call (a rank's local
+        experts as one stack; the reference one unit at a time): its fp16
+        kernels round a unit in a stack differently (measured: under 1% of
+        the step's update), a stacking bug moves it by about the whole
+        update."""
+        if self.device_type == "cpu":
+            self.skipTest("gram_polar_express runs quack's CUDA kernels")
+        self._check(n_kv_heads=2, update_tol=2e-2)
 
     @with_comms
     def test_fsdp4_moe_gains_scaled_by_the_whole_row(self):

@@ -39,9 +39,10 @@ launch per layer (`vllm_opt_moe/prologue.py`, after vLLM's Inkling prologue):
 q -> RMSNorm -> RoPE; k / v read in place from the projection, into the conv
 state, x + conv(x) over this forward's rows or the state, k -> RMSNorm -> RoPE
 (partial on `rope.dim < head_dim`, none on NoPE layers); the same path for
-prefill, decode and speculative tokens. Weights in bf16; `--quantization fp8`
-quantizes the linears and experts online (the router and the convs stay as they
-are). The model runs under vLLM's `torch.compile` (the prologue is the custom op
+prefill, decode and speculative tokens. Weights in bf16; FP8 serving is vLLM's
+online block-wise FP8, `--quantization fp8_per_block` (128 x 128 weight blocks,
+1 x 128 activation groups, the linears and experts quantized at load; the router
+and the convs stay as they are; every quantized dim a multiple of 128). The model runs under vLLM's `torch.compile` (the prologue is the custom op
 `vllm::opt_moe_attention_prologue`, which reads the conv state from the forward
 context) with piecewise CUDA graphs for prefill and full ones for decoding.
 
@@ -49,11 +50,12 @@ MoE kernel configs: vLLM ships tuned fused-MoE configs for many GPUs but none
 for GH200, so its Triton MoE runs a default config there. `register()` points
 `VLLM_TUNED_CONFIG_FOLDER` at `vllm_opt_moe/moe_configs/` (unless already set;
 vLLM reads it before its own folder). For now it holds H100's bf16 config for
-256 experts of width 512 (`E=256,N=512`, the only H100 config matching one of
-our shapes; vLLM's H100 FP8 configs at 256 experts are block-quantized, not the
-online per-tensor FP8 we serve). TODO: tune FP8 and bf16 on GH200 for the final
-expert shape (vLLM's benchmarks/kernels/benchmark_moe.py) once the architecture
-is final.
+256 experts of width 512 and H100's block-FP8 config for 256 experts of width
+384 (`E=256,N=384,...,block_shape=[128,128]`), the H100 configs matching our
+shapes. TODO: tune block FP8 and bf16 on GH200 for the final expert shape
+(vLLM's benchmarks/kernels/benchmark_moe.py) once the architecture is final.
+vLLM's DeepGEMM block-FP8 MoE does not import in this environment (its bundled
+`deep_gemm` lacks `_C`), so the block-FP8 MoE runs vLLM's Triton kernel.
 
 Tensor parallelism on nodes without NVSwitch (e.g. 4 x GH200) needs
 `VLLM_ALLREDUCE_USE_FLASHINFER=0`: FlashInfer's all-reduce falls back to its
@@ -111,7 +113,8 @@ mean 0.0002-0.0003, max 0.0006-0.0013). With the fused prologue (11-06), bf16:
 | sinks, CUDA graphs | 0.0002 / 0.0011 | 0.0003 / 0.0009 |
 | neither gate nor sinks, eager / CUDA graphs | 0.0002-0.0003 / 0.0011 | 0.0003 / 0.0009 |
 | gate + partial RoPE (64 of 128 dims on the SWA layers), CUDA graphs | 0.0002-0.0003 / 0.0014 | 0.0003 / 0.0013 |
-| gate, FP8 online, CUDA graphs | 0.0008-0.0010 / 0.0034 | 0.0007 / 0.0019 |
+| gate, block FP8 (`fp8_per_block`, experts 256 wide), eager | 0.0008-0.0011 / 0.0040 | 0.0009 / 0.0025 |
+| gate, block FP8, CUDA graphs | 0.0009-0.0010 / 0.0036 | 0.0009 / 0.0025 |
 | gate, the conv broken (zero conv weights) | 0.0091-0.0119 / 0.0411 | 0.0109 / 0.0320 |
 
 Preemption (`check_vllm_preempt.py`): 24 sequences of 150 tokens on a
@@ -124,22 +127,8 @@ through the paged state, rope_dim 128 / 64 / 0): within 0.09 bf16 ulp; with the
 state wiped between steps 126-223 ulps. Before the k / v-only change (the q / k
 / v conv, 11-06): TP 2 (custom all-reduce, CUDA graphs) at the floor.
 
-## Speed of the conv
+## Speed
 
-Measured with the q / k / v conv, before the k / v-only change and the fused
-prologue (to re-measure):
-
-FP8 (online, from the bf16 folder), TP 1, one GH200, CUDA graphs, a 41.4B /
-3.05B-active shape (40 layers, d 2048, 32 q / 4 kv heads, 256 experts top-6 of
-width 640, SWA 512 at 5:1) with vs without the q / k / v conv, random weights,
-1,024-token prompts, 256 decoded tokens, 3 fresh processes each (11-06):
-
-| batch | decode ms / step, conv / no conv |
-|---|---|
-| 1 | 8.05 / 7.55 (+6.6%) |
-| 16 | 13.89 / 13.09 (+6.1%) |
-| 64 | 20.44 / 19.59 (+4.3%) |
-| 256 | 30.25 / 29.25 (+3.4%) |
-
-Prefill not measured yet: that run's prefill timings were prefix-cache hits
-(the timed calls repeated the warm-up's prompts).
+To be measured: block FP8 (TP 1) and bf16 (TP 2) prefill / decode on one GH200
+at a 41.4B / 3.05B-active shape, with the k / v conv (fused prologue and not),
+the earlier q / k / v conv, and no conv (11-06 bench job).

@@ -127,6 +127,23 @@ head `scion_normal_output` std 1; MoE: 64 routed experts + 1 shared, top 8,
 `route_scale` 1.0, sigmoid scores, the bias update (sign, 0.001), router
 `scaled_orthogonal` std 4.
 
+## Compile
+
+Two ways, measured at mis-8b (16 nodes, 32768 tokens per GPU, tokens / s /
+GPU at steps 20 / 30 / 40; the 0.5.4 tree, which compiled every block: 16.7k /
+16.8k / 16.6k):
+
+- `compile_blocks=True` (model config): `torch.compile` on every block (the
+  MTP blocks too), after the activation remat and before FSDP, with only the
+  `loss` region left in `local_compile.regions`. 16.7k / 16.9k / 16.5k. The
+  blocks' linears run without in-place WGRAD accumulation (a traced backward
+  cannot add into `.grad`); the compiled gather / scatter backwards use atomic
+  adds, so repeats are not bitwise without `debug.deterministic`.
+- the default: `local_compile.regions` only (upstream's regions plus opt_moe's,
+  `moe_score_and_scatter_add` the MoE combine). 16.0k / 16.0k / 15.6k, repeats
+  bitwise; without remat a 2-layer step equals block compile's, so the rest is
+  the eager glue replayed by the remat.
+
 ## HF export
 
 `state_dict_adapter.py` maps every native tensor to its HF name and back

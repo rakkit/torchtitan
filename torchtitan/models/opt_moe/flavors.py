@@ -829,7 +829,7 @@ def build_model_config(
             f"Unknown opt_moe flavor {flavor!r}; available: {', '.join(MODEL_FLAVORS)}"
         )
     if parallelism.tensor_parallel_degree > 1:
-        raise NotImplementedError(
+        raise ValueError(
             "OPT MoE has no tensor-parallel plan (its gate, convs, sinks and "
             "OptMoE are replicated over TP): run with tensor_parallel_degree=1"
         )

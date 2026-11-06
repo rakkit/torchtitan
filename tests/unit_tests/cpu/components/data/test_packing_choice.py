@@ -93,15 +93,9 @@ def _tokens_emitted(packed) -> int:
     return sum(int((row.labels != IGNORE_INDEX).sum()) for row in packed)
 
 
-def test_first_fit_drop_threshold_is_max_context_length_not_the_row_width(tmp_path):
-    """Upstream #4156 removed first-fit's silent drop; it now SPLITS instead.
-
-    This test used to assert the drop (emitted == 30) and called it "the dominant
-    cost on a long-document corpus, and it is silent". Upstream deleted the
-    `TODO(data-overflow-policy)` that documented the divergence and made first-fit
-    chunk long documents the way concat-then-split already did. Kept as a
-    regression guard so the drop cannot come back.
-    """
+def test_first_fit_keeps_a_document_longer_than_the_row(tmp_path):
+    """first-fit splits a document longer than the row (upstream #4156) instead
+    of dropping it: every token is emitted."""
     lengths = [10, 10, NUM_TOKENS_PER_BATCH + 1, 10]
 
     packed = list(
@@ -155,14 +149,10 @@ def test_num_packing_bins_must_be_positive():
         FirstFitPackingConfig(dataset=_Docs([4]), num_packing_bins=0)
 
 
-def test_first_fit_drop_threshold_is_max_context_length_not_the_row_width():
-    """A document can fit the row and still be dropped.
-
-    `num_tokens_per_microbatch_per_dp_rank` is usually a MULTIPLE of
-    `max_context_length` (0.4.0's local_batch_size * seq_len), so the row is wider than
-    the context. first_fit filters on the CONTEXT (packing.py:77-79), so a document
-    between the two is discarded even though it would fit the row.
-    """
+def test_first_fit_keeps_a_document_between_the_context_and_the_row_width():
+    """The row (`num_tokens_per_microbatch_per_dp_rank`) is usually a multiple of
+    `max_context_length`; a document longer than the context but shorter than the
+    row is split at `max_context_length`, not dropped."""
     context = dataclasses.replace(CONTEXT, max_context_length=NUM_TOKENS_PER_BATCH // 2)
     # 40 tokens: longer than max_context_length (32), shorter than the row (64).
     lengths = [10, NUM_TOKENS_PER_BATCH // 2 + 8, 10]
@@ -173,8 +163,7 @@ def test_first_fit_drop_threshold_is_max_context_length_not_the_row_width():
         )
     )
 
-    # Was 20 (the 40-token document dropped). Upstream #4156 splits it at
-    # max_context_length instead -- 10..42 then 42..50 -- so nothing is lost.
+    # The 40-token document is split at max_context_length (10..42, 42..50).
     assert _tokens_emitted(packed) == sum(
         lengths
     ), "a document between max_context_length and the row width must not be dropped"
@@ -185,8 +174,9 @@ def test_concat_then_split_restarts_positions_every_max_context_length():
 
     `_text_sequence_to_packing_input` synthesizes `arange % max_context_length`
     (packing.py:126-129), so a long document arrives as consecutive context-sized
-    segments. `positions` resetting to 0 is what `opt_moe/model.py:732-743` turns into
-    `doc_id`, so block-causal attention treats each segment independently and no query
+    segments. `positions` resetting to 0 is what the document masks (the attention's
+    `get_efficient_causal_mask_mod_for_packed_document`) read as a document start, so
+    block-causal attention treats each segment independently and no query
     ever sees a key further back than `max_context_length`.
     """
     context = dataclasses.replace(CONTEXT, max_context_length=NUM_TOKENS_PER_BATCH // 4)

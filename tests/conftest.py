@@ -6,12 +6,11 @@
 
 """Skip test modules whose imports this environment cannot satisfy.
 
-``torchvision`` is deliberately absent: installing it resolves torch back to a
-release build and downgraded this environment from 2.15.0.dev20260906+cu132 to
-2.14.0+cu130 once already. Nothing this fork trains needs it -- it is reached
-only by the multimodal/vision paths of models we do not use -- so the modules
-that import it are ignored at collection rather than left as hard errors that
-mask real failures elsewhere in the suite.
+``torchvision`` is not installed in llm_env (installing it resolves torch to a
+release build instead of the nightly the env pins). Only the multimodal / vision
+paths of models this fork does not train need it, so the modules that import it
+are ignored at collection rather than left as hard errors that mask real
+failures elsewhere in the suite.
 """
 
 import importlib.util
@@ -22,7 +21,7 @@ import pytest
 def _has_attr_module(module: str, submodule: str) -> bool:
     try:
         return importlib.util.find_spec(f"{module}.{submodule}") is not None
-    except (ImportError, ValueError, ModuleNotFoundError):
+    except (ImportError, ValueError):
         return False
 
 

@@ -714,10 +714,9 @@ def clip_grad_norm_(
 # DiSCO partitions per-parameter metric ownership over exactly one mesh, and
 # `metrics.save_all_shard_ranks` must hand a logger to exactly the ranks of
 # that mesh. When the two disagree the failure is silent: the ranks that own a
-# slice compute it, store it, and have no logger to write it to. That is not
-# hypothetical -- it is what pure DDP did before these helpers existed.
+# slice compute it, store it, and have no logger to write it to.
 #
-# Keep this the single source of truth. `components/metrics.py` uses it to
+# Keep this the single source of truth. `observability/metrics.py` uses it to
 # decide who builds a logger, and DiSCO's metric sink uses it to decide who
 # keeps replicated (embed/scalar) metrics and to assert the two agree.
 # ---------------------------------------------------------------------------
@@ -739,6 +738,8 @@ def fsdp_shard_mesh(parallelism_context: "ParallelismContext") -> DeviceMesh | N
     sub = parallelism_context.get_optional_mesh(["dp_shard", "cp"])
     if sub is None:
         return None
+    # TODO: DeviceMesh._flatten is private (upstream's ParallelismContext uses it
+    # for its loss mesh too); switch when DeviceMesh exposes flattening.
     return sub._flatten("dp_shard_cp")
 
 

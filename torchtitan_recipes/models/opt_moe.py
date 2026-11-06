@@ -116,16 +116,14 @@ def opt_moe_mis_8b() -> Trainer.Config:
                 }
             ),
         ),
-        # Plain chunked cross-entropy. The load-balance term is no longer added
-        # here: OptMoE injects its gradient at the layer via LoadBalanceLoss,
-        # so the model returns logits alone.
-        # ChunkedLossWrapper splits the token dim and runs lm_head + CE per
-        # chunk, so the [T, vocab] logits never exist all at once. With
-        # vocab=201088 that is the single largest activation in the step.
+        # Plain chunked cross-entropy (an MoE auxiliary loss, when configured,
+        # injects its gradient at the router). ChunkedLossWrapper splits the
+        # token dim and runs lm_head + CE per chunk (the engine hands it the
+        # head: set_lm_head), so the [T, vocab] logits never exist all at once.
+        # With vocab=201088 that is the single largest activation in the step.
         # MEASURED at T=4096: peak fwd+bwd 12.02 GiB -> 3.02 GiB (-75%), with
-        # bit-identical loss. `trainer.py` already looks one level into
-        # `loss_fn.inner` to wire lm_head, and every token count we run
-        # (1024/4096/8192/40960) divides by 8.
+        # bit-identical loss. Every token count we run (1024/4096/8192/40960)
+        # divides by 8.
         loss=ChunkedLossWrapper.Config(
             num_chunks=8,
             loss_fn=CrossEntropyLoss.Config(global_vocab_size=model.vocab_size),
@@ -146,9 +144,10 @@ def opt_moe_mis_8b() -> Trainer.Config:
         ),
         checkpointer=CheckpointManager.Config(
             interval=50,
+            # The final save is a full one (optimizer included); with
+            # last_save_model_only it would be the model at export_dtype (fp32:
+            # the master weights).
             last_save_model_only=False,
-            # A final model-only save (last_save_model_only) keeps the fp32
-            # master weights.
             export_dtype="float32",
             # Upstream defaults to "disabled" -- a synchronous save on the
             # training thread. "async" stages to CPU and uploads from a

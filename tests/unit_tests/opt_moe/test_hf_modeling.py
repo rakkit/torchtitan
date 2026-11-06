@@ -169,8 +169,8 @@ def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "yo"},
     ]
-    rendered = tokenizer.apply_chat_template(messages, tokenize=False)
-    assert rendered.index("hi") < rendered.index("yo")
+    # The placeholder joins the turns' text with a blank line.
+    assert tokenizer.apply_chat_template(messages, tokenize=False) == "hi\n\nyo"
     config = json.loads((out / "config.json").read_text())
     generation = GenerationConfig.from_pretrained(out)
     assert (config["bos_token_id"], config["eos_token_id"]) == (2002, 2003)

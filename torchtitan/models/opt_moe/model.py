@@ -302,7 +302,9 @@ class OPTMoEModel(Decoder):
                 for module in block.modules():
                     if hasattr(module, "inplace_wgrad_accum"):
                         module.inplace_wgrad_accum = False
-                block.compile(fullgraph=True)
+                # EP's token dispatch (all-to-all under the SPMD mesh stack)
+                # does not trace: let it break the graph there
+                block.compile(fullgraph=parallelism_context.ep == 1)
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
         edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
         apply_fsdp_to_decoder(
@@ -346,7 +348,9 @@ class OPTMoEModel(Decoder):
         compile_blocks: bool = False
         """torch.compile on each block (0.5.4's compile, before upstream removed
         it): the block's ops in one graph, with ``local_compile`` keeping only
-        the regions outside the blocks (``loss``)."""
+        the regions outside the blocks (``loss``). Under expert parallelism the
+        graph breaks around the token dispatch (its all-to-all does not trace),
+        so the block is several graphs."""
         local_compile: LocalCompileConfig = field(
             default_factory=lambda: LocalCompileConfig(
                 regions=[

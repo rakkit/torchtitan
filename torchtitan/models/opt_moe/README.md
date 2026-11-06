@@ -138,7 +138,9 @@ GPU at steps 20 / 30 / 40; the 0.5.4 tree, which compiled every block: 16.7k /
   `loss` region left in `local_compile.regions`. 16.7k / 16.9k / 16.5k. The
   blocks' linears run without in-place WGRAD accumulation (a traced backward
   cannot add into `.grad`); the compiled gather / scatter backwards use atomic
-  adds, so repeats are not bitwise without `debug.deterministic`.
+  adds, so repeats are not bitwise without `debug.deterministic`. With EP the
+  block compiles without `fullgraph`: the graph breaks around the token
+  dispatch's all-to-all, which dynamo does not trace.
 - the default: `local_compile.regions` only (upstream's regions plus opt_moe's,
   `moe_score_and_scatter_add` the MoE combine). 16.0k / 16.0k / 15.6k, repeats
   bitwise; without remat a 2-layer step equals block compile's, so the rest is

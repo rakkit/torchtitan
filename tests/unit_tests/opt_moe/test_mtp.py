@@ -196,7 +196,12 @@ def test_eval_mode_skips_the_mtp_depth():
 def test_parallelize_treats_the_mtp_block_as_a_decoder_block(tmp_path):
     """FSDP wraps the MTP block and activation remat checkpoints it, as a
     decoder block (both walk `layers`); `layers` holds the decoder blocks
-    only afterwards. Fake process group, CPU: no collective runs."""
+    only afterwards. With compile_blocks every block, the MTP one included,
+    is torch.compile'd and its linears drop the in-place WGRAD accumulation a
+    traced backward cannot do; the LM head, outside the blocks, keeps it.
+    Fake process group, CPU: no collective runs, nothing is traced. (One
+    parallelize per process: a second one in the same process fails on a mesh
+    left from the first.)"""
     from unittest import mock
 
     import torch.distributed as dist
@@ -233,6 +238,7 @@ def test_parallelize_treats_the_mtp_block_as_a_decoder_block(tmp_path):
             rope_pattern=None,
             num_mtp_layers=1,
         )
+        cfg.compile_blocks = True
         with torch.device("meta"):
             model = cfg.build()
         block = model.mtp_layers[0]
@@ -241,12 +247,21 @@ def test_parallelize_treats_the_mtp_block_as_a_decoder_block(tmp_path):
             parallelism_context=pc,
             precision=PrecisionConfig(),
             parallelism=parallelism,
-            local_compile=LocalCompileConfig(regions=[]),
+            local_compile=LocalCompileConfig(regions=["loss"]),
             activation_remat=DefaultActivationRematConfig(),
             dump_folder=str(tmp_path),
         )
         assert list(model.layers.keys()) == ["0", "1"]
         assert "FSDP" in type(block).__name__
         assert block.forward is not plain_forward  # remat.checkpoint's wrapper
+        for b in [*model.layers.values(), block]:
+            assert b._compiled_call_impl is not None
+            flags = [
+                m.inplace_wgrad_accum
+                for m in b.modules()
+                if hasattr(m, "inplace_wgrad_accum")
+            ]
+            assert flags and not any(flags)
+        assert model.lm_head.inplace_wgrad_accum
     finally:
         dist.destroy_process_group()

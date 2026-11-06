@@ -12,6 +12,7 @@ import torch
 import torch_remat as remat
 from torch.distributed._functional_collectives import all_to_all_single
 
+from torchtitan.distributed.local_compile import local_compile
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_mesh_group
 from torchtitan.models.base.module import Module
@@ -152,6 +153,11 @@ class LocalTokenDispatcher(Module):
             x_TD,
         )
 
+    # Eager, the score multiply runs as separate float32 kernels over the
+    # routed output (and casts around them); compiled, it fuses into one
+    # kernel each way, the scatter-add staying the deterministic custom op
+    # (bitwise the eager result).
+    @local_compile("moe_score_and_scatter_add", batch_invariant=True)
     def _score_and_scatter_add(
         self,
         routed_output_ND: torch.Tensor,

@@ -289,6 +289,20 @@ class OPTMoEModel(Decoder):
             resolve_sparse_fsdp_mesh,
         )
 
+        if self.config.compile_blocks:
+            # 0.5.4's compile (wave 2): torch.compile on each block, after the
+            # activation remat and before FSDP, with its dynamo settings
+            # (token-choice MoE shapes; no forward side effects replayed in a
+            # recompute).
+            torch._dynamo.config.capture_scalar_outputs = True
+            torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
+            for block in self.layers.values():
+                # a traced backward cannot add a WGRAD into .grad in place; one
+                # microbatch per step leaves nothing to accumulate in a block
+                for module in block.modules():
+                    if hasattr(module, "inplace_wgrad_accum"):
+                        module.inplace_wgrad_accum = False
+                block.compile(fullgraph=True)
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
         edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
         apply_fsdp_to_decoder(
@@ -329,6 +343,10 @@ class OPTMoEModel(Decoder):
         # Upstream's regions the model passes through plus opt_moe's own
         # elementwise code (fused attention-prep / residual-norm regions: only
         # once measured on the production dims).
+        compile_blocks: bool = False
+        """torch.compile on each block (0.5.4's compile, before upstream removed
+        it): the block's ops in one graph, with ``local_compile`` keeping only
+        the regions outside the blocks (``loss``)."""
         local_compile: LocalCompileConfig = field(
             default_factory=lambda: LocalCompileConfig(
                 regions=[
@@ -336,6 +354,7 @@ class OPTMoEModel(Decoder):
                     "fused_binary_activation",
                     "fp32_to_bf16_split",
                     "rope",
+                    "moe_score_and_scatter_add",
                     "opt_moe_sink_rescale",
                     "opt_moe_attention_output",
                 ]

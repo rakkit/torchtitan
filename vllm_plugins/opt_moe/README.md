@@ -31,17 +31,19 @@ x -> RMSNorm -> qkv_proj -> [q|k|v] -> x + conv(x)   <- conv state: the last W -
 ```
 
 The KV cache holds k and v after the conv, qk-norm and RoPE, and q is not
-cached, so the raw inputs the next step's conv needs are kept separately: as one
-more sliding-window KV cache per layer (window = block = the conv width), the
-k and v heads as the cache's heads (one launch over the projection's
-`[k | v]` slice), read and written by vLLM's Inkling
-`fused_sconv` kernel (insert + conv in one launch, the same path for prefill,
-decode and speculative tokens, CUDA-graph safe), as vLLM's Inkling model keeps
-its conv state. Weights in bf16; `--quantization fp8` quantizes the linears and
-experts online (the router and the convs stay as they are). The model runs
-under vLLM's `torch.compile` (each conv is the custom op
-`vllm::opt_moe_short_conv`, which reads its state from the forward context) with
-piecewise CUDA graphs for prefill and full ones for decoding.
+cached, so the raw k / v the next step's conv needs are kept separately: as one
+more sliding-window KV cache per layer (window = the conv width; vLLM's Inkling
+sconv backend builds its block table and slots), the k heads then the v heads
+as its heads. Everything between the qkv projection and the attention is one
+launch per layer (`vllm_opt_moe/prologue.py`, after vLLM's Inkling prologue):
+q -> RMSNorm -> RoPE; k / v read in place from the projection, into the conv
+state, x + conv(x) over this forward's rows or the state, k -> RMSNorm -> RoPE
+(partial on `rope.dim < head_dim`, none on NoPE layers); the same path for
+prefill, decode and speculative tokens. Weights in bf16; `--quantization fp8`
+quantizes the linears and experts online (the router and the convs stay as they
+are). The model runs under vLLM's `torch.compile` (the prologue is the custom op
+`vllm::opt_moe_attention_prologue`, which reads the conv state from the forward
+context) with piecewise CUDA graphs for prefill and full ones for decoding.
 
 Tensor parallelism on nodes without NVSwitch (e.g. 4 x GH200) needs
 `VLLM_ALLREDUCE_USE_FLASHINFER=0`: FlashInfer's all-reduce falls back to its
@@ -83,21 +85,32 @@ greedy continuations of 48 tokens with the draft equal the ones without,
 
 ## Checks
 
-Against the HF model's transformers forward in fp32, on a small converted model
-with every feature (q / k / v conv, sinks, gate, a sliding window of 16, a full
-and a NoPE layer, a dense and MoE layers with the router bias and a shared
-expert), bf16, eager, TP 1 (11-06): teacher-forced logprobs of 41 / 64 / 100
-tokens and of 40 decoded tokens past the window, |vLLM - HF fp32| mean 0.0002 /
-0.0003, max <= 0.0012, equal to the HF bf16 model's own (the bf16 floor); with
-the conv broken to the identity 0.006 - 0.0075 (the check sees the conv). With
-2 KV heads (11-06), prefill / decode mean: TP 1 0.0002 / 0.0004, with CUDA
-graphs 0.0003 / 0.0004, TP 2 (custom all-reduce, CUDA graphs) 0.0003 / 0.0003,
-all at the floor; FP8 0.0009 / 0.0007 (max 0.0028). The conv on k / v only and
-partial RoPE (64 of 128 dims on the sliding-window layers), 2 KV heads, eager and
-CUDA graphs: prefill / decode mean 0.0002 / 0.0003-0.0004, max <= 0.0019, at the
-floor; k / v with the conv broken 0.009 (11-06).
+Against the HF model's transformers forward in fp32 (`check_vllm_model.py` in
+the user's configs), on a small converted model: 4 layers, 2 KV heads, the k / v
+conv, a sliding window of 16, a full and a NoPE layer, a dense and MoE layers
+with the router bias and a shared expert, with the element-wise gate or sinks;
+teacher-forced logprobs of 41 / 64 / 100 tokens and of 40 decoded tokens past
+the window, |vLLM - HF fp32| against the HF bf16 model's own (the bf16 floor:
+mean 0.0002-0.0003, max 0.0006-0.0013). With the fused prologue (11-06), bf16:
+
+| model | prefill mean / max | decode mean / max |
+|---|---|---|
+| gate, eager | 0.0002 / 0.0014 | 0.0003 / 0.0011 |
+| gate, CUDA graphs | 0.0002-0.0003 / 0.0014 | 0.0003 / 0.0011 |
+| sinks, CUDA graphs | 0.0002 / 0.0011 | 0.0003 / 0.0009 |
+| gate + partial RoPE (64 of 128 dims on the SWA layers), CUDA graphs | 0.0002-0.0003 / 0.0014 | 0.0003 / 0.0013 |
+| gate, FP8 online, CUDA graphs | 0.0008-0.0010 / 0.0034 | 0.0007 / 0.0019 |
+| gate, the conv broken (zero conv weights) | 0.0091-0.0119 / 0.0411 | 0.0109 / 0.0320 |
+
+The kernel alone against a PyTorch reference (a prefill then 6 decode steps
+through the paged state, rope_dim 128 / 64 / 0): within 0.09 bf16 ulp; with the
+state wiped between steps 126-223 ulps. Before the k / v-only change (the q / k
+/ v conv, 11-06): TP 2 (custom all-reduce, CUDA graphs) at the floor.
 
 ## Speed of the conv
+
+Measured with the q / k / v conv, before the k / v-only change and the fused
+prologue (to re-measure):
 
 FP8 (online, from the bf16 folder), TP 1, one GH200, CUDA graphs, a 41.4B /
 3.05B-active shape (40 layers, d 2048, 32 q / 4 kv heads, 256 experts top-6 of

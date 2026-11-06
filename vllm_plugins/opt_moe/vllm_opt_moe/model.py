@@ -15,8 +15,9 @@ with the sinks, the layer's sliding window) and the k / v short conv's
 state, the last ``conv_kernel_size`` raw k / v per sequence, kept as one more
 sliding-window KV cache (window = block = the conv width) as vLLM's Inkling
 model keeps its conv state (``OptMoeConvState``; vLLM's Inkling sconv backend
-and ``fused_sconv`` kernel: insert + conv in one launch, positions addressed,
-the same path for prefill / decode / speculative tokens, CUDA-graph safe). The ops follow the HF model's
+for its block table and slots). The q / k / v preparation is one launch per
+layer (``prologue.py``: positions addressed, the same path for prefill / decode /
+speculative tokens, CUDA-graph safe). The ops follow the HF model's
 transformers forward: q / k / v -> x + conv(x) on k / v -> qk-norm -> RoPE (none on
 NoPE layers, partial when ``dim`` < head_dim) -> attention -> the element-wise
 gate sigmoid(gate_proj(x)) -> o_proj; RMSNorm blocks with the per-layer
@@ -62,13 +63,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.models.inkling.nvidia.ops import fused_sconv
 from vllm.models.inkling.nvidia.sconv_swa_attn import (
     InklingSconvBackend,
     InklingSconvMetadata,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec
+
+from .prologue import attention_prologue
 
 
 def _sliding(config, layer_idx: int) -> bool:
@@ -80,7 +82,7 @@ class OptMoeConvState(nn.Module, AttentionLayerBase):
     width) holding the last raw k and v of each sequence, as ``2 G`` heads of
     ``head_dim`` (this rank's k heads, then its v heads: the channel order of
     the qkv projection's ``[k | v]`` slice). The conv reads and writes it out
-    of band (``opt_moe_short_conv``); vLLM's Inkling sconv backend builds the
+    of band (``opt_moe_attention_prologue``); vLLM's Inkling sconv backend builds the
     block table / slot metadata."""
 
     def __init__(self, config, *, prefix: str) -> None:
@@ -119,60 +121,99 @@ class OptMoeConvState(nn.Module, AttentionLayerBase):
         )
 
 
-def opt_moe_short_conv(
-    x_TC: torch.Tensor,
-    weight_CW: torch.Tensor,
+def opt_moe_attention_prologue(
+    qkv_TC: torch.Tensor,
+    conv_weight_CW: torch.Tensor,
+    q_norm_weight: torch.Tensor | None,
+    k_norm_weight: torch.Tensor | None,
+    cos_sin_cache: torch.Tensor | None,
     positions: torch.Tensor,
     layer_name: str,
-) -> torch.Tensor:
-    """``x + conv(x)`` on this rank's ``[k | v]`` channels as a custom op, so
-    torch.compile sees one opaque call: the conv state and its metadata come
-    from the forward context, as vLLM's short_conv op takes them."""
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rope_dim: int,
+    qk_norm: bool,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The layer's attention prologue (``prologue.attention_prologue``: q / k
+    / v from the projection, the k / v conv on the state, qk-norm, RoPE) as a
+    custom op, so torch.compile sees one opaque call; the conv state and its
+    metadata come from the forward context, as vLLM's short_conv op takes
+    them."""
     context = get_forward_context()
     metadata = context.attn_metadata
-    if metadata is None:  # vLLM's profiling / dummy runs: no state yet
-        return x_TC.clone()
     owner = context.no_compile_layers[layer_name]
-    m = metadata.get(layer_name) if isinstance(metadata, dict) else None
-    if not isinstance(m, InklingSconvMetadata) or owner.kv_cache.numel() == 0:
-        # never run without the conv (the model would be wrong, not slow)
-        raise RuntimeError(
-            f"vLLM opt_moe: no conv state for {layer_name} in this forward "
-            f"(metadata {type(m).__name__}, cache bound: {owner.kv_cache.numel() > 0})"
+    T, dev = qkv_TC.shape[0], qkv_TC.device
+    if metadata is None:  # vLLM's profiling / dummy runs: no state, no conv
+        none = torch.full((T,), -1, dtype=torch.int64, device=dev)
+        zeros = torch.zeros((T,), dtype=torch.int32, device=dev)
+        state = torch.empty(
+            (1, 2 * num_kv_heads, 1, head_dim), dtype=qkv_TC.dtype, device=dev
         )
-    return fused_sconv(
-        x_TC,
-        weight_CW,
-        owner.kv_cache,
+        table = torch.zeros((1, 1), dtype=torch.int32, device=dev)
+        meta = (table, zeros, none, zeros)
+    else:
+        m = metadata.get(layer_name) if isinstance(metadata, dict) else None
+        if not isinstance(m, InklingSconvMetadata) or owner.kv_cache.numel() == 0:
+            # never run without the conv (the model would be wrong, not slow)
+            raise RuntimeError(
+                f"vLLM opt_moe: no conv state for {layer_name} in this forward "
+                f"(metadata {type(m).__name__}, cache bound: "
+                f"{owner.kv_cache.numel() > 0})"
+            )
+        state = owner.kv_cache
+        meta = (m.block_table, m.seq_idx, m.slot_mapping, m.query_start)
+    block_table, seq_idx, slot_mapping, query_start = meta
+    return attention_prologue(
+        qkv_TC,
+        conv_weight_CW,
+        q_norm_weight,
+        k_norm_weight,
+        qk_norm,
+        eps,
+        cos_sin_cache,
+        rope_dim,
+        state,
         positions,
-        m.block_table,
-        m.seq_idx,
-        m.slot_mapping,
-        m.query_start,
-        0,  # one stream per cache head: channel c is head c // head_size
-        owner.head_size,
-        # the cache's block size ([blocks, H, N, D]): vLLM enlarges the
-        # requested one (the conv width) when this page is smaller than the
-        # attention page (unify_kv_cache_spec_page_size)
-        owner.kv_cache.shape[2],
-        activation=None,
-        use_residual=True,
+        block_table,
+        seq_idx,
+        slot_mapping,
+        query_start,
+        num_heads,
+        num_kv_heads,
+        head_dim,
     )
 
 
-def _opt_moe_short_conv_fake(
-    x_TC: torch.Tensor,
-    weight_CW: torch.Tensor,
+def _opt_moe_attention_prologue_fake(
+    qkv_TC: torch.Tensor,
+    conv_weight_CW: torch.Tensor,
+    q_norm_weight: torch.Tensor | None,
+    k_norm_weight: torch.Tensor | None,
+    cos_sin_cache: torch.Tensor | None,
     positions: torch.Tensor,
     layer_name: str,
-) -> torch.Tensor:
-    return torch.empty_like(x_TC)
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rope_dim: int,
+    qk_norm: bool,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    T = qkv_TC.shape[0]
+    q = qkv_TC.new_empty((T, num_heads * head_dim))
+    return (
+        q,
+        qkv_TC.new_empty((T, num_kv_heads * head_dim)),
+        qkv_TC.new_empty((T, num_kv_heads * head_dim)),
+    )
 
 
 direct_register_custom_op(
-    op_name="opt_moe_short_conv",
-    op_func=opt_moe_short_conv,
-    fake_impl=_opt_moe_short_conv_fake,
+    op_name="opt_moe_attention_prologue",
+    op_func=opt_moe_attention_prologue,
+    fake_impl=_opt_moe_attention_prologue_fake,
 )
 
 
@@ -269,21 +310,32 @@ class OptMoeAttention(nn.Module):
 
     def forward(self, positions: torch.Tensor, x_TD: torch.Tensor) -> torch.Tensor:
         qkv, _ = self.qkv_proj(x_TD)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.conv_state is not None:
-            kv = torch.ops.vllm.opt_moe_short_conv(
-                qkv[:, self.q_size :].contiguous(),
+            # one launch: the k / v conv on its state, qk-norm, RoPE
+            norm = self.q_norm
+            q, k, v = torch.ops.vllm.opt_moe_attention_prologue(
+                qkv,
                 self.conv_weight,
+                norm.weight if norm is not None and norm.has_weight else None,
+                self.k_norm.weight if norm is not None and norm.has_weight else None,
+                None if self.rotary_emb is None else self.rotary_emb.cos_sin_cache,
                 positions,
                 self.conv_state.prefix,
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                0 if self.rotary_emb is None else self.rotary_emb.rotary_dim,
+                norm is not None,
+                1e-6 if norm is None else norm.variance_epsilon,
             )
-            k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
-        if self.q_norm is not None:
-            t = q.shape[0]
-            q = self.q_norm(q.reshape(t, -1, self.head_dim)).reshape(t, -1)
-            k = self.k_norm(k.reshape(t, -1, self.head_dim)).reshape(t, -1)
-        if self.rotary_emb is not None:
-            q, k = self.rotary_emb(positions, q, k)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.q_norm is not None:
+                t = q.shape[0]
+                q = self.q_norm(q.reshape(t, -1, self.head_dim)).reshape(t, -1)
+                k = self.k_norm(k.reshape(t, -1, self.head_dim)).reshape(t, -1)
+            if self.rotary_emb is not None:
+                q, k = self.rotary_emb(positions, q, k)
         out = self.attn(q, k, v)
         if self.gate_proj is not None:
             gate, _ = self.gate_proj(x_TD)

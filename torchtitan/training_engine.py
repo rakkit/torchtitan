@@ -910,8 +910,11 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         ):
             pred = self.model_parts[0](inputs, **model_kwargs)
             if self._head_input_rows:
+                # multi-token prediction: the main (next-token) prediction's rows
                 self._head_input = sample_rows(
-                    pred, self._head_input_rows, self._head_input_seed
+                    pred[0] if isinstance(pred, tuple) else pred,
+                    self._head_input_rows,
+                    self._head_input_seed,
                 )
             loss, self.loss_metrics = self.loss_fn(
                 pred,

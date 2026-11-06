@@ -229,11 +229,16 @@ def build_opt_moe_layers(
     init_gate_as_residual: bool = False,
     router_init_fn_type: str = "scion_normal_output",
     router_init_std: float = 1.0,
+    num_mtp_layers: int = 0,
     enable_sp: bool,
     enable_ep: bool,
     enable_cp: bool,
 ) -> list[OPTMoETransformerBlock.Config]:
-    """The sharded per-layer ``OPTMoETransformerBlock`` configs.
+    """The sharded per-layer ``OPTMoETransformerBlock`` configs: the
+    ``n_layers`` decoder layers, then ``num_mtp_layers`` blocks for the MTP
+    depths, each a mirror of the last layer (its attention, which must be full
+    attention, its feed-forward / MoE and its inits, depth-init divisors
+    included) with its own expert seeds (layer id ``n_layers + i``).
 
     Norms and residuals: ``norm_type`` / ``norm_eps`` for the q/k and block
     norms, ``prenorm_gain_init`` the block norms' starting gain;
@@ -315,13 +320,21 @@ def build_opt_moe_layers(
             sharding_config=dense_linear_sharding_config(),
         )
 
+    if num_mtp_layers > 0 and use_swa[-1]:
+        raise ValueError(
+            "the MTP block mirrors the last layer, which must be full attention: "
+            f"swa_pattern ends in S ({swa_pattern!r})"
+        )
     layers = []
-    for layer_id in range(n_layers):
-        div_attn, div_ffn = setup_depth_init(depth_init, layer_id, n_layers)
+    for layer_id in range(n_layers + num_mtp_layers):
+        # The layer whose settings this block takes: itself, or for an MTP
+        # block the last decoder layer (the expert seeds stay layer_id's).
+        mirror = min(layer_id, n_layers - 1)
+        div_attn, div_ffn = setup_depth_init(depth_init, mirror, n_layers)
         w3_div = div_ffn if init_gate_as_residual else 1.0
 
         inner = get_attention_config(attn_backend)
-        if use_swa[layer_id]:
+        if use_swa[mirror]:
             if isinstance(inner, FlexInnerAttention.Config):
                 inner = SlidingWindowFlexInnerAttention.Config(
                     block_size=inner.block_size,
@@ -338,7 +351,7 @@ def build_opt_moe_layers(
                     sliding_window_size=sliding_window_size,
                 )
         layer_rope = (
-            rope_of_swa if use_swa[layer_id] and rope_of_swa is not None else rope
+            rope_of_swa if use_swa[mirror] and rope_of_swa is not None else rope
         )
         gqa = make_gqa_config(
             dim=dim,
@@ -352,7 +365,7 @@ def build_opt_moe_layers(
                 "weight": make_param_init(wo_init_fn_type, wo_init_std, div_attn)
             },
             inner_attention=inner,
-            rope=layer_rope if use_rope[layer_id] else None,
+            rope=layer_rope if use_rope[mirror] else None,
             qk_norm=_norm(norm_type, head_dim, norm_eps) if qk_norm else None,
             enable_sp=enable_sp,
         )
@@ -382,7 +395,7 @@ def build_opt_moe_layers(
                 gqa.sharding_config
             )
 
-        if layer_id < n_dense_layers:
+        if mirror < n_dense_layers:
             feed_forward = _ffn(
                 dim=dim,
                 hidden_dim=dense_hidden_dim,
@@ -530,8 +543,8 @@ def _opt_moe_config(
     ``norm_eps``: every norm.
 
     ``num_mtp_layers`` (0 or 1): DeepSeek-V3's multi-token prediction, one
-    ``OPTMoEMTPBlock`` predicting the token after next: a copy of the last
-    layer (its attention, feed-forward / MoE and inits) behind
+    ``OPTMoEMTPBlock`` predicting the token after next: a mirror of the last
+    layer (``build_opt_moe_layers``: full attention, its own expert seeds) behind
     ``eh_proj(cat(enorm(e), hnorm(h)))`` (``eh_proj_init_*``: the fusion's
     init), then ``mtp_norm``. The run adds the MTP loss (``mtp.py``
     ``MTPCrossEntropyLoss``) and ``dataloader.num_mtp_layers``."""
@@ -539,7 +552,7 @@ def _opt_moe_config(
         raise ValueError(f"num_mtp_layers must be 0 or 1, got {num_mtp_layers}")
     flags = layout_flags(parallelism)
     cache_length = max(seq_len, rope_length or 0)
-    layers = build_opt_moe_layers(
+    blocks = build_opt_moe_layers(
         dim=dim,
         norm_type=norm_type,
         norm_eps=norm_eps,
@@ -550,17 +563,17 @@ def _opt_moe_config(
             else CosSinRoPE.Config(**rope_of_swa, max_context_length=cache_length)
         ),
         **layer_settings,
+        num_mtp_layers=num_mtp_layers,
         enable_sp=flags["sp"],
         enable_ep=flags["ep"],
         enable_cp=flags["cp"],
     )
+    n_layers = len(blocks) - num_mtp_layers
+    layers = blocks[:n_layers]
     block_norm_sharding = norm_sharding_config(enable_sp=flags["sp"])
     mtp_layers = [
         OPTMoEMTPBlock.Config(
-            **{
-                f.name: copy.deepcopy(getattr(layers[-1], f.name))
-                for f in dataclasses.fields(layers[-1])
-            },
+            **{f.name: getattr(block, f.name) for f in dataclasses.fields(block)},
             enorm=_norm(norm_type, dim, norm_eps, sharding_config=block_norm_sharding),
             hnorm=_norm(norm_type, dim, norm_eps, sharding_config=block_norm_sharding),
             eh_proj=Linear.Config(
@@ -578,7 +591,7 @@ def _opt_moe_config(
                 sharding_config=pre_lm_head_norm_sharding_config(enable_sp=flags["sp"]),
             ),
         )
-        for _ in range(num_mtp_layers)
+        for block in blocks[n_layers:]
     ]
     return OPTMoEModel.Config(
         max_context_length=seq_len,

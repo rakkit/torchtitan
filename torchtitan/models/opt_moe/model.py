@@ -512,7 +512,8 @@ class OPTMoEModel(Decoder):
 
         Returns:
             The logits (hidden states with ``_skip_lm_head``); with MTP a tuple,
-            the main prediction then one per depth.
+            the main prediction then one per depth (in eval mode the main
+            prediction only).
         """
         if self.mtp_layers is None:
             mtp_tokens: list[torch.Tensor] = []
@@ -574,11 +575,14 @@ class OPTMoEModel(Decoder):
         prev_hidden = h  # the MTP depths read the pre-norm hidden state
         h = self.norm(h) if self.norm is not None else h
         outputs = [h]
+        # In eval mode (validation, offline evaluation: they score the main
+        # prediction) the MTP depths do not run.
+        run_mtp = self.mtp_layers is not None and self.training
         for depth, (layer, depth_tokens, valid) in enumerate(
             zip(
-                self.mtp_layers or (),
-                mtp_tokens,
-                mtp_input_valid_masks or (),
+                self.mtp_layers if run_mtp else (),
+                mtp_tokens if run_mtp else (),
+                mtp_input_valid_masks if run_mtp else (),
                 strict=True,
             ),
             1,

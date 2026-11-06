@@ -54,8 +54,9 @@ class MTPCrossEntropyLoss(Loss[torch.Tensor | tuple[torch.Tensor, ...]]):
     """``CE(main) + mtp_scale * mean over depths CE(depth)``: the main
     prediction and one per MTP depth, each against its own labels and its own
     global token count (the collator counts each depth's targets). Metrics:
-    ``mtp/main_loss`` and ``mtp/depth_<d>_loss`` (normalized as the loss, so the
-    trainer sums them over microbatches and ranks). On one prediction (the
+    ``mtp/main_loss_mean`` and ``mtp/depth_<d>_loss_mean`` (normalized as the
+    loss: the chunked loss and the trainer sum them over chunks, microbatches
+    and ranks). On one prediction (the
     validator's main objective) it is the cross-entropy."""
 
     @dataclass(kw_only=True, slots=True)
@@ -104,7 +105,7 @@ class MTPCrossEntropyLoss(Loss[torch.Tensor | tuple[torch.Tensor, ...]]):
                     c.clamp_min(1) for c in global_loss_token_counts.unbind()
                 )
         main_loss, _ = self.cross_entropy_loss(pred[0], labels[0], counts[0])
-        metrics = {"mtp/main_loss": main_loss.detach()}
+        metrics = {"mtp/main_loss_mean": main_loss.detach()}
         mtp_weight = self.mtp_scale / (len(pred) - 1)
         mtp_loss = pred[0].new_zeros((), dtype=torch.float32)
         if spmd.is_type_checking():
@@ -115,6 +116,6 @@ class MTPCrossEntropyLoss(Loss[torch.Tensor | tuple[torch.Tensor, ...]]):
             depth_loss, _ = self.cross_entropy_loss(
                 pred[depth], labels[depth], counts[depth]
             )
-            metrics[f"mtp/depth_{depth}_loss"] = depth_loss.detach()
+            metrics[f"mtp/depth_{depth}_loss_mean"] = depth_loss.detach()
             mtp_loss = mtp_loss + depth_loss * mtp_weight
         return main_loss + mtp_loss, metrics

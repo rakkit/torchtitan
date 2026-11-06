@@ -111,3 +111,83 @@ def test_mtp_keeps_the_main_prediction_and_trains_its_block():
     for name, p in mtp.named_parameters():
         if name.startswith("mtp_layers.") and "expert_bias" not in name:
             assert p.grad is not None and p.grad.abs().sum() > 0, name
+
+
+def test_mtp_loss_runs_chunked_and_reports_its_terms():
+    """The run's loss: ChunkedLossWrapper(MTPCrossEntropyLoss) over several
+    chunks equals the loss on the whole logits, and its metrics are the two
+    terms (summed over the chunks, as their suffix says)."""
+    from torch import nn
+
+    from torchtitan.components.loss import ChunkedLossWrapper
+
+    torch.manual_seed(0)
+    t, d = 64, 16
+    head = nn.Linear(d, VOCAB, bias=False)
+    hidden = (torch.randn(t, d), torch.randn(t, d))
+    labels = tuple(torch.randint(0, VOCAB, (t,)) for _ in range(2))
+    labels[1][-1] = IGNORE_INDEX
+    counts = torch.stack([(lab != IGNORE_INDEX).sum() for lab in labels])
+    mtp = MTPCrossEntropyLoss(MTPCrossEntropyLoss.Config(mtp_scale=0.3))
+    chunked = ChunkedLossWrapper(
+        ChunkedLossWrapper.Config(
+            num_chunks=4, loss_fn=MTPCrossEntropyLoss.Config(mtp_scale=0.3)
+        )
+    )
+    chunked.lm_head = head
+    loss, metrics = chunked(hidden, labels, counts)
+    want, want_metrics = mtp(tuple(head(h) for h in hidden), labels, counts)
+    torch.testing.assert_close(loss, want)
+    assert (
+        metrics.keys()
+        == want_metrics.keys()
+        == {
+            "mtp/main_loss_mean",
+            "mtp/depth_1_loss_mean",
+        }
+    )
+    for key in metrics:
+        torch.testing.assert_close(metrics[key], want_metrics[key])
+
+
+def test_the_mtp_block_mirrors_the_last_layer_with_its_own_expert_seed():
+    with torch.device("meta"):
+        cfg = build_model_config(
+            "mis-8b-proxy",
+            parallelism=ParallelismConfig(),
+            seq_len=128,
+            n_layers=2,
+            swa_pattern="SF",
+            rope_pattern=None,
+            num_mtp_layers=1,
+        )
+    last, block = cfg.layers[-1], cfg.mtp_layers[0]
+    assert type(block.attention.inner_attention) is type(last.attention.inner_attention)
+    model = cfg.build()  # CPU: the expert inits are seeded per layer id
+    with torch.no_grad():
+        model.init_states(buffer_device=torch.device("cpu"))
+    a = model.layers["1"].feed_forward.routed_experts.w13.weight
+    b = model.mtp_layers[0].feed_forward.routed_experts.w13.weight
+    assert a.shape == b.shape and not torch.equal(a, b)
+    with pytest.raises(ValueError, match="full attention"):
+        build_model_config(
+            "mis-8b-proxy",
+            parallelism=ParallelismConfig(),
+            n_layers=2,
+            swa_pattern="FS",
+            rope_pattern=None,
+            num_mtp_layers=1,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="flex / conv need CUDA")
+def test_eval_mode_skips_the_mtp_depth():
+    positions = torch.cat([torch.arange(n) for n in DOCS]).cuda()
+    tokens = torch.randint(0, VOCAB, (positions.numel(),), device="cuda")
+    model = _model(1)
+    with torch.no_grad():
+        train_out = _forward(model, tokens, positions)
+        model.eval()
+        eval_out = _forward(model, tokens, positions)
+    assert len(train_out) == 2 and len(eval_out) == 1
+    assert torch.equal(eval_out[0], train_out[0])

@@ -112,3 +112,18 @@ def _reset_aux_loss_registry():
     finally:
         AuxLoss._group_counts.clear()
         AuxLoss._group_counts.update(before)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _fresh_dynamo_per_module():
+    """Reset dynamo after every test module.
+
+    One pytest process runs many modules, and each compiles FlexAttention for
+    its own shapes and masks. The compiled FlexAttention (recompile_limit 16,
+    fullgraph) then hits its recompile limit in whichever module comes late
+    (test_residual_stats_remat failed so in the full GPU suite).
+    """
+    yield
+    import torch._dynamo
+
+    torch._dynamo.reset()

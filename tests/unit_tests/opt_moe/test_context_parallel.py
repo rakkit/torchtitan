@@ -17,6 +17,7 @@ contiguous sharding and head-tail load balancing; the flex (fp32) and varlen
 import pytest
 import torch
 import torch.distributed as dist
+from torch.testing._internal.common_distributed import TIMEOUT_OVERRIDE
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
@@ -70,6 +71,12 @@ def _model(parallelism: ParallelismConfig, backend: str, dtype: torch.dtype):
 
 def _relative(got: torch.Tensor, want: torch.Tensor) -> float:
     return ((got.float() - want.float()).norm() / want.float().norm()).item()
+
+
+# Every rank compiles FlexAttention (max_autotune: forward and backward, full and
+# sliding-window) for two backends and two shardings: more than the harness's
+# default 300 s per test.
+TIMEOUT_OVERRIDE["test_cp_matches_one_rank"] = 1500
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < CP, reason=f"needs {CP} GPUs")

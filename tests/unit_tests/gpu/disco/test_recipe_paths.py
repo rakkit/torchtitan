@@ -99,10 +99,16 @@ class TestRecipePaths(DTensorTestBase):
         model_cfg["n_kv_heads"] = n_kv_heads
         cfg = harness.trainer_config(model_cfg, **FSDP)
         groups = copy.deepcopy(opt_moe_mis_8b().optim.optimizer.groups)
-        if device.type == "cpu":  # gram_polar_express runs quack's CUDA kernels only
-            args = groups["default"]["args"]
-            args["compute"] = "svd"
-            args.pop("polar_express_safety")
+        # The orthogonaliser is svd on every device: the reference steps one
+        # unit at a time while a rank steps its local experts as one stack, and
+        # gram_polar_express (the recipe's; quack's fp16 kernels, CUDA only)
+        # rounds a tall unit differently in a stack than alone (~2e-3 of |O|),
+        # which is the kernel's precision, not the path. svd is batch-invariant,
+        # so this checks the path exactly; the kernel's own accuracy is
+        # test_gram_polar_express_rank's.
+        args = groups["default"]["args"]
+        args["compute"] = "svd"
+        args.pop("polar_express_safety")
         if gains_scale is not None:
             groups["gains"]["args"]["scale"] = gains_scale
         cfg.optim.optimizer.groups = {**copy.deepcopy(CONV_AND_SINKS), **groups}
@@ -114,7 +120,7 @@ class TestRecipePaths(DTensorTestBase):
         rules = {type(e.rule.compute).__name__ for _, e in entries}
         self.assertTrue({"AmphioneMap", "Sign", "RowL2"} <= rules, rules)
         ref = {
-            names[id(e.param)]: harness.full_tensor(e.param).float().cpu().clone()
+            names[id(e.param)]: harness.full_tensor(e.param).float().clone()
             for _, e in entries
         }
         buf = {n: torch.zeros_like(w) for n, w in ref.items()}
@@ -150,10 +156,10 @@ class TestRecipePaths(DTensorTestBase):
                 lr, wd = float(g["lr"]), float(g["weight_decay"])
                 beta, nes = float(g["momentum"]), bool(g["nesterov"])
                 if cm.owns_momentum:  # amphione: the raw gradient, its own averages
-                    eff = grads[name].float().cpu()
+                    eff = grads[name].float()
                 else:
                     buf[name], eff = _momentum(
-                        buf[name], grads[name].float().cpu(), beta, nes
+                        buf[name], grads[name].float(), beta, nes
                     )
                 W2 = ref[name].reshape(-1, e.view[1])
                 G2 = eff.reshape(-1, e.view[1])
@@ -179,7 +185,9 @@ class TestRecipePaths(DTensorTestBase):
                     if e.rule.kind == "unit":  # whole-unit computes take a stack
                         st = state.get((name, k))
                         if st is None and e.rule.has_state:
-                            st = torch.zeros(1, *cm.state_shape(*u.shape))
+                            st = torch.zeros(
+                                1, *cm.state_shape(*u.shape), device=device
+                            )
                         res = e.rule.reference(
                             Gu[None], Wu[None] if e.rule.needs_weight else None, ctx, st
                         )
@@ -199,7 +207,7 @@ class TestRecipePaths(DTensorTestBase):
                 ref[name] = out.reshape(ref[name].shape)
             for _, e in entries:
                 name = names[id(e.param)]
-                got, want = harness.full_tensor(e.param).float().cpu(), ref[name]
+                got, want = harness.full_tensor(e.param).float(), ref[name]
                 d = (got - want).abs().max().item()
                 if d > TOL * max(1.0, want.abs().max().item()):
                     failures.append(f"step {step} {name}: max |diff| {d:.3e}")

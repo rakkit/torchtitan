@@ -174,6 +174,24 @@ def test_cached_decode_gives_the_full_forward(arch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="grouped GEMMs need CUDA")
+@pytest.mark.parametrize("arch", [{}, _SINKS], ids=["gate", "sinks"])
+def test_the_eager_attention_in_query_chunks_is_the_whole(arch, monkeypatch):
+    """Long contexts run the eager attention in query chunks: one query per
+    chunk (the window and causal masks, the sinks sliced per chunk) gives the
+    one-chunk forward's logits."""
+    from torchtitan.models.opt_moe.hf import modeling_opt_moe
+
+    hf = _hf_model(sliding_window_size=16, **arch)
+    torch.manual_seed(2)
+    ids = torch.randint(0, VOCAB, (2, 37), device="cuda")
+    with torch.no_grad():
+        whole = hf(ids, use_cache=False).logits
+        monkeypatch.setattr(modeling_opt_moe, "_EAGER_SCORES_PER_CHUNK", 1)
+        chunked = hf(ids, use_cache=False).logits
+    torch.testing.assert_close(chunked, whole, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="grouped GEMMs need CUDA")
 def test_a_left_padded_batch_generates_each_rows_tokens():
     """``generate`` on two left-padded prompts (13 and 29 tokens, the window 16
     exceeded) gives each prompt's greedy tokens and logits alone: the padding is

@@ -171,6 +171,10 @@ class OptMoeRotary(nn.Module):
         return rotate(q_THK), rotate(k_THK)
 
 
+# fp32 attention scores per query chunk of the eager attention (0.5 GB)
+_EAGER_SCORES_PER_CHUNK = 1 << 27
+
+
 class OptMoeAttention(nn.Module):
     def __init__(self, config: OptMoeConfig, layer_idx: int):
         super().__init__()
@@ -280,28 +284,38 @@ class OptMoeAttention(nn.Module):
     def _eager(self, xq_BTHK, xk_BTGK, xv_BTGK, rows):
         """Eager attention in fp32 over the cached and the new K / V, the sinks
         one more logit of the softmax (gpt_oss; the same as torchtitan's
-        ``sigmoid(lse - sink)`` rescale)."""
-        q_BHTK = xq_BTHK.transpose(1, 2)
+        ``sigmoid(lse - sink)`` rescale). The queries in chunks: ``[B, H, c,
+        S]`` fp32 scores of about 0.5 GB, not ``[B, H, T, S]`` (34 GB per layer
+        at 16k tokens and 32 heads)."""
         k_BGSK, v_BGSK = xk_BTGK.transpose(1, 2), xv_BTGK.transpose(1, 2)
         if rows.cache is not None:
             k_BGSK, v_BGSK = rows.cache.update(k_BGSK, v_BGSK, self.layer_idx)
-        # q head i reads KV head i // (heads per KV head): torchtitan's layout
-        groups = self.n_heads // self.n_kv_heads
-        k_BHSK = k_BGSK.repeat_interleave(groups, dim=1).float()
-        v_BHSK = v_BGSK.repeat_interleave(groups, dim=1).float()
-        scores = torch.matmul(q_BHTK.float(), k_BHSK.transpose(-2, -1))
-        scores = scores * self.head_dim**-0.5
+        b, t, h, d = xq_BTHK.shape
+        g, s = self.n_kv_heads, k_BGSK.shape[-2]
+        # q head i reads KV head i // (h / g) (torchtitan's layout): each KV
+        # head's q heads as one batch of rows
+        k_BGKS = k_BGSK.float().transpose(-2, -1)
+        v_BGSK = v_BGSK.float()
         mask = rows.masks[self.window]
-        if mask is not None:
-            scores = scores + mask[..., : k_BHSK.shape[-2]]
-        if self.sinks is not None:
-            b, h, t, _ = scores.shape
-            sinks = self.sinks.float().view(1, h, 1, 1).expand(b, h, t, 1)
-            scores = torch.cat([scores, sinks], dim=-1)
-        probs = F.softmax(scores, dim=-1)
-        if self.sinks is not None:
-            probs = probs[..., :-1]
-        return torch.matmul(probs, v_BHSK).transpose(1, 2).to(xq_BTHK.dtype)
+        c = max(1, _EAGER_SCORES_PER_CHUNK // (b * h * s))
+        out = []
+        for t0 in range(0, t, c):
+            q_BHCK = xq_BTHK[:, t0 : t0 + c].transpose(1, 2).float()
+            n = q_BHCK.shape[2]
+            scores = torch.matmul(q_BHCK.reshape(b, g, -1, d), k_BGKS).view(b, h, n, s)
+            scores = scores * self.head_dim**-0.5
+            if mask is not None:
+                scores = scores + mask[..., t0 : t0 + n, :s]
+            if self.sinks is not None:
+                sinks = self.sinks.float().view(1, h, 1, 1).expand(b, h, n, 1)
+                scores = torch.cat([scores, sinks], dim=-1)
+            probs = F.softmax(scores, dim=-1)
+            if self.sinks is not None:
+                probs = probs[..., :-1]
+            out.append(
+                torch.matmul(probs.reshape(b, g, -1, s), v_BGSK).view(b, h, n, d)
+            )
+        return torch.cat(out, dim=2).transpose(1, 2).to(xq_BTHK.dtype)
 
 
 class OptMoeMLP(nn.Module):

@@ -108,17 +108,29 @@ def test_hf_forward_is_torchtitan_forward_bitwise(dtype):
 
 def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
     """convert_opt_moe_to_hf: a run's DCP checkpoint (its model rebuilt from
-    job_config.json) becomes an HF folder that AutoModelForCausalLM loads with
-    trust_remote_code, every weight unchanged (fp32 export)."""
+    job_config.json) becomes a complete HF folder: AutoModelForCausalLM loads it
+    with trust_remote_code, every weight unchanged (fp32 export), and
+    AutoTokenizer loads it with a chat template. The run's assets are a pretrain
+    run's (a tokenizer, no chat template, no generation config): the folder gets
+    the placeholder template and a generation config with the bos / eos ids."""
     import json
+    import shutil
+    from pathlib import Path
 
     import torch.distributed.checkpoint as dcp
 
     from scripts.checkpoint_conversion.convert_opt_moe_to_hf import (
         convert_opt_moe_to_hf,
     )
+    from torchtitan.models.opt_moe import hf as hf_files
     from torchtitan_recipes.models.opt_moe import opt_moe_mis_8b
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+
+    assets = tmp_path / "assets"
+    shutil.copytree(Path(__file__).parents[2] / "assets" / "tokenizer", assets)
+    tokenizer_config = json.loads((assets / "tokenizer_config.json").read_text())
+    del tokenizer_config["chat_template"]
+    (assets / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
 
     run = opt_moe_mis_8b()
     run.model = build_model_config(
@@ -133,7 +145,7 @@ def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
         num_mtp_layers=1,
         vocab_size=VOCAB,
     )
-    run.hf_assets_path = str(tmp_path / "assets")  # no tokenizer files to copy
+    run.hf_assets_path = str(assets)
     (tmp_path / "job_config.json").write_text(json.dumps(run.to_dict()))
     model = run.model.build()
     torch.manual_seed(0)
@@ -149,16 +161,20 @@ def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
         "float32",
         read_threads=4,
     )
-    # The run has no tokenizer assets (a pretrain run has no chat template):
-    # the folder carries the placeholder template, which vLLM needs.
-    from pathlib import Path
-
-    from torchtitan.models.opt_moe import hf as hf_files
-
+    out = tmp_path / "hf"
     placeholder = Path(hf_files.__file__).parent / "chat_template.jinja"
-    assert (
-        tmp_path / "hf" / "chat_template.jinja"
-    ).read_text() == placeholder.read_text()
+    assert (out / "chat_template.jinja").read_text() == placeholder.read_text()
+    tokenizer = AutoTokenizer.from_pretrained(out)
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "yo"},
+    ]
+    rendered = tokenizer.apply_chat_template(messages, tokenize=False)
+    assert rendered.index("hi") < rendered.index("yo")
+    config = json.loads((out / "config.json").read_text())
+    generation = GenerationConfig.from_pretrained(out)
+    assert (config["bos_token_id"], config["eos_token_id"]) == (2002, 2003)
+    assert (generation.bos_token_id, generation.eos_token_id) == (2002, 2003)
     hf = AutoModelForCausalLM.from_pretrained(
         tmp_path / "hf", trust_remote_code=True, dtype=torch.float32
     )

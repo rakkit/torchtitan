@@ -17,10 +17,12 @@ Upstream's ``convert_to_hf.py`` (DCP load, ``export_state_dict``, the adapter's
    checkpoint anyway.
 3. The checkpoint's shard files read by a thread pool
    (``ParallelFileSystemReader``).
-4. A complete folder: ``config.json`` (``hf_config``), the modeling files
-   (``opt_moe/hf/``), the run's tokenizer files (``hf_assets_path``) and a chat
-   template: the run's, else ``opt_moe/hf/chat_template.jinja`` (the turns'
-   text, concatenated: a pretrain run has none, and vLLM needs one).
+4. A complete folder: ``config.json`` (``hf_config`` + the tokenizer's bos /
+   eos ids), the modeling files (``opt_moe/hf/``), the run's tokenizer files
+   (``hf_assets_path``), a generation config (the run's, else one with the bos /
+   eos ids) and a chat template (the run's, else
+   ``opt_moe/hf/chat_template.jinja``, the turns' text concatenated). A pretrain
+   run's assets have neither; vLLM needs both.
 
     python scripts/checkpoint_conversion/convert_opt_moe_to_hf.py \\
         <dump>/checkpoint/step-N <dump>/job_config.json <out> --export_dtype bfloat16
@@ -47,6 +49,7 @@ from torch.distributed.checkpoint.planner import (
 from torch.futures import Future
 
 from torchtitan.components.checkpointer import export_state_dict, ModelWrapper
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.evaluation.config import load_training_config
 from torchtitan.models.opt_moe import hf as hf_files
@@ -55,6 +58,8 @@ from torchtitan.models.opt_moe.state_dict_adapter import (
     hf_config,
     OPTMoEStateDictAdapter,
 )
+
+from transformers import GenerationConfig
 
 # The tokenizer files an HF folder carries (whichever the run's assets have).
 _TOKENIZER_FILES = (
@@ -135,8 +140,17 @@ class ParallelFileSystemReader(FileSystemReader):
 def _write_hf_files(
     model_config, hf_assets_path: Path, output_dir: Path, export_dtype: str
 ) -> None:
-    """config.json, the modeling files, the tokenizer files and a chat template."""
-    config = OptMoeConfig(**hf_config(model_config), torch_dtype=export_dtype)
+    """config.json (with the tokenizer's bos / eos ids), the modeling files, the
+    tokenizer files, a generation config and a chat template."""
+    token_ids = {}
+    if (hf_assets_path / "tokenizer.json").is_file():
+        tokenizer = HuggingFaceTokenizer.Config().build(
+            tokenizer_path=str(hf_assets_path)
+        )
+        token_ids = {"bos_token_id": tokenizer.bos_id, "eos_token_id": tokenizer.eos_id}
+    config = OptMoeConfig(
+        **hf_config(model_config), torch_dtype=export_dtype, **token_ids
+    )
     config.save_pretrained(output_dir)
     if OptMoeConfig.from_pretrained(output_dir).to_dict() != config.to_dict():
         raise RuntimeError(f"{output_dir}/config.json does not read back as written")
@@ -153,6 +167,10 @@ def _write_hf_files(
     )
     if not has_template:
         shutil.copy(hf_dir / "chat_template.jinja", output_dir / "chat_template.jinja")
+    # A pretrain run's assets carry no generation config: without its eos id,
+    # HF and vLLM generation would never stop.
+    if token_ids and not (output_dir / "generation_config.json").is_file():
+        GenerationConfig(**token_ids).save_pretrained(output_dir)
 
 
 @torch.inference_mode()

@@ -9,7 +9,9 @@ name = "vllm-opt-moe"
 version = "0.5.5"
 description = "vLLM plugin: torchtitan's opt_moe HF checkpoints (q / k / v short conv, sinks, gate, sigmoid MoE)"
 requires-python = ">=3.11"
-dependencies = ["vllm"]
+# The model uses vLLM's Inkling conv-state backend and kernel (vllm.models.inkling), internals
+# that change between builds: the build it was checked with.
+dependencies = ["vllm==1.0.0.dev20261030"]
 
 [project.entry-points."vllm.general_plugins"]
 register_opt_moe = "vllm_opt_moe:register"

@@ -49,6 +49,8 @@ def _torchtitan_model(**overrides):
         gated_attention_type="element-wise",
         num_mtp_layers=1,
         vocab_size=VOCAB,
+        # two KV groups: one would make every per-group layout trivially right
+        n_kv_heads=2,
     )
     cfg = build_model_config(
         "mis-8b-proxy",

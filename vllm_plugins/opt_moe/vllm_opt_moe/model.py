@@ -90,9 +90,9 @@ class OptMoeConvState(nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.kv_cache = torch.tensor([])
         tp = get_tensor_model_parallel_world_size()
-        if tp > config.num_key_value_heads:
-            raise NotImplementedError("vLLM opt_moe: TP above the KV head count")
-        self.num_kv_heads = config.num_key_value_heads // tp
+        # above the KV head count vLLM replicates each KV head over tp / G ranks:
+        # each rank keeps its one head's k / v state (q has none)
+        self.num_kv_heads = max(1, config.num_key_value_heads // tp)
         self.head_size = config.head_dim
         self.sliding_window = self.block_size = config.conv_kernel_size
         vllm_config = get_current_vllm_config()
@@ -224,6 +224,7 @@ class OptMoeAttention(nn.Module):
         d, k = config.hidden_size, config.head_dim
         self.n_heads = config.num_attention_heads // tp
         self.n_kv_heads = max(1, config.num_key_value_heads // tp)
+        self.total_kv_heads = config.num_key_value_heads
         self.head_dim = k
         self.q_size, self.kv_size = self.n_heads * k, self.n_kv_heads * k
         self.qkv_proj = QKVParallelLinear(
@@ -301,11 +302,16 @@ class OptMoeAttention(nn.Module):
 
     def _load_conv(self, param: nn.Parameter, loaded: torch.Tensor, shard: int):
         """An HF ``k_conv`` (shard 0) / ``v_conv`` (1) weight ``[G K, 1, W]``:
-        this rank's heads' rows into its half of ``conv_weight``."""
+        this rank's heads' rows into its half of ``conv_weight`` (above the KV
+        head count, the head vLLM's qkv_proj gives the rank: tp_rank //
+        replicas)."""
         rows = loaded.squeeze(1)
         n = self.kv_size
         if rows.shape[0] != n:
-            rows = rows.narrow(0, get_tensor_model_parallel_rank() * n, n)
+            tp = get_tensor_model_parallel_world_size()
+            replicas = max(1, tp // self.total_kv_heads)
+            shard_rank = get_tensor_model_parallel_rank() // replicas
+            rows = rows.narrow(0, shard_rank * n, n)
         param.data[shard * n : (shard + 1) * n].copy_(rows)
 
     def forward(self, positions: torch.Tensor, x_TD: torch.Tensor) -> torch.Tensor:

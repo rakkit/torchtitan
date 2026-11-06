@@ -89,8 +89,7 @@ greedy continuations of 48 tokens with the draft equal the ones without,
 
 ## Not yet supported
 
-- other `scoring_func`s than sigmoid;
-- tensor parallelism above the KV head count.
+- other `scoring_func`s than sigmoid.
 
 `max_position_embeddings` is the training context (`seq_len`) and caps vLLM's
 `max_model_len`.

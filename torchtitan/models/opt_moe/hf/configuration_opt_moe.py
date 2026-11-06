@@ -1,0 +1,132 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""The HF config of opt_moe (shipped with an HF checkpoint, loaded with
+``trust_remote_code``; no torchtitan import). Written from a torchtitan model
+config by ``torchtitan.models.opt_moe.state_dict_adapter.hf_config``."""
+
+from typing import Any
+
+from transformers import PretrainedConfig
+
+
+class OptMoeConfig(PretrainedConfig):
+    """Every architecture setting of an opt_moe model; per layer where the
+    model chooses per layer.
+
+    Attention: GQA (``num_attention_heads`` / ``num_key_value_heads`` x
+    ``head_dim``) with qk-norm (``qk_norm``); ``layer_types``
+    (``sliding_attention`` with ``sliding_window`` / ``full_attention``);
+    ``rope_layers`` (``{"dim", "theta"}``, None: NoPE; ``dim`` < ``head_dim``:
+    partial RoPE); ``attention_gate`` (None | ``element-wise``:
+    ``sigmoid(gate_proj(x))`` on the output); ``attention_sinks`` (one logit
+    per head in the softmax); ``conv_kernel_size`` / ``conv_streams`` (the
+    Canon short conv ``x + conv(x)`` on q / k / v or k / v, 0: none).
+
+    Feed-forward: the first ``first_k_dense_replace`` layers a SwiGLU FFN of
+    ``intermediate_size``, the rest MoE: ``n_routed_experts`` of
+    ``moe_intermediate_size``, a shared expert of
+    ``shared_expert_intermediate_size``, top ``num_experts_per_tok`` by
+    ``scoring_func`` (+ ``e_score_correction_bias`` for the choice when
+    ``router_bias``), weights renormalized (``norm_topk_prob``,
+    ``norm_topk_epsilon``) and scaled by ``routed_scaling_factor``.
+
+    Blocks: ``x = identity_scale * x + block_scale * f(x)`` per layer
+    (``residual_identity_scales`` / ``residual_block_scales``); RMSNorm
+    (``rms_norm_eps``, gains when ``norm_has_weight``).
+    ``num_nextn_predict_layers``: the MTP depths (DeepSeek-V3's MTP, HF layers
+    after the decoder layers)."""
+
+    model_type = "opt_moe"
+    keys_to_ignore_at_inference = ["past_key_values"]
+
+    def __init__(
+        self,
+        vocab_size: int = 201088,
+        hidden_size: int = 2048,
+        num_hidden_layers: int = 24,
+        max_position_embeddings: int = 4096,
+        tie_word_embeddings: bool = False,
+        rms_norm_eps: float = 1e-30,
+        norm_has_weight: bool = True,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int = 4,
+        head_dim: int = 128,
+        qk_norm: bool = True,
+        layer_types: list[str] | None = None,
+        sliding_window: int | None = None,
+        rope_layers: list[dict[str, Any] | None] | None = None,
+        attention_gate: str | None = None,
+        attention_sinks: bool = False,
+        conv_kernel_size: int = 0,
+        conv_streams: str | None = None,
+        first_k_dense_replace: int = 0,
+        intermediate_size: int | None = None,
+        moe_intermediate_size: int | None = None,
+        n_routed_experts: int | None = None,
+        shared_expert_intermediate_size: int | None = None,
+        num_experts_per_tok: int | None = None,
+        scoring_func: str | None = None,
+        norm_topk_prob: bool | None = None,
+        norm_topk_epsilon: float | None = None,
+        routed_scaling_factor: float | None = None,
+        router_bias: bool | None = None,
+        residual_block_scales: list[float] | None = None,
+        residual_identity_scales: list[float] | None = None,
+        num_nextn_predict_layers: int = 0,
+        hidden_act: str = "silu",
+        **kwargs: Any,
+    ):
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.max_position_embeddings = max_position_embeddings
+        self.rms_norm_eps = rms_norm_eps
+        self.norm_has_weight = norm_has_weight
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.qk_norm = qk_norm
+        self.layer_types = layer_types or ["full_attention"] * num_hidden_layers
+        self.sliding_window = sliding_window
+        self.rope_layers = (
+            rope_layers or [{"dim": head_dim, "theta": 10000.0}] * num_hidden_layers
+        )
+        self.attention_gate = attention_gate
+        self.attention_sinks = attention_sinks
+        self.conv_kernel_size = conv_kernel_size
+        self.conv_streams = conv_streams
+        self.first_k_dense_replace = first_k_dense_replace
+        self.intermediate_size = intermediate_size
+        self.moe_intermediate_size = moe_intermediate_size
+        self.n_routed_experts = n_routed_experts
+        self.shared_expert_intermediate_size = shared_expert_intermediate_size
+        self.num_experts_per_tok = num_experts_per_tok
+        self.scoring_func = scoring_func
+        self.norm_topk_prob = norm_topk_prob
+        self.norm_topk_epsilon = norm_topk_epsilon
+        self.routed_scaling_factor = routed_scaling_factor
+        self.router_bias = router_bias
+        self.residual_block_scales = residual_block_scales or [1.0] * num_hidden_layers
+        self.residual_identity_scales = (
+            residual_identity_scales or [1.0] * num_hidden_layers
+        )
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.hidden_act = hidden_act
+        for name in (
+            "layer_types",
+            "rope_layers",
+            "residual_block_scales",
+            "residual_identity_scales",
+        ):
+            if len(getattr(self, name)) != num_hidden_layers:
+                raise ValueError(
+                    f"{name} needs one entry per layer ({num_hidden_layers})"
+                )
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
+
+__all__ = ["OptMoeConfig"]

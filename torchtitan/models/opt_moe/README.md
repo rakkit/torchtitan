@@ -129,9 +129,12 @@ head `scion_normal_output` std 1; MoE: 64 routed experts + 1 shared, top 8,
 
 ## HF export
 
-`state_dict_adapter.py` maps the native state dict to HF-style names (fused
-projections split). The HF configuration / modeling files are written for this
-model in wave 5 of the `llm-0.5.4` plan.
+`state_dict_adapter.py` maps every native tensor to its HF name and back
+(fused projections split; the MTP depth is HF layer `L` with DeepSeek-V3's
+`enorm` / `hnorm` / `eh_proj` / `shared_head.norm`), and `hf_config` writes the
+HF config of a model config (`hf/configuration_opt_moe.py`, `model_type`
+`opt_moe`, loaded with `trust_remote_code`). The HF modeling file is not
+written yet.
 
 ## What the optimizer study measured (13.4B tokens, batch 128, run learning rates)
 

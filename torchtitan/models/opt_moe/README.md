@@ -155,7 +155,8 @@ A run's checkpoint becomes an HF folder with
         <dump>/checkpoint/step-N <dump>/job_config.json <out> --export_dtype bfloat16
 
 (the model rebuilt from `job_config.json`; config, HF files, tokenizer files,
-safetensors).
+safetensors). The run's EMA weights instead (an EMA copy, `--ema_key` when the
+run kept several): `convert_opt_moe_ema_to_hf.py`, same arguments.
 
 ## What the optimizer study measured (13.4B tokens, batch 128, run learning rates)
 

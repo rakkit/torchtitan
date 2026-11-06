@@ -24,6 +24,9 @@ Upstream's ``convert_to_hf.py`` (DCP load, ``export_state_dict``, the adapter's
    ``opt_moe/hf/chat_template.jinja``, the turns' text concatenated). A pretrain
    run's assets have neither; vLLM needs both.
 
+The run's EMA weights: ``convert_opt_moe_ema_to_hf.py`` (upstream's pair
+``convert_to_hf.py`` / ``convert_ema_to_hf.py``).
+
     python scripts/checkpoint_conversion/convert_opt_moe_to_hf.py \\
         <dump>/checkpoint/step-N <dump>/job_config.json <out> --export_dtype bfloat16
 """
@@ -173,34 +176,26 @@ def _write_hf_files(
         GenerationConfig(**token_ids).save_pretrained(output_dir)
 
 
-@torch.inference_mode()
-def convert_opt_moe_to_hf(
-    checkpoint_dir: Path,
-    job_config: Path,
-    output_dir: Path,
-    export_dtype: str,
-    *,
-    read_threads: int = 16,
-) -> None:
+def load_run_model(job_config: Path):
+    """The run (its training config) and its model, rebuilt from the run's
+    ``job_config.json`` without init: built on meta, materialized empty on CPU."""
     run = load_training_config(job_config).config
-    model_config = run.model
-    if model_config.name != "opt_moe":
-        raise ValueError(f"{job_config} is not an opt_moe run: {model_config.name}")
+    if run.model.name != "opt_moe":
+        raise ValueError(f"{job_config} is not an opt_moe run: {run.model.name}")
     with torch.device("meta"):
-        model = model_config.build()
+        model = run.model.build()
     model.to_empty(device="cpu")
+    return run, model
 
-    state_dict = ModelWrapper(model)._get_state_dict()
-    dcp.load(
-        state_dict,
-        storage_reader=ParallelFileSystemReader(
-            checkpoint_dir, thread_count=read_threads
-        ),
-    )
+
+def save_hf_folder(run, model, state_dict, output_dir: Path, export_dtype: str) -> None:
+    """``state_dict`` (native names) as a complete HF folder: the weights in
+    ``export_dtype`` (the adapter's fp32 tensors kept fp32), the config, the
+    modeling and tokenizer files, a generation config and a chat template."""
     state_dict = export_state_dict(
         state_dict, dtype=TORCH_DTYPE_MAP[export_dtype], model_parts=[model]
     )
-    adapter = OPTMoEStateDictAdapter(model_config, None)
+    adapter = OPTMoEStateDictAdapter(run.model, None)
     hf_state_dict = adapter.to_hf(state_dict)
     for key in hf_state_dict:
         if key.endswith(adapter.keep_in_fp32):
@@ -217,7 +212,27 @@ def convert_opt_moe_to_hf(
             thread_count_consolidation=5,
         ),
     )
-    _write_hf_files(model_config, Path(run.hf_assets_path), output_dir, export_dtype)
+    _write_hf_files(run.model, Path(run.hf_assets_path), output_dir, export_dtype)
+
+
+@torch.inference_mode()
+def convert_opt_moe_to_hf(
+    checkpoint_dir: Path,
+    job_config: Path,
+    output_dir: Path,
+    export_dtype: str,
+    *,
+    read_threads: int = 16,
+) -> None:
+    run, model = load_run_model(job_config)
+    state_dict = ModelWrapper(model)._get_state_dict()
+    dcp.load(
+        state_dict,
+        storage_reader=ParallelFileSystemReader(
+            checkpoint_dir, thread_count=read_threads
+        ),
+    )
+    save_hf_folder(run, model, state_dict, output_dir, export_dtype)
 
 
 if __name__ == "__main__":

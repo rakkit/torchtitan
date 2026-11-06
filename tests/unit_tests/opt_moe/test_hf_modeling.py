@@ -198,25 +198,15 @@ def test_the_transformers_forward_is_the_packed_forward():
     torch.testing.assert_close(got, packed, atol=1e-4, rtol=1e-4)
 
 
-def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
-    """convert_opt_moe_to_hf: a run's DCP checkpoint (its model rebuilt from
-    job_config.json) becomes a complete HF folder: AutoModelForCausalLM loads it
-    with trust_remote_code, every weight unchanged (fp32 export), and
-    AutoTokenizer loads it with a chat template. The run's assets are a pretrain
-    run's (a tokenizer, no chat template, no generation config): the folder gets
-    the placeholder template and a generation config with the bos / eos ids."""
+def _pretrain_run(tmp_path):
+    """A small opt_moe run as conversion sees it: its job_config.json and a
+    pretrain run's assets (a tokenizer, no chat template, no generation
+    config); the model built with random weights."""
     import json
     import shutil
     from pathlib import Path
 
-    import torch.distributed.checkpoint as dcp
-
-    from scripts.checkpoint_conversion.convert_opt_moe_to_hf import (
-        convert_opt_moe_to_hf,
-    )
-    from torchtitan.models.opt_moe import hf as hf_files
     from torchtitan_recipes.models.opt_moe import opt_moe_mis_8b
-    from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
     assets = tmp_path / "assets"
     shutil.copytree(Path(__file__).parents[2] / "assets" / "tokenizer", assets)
@@ -244,6 +234,36 @@ def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
     with torch.no_grad():
         for p in model.parameters():
             p.copy_(torch.randn_like(p))
+    return run, model
+
+
+def _hf_weights(folder):
+    from transformers import AutoModelForCausalLM
+
+    return AutoModelForCausalLM.from_pretrained(
+        folder, trust_remote_code=True, dtype=torch.float32
+    ).state_dict()
+
+
+def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
+    """convert_opt_moe_to_hf: a run's DCP checkpoint (its model rebuilt from
+    job_config.json) becomes a complete HF folder: AutoModelForCausalLM loads it
+    with trust_remote_code, every weight unchanged (fp32 export), and
+    AutoTokenizer loads it with a chat template. The run's assets are a pretrain
+    run's (a tokenizer, no chat template, no generation config): the folder gets
+    the placeholder template and a generation config with the bos / eos ids."""
+    import json
+    from pathlib import Path
+
+    import torch.distributed.checkpoint as dcp
+
+    from scripts.checkpoint_conversion.convert_opt_moe_to_hf import (
+        convert_opt_moe_to_hf,
+    )
+    from torchtitan.models.opt_moe import hf as hf_files
+    from transformers import AutoTokenizer, GenerationConfig
+
+    run, model = _pretrain_run(tmp_path)
     dcp.save(model.state_dict(), checkpoint_id=str(tmp_path / "step-1"))
 
     convert_opt_moe_to_hf(
@@ -267,11 +287,51 @@ def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
     generation = GenerationConfig.from_pretrained(out)
     assert (config["bos_token_id"], config["eos_token_id"]) == (2002, 2003)
     assert (generation.bos_token_id, generation.eos_token_id) == (2002, 2003)
-    hf = AutoModelForCausalLM.from_pretrained(
-        tmp_path / "hf", trust_remote_code=True, dtype=torch.float32
-    )
     want = OPTMoEStateDictAdapter(run.model, None).to_hf(model.state_dict())
-    got = hf.state_dict()
+    got = _hf_weights(out)
+    assert got.keys() == want.keys()
+    for key, value in want.items():
+        assert torch.equal(got[key], value), key
+
+
+def test_an_ema_copy_converts_in_place_of_the_trained_weights(tmp_path):
+    """convert_opt_moe_ema_to_hf: a checkpoint laid out as CheckpointManager
+    writes it (the model at the top level, two EMA copies under "ema") exports
+    the chosen copy's averages for every parameter and the trained buffers (the
+    router bias, not averaged); with two copies and no ema_key it refuses."""
+    import pytest
+    import torch.distributed.checkpoint as dcp
+
+    from scripts.checkpoint_conversion.convert_opt_moe_ema_to_hf import (
+        convert_opt_moe_ema_to_hf,
+    )
+    from torchtitan.components.checkpointer import ModelWrapper
+    from torchtitan.components.optim import EMA
+
+    run, model = _pretrain_run(tmp_path)
+    ema = EMA.Config(decays=[0.9, 0.99]).build(model_parts=[model])
+    averages = {}
+    for opt in ema._param_optimizers:
+        for group in opt.param_groups:
+            for name, tensor in zip(group["param_names"], group["params"]):
+                copies = opt.state[tensor]["ema_params"]
+                copies["decay_0p9"].copy_(3 * tensor.detach())
+                copies["decay_0p99"].copy_(-2 * tensor.detach())
+                averages[name] = copies["decay_0p99"].clone()
+    assert averages.keys() == dict(model.named_parameters()).keys()
+    dcp.save(
+        {"ema": ema, **ModelWrapper(model).state_dict()},
+        checkpoint_id=str(tmp_path / "step-1"),
+    )
+
+    args = (tmp_path / "step-1", tmp_path / "job_config.json")
+    with pytest.raises(ValueError, match="pass --ema_key"):
+        convert_opt_moe_ema_to_hf(*args, tmp_path / "hf", "float32")
+    convert_opt_moe_ema_to_hf(
+        *args, tmp_path / "hf", "float32", read_threads=4, ema_key="decay_0p99"
+    )
+    want = OPTMoEStateDictAdapter(run.model, None).to_hf(model.state_dict() | averages)
+    got = _hf_weights(tmp_path / "hf")
     assert got.keys() == want.keys()
     for key, value in want.items():
         assert torch.equal(got[key], value), key

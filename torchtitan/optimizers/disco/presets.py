@@ -33,7 +33,10 @@ from dataclasses import dataclass
 import torch
 
 from ..kernels.floors import SUMSQ_FLOOR
-from ..kernels.gram_newton_schulz import gram_polar_factor
+from ..kernels.gram_newton_schulz import (
+    gram_polar_factor,
+    resolve_gram_polar_express_kernels,
+)
 from ..kernels.zeropower import POLAR_EXPRESS_SAFETY_DEFAULT, zeropower_backends
 from .rules import (
     call_compiled,
@@ -166,6 +169,13 @@ class Orthogonalise(Compute):
     def __post_init__(self):
         if self.backend not in zeropower_backends or self.backend == "identity":
             raise ValueError(f"unknown backend {self.backend!r}")
+        if self.backend == "gram_polar_express" and torch.cuda.is_available():
+            # Import quack's GEMM now, at optimizer build: importing it registers
+            # a pytree node type, and doing that at the first optimizer step
+            # (after the model's first forward compiled) fails every compiled
+            # graph's pytree-registry guard, so FlexAttention recompiled and
+            # re-autotuned at step 2.
+            resolve_gram_polar_express_kernels()
         if (
             self.polar_express_safety != POLAR_EXPRESS_SAFETY_DEFAULT
             and self.backend not in POLAR_EXPRESS_BACKENDS

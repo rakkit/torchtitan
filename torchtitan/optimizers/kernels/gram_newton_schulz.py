@@ -69,6 +69,14 @@ _RESET_ITERATIONS = frozenset({2})
 _QUACK = None
 
 
+def resolve_gram_polar_express_kernels() -> None:
+    """Import quack's symmetric-GEMM kernels now (they are otherwise imported at
+    the first call). Importing quack registers a pytree node type, which fails
+    the pytree-registry guard of every graph compiled before it: call this
+    before the model's first compile."""
+    _quack_ops()
+
+
 def _quack_ops():
     """Symmetric-GEMM kernels if available, else plain torch matmuls."""
     global _QUACK

@@ -133,8 +133,19 @@ head `scion_normal_output` std 1; MoE: 64 routed experts + 1 shared, top 8,
 (fused projections split; the MTP depth is HF layer `L` with DeepSeek-V3's
 `enorm` / `hnorm` / `eh_proj` / `shared_head.norm`), and `hf_config` writes the
 HF config of a model config (`hf/configuration_opt_moe.py`, `model_type`
-`opt_moe`, loaded with `trust_remote_code`). The HF modeling file is not
-written yet.
+`opt_moe`, loaded with `trust_remote_code`). `hf/modeling_opt_moe.py`
+(`OptMoeForCausalLM`, no torchtitan import) does torchtitan's ops in
+torchtitan's order and dtypes: its forward equals torchtitan's bitwise (main
+and MTP logits, fp32 and bf16, torchtitan without its local_compile regions;
+`tests/unit_tests/opt_moe/test_hf_modeling.py`). It takes packed rows
+(`position_ids` restart per document) and has no generation cache (decoding is
+vLLM's). A run's checkpoint becomes an HF folder with
+
+    python scripts/checkpoint_conversion/convert_opt_moe_to_hf.py \
+        <dump>/checkpoint/step-N <dump>/job_config.json <out> --export_dtype bfloat16
+
+(the model rebuilt from `job_config.json`; config, HF files, tokenizer files,
+safetensors).
 
 ## What the optimizer study measured (13.4B tokens, batch 128, run learning rates)
 

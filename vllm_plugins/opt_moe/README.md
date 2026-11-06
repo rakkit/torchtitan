@@ -21,7 +21,7 @@ Per decoder layer, two caches:
 
 ```
 x -> RMSNorm -> qkv_proj -> [q|k|v] -> x + conv(x)   <- conv state: the last W - 1 raw
-                                                        q / k / v of each sequence
+                                                        q / k / v (or k / v) of each sequence
                             -> qk-norm -> RoPE (none on NoPE layers, partial RoPE)
                             -> Attention              <- KV cache (sinks, per-layer
                                                         sliding window)
@@ -33,7 +33,8 @@ x -> RMSNorm -> qkv_proj -> [q|k|v] -> x + conv(x)   <- conv state: the last W -
 The KV cache holds k and v after the conv, qk-norm and RoPE, and q is not
 cached, so the raw inputs the next step's conv needs are kept separately: as one
 more sliding-window KV cache per layer (window = block = the conv width), the
-three streams packed per KV head, read and written by vLLM's Inkling
+streams (q / k / v, or k / v for `conv_streams: kv`) packed per KV head, read
+and written by vLLM's Inkling
 `fused_sconv` kernel (insert + conv in one launch, the same path for prefill,
 decode and speculative tokens, CUDA-graph safe), as vLLM's Inkling model keeps
 its conv state. Weights in bf16; `--quantization fp8` quantizes the linears and
@@ -46,16 +47,39 @@ Tensor parallelism on nodes without NVSwitch (e.g. 4 x GH200) needs
 `VLLM_ALLREDUCE_USE_FLASHINFER=0`: FlashInfer's all-reduce falls back to its
 trtllm backend there, and the first forward hangs.
 
+## Speculative decoding with the MTP depths
+
+A folder with MTP depths (`num_nextn_predict_layers`, HF layers `L ..`) drafts
+with them, as DeepSeek / Qwen do:
+
+```bash
+vllm serve <folder> --trust-remote-code --dtype bfloat16 \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}'
+```
+
+The draft (`OptMoeMTP`, architecture `OptMoeMTPModel`) is torchtitan's MTP
+block: `shared_head.norm(layer(eh_proj(cat(enorm(e), hnorm(h)))))` on the
+target's pre-norm hidden state (the target applies its final norm in
+`compute_logits`), the decoder layer a copy of the last one, the embedding and
+lm_head shared with the target; more speculative tokens than depths reuse the
+depths. TODO: vLLM maps a target's `model_type` to its MTP draft only inside
+`SpeculativeConfig.hf_config_override`, with no entry for out-of-tree models;
+the plugin wraps that static method for `opt_moe`.
+
+Check (11-06; `check_vllm_mtp.py` in the user's configs): the every-feature
+4-layer model with one MTP depth, trained on a pattern whose token `t + 2` is
+token `t` + 1 (the draft needs the target's hidden state), bf16, eager: 16
+greedy continuations of 48 tokens with the draft equal the ones without,
+384 / 384 drafts accepted; with the draft's hidden state zeroed 11 / 741
+(0.015).
+
 ## Not yet supported
 
-- `conv_streams: kv` (the conv on k and v only), other `scoring_func`s than
-  sigmoid;
-- tensor parallelism above the KV head count;
-- the MTP depths (ignored, not refused: not loaded; speculative decoding with
-  them is a later step).
+- other `scoring_func`s than sigmoid;
+- tensor parallelism above the KV head count.
 
-Untested: partial RoPE (`rope.dim < head_dim`). `max_position_embeddings` is the
-training context (`seq_len`) and caps vLLM's `max_model_len`.
+`max_position_embeddings` is the training context (`seq_len`) and caps vLLM's
+`max_model_len`.
 
 ## Checks
 
@@ -68,7 +92,10 @@ tokens and of 40 decoded tokens past the window, |vLLM - HF fp32| mean 0.0002 /
 the conv broken to the identity 0.006 - 0.0075 (the check sees the conv). With
 2 KV heads (11-06), prefill / decode mean: TP 1 0.0002 / 0.0004, with CUDA
 graphs 0.0003 / 0.0004, TP 2 (custom all-reduce, CUDA graphs) 0.0003 / 0.0003,
-all at the floor; FP8 0.0009 / 0.0007 (max 0.0028).
+all at the floor; FP8 0.0009 / 0.0007 (max 0.0028). The conv on k / v only and
+partial RoPE (64 of 128 dims on the sliding-window layers), 2 KV heads, eager and
+CUDA graphs: prefill / decode mean 0.0002 / 0.0003-0.0004, max <= 0.0019, at the
+floor; k / v with the conv broken 0.009 (11-06).
 
 ## Speed of the conv
 

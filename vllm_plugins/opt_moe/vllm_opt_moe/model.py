@@ -60,6 +60,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.inkling.nvidia.ops import fused_sconv
 from vllm.models.inkling.nvidia.sconv_swa_attn import (
@@ -76,9 +77,9 @@ def _sliding(config, layer_idx: int) -> bool:
 
 class OptMoeConvState(nn.Module, AttentionLayerBase):
     """A layer's conv state: one sliding-window KV cache (window = block = the
-    conv width) holding, per KV head of this rank, its q heads' / k / v raw
-    inputs packed head-major into one width (padded to a power of two, as
-    Inkling's, so every layer's page is the same size). The convs read and
+    conv width) holding, per KV head of this rank, its q heads' (``conv_streams``
+    qkv) / k / v raw inputs packed head-major into one width (padded to a power
+    of two, as Inkling's, so every layer's page is the same size). The convs read and
     write it out of band (``OptMoeShortConv``); vLLM's Inkling sconv backend
     builds the block table / slot metadata."""
 
@@ -90,11 +91,15 @@ class OptMoeConvState(nn.Module, AttentionLayerBase):
         if tp > config.num_key_value_heads:
             raise NotImplementedError("vLLM opt_moe: TP above the KV head count")
         k = config.head_dim
-        q_width = config.num_attention_heads // config.num_key_value_heads * k
+        q_width = (
+            config.num_attention_heads // config.num_key_value_heads * k
+            if config.conv_streams == "qkv"
+            else 0
+        )
         self.num_kv_heads = config.num_key_value_heads // tp
         self.head_size = 1 << (q_width + 2 * k - 1).bit_length()
         self.sliding_window = self.block_size = config.conv_kernel_size
-        # per KV head: (offset, width) of q (its group's heads), k, v
+        # per KV head: (offset, width) of q (its group's heads; none for kv), k, v
         self.stream_ranges = ((0, q_width), (q_width, k), (q_width + k, k))
         vllm_config = get_current_vllm_config()
         self._dtype = vllm_config.model_config.dtype
@@ -184,7 +189,10 @@ def opt_moe_short_conv(
         m.query_start,
         offset,
         width,
-        owner.block_size,
+        # the cache's block size ([blocks, H, N, D]): vLLM enlarges the
+        # requested one (the conv width) when this page is smaller than the
+        # attention page (unify_kv_cache_spec_page_size), e.g. conv_streams kv
+        owner.kv_cache.shape[2],
         activation=None,
         use_residual=True,
     )
@@ -234,11 +242,13 @@ class OptMoeAttention(nn.Module):
         )
         self.conv_state = None
         if config.conv_kernel_size:
-            if config.conv_streams != "qkv":
-                raise NotImplementedError("vLLM opt_moe: conv_streams kv")
             w = config.conv_kernel_size
             self.conv_state = OptMoeConvState(config, prefix=f"{prefix}.conv_state")
-            self.q_conv = OptMoeShortConv(self.q_size, w, self.conv_state, 0)
+            self.q_conv = (
+                OptMoeShortConv(self.q_size, w, self.conv_state, 0)
+                if config.conv_streams == "qkv"
+                else None
+            )
             self.k_conv = OptMoeShortConv(self.kv_size, w, self.conv_state, 1)
             self.v_conv = OptMoeShortConv(self.kv_size, w, self.conv_state, 2)
         affine, eps = config.norm_has_weight, config.rms_norm_eps
@@ -292,7 +302,8 @@ class OptMoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(x_TD)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.conv_state is not None:
-            q = self.q_conv(q, positions)
+            if self.q_conv is not None:
+                q = self.q_conv(q, positions)
             k = self.k_conv(k, positions)
             v = self.v_conv(v, positions)
         if self.q_norm is not None:
@@ -466,7 +477,8 @@ class OptMoeModel(nn.Module):
         h = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         for layer in self.layers:
             h = layer(positions, h)
-        return self.norm(h)
+        # pre-norm: the MTP draft reads it (torchtitan's MTP does); compute_logits norms
+        return h
 
 
 class OptMoeForCausalLM(nn.Module):
@@ -499,73 +511,160 @@ class OptMoeForCausalLM(nn.Module):
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """The main model's tensors (the MTP depths, HF layers ``L ..``, are the
+        draft's: ``OptMoeMTP``)."""
+        n, tied = self.config.num_hidden_layers, self.config.tie_word_embeddings
+        return _load_weights(
+            self,
+            weights,
+            keep=lambda name: _layer_of(name) < n
+            and not (tied and name == "lm_head.weight"),
+        )
+
+
+class OptMoeMTPLayer(OptMoeDecoderLayer):
+    """One MTP depth: ``shared_head.norm(layer(eh_proj(cat(enorm(e), hnorm(h)))))``
+    with the decoder layer built as the last one (torchtitan's OPTMoEMTPBlock,
+    the HF model's OptMoeMTPLayer)."""
+
+    def __init__(self, config, *, cache_config, quant_config, prefix):
+        super().__init__(
+            config,
+            config.num_hidden_layers - 1,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        d, eps, affine = config.hidden_size, config.rms_norm_eps, config.norm_has_weight
+        self.enorm = RMSNorm(d, eps=eps, has_weight=affine)
+        self.hnorm = RMSNorm(d, eps=eps, has_weight=affine)
+        self.eh_proj = nn.Linear(2 * d, d, bias=False)
+        self.shared_head = nn.Module()
+        self.shared_head.norm = RMSNorm(d, eps=eps, has_weight=affine)
+
+    def forward(self, positions, embed_TD, prev_TD):  # pyrefly: ignore [bad-override]
+        h = self.eh_proj(torch.cat([self.enorm(embed_TD), self.hnorm(prev_TD)], dim=-1))
+        return self.shared_head.norm(super().forward(positions, h))
+
+
+class OptMoeMTP(nn.Module):
+    """The MTP depths as vLLM's speculative draft (``"method": "mtp"``, as for
+    DeepSeek / Qwen). Draft step ``k`` runs depth ``k % depths`` on the target's
+    pre-norm hidden state (step 0) or the previous step's output and returns
+    its normed output: the lm_head input and the next step's hidden state, as
+    torchtitan chains its depths. The embedding and lm_head are the target's
+    (vLLM shares them with an MTP draft); the checkpoint's MTP layers are HF
+    layers ``L ..``."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.speculative_config.draft_model_config.hf_config
+        self.config = config
+        n = config.num_hidden_layers
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleDict(
+            {
+                str(n + i): OptMoeMTPLayer(
+                    config,
+                    cache_config=vllm_config.cache_config,
+                    quant_config=vllm_config.quant_config,
+                    prefix=f"{maybe_prefix(prefix, 'model')}.layers.{n + i}",
+                )
+                for i in range(config.num_nextn_predict_layers)
+            }
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        hidden_states,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        spec_step_idx: int = 0,
+    ):
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
+        n, depths = self.config.num_hidden_layers, self.config.num_nextn_predict_layers
+        depth = self.model.layers[str(n + spec_step_idx % depths)]
+        return depth(positions, inputs_embeds, hidden_states)
+
+    def compute_logits(self, hidden_states, spec_step_idx: int = 0):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Our HF names (``hf/modeling_opt_moe.py``) onto this model: q / k / v
-        into qkv_proj, gate / up into gate_up_proj, the 3-D expert stacks one
-        expert at a time into FusedMoE; the q / k / v convs (same names) take
-        their rank's channels in their own loader; the MTP layers are skipped."""
-        params = dict(self.named_parameters())
-        tp, rank = (
-            get_tensor_model_parallel_world_size(),
-            get_tensor_model_parallel_rank(),
-        )
-        n_layers = self.config.num_hidden_layers
-        loaded = set()
-        for name, w in weights:
-            parts = name.split(".")
-            if name.startswith("model.layers.") and int(parts[2]) >= n_layers:
-                continue  # MTP depth
-            for shard, src in (("q", "q_proj"), ("k", "k_proj"), ("v", "v_proj")):
-                if f".self_attn.{src}." in name:
-                    key = name.replace(src, "qkv_proj")
+        n = self.config.num_hidden_layers
+        return _load_weights(self, weights, keep=lambda name: _layer_of(name) >= n)
+
+
+def _layer_of(name: str) -> int:
+    """The HF layer of a checkpoint tensor (-1: embedding, final norm, lm_head)."""
+    return int(name.split(".")[2]) if name.startswith("model.layers.") else -1
+
+
+def _load_weights(model: nn.Module, weights, *, keep) -> set[str]:
+    """Our HF names (``hf/modeling_opt_moe.py``) onto ``model``'s parameters,
+    the checkpoint tensors ``keep`` picks: q / k / v into qkv_proj, gate / up
+    into gate_up_proj, the 3-D expert stacks one expert at a time into
+    FusedMoE; the q / k / v convs (same names) take their rank's channels in
+    their own loader."""
+    params = dict(model.named_parameters())
+    tp, rank = (
+        get_tensor_model_parallel_world_size(),
+        get_tensor_model_parallel_rank(),
+    )
+    loaded = set()
+    for name, w in weights:
+        if not keep(name):
+            continue
+        for shard, src in (("q", "q_proj"), ("k", "k_proj"), ("v", "v_proj")):
+            if f".self_attn.{src}." in name:
+                key = name.replace(src, "qkv_proj")
+                params[key].weight_loader(params[key], w, shard)
+                loaded.add(key)
+                break
+        else:
+            if ".mlp.experts.gate_up_proj" in name or ".mlp.experts.down_proj" in name:
+                loaded |= _load_experts(params, name, w)
+                continue
+            for shard, src in ((0, "gate_proj"), (1, "up_proj")):
+                if f".mlp.{src}." in name or f".shared_experts.{src}." in name:
+                    key = name.replace(src, "gate_up_proj")
                     params[key].weight_loader(params[key], w, shard)
                     loaded.add(key)
                     break
             else:
-                if (
-                    ".mlp.experts.gate_up_proj" in name
-                    or ".mlp.experts.down_proj" in name
-                ):
-                    loaded |= self._load_experts(params, name, w)
-                    continue
-                for shard, src in ((0, "gate_proj"), (1, "up_proj")):
-                    if f".mlp.{src}." in name or f".shared_experts.{src}." in name:
-                        key = name.replace(src, "gate_up_proj")
-                        params[key].weight_loader(params[key], w, shard)
-                        loaded.add(key)
-                        break
-                else:
-                    if name == "lm_head.weight" and self.config.tie_word_embeddings:
-                        continue  # the embedding's (one parameter, loaded once)
-                    if name.endswith(".self_attn.sinks"):
-                        w = w.chunk(tp)[rank]
-                    param = params[name]
-                    getattr(param, "weight_loader", default_weight_loader)(param, w)
-                    loaded.add(name)
-        return loaded
+                if name.endswith(".self_attn.sinks"):
+                    w = w.chunk(tp)[rank]
+                param = params[name]
+                getattr(param, "weight_loader", default_weight_loader)(param, w)
+                loaded.add(name)
+    return loaded
 
-    def _load_experts(self, params, name: str, w_EXY: torch.Tensor) -> set[str]:
-        prefix = name.rsplit(".mlp.experts.", 1)[0] + ".mlp.experts."
-        if name.endswith("gate_up_proj"):
-            f = w_EXY.shape[1] // 2
-            targets = (
-                ("w13_weight", "w1", w_EXY[:, :f]),
-                ("w13_weight", "w3", w_EXY[:, f:]),
-            )
-        else:
-            targets = (("w2_weight", "w2", w_EXY),)
-        out = set()
-        for param_name, shard, w in targets:
-            # FusedMoE keeps them in a submodule (``routed_experts`` in vLLM 1.0)
-            (key,) = [
-                k for k in params if k.startswith(prefix) and k.endswith(param_name)
-            ]
-            param = params[key]
-            for expert in range(w.shape[0]):
-                param.weight_loader(
-                    param, w[expert], key, shard_id=shard, expert_id=expert
-                )
-            out.add(key)
-        return out
+
+def _load_experts(params, name: str, w_EXY: torch.Tensor) -> set[str]:
+    prefix = name.rsplit(".mlp.experts.", 1)[0] + ".mlp.experts."
+    if name.endswith("gate_up_proj"):
+        f = w_EXY.shape[1] // 2
+        targets = (
+            ("w13_weight", "w1", w_EXY[:, :f]),
+            ("w13_weight", "w3", w_EXY[:, f:]),
+        )
+    else:
+        targets = (("w2_weight", "w2", w_EXY),)
+    out = set()
+    for param_name, shard, w in targets:
+        # FusedMoE keeps them in a submodule (``routed_experts`` in vLLM 1.0)
+        (key,) = [k for k in params if k.startswith(prefix) and k.endswith(param_name)]
+        param = params[key]
+        for expert in range(w.shape[0]):
+            param.weight_loader(param, w[expert], key, shard_id=shard, expert_id=expert)
+        out.add(key)
+    return out

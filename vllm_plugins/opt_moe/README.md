@@ -71,12 +71,12 @@ FP8 (online, from the bf16 folder), TP 1, one GH200, CUDA graphs, a 41.4B /
 width 640, SWA 512 at 5:1) with vs without the q / k / v conv, random weights,
 1,024-token prompts, 256 decoded tokens, 3 fresh processes each (11-06):
 
-| batch | decode ms / step, conv / no conv | prefill ms, conv / no conv |
-|---|---|---|
-| 1 | 8.05 / 7.55 (+6.6%) | 124 / 110 (+13%) |
-| 16 | 13.89 / 13.09 (+6.1%) | 137 / 118 (+16%) |
-| 64 | 20.44 / 19.59 (+4.3%) | 192 / 143 (+33%) |
-| 256 | 30.25 / 29.25 (+3.4%) | 491 / 260 (+88%) |
+| batch | decode ms / step, conv / no conv |
+|---|---|
+| 1 | 8.05 / 7.55 (+6.6%) |
+| 16 | 13.89 / 13.09 (+6.1%) |
+| 64 | 20.44 / 19.59 (+4.3%) |
+| 256 | 30.25 / 29.25 (+3.4%) |
 
-Not profiled yet: in prefill the conv state is written for every prompt token,
-the three streams padded to a power-of-two width, by three launches per layer.
+Prefill not measured yet: that run's prefill timings were prefix-cache hits
+(the timed calls repeated the warm-up's prompts).

@@ -31,6 +31,10 @@ from typing import Any, Literal
 from torch import nn
 
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config.transform import (
+    ModelConfigConverter,
+    validate_converter_compatibility,
+)
 from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.activation import Sigmoid, Softmax, SqrtSoftplus
 from torchtitan.models.common.attention import (
@@ -818,12 +822,15 @@ def build_model_config(
     parallelism: ParallelismConfig,
     seq_len: int | None = None,
     rope_length: int | None = None,
+    converters: list[ModelConfigConverter.Config] | None = None,
     **overrides: Any,
 ) -> OPTMoEModel.Config:
     """The complete, sharded config of ``flavor`` for ``parallelism``, with the
     recipe's ``overrides`` (they replace the flavor's settings of the same
     name). ``seq_len``: the training context (default: the flavor's);
-    ``rope_length``: a longer RoPE cache (validation sequences)."""
+    ``rope_length``: a longer RoPE cache (validation sequences); ``converters``:
+    model config converters applied to the result (e.g. TitanRL's fp32
+    lm_head)."""
     if flavor not in MODEL_FLAVORS:
         raise ValueError(
             f"Unknown opt_moe flavor {flavor!r}; available: {', '.join(MODEL_FLAVORS)}"
@@ -864,6 +871,10 @@ def build_model_config(
                 ),
             }
         ).transform(config)
+    if converters is not None:
+        validate_converter_compatibility(converters)
+        for c in converters:
+            config = c.build().convert(config)
     config.flavor = flavor
     config.build_args = copy.deepcopy(overrides)
     return config

@@ -43,6 +43,7 @@ from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.dist_moe import DistMoeRuntime
+from torchtitan.models.opt_moe.gated_swa_attention import GatedSWAttention
 from torchtitan.rl.generator.engine import ModelStateDictLoadMode
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 
@@ -250,7 +251,12 @@ def register_to_vllm(
     has_kda = any(
         isinstance(layer.attention, KDA.Config) for layer in model_config.layers
     )
-    if has_gdn or has_kda:
+    has_conv = any(
+        isinstance(layer.attention, GatedSWAttention.Config)
+        and layer.attention.k_conv is not None
+        for layer in model_config.layers
+    )
+    if has_gdn or has_kda or has_conv:
         # Attention Gym's paged linear-attention kernels require channels to
         # be contiguous in vLLM's convolution state cache.
         os.environ["VLLM_SSM_CONV_STATE_LAYOUT"] = "SD"
@@ -301,6 +307,12 @@ def register_to_vllm(
         )
 
         maybe_configure_kda_hybrid_model(VLLMModelFromSpec, model_config)
+    if has_conv:
+        from torchtitan.rl.generator.vllm.attention.short_conv import (
+            maybe_configure_short_conv_hybrid_model,
+        )
+
+        maybe_configure_short_conv_hybrid_model(VLLMModelFromSpec, model_config)
     ModelRegistry.register_model(VLLM_MODEL_NAME, VLLMModelFromSpec)
 
     # Dynamic config parser class capturing the model config in the closure. This

@@ -51,6 +51,7 @@ from torchtitan.models.common.attention.gdn import GDN
 from torchtitan.models.common.attention.kda import KDA
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.dist_moe import DistMoeRoutedExperts, DistMoeRuntime
+from torchtitan.models.opt_moe.gated_swa_attention import GatedSWAttention
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
 from torchtitan.rl.generator.engine import ModelStateDictLoadMode
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
@@ -122,9 +123,10 @@ def _replace_vllm_layer_configs(model_config):
                     head_dim=head_dim,
                     value_head_dim=value_head_dim,
                     scale=attention_cfg.softmax_scale,
-                    sliding_window_size=getattr(
-                        attention_cfg, "sliding_window_size", None
-                    ),
+                    # The inner attention implements the window (opt_moe sets it
+                    # there only); GPT-OSS also keeps it on the attention.
+                    sliding_window_size=getattr(kernel_cfg, "sliding_window_size", None)
+                    or getattr(attention_cfg, "sliding_window_size", None),
                     sharding_config=kernel_cfg.sharding_config,
                 )
                 if is_mla:
@@ -138,6 +140,19 @@ def _replace_vllm_layer_configs(model_config):
                 attention_cfg,
                 inner_attention=vllm_attention_cfg,
             )
+            if (
+                isinstance(attention_cfg, GatedSWAttention.Config)
+                and attention_cfg.k_conv is not None
+            ):
+                from torchtitan.rl.generator.vllm.attention.short_conv import (
+                    generation_short_conv_config,
+                )
+
+                # opt_moe's Canon short conv on vLLM's paged per-sequence state
+                attention_cfg = dataclasses.replace(
+                    attention_cfg,
+                    short_conv=generation_short_conv_config(attention_cfg, layer_idx),
+                )
             new_layer_cfg = dataclasses.replace(
                 new_layer_cfg,
                 attention=attention_cfg,
@@ -731,19 +746,27 @@ class VLLMModelWrapper(Module):
 
     # TODO: followup with potentially adding extra kwarg ``sinks`` to vLLM attn
     def _inject_attention_sinks(self) -> None:
-        """Give each gpt-oss attention's vLLM backend its sink-rescale hook."""
+        """Give each gpt-oss / opt_moe sink attention's vLLM backend its
+        sink-rescale hook (VLLMInnerAttention ignores ``out_transform``)."""
         from torchtitan.models.gpt_oss.model import (
             apply_attention_sink_rescale,
             GptOssAttention,
         )
+        from torchtitan.models.opt_moe.gated_swa_attention import (
+            apply_attention_sink_rescale as opt_moe_sink_rescale,
+        )
 
         for module in self.model.modules():
-            if not isinstance(module, GptOssAttention):
+            if isinstance(module, GptOssAttention):
+                rescale = apply_attention_sink_rescale
+            elif isinstance(module, GatedSWAttention) and module.sinks is not None:
+                rescale = opt_moe_sink_rescale
+            else:
                 continue
             # Read sinks per call: FSDP swaps the parameter between its sharded
             # and unsharded tensors and frees the sharded storage after unsharding.
             module.inner_attention.vllm_attn.impl.out_transform = (
-                lambda out, lse, attention=module: apply_attention_sink_rescale(
+                lambda out, lse, attention=module, rescale=rescale: rescale(
                     out, lse, attention.sinks
                 )
             )

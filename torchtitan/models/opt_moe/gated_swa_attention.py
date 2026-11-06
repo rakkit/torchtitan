@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch_remat as remat
@@ -13,6 +13,7 @@ from torch import nn
 from torchtitan.distributed.local_compile import local_compile
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
+from torchtitan.models.base.module import Module
 from torchtitan.models.common.attention import (
     FlexAttentionMetadata,
     GQAttention,
@@ -91,6 +92,28 @@ def canon_short_conv(
     return conv_1TC.squeeze(0) + x_TC
 
 
+class CanonShortConv(Module):
+    """The short conv's computation ``x + conv(x)`` (``canon_short_conv``)
+    as a component without parameters (the attention owns the conv weights),
+    so that an inference engine can swap in a version that keeps each
+    sequence's last ``W - 1`` inputs (TitanRL's generator)."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        pass
+
+    def __init__(self, config: Config):
+        super().__init__()
+
+    def forward(
+        self,
+        x_TC: torch.Tensor,
+        weight_C1W: torch.Tensor,
+        conv_metadata: LinearAttentionMetadata | None,
+    ) -> torch.Tensor:
+        return canon_short_conv(x_TC, weight_C1W, conv_metadata)
+
+
 # Attention sinks: a copy of gpt_oss's apply_attention_sink_rescale (same math),
 # compiled as its own region; opt_moe does not import gpt_oss code.
 @local_compile("opt_moe_sink_rescale", batch_invariant=True)
@@ -127,6 +150,8 @@ class GatedSWAttention(GQAttention):
         v_conv: Conv1d.Config | None = None
         """The Canon short conv ``x + conv(x)`` on q, k and v (k and v together;
         q optional; None: no conv)."""
+        short_conv: CanonShortConv.Config = field(default_factory=CanonShortConv.Config)
+        """The conv's computation (with the convs above)."""
         attention_sinks: bool = False
         """A learned logit per head in the softmax denominator (gpt-oss), the
         parameter ``sinks``, initialized from ``param_init["sinks"]``."""
@@ -157,6 +182,9 @@ class GatedSWAttention(GQAttention):
         self.q_conv = config.q_conv.build() if config.q_conv is not None else None
         self.k_conv = config.k_conv.build() if config.k_conv is not None else None
         self.v_conv = config.v_conv.build() if config.v_conv is not None else None
+        self.short_conv = (
+            config.short_conv.build() if config.k_conv is not None else None
+        )
         if self.k_conv is not None:
             require_attn_gym(
                 causal_conv1d, context_parallel_conv_history, ContextParallelRouting
@@ -201,12 +229,16 @@ class GatedSWAttention(GQAttention):
         # The q / k / v preparation reads the projection's outputs with bare ops.
         remat.recompute_needs_tensor(xq, xk, xv)
         if self.k_conv is not None and self.q_conv is None:
-            xk = canon_short_conv(
-                xk.flatten(-2), self.k_conv.weight, conv_metadata
-            ).view_as(xk)
-            xv = canon_short_conv(
-                xv.flatten(-2), self.v_conv.weight, conv_metadata
-            ).view_as(xv)
+            # k and v in one call (the conv is depthwise): one conv state in
+            # generation, as the q / k / v call
+            kv_TC = self.short_conv(
+                torch.cat([xk.flatten(-2), xv.flatten(-2)], dim=-1),
+                torch.cat([self.k_conv.weight, self.v_conv.weight]),
+                conv_metadata,
+            )
+            k_TC, v_TC = kv_TC.chunk(2, dim=-1)
+            xk = k_TC.reshape(xk.shape).contiguous()
+            xv = v_TC.reshape(xv.shape).contiguous()
         if self.q_norm is not None:
             xq = self.q_norm(xq)
         if self.k_norm is not None:
@@ -259,7 +291,7 @@ class GatedSWAttention(GQAttention):
             ],
             dim=1,
         ).view(-1, 1, W)
-        qkv_TC = canon_short_conv(qkv_TC, weight_C1W, conv_metadata)
+        qkv_TC = self.short_conv(qkv_TC, weight_C1W, conv_metadata)
         T = qkv_TC.shape[0]
         qkv_TGRK = qkv_TC.view(T, G, -1, K)
         xq, xk, xv = torch.split(qkv_TGRK, [self.qkv_linear.heads_per_kv, 1, 1], dim=-2)

@@ -103,6 +103,53 @@ def test_vllm_replacement_preserves_full_attention_selection(build_config) -> No
         assert inner_attention.build_attention_metadata(torch.arange(8)) is None
 
 
+def _opt_moe_config(conv_streams="qkv"):
+    from torchtitan.models.opt_moe import build_model_config as build_opt_moe_config
+
+    return build_opt_moe_config(
+        "mis-8b-proxy",
+        parallelism=ParallelismConfig(),
+        n_layers=4,
+        swa_pattern="SSSF",
+        rope_pattern="RRRN",
+        sliding_window_size=16,
+        attn_backend="varlen",
+        conv_kernel_size=4,
+        conv_streams=conv_streams,
+        n_kv_heads=2,
+    )
+
+
+def test_vllm_replacement_keeps_the_inner_attentions_sliding_window() -> None:
+    """opt_moe sets the window on its inner attention only: the vLLM attention
+    must get it, or the sliding-window layers generate with full attention."""
+    vllm_config = _replace_vllm_layer_configs(_opt_moe_config())
+    windows = [
+        layer.attention.inner_attention.sliding_window_size
+        for layer in vllm_config.layers
+    ]
+    assert windows == [16, 16, 16, None]
+
+
+@pytest.mark.parametrize("conv_streams,heads", [("qkv", 12), ("kv", 4)])
+def test_vllm_replacement_runs_opt_moe_convs_on_paged_state(
+    conv_streams, heads
+) -> None:
+    """opt_moe's conv becomes the paged-state conv over the width of its one
+    call: 8 q + 2 k + 2 v heads of 128 (qkv), 2 k + 2 v (kv)."""
+    from torchtitan.rl.generator.vllm.attention.short_conv import VLLMCanonShortConv
+
+    vllm_config = _replace_vllm_layer_configs(_opt_moe_config(conv_streams))
+    for layer_idx, layer in enumerate(vllm_config.layers):
+        conv = layer.attention.short_conv
+        assert isinstance(conv, VLLMCanonShortConv.Config)
+        assert (conv.layer_idx, conv.num_channels, conv.conv_kernel_size) == (
+            layer_idx,
+            heads * 128,
+            4,
+        )
+
+
 @pytest.mark.parametrize("sliding_window_size", [None, 128])
 def test_vllm_attention_classifies_sliding_window(sliding_window_size) -> None:
     config = VLLMInnerAttention.Config(

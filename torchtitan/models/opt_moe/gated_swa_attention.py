@@ -185,23 +185,22 @@ class GatedSWAttention(GQAttention):
     ) -> torch.Tensor:
         """``conv_metadata``: the short conv's document offsets (the model's
         ``ShortConvDocuments`` entry)."""
-        xq, xk, xv = self.qkv_linear(x_TD)
+        if self.k_conv is not None and conv_metadata is None and positions is not None:
+            # Packed documents without their offsets: the conv would run across them.
+            raise ValueError(
+                "the short conv needs its document offsets (the model's "
+                "_get_attention_metadata) when positions are given"
+            )
+        # The Canon short conv (on q, k and v, or k and v only), the QK norm
+        # (before RoPE, per Qwen3), then RoPE (partial, or none for NoPE).
+        if self.q_conv is not None:
+            xq, xk, xv = self._qkv_with_conv(x_TD, conv_metadata)
+        else:
+            xq, xk, xv = self.qkv_linear(x_TD)
         gate = self.gate_proj(x_TD) if self.gate_proj is not None else None
         # The q / k / v preparation reads the projection's outputs with bare ops.
         remat.recompute_needs_tensor(xq, xk, xv)
-        # The Canon short conv (on q, k and v, or k and v only), the QK norm
-        # (before RoPE, per Qwen3), then RoPE (partial, or none for NoPE).
-        if self.k_conv is not None:
-            if conv_metadata is None and positions is not None:
-                # Packed documents without their offsets: the conv would run across them.
-                raise ValueError(
-                    "the short conv needs its document offsets (the model's "
-                    "_get_attention_metadata) when positions are given"
-                )
-            if self.q_conv is not None:
-                xq = canon_short_conv(
-                    xq.flatten(-2), self.q_conv.weight, conv_metadata
-                ).view_as(xq)
+        if self.k_conv is not None and self.q_conv is None:
             xk = canon_short_conv(
                 xk.flatten(-2), self.k_conv.weight, conv_metadata
             ).view_as(xk)
@@ -233,6 +232,42 @@ class GatedSWAttention(GQAttention):
             remat.recompute_needs_tensor(gate)
         # Not in the compiled region: wo declares its own remat regions.
         return self.wo(self._flatten_attention_output(output, gate))
+
+    def _qkv_with_conv(
+        self,
+        x_TD: torch.Tensor,
+        conv_metadata: LinearAttentionMetadata | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """q, k and v with the Canon short conv in ONE call: wqkv, the conv over
+        its whole output, then QKVLinear's split. The conv is depthwise, so this
+        is the three per-stream convs; its weight is the q / k / v conv weights
+        interleaved per KV group as wqkv's rows (each group: its q heads, its k,
+        its v), built at forward from the three parameters, which keeps the
+        state dict, the HF format and the optimizer groups per stream. Bypasses
+        ``QKVLinear.forward`` (its spmd ``local_map`` declares TP placements,
+        and opt_moe refuses TP)."""
+        qkv_TC = self.qkv_linear.wqkv(x_TD)
+        # The conv reads the wqkv projection output with bare ops.
+        remat.recompute_needs_tensor(qkv_TC)
+        G, K = self.n_kv_heads, self.head_dim
+        W = self.k_conv.weight.shape[-1]
+        weight_C1W = torch.cat(
+            [
+                self.q_conv.weight.view(G, -1, W),
+                self.k_conv.weight.view(G, K, W),
+                self.v_conv.weight.view(G, K, W),
+            ],
+            dim=1,
+        ).view(-1, 1, W)
+        qkv_TC = canon_short_conv(qkv_TC, weight_C1W, conv_metadata)
+        T = qkv_TC.shape[0]
+        qkv_TGRK = qkv_TC.view(T, G, -1, K)
+        xq, xk, xv = torch.split(qkv_TGRK, [self.qkv_linear.heads_per_kv, 1, 1], dim=-2)
+        return (
+            xq.reshape(T, -1, K).contiguous(),
+            xk.reshape(T, -1, K).contiguous(),
+            xv.reshape(T, -1, K).contiguous(),
+        )
 
     def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
         return apply_attention_sink_rescale(out, lse, self.sinks)

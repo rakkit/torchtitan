@@ -17,16 +17,17 @@ contiguous sharding and head-tail load balancing; the flex (fp32) and varlen
 import pytest
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
 )
 
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.context_parallel import HeadTailCPLoadBalancer
 from torchtitan.models.opt_moe import build_model_config
+from torchtitan.models.opt_moe.mtp import MTPCrossEntropyLoss, roll_mtp_sequence
 
 CP = 4
 T = 1024
@@ -57,6 +58,7 @@ def _model(parallelism: ParallelismConfig, backend: str, dtype: torch.dtype):
         sinks_init_fn_type="trunc_normal",
         sinks_init_std=0.5,
         gated_attention_type="element-wise",
+        num_mtp_layers=1,
     )
     with torch.device("meta"):
         model = cfg.build()
@@ -100,14 +102,27 @@ class TestContextParallel(DTensorTestBase):
                 for name, p in reference.named_parameters():
                     if "_conv." in name:
                         p.add_(0.3 * torch.randn_like(p))
-            logits = reference(
-                tokens,
+            rolled, valid = roll_mtp_sequence(
+                tokens, shift=1, fill_value=0, positions_T=positions
+            )
+            mtp_labels, _ = roll_mtp_sequence(
+                labels, shift=1, fill_value=IGNORE_INDEX, positions_T=positions
+            )
+            counts = torch.stack(
+                [(labels != IGNORE_INDEX).sum(), (mtp_labels != IGNORE_INDEX).sum()]
+            )
+            loss_fn = MTPCrossEntropyLoss(MTPCrossEntropyLoss.Config(mtp_scale=0.3))
+            predictions = reference(
+                (tokens, rolled),
                 positions=positions,
                 attention_metadata=reference._get_attention_metadata(
                     positions, max_num_documents=MAX_DOCUMENTS
                 ),
+                mtp_input_valid_masks=(valid,),
             )
-            want_loss = F.cross_entropy(logits.float(), labels, reduction="sum") / T
+            want_loss, _ = loss_fn(
+                tuple(p.float() for p in predictions), (labels, mtp_labels), counts
+            )
             want_loss.backward()
             want_grads = {n: p.grad for n, p in reference.named_parameters()}
             for balancer in (None, HeadTailCPLoadBalancer.Config()):
@@ -125,12 +140,11 @@ class TestContextParallel(DTensorTestBase):
                             parallelism=parallelism,
                             max_num_documents=MAX_DOCUMENTS,
                         )
-                        local_logits = model(inputs, **model_kwargs)
-                        local_loss = (
-                            F.cross_entropy(
-                                local_logits.float(), local_labels, reduction="sum"
-                            )
-                            / T
+                        local_predictions = model(inputs, **model_kwargs)
+                        local_loss, _ = loss_fn(
+                            tuple(p.float() for p in local_predictions),
+                            local_labels,
+                            counts,
                         )
                         local_loss.backward()
                     loss = local_loss.detach().clone()

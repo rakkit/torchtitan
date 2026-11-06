@@ -191,3 +191,62 @@ def test_eval_mode_skips_the_mtp_depth():
         eval_out = _forward(model, tokens, positions)
     assert len(train_out) == 2 and len(eval_out) == 1
     assert torch.equal(eval_out[0], train_out[0])
+
+
+def test_parallelize_treats_the_mtp_block_as_a_decoder_block(tmp_path):
+    """FSDP wraps the MTP block and activation remat checkpoints it, as a
+    decoder block (both walk `layers`); `layers` holds the decoder blocks
+    only afterwards. Fake process group, CPU: no collective runs."""
+    from unittest import mock
+
+    import torch.distributed as dist
+    from torch.testing._internal.distributed.fake_pg import FakeStore
+
+    from torchtitan.config import PrecisionConfig
+    from torchtitan.distributed import ParallelismContext
+    from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
+    from torchtitan.distributed.local_compile import LocalCompileConfig
+
+    dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=2)
+    try:
+        parallelism = ParallelismConfig(data_parallel_shard_degree=2)
+        pc = ParallelismContext(
+            dp_replicate=1,
+            dp_shard=2,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=2,
+            enable_sequence_parallel=False,
+        )
+        with mock.patch(
+            "torchtitan.distributed.parallelism_context.device_type", "cpu"
+        ):
+            pc.build_mesh()
+        cfg = build_model_config(
+            "mis-8b-proxy",
+            parallelism=parallelism,
+            seq_len=128,
+            n_layers=2,
+            swa_pattern="SF",
+            rope_pattern=None,
+            num_mtp_layers=1,
+        )
+        with torch.device("meta"):
+            model = cfg.build()
+        block = model.mtp_layers[0]
+        plain_forward = block.forward
+        model.parallelize(
+            parallelism_context=pc,
+            precision=PrecisionConfig(),
+            parallelism=parallelism,
+            local_compile=LocalCompileConfig(regions=[]),
+            activation_remat=DefaultActivationRematConfig(),
+            dump_folder=str(tmp_path),
+        )
+        assert list(model.layers.keys()) == ["0", "1"]
+        assert "FSDP" in type(block).__name__
+        assert block.forward is not plain_forward  # remat.checkpoint's wrapper
+    finally:
+        dist.destroy_process_group()

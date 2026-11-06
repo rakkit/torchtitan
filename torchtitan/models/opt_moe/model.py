@@ -258,7 +258,23 @@ class OPTMoEModel(Decoder):
                 f"has {got}: build it with build_model_config for the run's "
                 "parallelism (a command-line override of these comes too late)"
             )
-        return super().parallelize(parallelism=parallelism, **kwargs)
+        try:
+            return super().parallelize(parallelism=parallelism, **kwargs)
+        finally:
+            for key in self._listed_mtp_keys:
+                del self.layers[key]
+            self._listed_mtp_keys = []
+
+    def _parallelize(self, parallelism_context: ParallelismContext) -> None:
+        """Upstream's sharding of every module; then, for the steps of
+        ``parallelize`` that walk ``layers`` (activation remat, FSDP wrapping
+        and prefetch), the MTP blocks are listed there after the decoder
+        blocks, as decoder blocks, until ``parallelize`` returns."""
+        super()._parallelize(parallelism_context)
+        for i, block in enumerate(self.mtp_layers or ()):
+            key = str(len(self.config.layers) + i)
+            self.layers[key] = block
+            self._listed_mtp_keys.append(key)
 
     def _apply_fsdp(
         self,
@@ -275,33 +291,23 @@ class OPTMoEModel(Decoder):
 
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
         edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
-        # The MTP blocks are sharded as the decoder blocks: listed after them in
-        # `layers` for the call (apply_fsdp_to_decoder walks `layers`).
-        mtp_keys = []
-        for i, block in enumerate(self.mtp_layers or ()):
-            mtp_keys.append(str(len(self.layers) + i))
-            self.layers[mtp_keys[-1]] = block
-        try:
-            apply_fsdp_to_decoder(
-                self,
-                dp_mesh,
-                param_dtype=TORCH_DTYPE_MAP[precision.param_dtype],
-                reduce_dtype=TORCH_DTYPE_MAP[precision.reduce_dtype],
-                pp_enabled=parallelism_context.pp_enabled,
-                cpu_offload=parallelism.fsdp_enable_cpu_offloading,
-                reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-                ep_degree=parallelism_context.ep,
-                edp_mesh=edp_mesh,
-                dp_mesh_dims=dp_mesh_dims,
-                edp_mesh_dims=edp_mesh_dims,
-                symm_mem_scope=parallelism.fsdp_symm_mem_scope,
-                # DiSCO runs each expert's rule on the rank's LOCAL expert rows
-                # with no gather, so a rank must own whole expert matrices.
-                expert_shard_dim=0,
-            )
-        finally:
-            for key in mtp_keys:
-                del self.layers[key]
+        apply_fsdp_to_decoder(
+            self,
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[precision.param_dtype],
+            reduce_dtype=TORCH_DTYPE_MAP[precision.reduce_dtype],
+            pp_enabled=parallelism_context.pp_enabled,
+            cpu_offload=parallelism.fsdp_enable_cpu_offloading,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            ep_degree=parallelism_context.ep,
+            edp_mesh=edp_mesh,
+            dp_mesh_dims=dp_mesh_dims,
+            edp_mesh_dims=edp_mesh_dims,
+            symm_mem_scope=parallelism.fsdp_symm_mem_scope,
+            # DiSCO runs each expert's rule on the rank's LOCAL expert rows
+            # with no gather, so a rank must own whole expert matrices.
+            expert_shard_dim=0,
+        )
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
@@ -360,6 +366,7 @@ class OPTMoEModel(Decoder):
     def __init__(self, config: Config):
         super().__init__(config)
         self.mtp_layers: ModuleList | None = None
+        self._listed_mtp_keys: list[str] = []
         if config.mtp_layers:
             self.mtp_layers = ModuleList()
             for layer_config in config.mtp_layers:
@@ -525,8 +532,22 @@ class OPTMoEModel(Decoder):
             ):
                 raise ValueError("MTP: one validity mask per MTP depth")
             tokens, *mtp_tokens = tokens
-        # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
-        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+        # In eval mode (validation, offline evaluation: they score the main
+        # prediction) the MTP depths do not run.
+        run_mtp = self.mtp_layers is not None and self.training
+        if run_mtp:
+            # One embedding call for the main and the MTP tokens: FSDP gathers
+            # the embedding once.
+            embedded = self.tok_embeddings(torch.cat([tokens, *mtp_tokens]))
+            h, *mtp_embeds = embedded.split(tokens.shape[0])
+        else:
+            mtp_embeds = []
+            # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
+            h = (
+                self.tok_embeddings(tokens)
+                if self.tok_embeddings is not None
+                else tokens
+            )
         # Upstream's aux-loss normaliser: the step-global routed-token count (one
         # per block; every block routes the same tokens), as Decoder.forward.
         with spmd.no_typecheck():
@@ -575,13 +596,10 @@ class OPTMoEModel(Decoder):
         prev_hidden = h  # the MTP depths read the pre-norm hidden state
         h = self.norm(h) if self.norm is not None else h
         outputs = [h]
-        # In eval mode (validation, offline evaluation: they score the main
-        # prediction) the MTP depths do not run.
-        run_mtp = self.mtp_layers is not None and self.training
-        for depth, (layer, depth_tokens, valid) in enumerate(
+        for depth, (layer, depth_embed, valid) in enumerate(
             zip(
                 self.mtp_layers if run_mtp else (),
-                mtp_tokens if run_mtp else (),
+                mtp_embeds,
                 mtp_input_valid_masks if run_mtp else (),
                 strict=True,
             ),
@@ -594,7 +612,7 @@ class OPTMoEModel(Decoder):
                     else aux_loss_denominators[depth]
                 )
             prev_hidden = layer(
-                self.tok_embeddings(depth_tokens),
+                depth_embed,
                 prev_hidden,
                 valid,
                 None

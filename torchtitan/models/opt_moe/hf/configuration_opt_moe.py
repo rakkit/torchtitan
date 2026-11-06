@@ -13,13 +13,20 @@ from typing import Any
 from transformers import PretrainedConfig
 
 
+_LAYER_TYPES = {"full_attention", "sliding_attention"}
+_CONV_LAYER_TYPES = {"hybrid", "hybrid_sliding"}
+
+
 class OptMoeConfig(PretrainedConfig):
     """Every architecture setting of an opt_moe model; per layer where the
     model chooses per layer.
 
     Attention: GQA (``num_attention_heads`` / ``num_key_value_heads`` x
-    ``head_dim``) with qk-norm (``qk_norm``); ``layer_types``
-    (``sliding_attention`` with ``sliding_window`` / ``full_attention``);
+    ``head_dim``) with qk-norm (``qk_norm``); ``layer_types``, transformers'
+    cache layer types: ``sliding_attention`` (with ``sliding_window``) /
+    ``full_attention``, and with a conv ``hybrid_sliding`` / ``hybrid`` (the
+    cache keeps the K / V and the conv inputs' last ``conv_kernel_size`` taps,
+    ``number_of_conv_states`` of them: one per conv stream);
     ``rope_layers`` (``{"dim", "theta"}``, None: NoPE; ``dim`` < ``head_dim``:
     partial RoPE); ``attention_gate`` (None | ``element-wise``:
     ``sigmoid(gate_proj(x))`` on the output); ``attention_sinks`` (one logit
@@ -78,6 +85,7 @@ class OptMoeConfig(PretrainedConfig):
         residual_identity_scales: list[float] | None = None,
         num_nextn_predict_layers: int = 0,
         hidden_act: str = "silu",
+        use_cache: bool = True,
         **kwargs: Any,
     ):
         self.vocab_size = vocab_size
@@ -116,6 +124,13 @@ class OptMoeConfig(PretrainedConfig):
         )
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.hidden_act = hidden_act
+        self.use_cache = use_cache
+        allowed = _CONV_LAYER_TYPES if conv_kernel_size else _LAYER_TYPES
+        if not set(self.layer_types) <= allowed:
+            raise ValueError(
+                f"layer_types {sorted(set(self.layer_types))}: with conv_kernel_size "
+                f"{conv_kernel_size} each layer is one of {sorted(allowed)}"
+            )
         for name in (
             "layer_types",
             "rope_layers",
@@ -127,6 +142,12 @@ class OptMoeConfig(PretrainedConfig):
                     f"{name} needs one entry per layer ({num_hidden_layers})"
                 )
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
+    @property
+    def number_of_conv_states(self) -> int:
+        """The conv states a ``hybrid`` cache layer keeps (transformers'
+        ``DynamicCache`` reads it): one per conv stream, q / k / v or k / v."""
+        return 3 if self.conv_streams == "qkv" else 2
 
 
 __all__ = ["OptMoeConfig"]

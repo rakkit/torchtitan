@@ -147,8 +147,13 @@ def hf_config(model_config: Any) -> dict[str, Any]:
         "num_key_value_heads": attn.n_kv_heads,
         "head_dim": qkv.head_dim,
         "qk_norm": attn.qk_norm is not None,
+        # transformers' cache layer types: a conv layer is "hybrid" (K / V and
+        # conv states in one cache layer)
         "layer_types": [
-            "full_attention" if w is None else "sliding_attention" for w in windows
+            ("hybrid" if conv is not None else "full_attention")
+            if w is None
+            else ("hybrid_sliding" if conv is not None else "sliding_attention")
+            for w in windows
         ],
         "sliding_window": next(iter(window), None),
         "rope_layers": [rope(l) for l in layers],

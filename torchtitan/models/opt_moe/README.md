@@ -134,12 +134,22 @@ head `scion_normal_output` std 1; MoE: 64 routed experts + 1 shared, top 8,
 `enorm` / `hnorm` / `eh_proj` / `shared_head.norm`), and `hf_config` writes the
 HF config of a model config (`hf/configuration_opt_moe.py`, `model_type`
 `opt_moe`, loaded with `trust_remote_code`). `hf/modeling_opt_moe.py`
-(`OptMoeForCausalLM`, no torchtitan import) does torchtitan's ops in
-torchtitan's order and dtypes: its forward equals torchtitan's bitwise (main
-and MTP logits, fp32 and bf16, torchtitan without its local_compile regions;
-`tests/unit_tests/opt_moe/test_hf_modeling.py`). It takes packed rows
-(`position_ids` restart per document) and has no generation cache (decoding is
-vLLM's). A run's checkpoint becomes an HF folder with
+(`OptMoeForCausalLM`, no torchtitan import) has two forwards over the same
+weights (`tests/unit_tests/opt_moe/test_hf_modeling.py`):
+
+- `packed_forward`: packed rows (`position_ids` restart per document) with
+  torchtitan's ops in torchtitan's order and dtypes (FlexAttention, attn_gym's
+  conv): torchtitan's forward bitwise (main and MTP logits, fp32 and bf16,
+  torchtitan without its local_compile regions).
+- `forward`, what `generate` calls: `[B, T]` rows with left padding, a
+  `DynamicCache` from the config's `layer_types` (a conv layer is `hybrid` /
+  `hybrid_sliding`: K / V plus each conv stream's last inputs), eager attention
+  in fp32 with the sinks as one more softmax logit, a torch conv. It rounds
+  differently from `packed_forward` (other kernels); a cached decode gives the
+  full forward's logits and a left-padded batch each row's tokens. Serving
+  speed is vLLM's.
+
+A run's checkpoint becomes an HF folder with
 
     python scripts/checkpoint_conversion/convert_opt_moe_to_hf.py \
         <dump>/checkpoint/step-N <dump>/job_config.json <out> --export_dtype bfloat16

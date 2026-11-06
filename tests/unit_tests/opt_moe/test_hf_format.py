@@ -80,7 +80,9 @@ def test_values_come_back_unchanged():
 def test_hf_config_states_the_architecture():
     cfg = _config("mis-8b-proxy", **_ALL_FEATURES)
     c = OptMoeConfig(**hf_config(cfg))
-    assert c.layer_types == ["sliding_attention", "sliding_attention", "full_attention"]
+    # with the conv: transformers' hybrid cache layers (K / V + the q / k / v conv states)
+    assert c.layer_types == ["hybrid_sliding", "hybrid_sliding", "hybrid"]
+    assert c.number_of_conv_states == 3
     assert c.rope_layers[2] is None and c.rope_layers[0]["dim"] == 128
     assert (c.first_k_dense_replace, c.intermediate_size) == (1, 256)
     assert (c.conv_kernel_size, c.conv_streams) == (4, "qkv")

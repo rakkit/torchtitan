@@ -5,12 +5,18 @@
 # LICENSE file in the root directory of this source tree.
 
 """The HF model (hf/modeling_opt_moe.py), loaded from a torchtitan state dict
-through the adapter, reproduces torchtitan's forward bitwise: the main and the
-MTP logits of a model with every feature (conv on q / k / v, sinks, gate, a
-sliding-window, a full and a NoPE layer, a dense and two MoE layers with a
-shared expert and the router bias, one MTP depth), packed documents, fp32 and
-bf16. torchtitan runs without its local_compile regions (they fuse the same
-element-wise ops, so they round differently)."""
+through the adapter, on a model with every feature (conv on q / k / v, sinks,
+gate, a sliding-window, a full and a NoPE layer, a dense and two MoE layers with
+a shared expert and the router bias, one MTP depth):
+
+- ``packed_forward`` reproduces torchtitan's forward bitwise: the main and the
+  MTP logits, packed documents, fp32 and bf16 (torchtitan without its
+  local_compile regions: they fuse the same element-wise ops, so they round
+  differently);
+- the transformers ``forward`` (``generate``): a cached decode past the sliding
+  window gives the full forward's logits, a left-padded batch gives each row's
+  own greedy tokens, and one document's logits are ``packed_forward``'s up to
+  the kernels' rounding."""
 
 import pytest
 import torch
@@ -29,7 +35,7 @@ DOCS = [70, 1, 185]
 VOCAB = 512
 
 
-def _torchtitan_model():
+def _torchtitan_model(**overrides):
     cfg = build_model_config(
         "mis-8b-proxy",
         parallelism=ParallelismConfig(),
@@ -46,6 +52,7 @@ def _torchtitan_model():
         gated_attention_type="element-wise",
         num_mtp_layers=1,
         vocab_size=VOCAB,
+        **overrides,
     )
     with torch.device("meta"):
         model = cfg.build()
@@ -96,14 +103,89 @@ def test_hf_forward_is_torchtitan_forward_bitwise(dtype):
             attention_metadata=tt._get_attention_metadata(positions),
             mtp_input_valid_masks=(valid,),
         )
-        hidden = hf.model(
+        hidden = hf.model.packed_forward(
             tokens, positions, mtp_input_ids=(rolled,), mtp_valid=(valid,)
         )
         got_main, got_mtp = (hf.lm_head(h) for h in hidden)
-        out = hf(tokens.view(1, -1), position_ids=positions.view(1, -1))
+        out = hf.packed_forward(tokens.view(1, -1), position_ids=positions.view(1, -1))
     assert torch.equal(got_main, want_main)
     assert torch.equal(got_mtp, want_mtp)
     assert torch.equal(out.logits.view_as(want_main), want_main)
+
+
+def _hf_model(dtype=torch.float32, **overrides):
+    """The HF model of ``_torchtitan_model(**overrides)``'s weights, in eval."""
+    cfg, tt = _torchtitan_model(**overrides)
+    hf = OptMoeForCausalLM(OptMoeConfig(**hf_config(cfg))).cuda()
+    hf.load_state_dict(OPTMoEStateDictAdapter(cfg, None).to_hf(tt.state_dict()))
+    for name, p in hf.named_parameters():
+        if not name.endswith("e_score_correction_bias"):
+            p.data = p.data.to(dtype)
+    return hf.eval()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="grouped GEMMs need CUDA")
+def test_cached_decode_gives_the_full_forward():
+    """A 21-token prefill, then 19 one-token steps through the DynamicCache
+    (its K / V, its sliding-window layers past their 16-token window, its conv
+    states): every position's logits are the full forward's (fp32, the same
+    math over other shapes)."""
+    hf = _hf_model(sliding_window_size=16)
+    torch.manual_seed(2)
+    tokens = torch.randint(0, VOCAB, (1, 40), device="cuda")
+    with torch.no_grad():
+        full = hf(tokens, use_cache=False).logits
+        out = hf(tokens[:, :21], use_cache=True)
+        cache, steps = out.past_key_values, [out.logits]
+        for i in range(21, 40):
+            out = hf(tokens[:, i : i + 1], past_key_values=cache, use_cache=True)
+            steps.append(out.logits)
+    assert cache.get_seq_length() == 40
+    torch.testing.assert_close(torch.cat(steps, dim=1), full, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="grouped GEMMs need CUDA")
+def test_a_left_padded_batch_generates_each_rows_tokens():
+    """``generate`` on two left-padded prompts (13 and 29 tokens, the window 16
+    exceeded) gives each prompt's greedy tokens and logits alone: the padding is
+    masked in attention and enters the conv as the zero history a row starts
+    from."""
+    hf = _hf_model(sliding_window_size=16)
+    hf.generation_config.pad_token_id = 0
+    torch.manual_seed(3)
+    prompts = [torch.randint(1, VOCAB, (n,), device="cuda") for n in (13, 29)]
+    greedy = {"max_new_tokens": 8, "do_sample": False}
+    greedy |= {"return_dict_in_generate": True, "output_logits": True}
+    alone = []
+    with torch.no_grad():
+        for p in prompts:
+            alone.append(hf.generate(p.view(1, -1), **greedy))
+        width = max(p.numel() for p in prompts)
+        ids = torch.zeros(len(prompts), width, dtype=torch.long, device="cuda")
+        mask = torch.zeros_like(ids)
+        for row, p in enumerate(prompts):
+            ids[row, width - p.numel() :] = p
+            mask[row, width - p.numel() :] = 1
+        batch = hf.generate(ids, attention_mask=mask, **greedy)
+    for row, (p, own) in enumerate(zip(prompts, alone, strict=True)):
+        assert torch.equal(batch.sequences[row, width:], own.sequences[0, p.numel() :])
+        for got, want in zip(batch.logits, own.logits, strict=True):
+            torch.testing.assert_close(got[row], want[0], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="flex / conv need CUDA")
+def test_the_transformers_forward_is_the_packed_forward():
+    """One document: the transformers forward (eager attention, torch conv)
+    gives ``packed_forward``'s logits (FlexAttention, attn_gym's conv) up to
+    the kernels' rounding (fp32)."""
+    torch._dynamo.reset()
+    hf = _hf_model()
+    torch.manual_seed(4)
+    tokens = torch.randint(0, VOCAB, (1, 200), device="cuda")
+    with torch.no_grad():
+        packed = hf.packed_forward(tokens).logits
+        got = hf(tokens, use_cache=False).logits
+    torch.testing.assert_close(got, packed, atol=1e-4, rtol=1e-4)
 
 
 def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):

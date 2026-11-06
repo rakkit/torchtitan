@@ -39,6 +39,12 @@ DOCS = [300, 1, 450, 273]
 MAX_DOCUMENTS = 8
 # backend -> (dtype, the largest |g_cp - g| / |g| per parameter and for the loss)
 BACKENDS = {"flex": (torch.float32, 1e-5), "varlen": (torch.bfloat16, 2e-2)}
+# The largest per-token cross-entropy difference CP vs one rank (nats): a bug at
+# a shard or document edge moves a few tokens by O(0.1 - 1), which a
+# whole-tensor norm above can dilute. Measured (4 GPUs, 11-06): flex fp32
+# 4.8e-7 / 9.5e-7, varlen bf16 5.0e-4 (without / with the head-tail balancer);
+# the bounds are 10x those.
+TOKEN_TOL = {"flex": 1e-5, "varlen": 5e-3}
 
 
 def _model(parallelism: ParallelismConfig, backend: str, dtype: torch.dtype):
@@ -132,6 +138,12 @@ class TestContextParallel(DTensorTestBase):
             )
             want_loss.backward()
             want_grads = {n: p.grad for n, p in reference.named_parameters()}
+            want_token_loss = torch.nn.functional.cross_entropy(
+                predictions[0].detach().float(),
+                labels,
+                reduction="none",
+                ignore_index=IGNORE_INDEX,
+            )
             for balancer in (None, HeadTailCPLoadBalancer.Config()):
                 with self.subTest(backend=backend, load_balancer=balancer):
                     parallelism = ParallelismConfig(
@@ -141,8 +153,22 @@ class TestContextParallel(DTensorTestBase):
                     model = _model(parallelism, backend, dtype)
                     model.load_state_dict(reference.state_dict())
                     with pc.activate_spmd():
-                        inputs, local_labels, model_kwargs, _ = model.preprocess_inputs(
-                            {"input": tokens, "labels": labels, "positions": positions},
+                        # the token index rides along as a loss kwarg: sharded
+                        # as the labels, so each rank knows its tokens
+                        (
+                            inputs,
+                            local_labels,
+                            model_kwargs,
+                            extra,
+                        ) = model.preprocess_inputs(
+                            {
+                                "input": tokens,
+                                "labels": labels,
+                                "positions": positions,
+                                "loss_kwargs": {
+                                    "token_index": torch.arange(T, device="cuda")
+                                },
+                            },
                             parallelism_context=pc,
                             parallelism=parallelism,
                             max_num_documents=MAX_DOCUMENTS,
@@ -154,9 +180,27 @@ class TestContextParallel(DTensorTestBase):
                             counts,
                         )
                         local_loss.backward()
+                        local_token_loss = torch.nn.functional.cross_entropy(
+                            local_predictions[0].detach().float(),
+                            local_labels[0],
+                            reduction="none",
+                            ignore_index=IGNORE_INDEX,
+                        )
                     loss = local_loss.detach().clone()
                     dist.all_reduce(loss)
                     self.assertLess(_relative(loss, want_loss.detach()), tol)
+                    index = torch.empty(T, dtype=torch.long, device="cuda")
+                    token_loss = torch.empty(T, device="cuda")
+                    dist.all_gather_into_tensor(
+                        index, extra["token_index"].contiguous()
+                    )
+                    dist.all_gather_into_tensor(
+                        token_loss, local_token_loss.contiguous()
+                    )
+                    got_token_loss = torch.full_like(want_token_loss, float("nan"))
+                    got_token_loss[index] = token_loss
+                    worst = (got_token_loss - want_token_loss).abs().max().item()
+                    self.assertLess(worst, TOKEN_TOL[backend])
                     for name, p in model.named_parameters():
                         grad = p.grad.clone()
                         dist.all_reduce(grad)  # each rank holds its tokens' share

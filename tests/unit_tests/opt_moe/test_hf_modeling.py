@@ -143,8 +143,22 @@ def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
     dcp.save(model.state_dict(), checkpoint_id=str(tmp_path / "step-1"))
 
     convert_opt_moe_to_hf(
-        tmp_path / "step-1", tmp_path / "job_config.json", tmp_path / "hf", "float32"
+        tmp_path / "step-1",
+        tmp_path / "job_config.json",
+        tmp_path / "hf",
+        "float32",
+        read_threads=4,
     )
+    # The run has no tokenizer assets (a pretrain run has no chat template):
+    # the folder carries the placeholder template, which vLLM needs.
+    from pathlib import Path
+
+    from torchtitan.models.opt_moe import hf as hf_files
+
+    placeholder = Path(hf_files.__file__).parent / "chat_template.jinja"
+    assert (
+        tmp_path / "hf" / "chat_template.jinja"
+    ).read_text() == placeholder.read_text()
     hf = AutoModelForCausalLM.from_pretrained(
         tmp_path / "hf", trust_remote_code=True, dtype=torch.float32
     )

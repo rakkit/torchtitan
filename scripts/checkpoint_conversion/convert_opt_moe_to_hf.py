@@ -4,25 +4,47 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""An opt_moe run's DCP checkpoint -> an HF folder (``trust_remote_code``).
+"""An opt_moe run's DCP checkpoint -> a complete HF folder (``trust_remote_code``).
 
-The model is the run's own, rebuilt from its ``job_config.json`` (flavor and
-the recipe's overrides, as offline evaluation); the folder holds
-``config.json`` (``state_dict_adapter.hf_config``), the HF model files
-(``torchtitan/models/opt_moe/hf/``), the run's tokenizer files
-(``hf_assets_path``) and the weights as safetensors::
+Upstream's ``convert_to_hf.py`` (DCP load, ``export_state_dict``, the adapter's
+``to_hf``, ``HuggingFaceStorageWriter``), plus what an opt_moe run needs:
+
+1. The run's own model, rebuilt from its ``job_config.json`` (flavor and the
+   recipe's overrides, as offline evaluation), not a flavor name.
+2. No init: the model is built on the meta device and materialized empty.
+   Building it on CPU would run ``nn.Linear``'s default init over every matrix
+   (and the recipe's own init is an SVD per matrix); every tensor comes from the
+   checkpoint anyway.
+3. The checkpoint's shard files read by a thread pool
+   (``ParallelFileSystemReader``).
+4. A complete folder: ``config.json`` (``hf_config``), the modeling files
+   (``opt_moe/hf/``), the run's tokenizer files (``hf_assets_path``) and a chat
+   template: the run's, else ``opt_moe/hf/chat_template.jinja`` (the turns'
+   text, concatenated: a pretrain run has none, and vLLM needs one).
 
     python scripts/checkpoint_conversion/convert_opt_moe_to_hf.py \\
         <dump>/checkpoint/step-N <dump>/job_config.json <out> --export_dtype bfloat16
 """
 
 import argparse
+import io
+import json
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import cast
 
 import torch
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint import HuggingFaceStorageWriter
+from torch.distributed._shard._utils import narrow_tensor_by_index
+from torch.distributed.checkpoint import FileSystemReader, HuggingFaceStorageWriter
+from torch.distributed.checkpoint.planner import (
+    LoadItemType,
+    LoadPlan,
+    LoadPlanner,
+    ReadItem,
+)
+from torch.futures import Future
 
 from torchtitan.components.checkpointer import export_state_dict, ModelWrapper
 from torchtitan.config import TORCH_DTYPE_MAP
@@ -44,18 +66,119 @@ _TOKENIZER_FILES = (
 )
 
 
+class ParallelFileSystemReader(FileSystemReader):
+    """``FileSystemReader`` reading the checkpoint's shard files on a thread pool.
+
+    TODO: torch's ``FileSystemReader.read_data`` reads the files one after
+    another in the calling thread, which serializes an I/O-bound load of
+    hundreds of shard files (one per training rank). This runs its per-file
+    body (torch 2.16) on ``thread_count`` threads; each file's items are read
+    and committed independently.
+    """
+
+    def __init__(self, path: str | Path, *, thread_count: int) -> None:
+        super().__init__(path)
+        self.thread_count = thread_count
+
+    def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
+        per_file: dict[str, list[ReadItem]] = {}
+        for item in plan.items:
+            path = self.storage_data[item.storage_index].relative_path
+            per_file.setdefault(path, []).append(item)
+        # No more threads than files (more has been seen to hang).
+        workers = max(1, min(self.thread_count, len(per_file)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda kv: self._read_file(*kv, planner), per_file.items()))
+        fut: Future = Future()
+        fut.set_result(None)
+        return fut
+
+    def _read_file(
+        self, relative_path: str, reqs: list[ReadItem], planner: LoadPlanner
+    ) -> None:
+        with self.fs.create_stream(
+            self.fs.concat_path(self.path, relative_path), "rb"
+        ) as stream:
+            for req in reqs:
+                item_md = self.storage_data[req.storage_index]
+                transform_from = self.transforms.transform_load_stream(
+                    req,
+                    item_md.transform_descriptors or (),
+                    self._slice_file(stream, item_md),
+                )
+                if req.type == LoadItemType.BYTE_IO:
+                    read_bytes = io.BytesIO(transform_from.read(-1))
+                    read_bytes.seek(0)
+                    planner.load_bytes(req, read_bytes)
+                    continue
+                if transform_from.seekable():
+                    seekable = transform_from
+                else:
+                    seekable = io.BytesIO(transform_from.read(-1))
+                    seekable.seek(0)
+                tensor = cast(
+                    torch.Tensor,
+                    torch.load(seekable, map_location="cpu", weights_only=True),
+                )
+                tensor = narrow_tensor_by_index(
+                    tensor, req.storage_offsets, req.lengths
+                )
+                target = planner.resolve_tensor(req).detach()
+                if target.size() != tensor.size():
+                    raise AssertionError(
+                        f"req {req.storage_index} mismatch sizes {target.size()} vs {tensor.size()}"
+                    )
+                target.copy_(tensor)
+                planner.commit_tensor(req, target)
+
+
+def _write_hf_files(
+    model_config, hf_assets_path: Path, output_dir: Path, export_dtype: str
+) -> None:
+    """config.json, the modeling files, the tokenizer files and a chat template."""
+    config = OptMoeConfig(**hf_config(model_config), torch_dtype=export_dtype)
+    config.save_pretrained(output_dir)
+    if OptMoeConfig.from_pretrained(output_dir).to_dict() != config.to_dict():
+        raise RuntimeError(f"{output_dir}/config.json does not read back as written")
+    hf_dir = Path(hf_files.__file__).parent
+    for name in ("configuration_opt_moe.py", "modeling_opt_moe.py"):
+        shutil.copy(hf_dir / name, output_dir / name)
+    for name in _TOKENIZER_FILES:
+        if (hf_assets_path / name).is_file():
+            shutil.copy(hf_assets_path / name, output_dir / name)
+    tokenizer_config = output_dir / "tokenizer_config.json"
+    has_template = (output_dir / "chat_template.jinja").is_file() or (
+        tokenizer_config.is_file()
+        and "chat_template" in json.loads(tokenizer_config.read_text())
+    )
+    if not has_template:
+        shutil.copy(hf_dir / "chat_template.jinja", output_dir / "chat_template.jinja")
+
+
 @torch.inference_mode()
 def convert_opt_moe_to_hf(
-    checkpoint_dir: Path, job_config: Path, output_dir: Path, export_dtype: str
+    checkpoint_dir: Path,
+    job_config: Path,
+    output_dir: Path,
+    export_dtype: str,
+    *,
+    read_threads: int = 16,
 ) -> None:
     run = load_training_config(job_config).config
     model_config = run.model
     if model_config.name != "opt_moe":
         raise ValueError(f"{job_config} is not an opt_moe run: {model_config.name}")
-    with torch.device("cpu"):
+    with torch.device("meta"):
         model = model_config.build()
+    model.to_empty(device="cpu")
+
     state_dict = ModelWrapper(model)._get_state_dict()
-    dcp.load(state_dict, checkpoint_id=str(checkpoint_dir))
+    dcp.load(
+        state_dict,
+        storage_reader=ParallelFileSystemReader(
+            checkpoint_dir, thread_count=read_threads
+        ),
+    )
     state_dict = export_state_dict(
         state_dict, dtype=TORCH_DTYPE_MAP[export_dtype], model_parts=[model]
     )
@@ -76,16 +199,7 @@ def convert_opt_moe_to_hf(
             thread_count_consolidation=5,
         ),
     )
-    OptMoeConfig(**hf_config(model_config), torch_dtype=export_dtype).save_pretrained(
-        output_dir
-    )
-    hf_dir = Path(hf_files.__file__).parent
-    for name in ("configuration_opt_moe.py", "modeling_opt_moe.py"):
-        shutil.copy(hf_dir / name, output_dir / name)
-    assets = Path(run.hf_assets_path)
-    for name in _TOKENIZER_FILES:
-        if (assets / name).is_file():
-            shutil.copy(assets / name, output_dir / name)
+    _write_hf_files(model_config, Path(run.hf_assets_path), output_dir, export_dtype)
 
 
 if __name__ == "__main__":
@@ -98,7 +212,17 @@ if __name__ == "__main__":
         choices=["float16", "bfloat16", "float32"],
         default="bfloat16",
     )
+    parser.add_argument(
+        "--read_threads",
+        type=int,
+        default=16,
+        help="threads reading the checkpoint's shard files",
+    )
     args = parser.parse_args()
     convert_opt_moe_to_hf(
-        args.checkpoint_dir, args.job_config, args.output_dir, args.export_dtype
+        args.checkpoint_dir,
+        args.job_config,
+        args.output_dir,
+        args.export_dtype,
+        read_threads=args.read_threads,
     )

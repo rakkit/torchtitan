@@ -68,9 +68,9 @@ def _torchtitan_model():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="flex / conv need CUDA")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_hf_forward_is_torchtitan_forward_bitwise(dtype):
-    # Both models' compiled FlexAttention start from the same state: with
-    # torch.compile's default dynamic=None, one that has seen other shapes
-    # (earlier tests) runs a dynamic-shape kernel, rounding differently.
+    # Both models' FlexAttention compile from the same state: what compiled
+    # before (other shapes, kernels autotuned under other load) can give one
+    # of them a different kernel, which rounds differently.
     torch._dynamo.reset()
     cfg, tt = _torchtitan_model()
     hf = OptMoeForCausalLM(OptMoeConfig(**hf_config(cfg))).cuda()

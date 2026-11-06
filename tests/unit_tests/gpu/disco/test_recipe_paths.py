@@ -114,7 +114,7 @@ class TestRecipePaths(DTensorTestBase):
         rules = {type(e.rule.compute).__name__ for _, e in entries}
         self.assertTrue({"AmphioneMap", "Sign", "RowL2"} <= rules, rules)
         ref = {
-            names[id(e.param)]: harness.full_tensor(e.param).float().clone()
+            names[id(e.param)]: harness.full_tensor(e.param).float().cpu().clone()
             for _, e in entries
         }
         buf = {n: torch.zeros_like(w) for n, w in ref.items()}

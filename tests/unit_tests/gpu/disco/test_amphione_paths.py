@@ -101,7 +101,7 @@ class TestAmphionePaths(DTensorTestBase):
                 any(_unit_type(e, u) in frozen for e in entries for u in e.units)
             )
         ref = {
-            names[id(e.param)]: harness.full_tensor(e.param).float().clone()
+            names[id(e.param)]: harness.full_tensor(e.param).float().cpu().clone()
             for e in entries
         }
         state = {

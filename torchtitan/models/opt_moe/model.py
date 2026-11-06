@@ -42,6 +42,13 @@ from .gated_swa_attention import ShortConvDocuments
 from .mtp import roll_mtp_sequence
 from .state_dict_adapter import OPTMoEStateDictAdapter
 
+# compile_blocks' recompile budget, shared by every block (see _apply_fsdp):
+# a 6-layer run with validation measured 9 entries (3 block types x the
+# training graph, the no_grad validation graph, and the dynamic-shape training
+# graph a new document count triggers); 32 leaves room for more block types
+# (MTP, NoPE).
+_BLOCK_RECOMPILE_LIMIT = 32
+
 
 def layout_flags(parallelism: ParallelismConfig) -> dict[str, bool]:
     """What the model config's sharding depends on (data parallel does not)."""
@@ -178,6 +185,9 @@ class OPTMoEMTPBlock(OPTMoETransformerBlock):
                 [self.enorm(mtp_input_embed_TD), self.hnorm(prev_hidden_TD)], dim=-1
             )
         )
+        # The block's residual stream starts here: its residual add reads the
+        # projection's output with bare ops.
+        remat.recompute_needs_tensor(h_TD)
         h_TD = super().forward(
             h_TD,
             attention_metadata,
@@ -186,6 +196,8 @@ class OPTMoEMTPBlock(OPTMoETransformerBlock):
             padding_mask=mtp_padding_mask_T,
             aux_loss_denominator=aux_loss_denominator,
         )
+        # ... and ends in this norm, inside the same remat region
+        remat.recompute_needs_tensor(h_TD)
         return self.mtp_norm(h_TD)
 
 
@@ -292,8 +304,9 @@ class OPTMoEModel(Decoder):
         if self.config.compile_blocks:
             # 0.5.4's compile (wave 2): torch.compile on each block, after the
             # activation remat and before FSDP, with its dynamo settings
-            # (token-choice MoE shapes; no forward side effects replayed in a
-            # recompute).
+            # (process-global: token-choice MoE shapes need the scalar outputs
+            # traced; a recompute must not replay the forward's side effects).
+            # debug.spmd_typechecking refuses compile_blocks (config/validation).
             torch._dynamo.config.capture_scalar_outputs = True
             torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
             for block in self.layers.values():
@@ -303,8 +316,14 @@ class OPTMoEModel(Decoder):
                     if hasattr(module, "inplace_wgrad_accum"):
                         module.inplace_wgrad_accum = False
                 # EP's token dispatch (all-to-all under the SPMD mesh stack)
-                # does not trace: let it break the graph there
-                block.compile(fullgraph=parallelism_context.ep == 1)
+                # does not trace: let it break the graph there. Every block
+                # shares one code object (Module._call_impl), so one recompile
+                # budget covers all block types x train / eval x shapes: the
+                # default 8 ran out at the first train step after validation.
+                block.compile(
+                    fullgraph=parallelism_context.ep == 1,
+                    recompile_limit=_BLOCK_RECOMPILE_LIMIT,
+                )
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
         edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
         apply_fsdp_to_decoder(

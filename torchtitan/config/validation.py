@@ -131,6 +131,12 @@ def validate_model_training_config(
             "Set model.local_compile.regions=[] or disable "
             "debug.spmd_typechecking."
         )
+    if debug.spmd_typechecking and getattr(model, "compile_blocks", False):
+        # opt_moe's per-block torch.compile: the same Dynamo limitation
+        raise ValueError(
+            "model.compile_blocks is not supported with SPMD typechecking. "
+            "Set model.compile_blocks=False or disable debug.spmd_typechecking."
+        )
 
     validate_context_parallel(model, parallelism)
 

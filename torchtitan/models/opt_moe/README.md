@@ -146,7 +146,11 @@ GPU at steps 20 / 30 / 40; the 0.5.4 tree, which compiled every block: 16.7k /
   cannot add into `.grad`); the compiled gather / scatter backwards use atomic
   adds, so repeats are not bitwise without `debug.deterministic`. With EP the
   block compiles without `fullgraph`: the graph breaks around the token
-  dispatch's all-to-all, which dynamo does not trace.
+  dispatch's all-to-all, which dynamo does not trace, so torch_remat's
+  compiled checkpoint runs eagerly and recomputes the whole block, whatever
+  the save regions; the config refuses compile_blocks with EP and a
+  selective remat (6 layers of the target shape at EP 4, one node: 34k
+  tokens/s/GPU vs 47k with eager blocks and the regions, same memory).
 - the default: `local_compile.regions` only (upstream's regions plus opt_moe's,
   `moe_score_and_scatter_add` the MoE combine). 16.0k / 16.0k / 15.6k, repeats
   bitwise; without remat a 2-layer step equals block compile's, so the rest is

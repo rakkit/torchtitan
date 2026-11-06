@@ -385,7 +385,8 @@ class OPTMoEModel(Decoder):
         it): the block's ops in one graph, with ``local_compile`` keeping only
         the regions outside the blocks (``loss``). Under expert parallelism the
         graph breaks around the token dispatch (its all-to-all does not trace),
-        so the block is several graphs."""
+        so the block is several graphs and its remat a full recompute: refused
+        with a selective activation_remat (config/validation.py)."""
         local_compile: LocalCompileConfig = field(
             default_factory=lambda: LocalCompileConfig(
                 regions=[

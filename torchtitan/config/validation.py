@@ -137,6 +137,23 @@ def validate_model_training_config(
             "model.compile_blocks is not supported with SPMD typechecking. "
             "Set model.compile_blocks=False or disable debug.spmd_typechecking."
         )
+    if (
+        getattr(model, "compile_blocks", False)
+        and parallelism.expert_parallel_degree > 1
+        and activation_remat is not None
+        and activation_remat.save_regions
+    ):
+        # The block graph-breaks at the EP token dispatch, so torch_remat's
+        # compiled checkpoint runs eagerly: a full block recompute that ignores
+        # the save regions (opt_moe 6-layer target shape, EP 4: 34k tokens/s
+        # vs 47k with eager blocks and the local_compile regions, same memory).
+        raise ValueError(
+            "model.compile_blocks with expert parallelism recomputes every block "
+            "in full: the token dispatch breaks the block's graph, and "
+            "activation_remat's save regions are ignored. Set "
+            "model.compile_blocks=False (the local_compile regions apply), or "
+            "use a full-recompute activation_remat."
+        )
 
     validate_context_parallel(model, parallelism)
 

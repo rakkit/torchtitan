@@ -188,6 +188,24 @@ def load_run_model(job_config: Path):
     return run, model
 
 
+# HF's usual file size: files load in parallel and stay under the Hub's 50 GB
+# per-file limit (one file of a 50B model in bf16 is ~100 GB).
+MAX_FILE_BYTES = 5 * 1024**3
+
+
+def _file_index_by_size(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, int]:
+    """HF file numbers (from 1) for the tensors in order, each file at most
+    ``MAX_FILE_BYTES`` (a larger tensor gets a file of its own)."""
+    index, used, mapping = 1, 0, {}
+    for key, value in hf_state_dict.items():
+        size = value.numel() * value.element_size()
+        if used and used + size > MAX_FILE_BYTES:
+            index, used = index + 1, 0
+        mapping[key] = index
+        used += size
+    return mapping
+
+
 def save_hf_folder(run, state_dict, output_dir: Path, export_dtype: str) -> None:
     """``state_dict`` (native names) as a complete HF folder: the weights in
     ``export_dtype`` (the adapter's fp32 tensors kept fp32), the config, the
@@ -211,7 +229,7 @@ def save_hf_folder(run, state_dict, output_dir: Path, export_dtype: str) -> None
         hf_state_dict,
         storage_writer=HuggingFaceStorageWriter(
             path=str(output_dir),
-            fqn_to_index_mapping=adapter.fqn_to_index_mapping_for_save(hf_state_dict),
+            fqn_to_index_mapping=_file_index_by_size(hf_state_dict),
         ),
     )
     _write_hf_files(run.model, Path(run.hf_assets_path), output_dir, export_dtype)

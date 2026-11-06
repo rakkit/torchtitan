@@ -247,9 +247,10 @@ def _hf_weights(folder):
     ).state_dict()
 
 
-def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
+def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path, monkeypatch):
     """convert_opt_moe_to_hf: a run's DCP checkpoint (its model rebuilt from
-    job_config.json) becomes a complete HF folder: AutoModelForCausalLM loads it
+    job_config.json) becomes a complete HF folder in several weight files (the
+    file size limit shrunk to 256 KiB here): AutoModelForCausalLM loads it
     with trust_remote_code, every weight unchanged (fp32 export), and
     AutoTokenizer loads it with a chat template. The run's assets are a pretrain
     run's (a tokenizer, no chat template, no generation config): the folder gets
@@ -259,6 +260,7 @@ def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
 
     import torch.distributed.checkpoint as dcp
 
+    from scripts.checkpoint_conversion import convert_opt_moe_to_hf as conversion
     from scripts.checkpoint_conversion.convert_opt_moe_to_hf import (
         convert_opt_moe_to_hf,
     )
@@ -268,6 +270,7 @@ def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
     run, model = _pretrain_run(tmp_path)
     dcp.save(model.state_dict(), checkpoint_id=str(tmp_path / "step-1"))
 
+    monkeypatch.setattr(conversion, "MAX_FILE_BYTES", 256 * 1024)
     convert_opt_moe_to_hf(
         tmp_path / "step-1",
         tmp_path / "job_config.json",
@@ -276,6 +279,9 @@ def test_a_dcp_checkpoint_converts_to_an_hf_folder_that_loads(tmp_path):
         read_threads=4,
     )
     out = tmp_path / "hf"
+    files = sorted(f.name for f in out.glob("*.safetensors"))
+    index = json.loads((out / "model.safetensors.index.json").read_text())
+    assert len(files) > 1 and sorted(set(index["weight_map"].values())) == files
     # the HF files only: no staged copy of the tensors left next to them
     assert not (out / "sharded").exists()
     placeholder = Path(hf_files.__file__).parent / "chat_template.jinja"

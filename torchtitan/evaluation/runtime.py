@@ -256,6 +256,9 @@ class EvaluationRuntime:
                     )
                     with self.amp_context:
                         logits = self.model(inputs, **model_kwargs)
+                        if isinstance(logits, tuple):
+                            # multi-token prediction: score the main (next-token) one
+                            logits, labels = logits[0], labels[0]
                         nll = dense_token_nll(logits, labels)
             except torch.OutOfMemoryError:
                 if self.device.type == "cuda":
@@ -263,7 +266,7 @@ class EvaluationRuntime:
                         "OOM at batch_index=%d, local_batch_size=%d, seq_len=%d, "
                         "rank=%d:\n%s",
                         batch_index,
-                        inputs.shape[0],
+                        rows,
                         seq_len,
                         dist.get_rank(),
                         torch.cuda.memory_summary(

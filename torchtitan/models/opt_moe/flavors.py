@@ -71,7 +71,7 @@ from torchtitan.models.common.nn_modules import Conv1d, RMSNorm
 from torchtitan.models.common.rope import CosSinRoPE, RoPE
 
 from .gated_swa_attention import GatedSWAttention
-from .model import layout_flags, OPTMoEModel, OPTMoETransformerBlock
+from .model import layout_flags, OPTMoEModel, OPTMoEMTPBlock, OPTMoETransformerBlock
 from .moe import OptMoE
 from .param_init import (
     conv_init_fn,
@@ -518,15 +518,68 @@ def _opt_moe_config(
     lm_head_init_std: float = 1.0,
     rope: dict[str, Any],
     rope_of_swa: dict[str, Any] | None = None,
+    num_mtp_layers: int = 0,
+    eh_proj_init_fn_type: str = "scaled_orthogonal",
+    eh_proj_init_std: float = 1.0,
     **layer_settings: Any,
 ) -> OPTMoEModel.Config:
     """The complete, sharded model config: the embedding, the final norm, the
     head and ``build_opt_moe_layers(**layer_settings)``. ``rope`` /
     ``rope_of_swa``: ``CosSinRoPE.Config`` fields (partial RoPE when ``dim`` <
     head_dim), the cache ``max(seq_len, rope_length)`` long; ``norm_type`` /
-    ``norm_eps``: every norm."""
+    ``norm_eps``: every norm.
+
+    ``num_mtp_layers`` (0 or 1): DeepSeek-V3's multi-token prediction, one
+    ``OPTMoEMTPBlock`` predicting the token after next: a copy of the last
+    layer (its attention, feed-forward / MoE and inits) behind
+    ``eh_proj(cat(enorm(e), hnorm(h)))`` (``eh_proj_init_*``: the fusion's
+    init), then ``mtp_norm``. The run adds the MTP loss (``mtp.py``
+    ``MTPCrossEntropyLoss``) and ``dataloader.num_mtp_layers``."""
+    if num_mtp_layers not in (0, 1):
+        raise ValueError(f"num_mtp_layers must be 0 or 1, got {num_mtp_layers}")
     flags = layout_flags(parallelism)
     cache_length = max(seq_len, rope_length or 0)
+    layers = build_opt_moe_layers(
+        dim=dim,
+        norm_type=norm_type,
+        norm_eps=norm_eps,
+        rope=CosSinRoPE.Config(**rope, max_context_length=cache_length),
+        rope_of_swa=(
+            None
+            if rope_of_swa is None
+            else CosSinRoPE.Config(**rope_of_swa, max_context_length=cache_length)
+        ),
+        **layer_settings,
+        enable_sp=flags["sp"],
+        enable_ep=flags["ep"],
+        enable_cp=flags["cp"],
+    )
+    block_norm_sharding = norm_sharding_config(enable_sp=flags["sp"])
+    mtp_layers = [
+        OPTMoEMTPBlock.Config(
+            **{
+                f.name: copy.deepcopy(getattr(layers[-1], f.name))
+                for f in dataclasses.fields(layers[-1])
+            },
+            enorm=_norm(norm_type, dim, norm_eps, sharding_config=block_norm_sharding),
+            hnorm=_norm(norm_type, dim, norm_eps, sharding_config=block_norm_sharding),
+            eh_proj=Linear.Config(
+                in_features=2 * dim,
+                out_features=dim,
+                param_init={
+                    "weight": make_param_init(eh_proj_init_fn_type, eh_proj_init_std)
+                },
+                sharding_config=dense_linear_sharding_config(),
+            ),
+            mtp_norm=_norm(
+                norm_type,
+                dim,
+                norm_eps,
+                sharding_config=pre_lm_head_norm_sharding_config(enable_sp=flags["sp"]),
+            ),
+        )
+        for _ in range(num_mtp_layers)
+    ]
     return OPTMoEModel.Config(
         max_context_length=seq_len,
         dim=dim,
@@ -554,21 +607,8 @@ def _opt_moe_config(
             },
             sharding_config=lm_head_sharding_config(),
         ),
-        layers=build_opt_moe_layers(
-            dim=dim,
-            norm_type=norm_type,
-            norm_eps=norm_eps,
-            rope=CosSinRoPE.Config(**rope, max_context_length=cache_length),
-            rope_of_swa=(
-                None
-                if rope_of_swa is None
-                else CosSinRoPE.Config(**rope_of_swa, max_context_length=cache_length)
-            ),
-            **layer_settings,
-            enable_sp=flags["sp"],
-            enable_ep=flags["ep"],
-            enable_cp=flags["cp"],
-        ),
+        layers=layers,
+        mtp_layers=mtp_layers,
         built_for=flags,
     )
 

@@ -10,8 +10,11 @@ modules and their Configs; `flavors.py` builds the complete, sharded config;
 `sharding.py` holds the sharding constructors it uses. The optimizer side
 (`amphione` and the other DiSCO rules) is `torchtitan/optimizers/readme.md`.
 
-Parallelism: FSDP / HSDP, EP (upstream's dispatchers) and CP (flex, all-gather
-KV; not with the conv or the sinks). TP is refused at build.
+Parallelism: FSDP / HSDP, EP (upstream's dispatchers) and CP (all-gather K/V,
+flex or varlen, with the conv, the sinks and the gate; the conv's first
+`W - 1` taps of each rank's fragments come from the ranks that hold those
+tokens; `tests/unit_tests/opt_moe/test_context_parallel.py`). TP is refused at
+build.
 
 ## Building a model
 
@@ -94,6 +97,8 @@ each a dict of `CosSinRoPE.Config` fields (the cache is `seq_len` long, or
 | `prenorm_gain_init` | 1.0 | a constant init of the attention_norm / ffn_norm gains (`rmsnorm` only) |
 | `embedding_init_*`, `lm_head_init_*` | `scion_normal_input` / `scion_normal_output`, 1.0 | the embedding's and the head's init |
 | `vocab_size` | 201088 | |
+| `num_mtp_layers` | 0 | 0 or 1: multi-token prediction (DeepSeek-V3's MTP, `mtp.py` / `OPTMoEMTPBlock`): `mtp_norm(block(eh_proj(cat(enorm(e_{t+1}), hnorm(h_t)))))` predicts token t + 2 through the shared head; the block is a copy of the last layer (its attention, feed-forward / MoE and inits). The run sets `dataloader.num_mtp_layers` and the loss `ChunkedLossWrapper(MTPCrossEntropyLoss(mtp_scale=...))` (0.3: DeepSeek-V3's first phase); the logs add `mtp/main_loss`, `mtp/depth_1_loss`; validation and offline evaluation score the main prediction. The gains group must match `enorm`, `hnorm`, `mtp_norm` |
+| `eh_proj_init_fn_type`, `eh_proj_init_std` | `scaled_orthogonal`, 1.0 | the MTP fusion's init |
 
 Residual statistics: with the optimizer's `log_residual_stats`, the eager
 layer loop records the RMS of every block's input and residual write and of

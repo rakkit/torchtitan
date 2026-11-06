@@ -334,6 +334,10 @@ class Validator(BaseValidator):
                 assert len(prepared) == len(model_parts) == 1
                 inputs, labels, kwargs = prepared[0]
                 predictions = model_parts[0](inputs, **kwargs)
+                if isinstance(predictions, tuple):
+                    # multi-token prediction: validate the main (next-token) one,
+                    # the objective the token count below normalizes
+                    predictions, labels = predictions[0], labels[0]
                 loss_sum, _ = self.loss_fn(predictions, labels)
                 del predictions
             post_validate_fsdp_for_accelerator_graph(model_parts)

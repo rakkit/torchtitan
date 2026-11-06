@@ -37,7 +37,8 @@ MAXVIO_EPS = 1e-12
 
 
 def moe_layers(model_parts: list[nn.Module]) -> Iterator[tuple[int, MoE]]:
-    """(layer id, MoE) of every block whose feed-forward is an MoE."""
+    """(layer id, MoE) of every block whose feed-forward is an MoE: the decoder
+    blocks, then the MTP blocks (``mtp_layers``) numbered after them."""
     for part in model_parts:
         layers = getattr(part, "layers", None)
         if layers is None:
@@ -45,6 +46,9 @@ def moe_layers(model_parts: list[nn.Module]) -> Iterator[tuple[int, MoE]]:
         for layer_key, block in layers.items():
             if isinstance(getattr(block, "feed_forward", None), MoE):
                 yield int(layer_key), block.feed_forward
+        for i, block in enumerate(getattr(part, "mtp_layers", None) or ()):
+            if isinstance(getattr(block, "feed_forward", None), MoE):
+                yield len(layers) + i, block.feed_forward
 
 
 def publish_moe_metrics(data: tuple) -> None:

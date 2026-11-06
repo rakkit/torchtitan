@@ -65,7 +65,7 @@ def opt_moe_mis_8b() -> Trainer.Config:
             optimizer=DiSCOOptimizersContainer.Config(
                 groups={
                     "gains": {
-                        "match": r"(^|\.)(q_norm|k_norm|attention_norm|ffn_norm|norm)\.weight$",
+                        "match": r"(^|\.)(q_norm|k_norm|attention_norm|ffn_norm|norm|enorm|hnorm|mtp_norm)\.weight$",
                         "rule": "sgd",
                         "args": {"pre": "identity", "compute": "sign", "scale": "one"},
                         "lr": 0.5 * _LR,

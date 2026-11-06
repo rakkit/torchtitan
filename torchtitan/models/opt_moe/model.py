@@ -11,10 +11,14 @@ import spmd_types as spmd
 import torch
 import torch_remat as remat
 
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.local_compile import LocalCompileConfig
+from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+from torchtitan.models.base.model import FlopsEstimator
+from torchtitan.models.base.module import Module, ModuleList
 
 from torchtitan.models.common.attention import (
     AttentionMetadata,
@@ -23,8 +27,11 @@ from torchtitan.models.common.attention import (
 )
 from torchtitan.models.common.attention.linear_attention import LinearAttentionMetadata
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 from torchtitan.models.common.feed_forward import DenseFeedForward
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE, RoutedExperts, TokenChoiceTopKRouter
+from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.param_layout import (
     by_rank,
     named,
@@ -32,6 +39,7 @@ from torchtitan.models.common.param_layout import (
     stacked_units,
 )
 from .gated_swa_attention import ShortConvDocuments
+from .mtp import roll_mtp_sequence
 from .state_dict_adapter import OPTMoEStateDictAdapter
 
 
@@ -125,6 +133,62 @@ class OPTMoETransformerBlock(TransformerBlock):
         )(_lhs, mlp_output)
 
 
+class OPTMoEMTPBlock(OPTMoETransformerBlock):
+    """One multi-token-prediction depth (DeepSeek-V3's MTP module): the fused
+    input ``eh_proj(cat(enorm(e), hnorm(h)))`` of the next token's embedding
+    ``e`` and the previous depth's hidden state ``h``, then one OPT MoE block,
+    then ``mtp_norm`` (the shared lm_head follows). ``h`` is zeroed where the
+    rolled token crosses a document or padding, and those tokens leave the MoE
+    statistics (``padding_mask``)."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(OPTMoETransformerBlock.Config):
+        enorm: RMSNorm.Config
+        hnorm: RMSNorm.Config
+        eh_proj: Linear.Config
+        mtp_norm: RMSNorm.Config
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.enorm = config.enorm.build()
+        self.hnorm = config.hnorm.build()
+        self.eh_proj = config.eh_proj.build()
+        self.mtp_norm = config.mtp_norm.build()
+
+    def forward(  # pyrefly: ignore [bad-override]
+        self,
+        mtp_input_embed_TD: torch.Tensor,
+        prev_hidden_TD: torch.Tensor,
+        mtp_input_valid_mask_T: torch.Tensor,
+        attention_metadata: AttentionMetadata | None,
+        positions: torch.Tensor | None,
+        *,
+        conv_metadata: LinearAttentionMetadata | None = None,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        mtp_padding_mask_T = ~mtp_input_valid_mask_T
+        if padding_mask is not None:
+            mtp_padding_mask_T = mtp_padding_mask_T | padding_mask
+        prev_hidden_TD = prev_hidden_TD * mtp_input_valid_mask_T.unsqueeze(-1).to(
+            prev_hidden_TD.dtype
+        )
+        h_TD = self.eh_proj(
+            torch.cat(
+                [self.enorm(mtp_input_embed_TD), self.hnorm(prev_hidden_TD)], dim=-1
+            )
+        )
+        h_TD = super().forward(
+            h_TD,
+            attention_metadata,
+            positions,
+            conv_metadata=conv_metadata,
+            padding_mask=mtp_padding_mask_T,
+            aux_loss_denominator=aux_loss_denominator,
+        )
+        return self.mtp_norm(h_TD)
+
+
 class OPTMoEModel(Decoder):
     """OPT MoE Transformer model with attention and feed-forward layers."""
 
@@ -211,23 +275,33 @@ class OPTMoEModel(Decoder):
 
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
         edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
-        apply_fsdp_to_decoder(
-            self,
-            dp_mesh,
-            param_dtype=TORCH_DTYPE_MAP[precision.param_dtype],
-            reduce_dtype=TORCH_DTYPE_MAP[precision.reduce_dtype],
-            pp_enabled=parallelism_context.pp_enabled,
-            cpu_offload=parallelism.fsdp_enable_cpu_offloading,
-            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-            ep_degree=parallelism_context.ep,
-            edp_mesh=edp_mesh,
-            dp_mesh_dims=dp_mesh_dims,
-            edp_mesh_dims=edp_mesh_dims,
-            symm_mem_scope=parallelism.fsdp_symm_mem_scope,
-            # DiSCO runs each expert's rule on the rank's LOCAL expert rows
-            # with no gather, so a rank must own whole expert matrices.
-            expert_shard_dim=0,
-        )
+        # The MTP blocks are sharded as the decoder blocks: listed after them in
+        # `layers` for the call (apply_fsdp_to_decoder walks `layers`).
+        mtp_keys = []
+        for i, block in enumerate(self.mtp_layers or ()):
+            mtp_keys.append(str(len(self.layers) + i))
+            self.layers[mtp_keys[-1]] = block
+        try:
+            apply_fsdp_to_decoder(
+                self,
+                dp_mesh,
+                param_dtype=TORCH_DTYPE_MAP[precision.param_dtype],
+                reduce_dtype=TORCH_DTYPE_MAP[precision.reduce_dtype],
+                pp_enabled=parallelism_context.pp_enabled,
+                cpu_offload=parallelism.fsdp_enable_cpu_offloading,
+                reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+                ep_degree=parallelism_context.ep,
+                edp_mesh=edp_mesh,
+                dp_mesh_dims=dp_mesh_dims,
+                edp_mesh_dims=edp_mesh_dims,
+                symm_mem_scope=parallelism.fsdp_symm_mem_scope,
+                # DiSCO runs each expert's rule on the rank's LOCAL expert rows
+                # with no gather, so a rank must own whole expert matrices.
+                expert_shard_dim=0,
+            )
+        finally:
+            for key in mtp_keys:
+                del self.layers[key]
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
@@ -242,6 +316,10 @@ class OPTMoEModel(Decoder):
         """The parallelism (tp / cp / ep / sp on or off) the per-layer configs
         were built for; ``parallelize`` refuses another one (a command-line
         override of these after the build would otherwise be ignored)."""
+        mtp_layers: list[OPTMoEMTPBlock.Config] = field(default_factory=list)
+        """The multi-token-prediction depths (``OPTMoEMTPBlock``; empty: no
+        MTP). With MTP the model takes and returns one tensor per objective
+        (the main prediction, then one per depth)."""
         # Upstream's regions the model passes through plus opt_moe's own
         # elementwise code (fused attention-prep / residual-norm regions: only
         # once measured on the production dims).
@@ -258,8 +336,34 @@ class OPTMoEModel(Decoder):
             )
         )
 
+        def build_flops_estimator(
+            self,
+            model: Module,
+            *,
+            seq_len: int,
+            excluded_submodules: tuple[Module | None, ...] = (),
+        ) -> FlopsEstimator:
+            """Upstream's decoder estimate (it counts the MTP blocks' parameters
+            and attention) plus the lm_head pass of every MTP depth."""
+            estimate = Decoder.Config.build_flops_estimator(
+                self, model, seq_len=seq_len, excluded_submodules=excluded_submodules
+            )
+            if not self.mtp_layers:
+                return estimate
+            head_params = sum(p.numel() for p in model.lm_head.parameters())
+            head_flops_per_token = 6 * len(self.mtp_layers) * head_params
+            return lambda input_dict: (
+                estimate(input_dict)
+                + head_flops_per_token * input_dict["input"].numel()
+            )
+
     def __init__(self, config: Config):
         super().__init__(config)
+        self.mtp_layers: ModuleList | None = None
+        if config.mtp_layers:
+            self.mtp_layers = ModuleList()
+            for layer_config in config.mtp_layers:
+                self.mtp_layers.append(layer_config.build())
         # Set to [] by the optimizer container on logging steps (log_residual_stats);
         # forward then appends its residual statistics. Not a buffer.
         self.residual_capture: list[torch.Tensor] | None = None
@@ -299,25 +403,127 @@ class OPTMoEModel(Decoder):
             )
         return attention_metadata
 
+    def preprocess_inputs(
+        self,
+        input_dict: dict[str, Any],
+        *,
+        parallelism_context: ParallelismContext,
+        parallelism: ParallelismConfig,
+        max_num_documents: int | None = None,
+        global_routing_token_counts: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> tuple[Any, Any, dict[str, Any], dict[str, Any]]:
+        """Upstream's ``Decoder.preprocess_inputs``; with MTP, first each depth's
+        inputs and labels: the tokens and labels rolled left by the depth
+        (``roll_mtp_sequence``: never across a document or padding), CP-sharded
+        with the batch, then returned as one tuple per objective."""
+        if self.mtp_layers is None:
+            return super().preprocess_inputs(
+                input_dict,
+                parallelism_context=parallelism_context,
+                parallelism=parallelism,
+                max_num_documents=max_num_documents,
+                global_routing_token_counts=global_routing_token_counts,
+                **kwargs,
+            )
+        del kwargs
+        loss_kwargs = input_dict.pop("loss_kwargs", {})
+        positions = input_dict.get("positions")
+        padding_mask = input_dict.get("padding_mask")
+        if positions is None:
+            raise ValueError("MTP needs the positions (document boundaries)")
+        depths = range(1, len(self.mtp_layers) + 1)
+        input_shardings = decoder_input_sharding()
+        for depth in depths:
+            tokens, valid = roll_mtp_sequence(
+                input_dict["input"],
+                shift=depth,
+                fill_value=0,
+                positions_T=positions,
+                padding_mask_T=padding_mask,
+            )
+            labels, _ = roll_mtp_sequence(
+                input_dict["labels"],
+                shift=depth,
+                fill_value=IGNORE_INDEX,
+                positions_T=positions,
+                padding_mask_T=padding_mask,
+            )
+            for name, value, like in (
+                (f"mtp_input_{depth}", tokens, "input"),
+                (f"mtp_labels_{depth}", labels, "labels"),
+                (f"mtp_valid_{depth}", valid, "input"),
+            ):
+                input_dict[name] = value
+                input_shardings[name] = input_shardings[like]
+        input_shardings.update(dict.fromkeys(loss_kwargs, input_shardings["labels"]))
+        input_dict.update(loss_kwargs)
+        input_dict["attention_metadata"] = self._get_attention_metadata(
+            positions, padding_mask=padding_mask, max_num_documents=max_num_documents
+        )
+        if parallelism_context.cp_enabled:
+            input_dict = self._cp_shard(
+                input_dict,
+                input_shardings=input_shardings,
+                parallelism_context=parallelism_context,
+                parallelism=parallelism,
+            )
+        input_dict = annotate_input_spmd_types(
+            parallelism_context, input_dict, input_shardings
+        )
+        loss_kwargs = {name: input_dict.pop(name) for name in loss_kwargs}
+        inputs = (
+            input_dict.pop("input"),
+            *(input_dict.pop(f"mtp_input_{d}") for d in depths),
+        )
+        labels = (
+            input_dict.pop("labels"),
+            *(input_dict.pop(f"mtp_labels_{d}") for d in depths),
+        )
+        input_dict["mtp_input_valid_masks"] = tuple(
+            input_dict.pop(f"mtp_valid_{d}") for d in depths
+        )
+        # one routed-token count per objective (the collator's, MTP depths too)
+        input_dict["aux_loss_denominators"] = global_routing_token_counts
+        return inputs, labels, input_dict, loss_kwargs
+
     def forward(
         self,
-        tokens: torch.Tensor,
+        tokens: torch.Tensor | tuple[torch.Tensor, ...],
         positions: torch.Tensor | None = None,
         attention_metadata: AttentionMetadataMap | None = None,
+        mtp_input_valid_masks: tuple[torch.Tensor, ...] | None = None,
         *,
         padding_mask: torch.Tensor | None = None,
         aux_loss_denominators: torch.Tensor | None = None,
     ):
-        """Upstream's ``Decoder.forward`` plus the residual statistics.
+        """Upstream's ``Decoder.forward`` plus the residual statistics and,
+        with MTP, the MTP depths after the main stack.
 
         Args:
             tokens: Input token indices ``[T]``, or hidden states when this is
-                not the first pipeline stage.
+                not the first pipeline stage; with MTP one tensor per objective
+                (the main tokens, then each depth's rolled tokens).
             positions: Position indices ``[T]``.
             attention_metadata: The inner attentions' metadata, by type.
+            mtp_input_valid_masks: Per MTP depth, where its rolled token is real.
             padding_mask: Upstream's padding mask (True: padding), the tokens
                 the MoE leaves out of its balance statistics.
+
+        Returns:
+            The logits (hidden states with ``_skip_lm_head``); with MTP a tuple,
+            the main prediction then one per depth.
         """
+        if self.mtp_layers is None:
+            mtp_tokens: list[torch.Tensor] = []
+        else:
+            if not isinstance(tokens, tuple) or len(tokens) != len(self.mtp_layers) + 1:
+                raise ValueError("MTP: one token tensor per objective")
+            if mtp_input_valid_masks is None or len(mtp_input_valid_masks) != len(
+                self.mtp_layers
+            ):
+                raise ValueError("MTP: one validity mask per MTP depth")
+            tokens, *mtp_tokens = tokens
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         # Upstream's aux-loss normaliser: the step-global routed-token count (one
@@ -365,8 +571,38 @@ class OPTMoEModel(Decoder):
                         [torch.stack(rows).flatten(), h.float().square().mean()[None]]
                     )
                 )
+        prev_hidden = h  # the MTP depths read the pre-norm hidden state
         h = self.norm(h) if self.norm is not None else h
+        outputs = [h]
+        for depth, (layer, depth_tokens, valid) in enumerate(
+            zip(
+                self.mtp_layers or (),
+                mtp_tokens,
+                mtp_input_valid_masks or (),
+                strict=True,
+            ),
+            1,
+        ):
+            with spmd.no_typecheck():
+                depth_denominator = (
+                    None
+                    if aux_loss_denominators is None
+                    else aux_loss_denominators[depth]
+                )
+            prev_hidden = layer(
+                self.tok_embeddings(depth_tokens),
+                prev_hidden,
+                valid,
+                None
+                if attention_metadata is None
+                else attention_metadata.get(type(layer.attention.inner_attention)),
+                positions,
+                conv_metadata=conv_metadata,
+                padding_mask=padding_mask,
+                aux_loss_denominator=depth_denominator,
+            )
+            outputs.append(prev_hidden)
         # _skip_lm_head: the chunked loss applies lm_head itself (upstream's).
-        if self._skip_lm_head:
-            return h
-        return self.lm_head(h) if self.lm_head is not None else h
+        if not self._skip_lm_head and self.lm_head is not None:
+            outputs = [self.lm_head(o) for o in outputs]
+        return outputs[0] if self.mtp_layers is None else tuple(outputs)

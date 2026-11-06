@@ -575,10 +575,40 @@ class Trainer(Configurable):
                 global_avg_loss = global_max_loss = float(accumulated_loss.item())
                 global_ntokens_seen = engine.ntokens_seen
 
+            # The loss function's own metrics (e.g. the MTP loss's terms), each
+            # normalized as the loss: summed over the microbatches and the loss
+            # mesh ("/max" keys: their max).
+            loss_fn_metrics: dict[str, torch.Tensor] = {}
+            for group_metrics in forward_backward_result.loss_metrics:
+                for microbatch_metrics in group_metrics:
+                    for key, value in microbatch_metrics.items():
+                        value = value.detach().float()
+                        if key not in loss_fn_metrics:
+                            loss_fn_metrics[key] = value
+                        elif key.endswith("/max"):
+                            loss_fn_metrics[key] = torch.maximum(
+                                loss_fn_metrics[key], value
+                            )
+                        else:
+                            loss_fn_metrics[key] = loss_fn_metrics[key] + value
+            loss_fn_logged = {
+                key: (
+                    (
+                        dist_utils.dist_max
+                        if key.endswith("/max")
+                        else dist_utils.dist_sum
+                    )(value, parallelism_context.get_mesh("loss"))
+                    if parallelism_context.dp_cp_enabled
+                    else float(value.item())
+                )
+                for key, value in sorted(loss_fn_metrics.items())
+            }
+
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
             **collect_aux_loss_metrics(parallelism_context),
+            **loss_fn_logged,
         }
         # No None guard: "nothing to report" is the null object's empty
         # dicts, not a missing attribute.

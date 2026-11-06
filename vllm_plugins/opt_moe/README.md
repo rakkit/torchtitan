@@ -45,6 +45,16 @@ are). The model runs under vLLM's `torch.compile` (the prologue is the custom op
 `vllm::opt_moe_attention_prologue`, which reads the conv state from the forward
 context) with piecewise CUDA graphs for prefill and full ones for decoding.
 
+MoE kernel configs: vLLM ships tuned fused-MoE configs for many GPUs but none
+for GH200, so its Triton MoE runs a default config there. `register()` points
+`VLLM_TUNED_CONFIG_FOLDER` at `vllm_opt_moe/moe_configs/` (unless already set;
+vLLM reads it before its own folder). For now it holds H100's bf16 config for
+256 experts of width 512 (`E=256,N=512`, the only H100 config matching one of
+our shapes; vLLM's H100 FP8 configs at 256 experts are block-quantized, not the
+online per-tensor FP8 we serve). TODO: tune FP8 and bf16 on GH200 for the final
+expert shape (vLLM's benchmarks/kernels/benchmark_moe.py) once the architecture
+is final.
+
 Tensor parallelism on nodes without NVSwitch (e.g. 4 x GH200) needs
 `VLLM_ALLREDUCE_USE_FLASHINFER=0`: FlashInfer's all-reduce falls back to its
 trtllm backend there, and the first forward hangs.
@@ -88,7 +98,8 @@ greedy continuations of 48 tokens with the draft equal the ones without,
 Against the HF model's transformers forward in fp32 (`check_vllm_model.py` in
 the user's configs), on a small converted model: 4 layers, 2 KV heads, the k / v
 conv, a sliding window of 16, a full and a NoPE layer, a dense and MoE layers
-with the router bias and a shared expert, with the element-wise gate or sinks;
+with the router bias and a shared expert, with the element-wise gate, sinks or
+neither;
 teacher-forced logprobs of 41 / 64 / 100 tokens and of 40 decoded tokens past
 the window, |vLLM - HF fp32| against the HF bf16 model's own (the bf16 floor:
 mean 0.0002-0.0003, max 0.0006-0.0013). With the fused prologue (11-06), bf16:
@@ -98,9 +109,15 @@ mean 0.0002-0.0003, max 0.0006-0.0013). With the fused prologue (11-06), bf16:
 | gate, eager | 0.0002 / 0.0014 | 0.0003 / 0.0011 |
 | gate, CUDA graphs | 0.0002-0.0003 / 0.0014 | 0.0003 / 0.0011 |
 | sinks, CUDA graphs | 0.0002 / 0.0011 | 0.0003 / 0.0009 |
+| neither gate nor sinks, eager / CUDA graphs | 0.0002-0.0003 / 0.0011 | 0.0003 / 0.0009 |
 | gate + partial RoPE (64 of 128 dims on the SWA layers), CUDA graphs | 0.0002-0.0003 / 0.0014 | 0.0003 / 0.0013 |
 | gate, FP8 online, CUDA graphs | 0.0008-0.0010 / 0.0034 | 0.0007 / 0.0019 |
 | gate, the conv broken (zero conv weights) | 0.0091-0.0119 / 0.0411 | 0.0109 / 0.0320 |
+
+Preemption (`check_vllm_preempt.py`): 24 sequences of 150 tokens on a
+400-block pool, 23 preemptions (vLLM recomputes the evicted requests, their
+conv state rebuilt from the prompt): decode mean 0.0003 / max 0.0022 eager,
+0.0003 / 0.0019 with CUDA graphs, worst sequence 0.0004, at the floor.
 
 The kernel alone against a PyTorch reference (a prefill then 6 decode steps
 through the paged state, rope_dim 128 / 64 / 0): within 0.09 bf16 ulp; with the

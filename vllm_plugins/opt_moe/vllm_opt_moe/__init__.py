@@ -11,6 +11,9 @@ its MTP depths as the speculative draft ``OptMoeMTPModel``
 (``--speculative-config '{"method": "mtp", "num_speculative_tokens": 1}'``, as
 for DeepSeek / Qwen)."""
 
+import os
+from pathlib import Path
+
 from vllm import ModelRegistry
 from vllm.config.speculative import SpeculativeConfig
 
@@ -40,6 +43,11 @@ def register() -> None:
     # TODO: vLLM maps a target's model_type to its MTP draft architecture in
     # this static method only (no registry entry for out-of-tree models).
     SpeculativeConfig.hf_config_override = staticmethod(draft_hf_config)
+    # fused-MoE kernel configs vLLM does not ship (GH200); vLLM reads this
+    # folder before its own, and a user's folder takes precedence
+    os.environ.setdefault(
+        "VLLM_TUNED_CONFIG_FOLDER", str(Path(__file__).parent / "moe_configs")
+    )
 
 
 __all__ = ["MODEL_ARCH", "MTP_ARCH", "register"]

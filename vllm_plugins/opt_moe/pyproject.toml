@@ -18,3 +18,6 @@ register_opt_moe = "vllm_opt_moe:register"
 
 [tool.setuptools.packages.find]
 include = ["vllm_opt_moe*"]
+
+[tool.setuptools.package-data]
+vllm_opt_moe = ["moe_configs/*.json"]

@@ -213,6 +213,14 @@ class GatedSWAttention(GQAttention):
         self.sinks = (
             nn.Parameter(torch.empty(self.n_heads)) if config.attention_sinks else None
         )
+        # The sliding-window layers' attention is its own remat region, so a policy
+        # can recompute it (cheap at the window size) and keep the full layers'
+        # saved: "*inner_attention_swa*" selects it, "*inner_attention*" both.
+        self.attention_region = (
+            "inner_attention_swa"
+            if getattr(config.inner_attention, "sliding_window_size", None)
+            else "inner_attention"
+        )
         self.sinks_after_region = config.sinks_after_region
 
     def param_layouts(self) -> dict:
@@ -279,8 +287,8 @@ class GatedSWAttention(GQAttention):
         )
         output = remat.region(
             self.inner_attention,
-            self.remat_region_name("inner_attention"),
-            recompute=self.remat_should_recompute("inner_attention"),
+            self.remat_region_name(self.attention_region),
+            recompute=self.remat_should_recompute(self.attention_region),
         )(
             xq,
             xk,

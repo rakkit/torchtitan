@@ -176,6 +176,24 @@ def test_the_gate_is_none_or_element_wise():
                 _tiny(conv=0, sinks=False, gate=bad).build()
 
 
+def test_a_remat_policy_can_recompute_only_the_window_layers_attention():
+    """The sliding-window layers' attention is its own remat region, so a policy
+    recomputes it there (cheap at the window size) and keeps the full layers'
+    saved; "*inner_attention*" still selects both."""
+    with torch.device("meta"):
+        model = _tiny(conv=0, sinks=False).build()  # layer 0 window, layer 1 full
+    for pattern, want in (
+        ("*inner_attention_swa*", {"0": True, "1": False}),
+        ("*inner_attention*", {"0": True, "1": True}),
+    ):
+        got = {}
+        for layer_id, block in model.layers.named_children():
+            block.configure_remat_regions(["*"], [pattern])
+            attention = block.attention
+            got[layer_id] = attention.remat_should_recompute(attention.attention_region)
+        assert got == want, pattern
+
+
 def test_features_off_add_nothing():
     with torch.device("meta"):
         plain = _tiny(conv=0, sinks=False).build()

@@ -17,6 +17,7 @@ Everything else -- rank keying, the DP-degree guard, iteration -- is inherited u
 from __future__ import annotations
 
 import logging
+import pickle
 
 from dataclasses import dataclass
 from typing import Annotated, Any
@@ -30,7 +31,7 @@ from torchtitan.components.data.keyed_mix_state import (
 )
 from torchtitan.components.data.loader import GrainDataLoader
 
-KEYED_STATE_VERSION = 2
+KEYED_STATE_VERSION = 3
 
 
 class KeyedMixDataLoader(GrainDataLoader):
@@ -65,8 +66,14 @@ class KeyedMixDataLoader(GrainDataLoader):
             )
 
     def state_dict(self) -> dict[str, Any]:
+        # The rank's state is ONE opaque item: DCP turns every nested leaf into its
+        # own checkpoint item (~1,200 per rank for a 44-dataset mix) and loads only
+        # the keys the live state asks for, which a stage adding datasets would not
+        # find in the checkpoint.
         state = super().state_dict()
-        state[self._rank_id] = to_keyed(state[self._rank_id], self._dataset_ids)
+        state[self._rank_id] = pickle.dumps(
+            to_keyed(state[self._rank_id], self._dataset_ids)
+        )
         state["version"] = KEYED_STATE_VERSION
         return state
 
@@ -120,7 +127,7 @@ class KeyedMixDataLoader(GrainDataLoader):
         # dataset this stage adds, in whatever shape the transform stack produces.
         fresh_state = self._iterator.get_state()
         restored_state, plan = from_keyed(
-            state_dict[self._rank_id], self._dataset_ids, fresh_state
+            pickle.loads(state_dict[self._rank_id]), self._dataset_ids, fresh_state
         )
         # Log on every rank's rank 0 only; a wrong stage config should be visible at
         # step 0 rather than inferred from a loss curve later.

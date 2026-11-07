@@ -14,12 +14,15 @@ not about state dictionaries agreeing with themselves.
 
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
 
 import grain.python as grain
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 
 from torchtitan.components.data.collators import TextCollator
 from torchtitan.components.data.keyed_loader import KeyedMixDataLoader
@@ -82,6 +85,11 @@ def _loader(tmp_path: Path, ids: list[str], rows: int = 256):
     )
 
 
+def _rank_state(checkpoint: dict) -> dict:
+    """The keyed state of rank 0: one opaque item in the checkpoint."""
+    return pickle.loads(checkpoint["dp_rank_0"])
+
+
 def _consume(loader, batches: int) -> int:
     iterator = iter(loader)
     for _ in range(batches):
@@ -99,7 +107,7 @@ def test_stage_two_resumes_old_datasets_and_starts_new_ones_fresh(tmp_path):
     stage1.close()
 
     # The checkpoint names its datasets -- that is the whole point.
-    rank_state = checkpoint["dp_rank_0"]
+    rank_state = _rank_state(checkpoint)
     assert set(rank_state["datasets"]) == set(stage1_ids)
     saved_cursors = {k: cursor_position(v) for k, v in rank_state["datasets"].items()}
     assert any(
@@ -132,7 +140,7 @@ def test_reordering_between_stages_does_not_move_cursors(tmp_path):
     _consume(stage1, batches=5)
     checkpoint = stage1.state_dict()
     saved = {
-        k: cursor_position(v) for k, v in checkpoint["dp_rank_0"]["datasets"].items()
+        k: cursor_position(v) for k, v in _rank_state(checkpoint)["datasets"].items()
     }
     stage1.close()
 
@@ -211,7 +219,7 @@ def test_per_dataset_document_counts_come_from_the_cursors(tmp_path):
     _consume(loader, batches=6)
 
     metrics = loader.consumption_metrics()
-    keyed = loader.state_dict()["dp_rank_0"]
+    keyed = _rank_state(loader.state_dict())
     counts = documents_consumed(keyed)
     loader.close()
 
@@ -241,3 +249,31 @@ def test_consumption_counts_survive_a_resume(tmp_path):
     second.close()
 
     assert after == before, "resumed counts must match what was checkpointed"
+
+
+def test_stage_two_resumes_through_dcp(tmp_path):
+    """The checkpointer's real path: dcp.save / dcp.load of {"dataloader": loader}.
+    DCP flattens nested dicts into one item per leaf and loads only the keys the
+    LIVE state asks for, so a nested rank state cannot resume a stage that adds
+    datasets, and a 44-dataset mixture made ~1,243 items per rank."""
+    stage1_ids = ["A", "B", "C", "D", "E"]
+    stage1 = _loader(tmp_path, stage1_ids)
+    _consume(stage1, batches=6)
+    saved = {
+        k: cursor_position(v)
+        for k, v in _rank_state(stage1.state_dict())["datasets"].items()
+    }
+    flat, _ = flatten_state_dict({"dataloader": stage1.state_dict()})
+    assert len(flat) == 3, sorted(flat)  # version, dp_world_size, the rank's state
+    checkpoint_id = str(tmp_path / "ckpt")
+    dcp.save({"dataloader": stage1}, checkpoint_id=checkpoint_id, no_dist=True)
+    stage1.close()
+
+    stage2_ids = [*stage1_ids, "F", "G", "H", "I"]
+    stage2 = _loader(tmp_path, stage2_ids)
+    dcp.load({"dataloader": stage2}, checkpoint_id=checkpoint_id, no_dist=True)
+    resumed = find_mix_node(stage2._iterator.get_state())["parents"]
+    stage2.close()
+    cursors = dict(zip(stage2_ids, [cursor_position(p) for p in resumed]))
+    assert {k: cursors[k] for k in stage1_ids} == saved
+    assert all(cursors[k] == 0 for k in ("F", "G", "H", "I"))

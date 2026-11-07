@@ -12,14 +12,15 @@ import pickle
 from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable, TYPE_CHECKING
 
-import datasets
 import grain.python as grain
-from datasets.distributed import split_dataset_by_node
 
 from torchtitan.components.data.types import DatasetIterationPolicy
 from torchtitan.config import Configurable
+
+if TYPE_CHECKING:  # imported where used: Hugging Face datasets pulls in pandas & co.
+    import datasets
 
 
 @runtime_checkable
@@ -110,6 +111,8 @@ class HuggingFaceRandomAccessSource(Configurable):
                 )
 
     def __init__(self, config: Config) -> None:
+        import datasets
+
         dataset = datasets.load_dataset(
             config.path,
             name=config.name,
@@ -154,6 +157,8 @@ class HuggingFaceStreamingSource(Configurable):
                 )
 
     def __init__(self, config: Config) -> None:
+        import datasets
+
         dataset = datasets.load_dataset(
             config.path,
             name=config.name,
@@ -178,6 +183,8 @@ class HuggingFaceStreamingSource(Configurable):
     def build_iter_dataset(
         self, *, dataset_iteration_policy: DatasetIterationPolicy
     ) -> grain.IterDataset:
+        from datasets.distributed import split_dataset_by_node
+
         dataset = split_dataset_by_node(
             self._dataset,
             rank=dataset_iteration_policy.dp_rank,
@@ -192,7 +199,7 @@ class HuggingFaceStreamingSource(Configurable):
 
 class _HuggingFaceIterDataset(grain.IterDataset):
     def __init__(
-        self, dataset: datasets.IterableDataset, *, repeat: bool, shuffle: bool
+        self, dataset: "datasets.IterableDataset", *, repeat: bool, shuffle: bool
     ) -> None:
         super().__init__()
         self._dataset = dataset
@@ -227,7 +234,7 @@ class _HuggingFaceCursorIterator(grain.DatasetIterator):
 
     def __init__(
         self,
-        dataset: datasets.IterableDataset,
+        dataset: "datasets.IterableDataset",
         *,
         repeat: bool,
         shuffle: bool,

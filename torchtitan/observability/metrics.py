@@ -22,13 +22,12 @@ from torch.distributed.pipelining.schedules import (
     ScheduleDualPipeV,
     ScheduleZBVZeroBubble,
 )
-from torch.utils.tensorboard import SummaryWriter
 
 from torchtitan.components.optim import OptimizersContainer
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelismContext
-from torchtitan.observability.logging import Color, NoColor
 from torchtitan.distributed.utils import rank_owns_metrics_shard
+from torchtitan.observability.logging import Color, NoColor
 from torchtitan.tools import utils
 from torchtitan.tools.utils import device_module, device_type
 
@@ -168,6 +167,8 @@ class TensorBoardLogger(BaseLogger):
         tag: str | None = None,
     ):
         self.tag = tag
+        from torch.utils.tensorboard import SummaryWriter  # only when TensorBoard is on
+
         self.writer = SummaryWriter(log_dir, max_queue=1000)
         logger.info(f"TensorBoard logging enabled. Logs will be saved at {log_dir}")
 

@@ -100,7 +100,7 @@ def test_only_metrics_rank_uses_mlflow(
     )
     writer = MagicMock()
     monkeypatch.setattr(
-        "torchtitan.observability.metrics.SummaryWriter", lambda *args, **kwargs: writer
+        "torch.utils.tensorboard.SummaryWriter", lambda *args, **kwargs: writer
     )
     result = MetricsProcessor.Config(
         loggers=[TensorBoardLogger.Config(), MLFlowLogger.Config()],

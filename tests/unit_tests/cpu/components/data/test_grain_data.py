@@ -464,7 +464,7 @@ def test_hf_explicit_fields_are_passed_to_load_dataset(
     )
     load_dataset = mock.Mock(return_value=loaded)
     monkeypatch.setattr(
-        "torchtitan.components.data.sources.datasets.load_dataset",
+        "datasets.load_dataset",
         load_dataset,
     )
 
@@ -540,7 +540,7 @@ def test_hf_config_rejects_duplicate_first_class_fields(source_type, field):
 )
 def test_hf_source_rejects_wrong_leaf(monkeypatch, source_type, wrong_leaf, message):
     monkeypatch.setattr(
-        "torchtitan.components.data.sources.datasets.load_dataset",
+        "datasets.load_dataset",
         lambda *args, **kwargs: wrong_leaf,
     )
 

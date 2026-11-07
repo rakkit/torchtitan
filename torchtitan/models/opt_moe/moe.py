@@ -29,6 +29,7 @@ from torchtitan.models.common.moe import (
     TokenChoiceTopKRouter,
 )
 from torchtitan.models.common.moe.token_dispatcher import AllToAllTokenDispatcher
+from torchtitan.ops.moe_rows import gather_sum, scatter_rows
 from torchtitan.ops.row_topk import row_topk
 
 
@@ -128,83 +129,25 @@ def _ep_group() -> torch.distributed.ProcessGroup | None:
 
 @dataclass(frozen=True, kw_only=True)
 class GatherDispatchMetadata:
-    """From `GatherTokenDispatcher.dispatch` for its `combine`. ``slot_row_N``:
-    each (token, k) slot's routed row; ``perm_N`` (unpadded layout only): each
-    routed row's slot."""
+    """From `GatherTokenDispatcher.dispatch` for its `combine`: each (token, k)
+    slot's routed row and the router's scores in slot order."""
 
     slot_row_N: torch.Tensor  # noqa: N815
-    perm_N: torch.Tensor | None  # noqa: N815
     topk_scores_TK: torch.Tensor  # noqa: N815
 
 
-class _DispatchRows(torch.autograd.Function):
-    """``x_TD[perm_N // K]`` (unpadded): every token once per routed expert,
-    expert-major. Backward: each token's K row gradients gathered and summed."""
-
-    @staticmethod
-    def forward(ctx, x_TD, perm_N, slot_row_N, top_k):
-        ctx.save_for_backward(slot_row_N)
-        ctx.top_k = top_k
-        return x_TD[perm_N // top_k]
-
-    @staticmethod
-    def backward(ctx, grad_ND):
-        (slot_row_N,) = ctx.saved_tensors
-        grad_TKD = grad_ND[slot_row_N].view(-1, ctx.top_k, grad_ND.shape[-1])
-        return grad_TKD.sum(dim=1), None, None, None
-
-
-class _DispatchPaddedRows(torch.autograd.Function):
-    """``[x_TD; 0][source_M]`` (padded): every token once per routed expert at its
-    padded expert-major row, zero rows elsewhere. Backward as `_DispatchRows`."""
-
-    @staticmethod
-    def forward(ctx, x_TD, source_M, slot_row_N, top_k):
-        ctx.save_for_backward(slot_row_N)
-        ctx.top_k = top_k
-        x_ext = torch.cat([x_TD, x_TD.new_zeros(1, x_TD.shape[-1])])
-        return x_ext[source_M]
-
-    @staticmethod
-    def backward(ctx, grad_MD):
-        (slot_row_N,) = ctx.saved_tensors
-        grad_TKD = grad_MD[slot_row_N].view(-1, ctx.top_k, grad_MD.shape[-1])
-        return grad_TKD.sum(dim=1), None, None, None
-
-
-class _GatherRows(torch.autograd.Function):
-    """``src_MD[index_N]`` for distinct rows. Backward: the gradient gathered by
-    ``inverse_M`` when the gather is a permutation, else written back into zeros
-    (an index_put without accumulate)."""
-
-    @staticmethod
-    def forward(ctx, src_MD, index_N, inverse_M):
-        ctx.save_for_backward(index_N, inverse_M)
-        ctx.num_rows = src_MD.shape[0]
-        return src_MD[index_N]
-
-    @staticmethod
-    def backward(ctx, grad_ND):
-        index_N, inverse_M = ctx.saved_tensors
-        if inverse_M.numel():
-            return grad_ND[inverse_M], None, None
-        grad_MD = grad_ND.new_zeros(ctx.num_rows, grad_ND.shape[-1])
-        grad_MD[index_N] = grad_ND
-        return grad_MD, None, None
-
-
 class GatherTokenDispatcher(AllToAllTokenDispatcher):
-    """At EP 1, dispatch and combine as row gathers: the dispatch gathers each
-    token once per routed expert in expert-major order, the combine gathers the
-    expert outputs back to [T, K, D] and sums the K score-weighted rows in fp32.
-    No backward is a sort-based index_put or a scatter_add. The combine rounds
-    once per token instead of once per added expert output, so it is not
-    bitwise equal to the scatter-add dispatcher (closer to the fp64 result).
+    """At EP 1, dispatch and combine as row kernels (`torchtitan/ops/moe_rows.py`):
+    the dispatch writes each token once per routed expert in expert-major order,
+    the combine gathers each token's K expert outputs back and sums them
+    score-weighted in fp32 (rounded once; upstream's scatter-add adds them into a
+    bf16 accumulator one by one, so this is not bitwise equal to it). Every
+    backward is a row gather or write (no sort-based index_put, no scatter-add).
 
-    ``pad_multiple`` > 1: every expert's rows start at a multiple of it in a
-    static ``T * K + E * (pad_multiple - 1)`` rows (rounded up), zero rows
-    between (the layout DeepGEMM's grouped GEMM needs); the returned counts are
-    the padded ones. EP > 1: the all-to-all dispatcher unchanged (unpadded)."""
+    ``pad_multiple`` > 1: every expert's rows start at a multiple of it in a static
+    ``T * K + E * (pad_multiple - 1)`` rows (rounded up), zero rows between (the
+    layout DeepGEMM's grouped GEMM needs); the returned counts are the padded
+    ones. EP > 1: the all-to-all dispatcher unchanged (unpadded)."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(AllToAllTokenDispatcher.Config):
@@ -222,47 +165,33 @@ class GatherTokenDispatcher(AllToAllTokenDispatcher):
         counts_E = routing_map_TE.sum(dim=0)
         expert_N = topk_expert_ids_TK.reshape(-1)
         perm_N = torch.argsort(expert_N, stable=True)
-        num_rows = perm_N.numel()
-        arange_N = torch.arange(num_rows, device=perm_N.device)
+        num_slots, align = perm_N.numel(), self.pad_multiple
+        row_N = torch.arange(num_slots, device=perm_N.device)  # sorted slot -> row
+        num_rows = num_slots
+        if align > 1:
+            padded_counts_E = (counts_E + align - 1) // align * align
+            pad_E = padded_counts_E - counts_E
+            row_N = row_N + (torch.cumsum(pad_E, 0) - pad_E)[expert_N[perm_N]]
+            num_rows = num_slots + self.num_experts * (align - 1)
+            num_rows = (num_rows + align - 1) // align * align
+            counts_E = padded_counts_E
         slot_row_N = torch.empty_like(perm_N)
-        align = self.pad_multiple
-        if align == 1:
-            slot_row_N[perm_N] = arange_N
-            routed_input = _DispatchRows.apply(x_TD, perm_N, slot_row_N, self.top_k)
-            metadata = GatherDispatchMetadata(
-                slot_row_N=slot_row_N, perm_N=perm_N, topk_scores_TK=topk_scores_TK
-            )
-            return routed_input, counts_E, metadata
-        padded_counts_E = (counts_E + align - 1) // align * align
-        pad_E = padded_counts_E - counts_E
-        row_N = arange_N + (torch.cumsum(pad_E, 0) - pad_E)[expert_N[perm_N]]
-        total = num_rows + self.num_experts * (align - 1)
-        total = (total + align - 1) // align * align
-        source_M = torch.full(
-            (total,), x_TD.shape[0], dtype=perm_N.dtype, device=perm_N.device
-        )
-        source_M[row_N] = perm_N // self.top_k
         slot_row_N[perm_N] = row_N
-        routed_input = _DispatchPaddedRows.apply(x_TD, source_M, slot_row_N, self.top_k)
+        routed_input_RD = scatter_rows(x_TD, slot_row_N, num_rows)
         metadata = GatherDispatchMetadata(
-            slot_row_N=slot_row_N, perm_N=None, topk_scores_TK=topk_scores_TK
+            slot_row_N=slot_row_N, topk_scores_TK=topk_scores_TK
         )
-        return routed_input, padded_counts_E, metadata
+        return routed_input_RD, counts_E, metadata
 
     def combine(self, routed_output_RD, metadata, x_TD):
         if not isinstance(metadata, GatherDispatchMetadata):
             return super().combine(routed_output_RD, metadata, x_TD)
-        # The combine reads the expert outputs with bare ops.
+        # The combine saves the expert outputs for its backward (score gradients).
         remat.recompute_needs_tensor(routed_output_RD)
-        inverse = (
-            metadata.perm_N
-            if metadata.perm_N is not None
-            else metadata.slot_row_N.new_empty(0)
+        out_TD = gather_sum(
+            routed_output_RD, metadata.slot_row_N, metadata.topk_scores_TK, self.top_k
         )
-        rows_TKD = _GatherRows.apply(routed_output_RD, metadata.slot_row_N, inverse)
-        rows_TKD = rows_TKD.view(x_TD.shape[0], self.top_k, -1)
-        scores_TK1 = metadata.topk_scores_TK.to(torch.float32).unsqueeze(-1)
-        return (rows_TKD * scores_TK1).sum(dim=1).to(x_TD.dtype)
+        return out_TD.to(x_TD.dtype)
 
 
 class RowTopKRouter(TokenChoiceTopKRouter):

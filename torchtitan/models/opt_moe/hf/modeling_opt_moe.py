@@ -364,7 +364,7 @@ class OptMoeSparseMoe(nn.Module):
     router's order (highest score first, lowest expert id on equal scores), the
     experts run in bf16 ``torch._grouped_mm`` (CUDA only) whatever the model's
     dtype, and the combine gathers each token's K expert outputs back and sums
-    them score-weighted in fp32 (every forward, generation included)."""
+    them score-weighted in fp32, k in order (every forward, generation included)."""
 
     def __init__(self, config: OptMoeConfig):
         super().__init__()
@@ -431,12 +431,14 @@ class OptMoeSparseMoe(nn.Module):
         ).type_as(routed_ND)
         inverse_N = torch.empty_like(order_N)
         inverse_N[order_N] = torch.arange(order_N.numel(), device=order_N.device)
-        out_TKD = out_ND[inverse_N].view(-1, self.top_k, out_ND.shape[-1])
-        out_TD = (
-            (out_TKD * topk_TK.unsqueeze(-1).to(torch.float32))
-            .sum(dim=1)
-            .to(x_TD.dtype)
-        )
+        rows_TKD = out_ND[inverse_N].view(-1, self.top_k, out_ND.shape[-1]).float()
+        weighted_TKD = rows_TKD * topk_TK.unsqueeze(-1).to(torch.float32)
+        # fp32, k in order, one add at a time: torchtitan's combine kernel
+        # (torchtitan/ops/moe_rows.py) bitwise
+        out_TD = weighted_TKD[:, 0]
+        for k in range(1, self.top_k):
+            out_TD = out_TD + weighted_TKD[:, k]
+        out_TD = out_TD.to(x_TD.dtype)
         if self.shared_experts is not None:
             out_TD = out_TD + self.shared_experts(x_TD)
         return out_TD.view_as(x)

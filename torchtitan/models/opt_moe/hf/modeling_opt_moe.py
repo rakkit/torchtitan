@@ -360,9 +360,11 @@ class OptMoeExperts(nn.Module):
 
 
 class OptMoeSparseMoe(nn.Module):
-    """torchtitan's MoE, bitwise: the experts run in bf16 ``torch._grouped_mm``
-    (CUDA only) whatever the model's dtype, and the combine is a deterministic
-    scatter-add (every forward, generation included)."""
+    """torchtitan's MoE (opt_moe's default paths), bitwise: the experts in the
+    router's order (highest score first, lowest expert id on equal scores), the
+    experts run in bf16 ``torch._grouped_mm`` (CUDA only) whatever the model's
+    dtype, and the combine gathers each token's K expert outputs back and sums
+    them score-weighted in fp32 (every forward, generation included)."""
 
     def __init__(self, config: OptMoeConfig):
         super().__init__()
@@ -399,7 +401,11 @@ class OptMoeSparseMoe(nn.Module):
         scores_TE = self._scores(gate_TE)
         bias = self.gate.e_score_correction_bias
         choice_TE = scores_TE if bias is None else scores_TE + bias
-        ids_TK = torch.topk(choice_TE, k=self.top_k, dim=-1, sorted=False).indices
+        ids_TK = (
+            torch.sort(choice_TE, dim=-1, descending=True, stable=True)
+            .indices[:, : self.top_k]
+            .contiguous()
+        )
         topk_TK = scores_TE.gather(dim=-1, index=ids_TK)
         if self.norm_topk_prob:
             topk_TK = topk_TK / (
@@ -409,7 +415,6 @@ class OptMoeSparseMoe(nn.Module):
 
         counts_E = torch.bincount(ids_TK.view(-1), minlength=w.shape[0])
         order_N = torch.argsort(ids_TK.view(-1), stable=True)
-        scores_N = topk_TK.view(-1)[order_N]
         tokens_N = order_N // self.top_k
         routed_ND = x_TD[tokens_N]
         offsets_E = torch.cumsum(counts_E, dim=0, dtype=torch.int32)
@@ -424,16 +429,14 @@ class OptMoeSparseMoe(nn.Module):
             self.experts.down_proj.bfloat16().transpose(-2, -1),
             offs=offsets_E,
         ).type_as(routed_ND)
-        out_ND = (out_ND * scores_N.reshape(-1, 1).to(torch.float32)).to(out_ND.dtype)
-        prev = torch.are_deterministic_algorithms_enabled()
-        prev_warn = torch.is_deterministic_algorithms_warn_only_enabled()
-        torch.use_deterministic_algorithms(True, warn_only=False)
-        try:
-            out_TD = torch.zeros_like(x_TD).scatter_add(
-                0, tokens_N.reshape(-1, 1).expand(-1, x_TD.shape[-1]), out_ND
-            )
-        finally:
-            torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
+        inverse_N = torch.empty_like(order_N)
+        inverse_N[order_N] = torch.arange(order_N.numel(), device=order_N.device)
+        out_TKD = out_ND[inverse_N].view(-1, self.top_k, out_ND.shape[-1])
+        out_TD = (
+            (out_TKD * topk_TK.unsqueeze(-1).to(torch.float32))
+            .sum(dim=1)
+            .to(x_TD.dtype)
+        )
         if self.shared_experts is not None:
             out_TD = out_TD + self.shared_experts(x_TD)
         return out_TD.view_as(x)

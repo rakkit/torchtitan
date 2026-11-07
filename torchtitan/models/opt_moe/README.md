@@ -94,6 +94,24 @@ each a dict of `CosSinRoPE.Config` fields (the cache is `seq_len` long, or
   every token.
 - `w{1,2,3}_init_fn_type`, `..._init_std` (`scaled_orthogonal`, 1.0): one
   init for the dense FFN, the routed and the shared experts.
+- MoE paths at EP 1 (EP > 1 keeps the all-to-all dispatch):
+  - `token_dispatch` (`"gather"`; `"scatter_add"` = upstream's): dispatch and
+    combine as row gathers; each token's K score-weighted expert outputs are
+    summed in fp32 and rounded once (upstream adds them into a bf16
+    accumulator one by one), and no backward is a sort-based index_put or a
+    scatter-add.
+  - `router_topk` (`"triton"`; `"torch"`): the expert choice by one Triton
+    pass per row (`torchtitan/ops/row_topk.py`): highest score first, the
+    lowest expert id on equal scores.
+  - `expert_gemm` (`"torch"`; `"deepgemm"`): DeepGEMM's grouped GEMMs for the
+    experts' forward and input gradient (`deepgemm_experts.py`; bitwise equal
+    to `torch._grouped_mm`); needs `token_dispatch="gather"`, EP 1 and `dim` /
+    `moe_hidden_dim` multiples of 64. Set `DG_JIT_CACHE_DIR` (its kernels
+    compile on first use; the default is under `$HOME`).
+  l44 q32 top 8 E256, 16k context, 64k tokens, 16 nodes, same nodes (steps 20 /
+  30, tokens / s / GPU): upstream's 12,324 / 12,315; gather 12,479 / 12,464;
+  + DeepGEMM 12,620 / 12,586; + Triton top-k 12,738 / 12,674 (+3.4% / +2.9%).
+  The HF modeling file reproduces the default paths bitwise.
 
 ## Block and model
 

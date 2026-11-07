@@ -87,10 +87,16 @@ from torchtitan.models.common.moe.sharding import (
 from torchtitan.models.common.moe.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.common.nn_modules import Conv1d, RMSNorm
 from torchtitan.models.common.rope import CosSinRoPE, RoPE
+from .deepgemm_experts import DEEPGEMM_ALIGN, DeepGEMMGroupedLinear
 
 from .gated_swa_attention import GatedSWAttention
 from .model import layout_flags, OPTMoEModel, OPTMoEMTPBlock, OPTMoETransformerBlock
-from .moe import OptMoE
+from .moe import (
+    GatherTokenDispatcher,
+    OptMoE,
+    RowTopKQuantileBalancedRouter,
+    RowTopKRouter,
+)
 from .param_init import (
     conv_init_fn,
     make_expert_param_init,
@@ -255,6 +261,9 @@ def build_opt_moe_layers(
     aux_loss: dict[str, Any] | None = None,
     quantile_balance_bins: int | None = None,
     track_router_metrics: bool = True,
+    token_dispatch: Literal["scatter_add", "gather"] = "gather",
+    expert_gemm: Literal["torch", "deepgemm"] = "torch",
+    router_topk: Literal["torch", "triton"] = "triton",
     w1_init_fn_type: str = "scaled_orthogonal",
     w1_init_std: float = 1.0,
     w2_init_fn_type: str = "scaled_orthogonal",
@@ -482,20 +491,49 @@ def build_opt_moe_layers(
                 sharding_config=router_sharding_config(),
             )
             expert_sharding = routed_expert_linear_sharding_config(enable_ep=enable_ep)
+            if expert_gemm == "deepgemm" and (token_dispatch != "gather" or enable_ep):
+                raise ValueError(
+                    'expert_gemm="deepgemm" needs token_dispatch="gather" and EP 1 '
+                    "(its padded expert-major layout)"
+                )
+            if expert_gemm == "deepgemm" and (dim % 64 or moe_hidden_dim % 64):
+                raise ValueError(
+                    'expert_gemm="deepgemm" needs dim and moe_hidden_dim multiples of '
+                    f"64 (DeepGEMM's SM90 bf16 K granularity), got {dim} / {moe_hidden_dim}"
+                )
+            expert_linear = (
+                DeepGEMMGroupedLinear if expert_gemm == "deepgemm" else GroupedLinear
+            )
+            dispatcher = (
+                GatherTokenDispatcher.Config(
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    pad_multiple=DEEPGEMM_ALIGN if expert_gemm == "deepgemm" else 1,
+                )
+                if token_dispatch == "gather"
+                else AllToAllTokenDispatcher.Config(
+                    num_experts=num_experts, top_k=top_k
+                )
+            )
+            plain_router, quantile_router = (
+                (RowTopKRouter, RowTopKQuantileBalancedRouter)
+                if router_topk == "triton"
+                else (TokenChoiceTopKRouter, QuantileBalancedTopKRouter)
+            )
             feed_forward = OptMoE.Config(
                 num_experts=num_experts,
                 load_balance_coeff=load_balance_coeff,
                 bias_update_norm_factor=bias_update_norm_factor,
                 track_router_metrics=track_router_metrics,
                 router=(
-                    QuantileBalancedTopKRouter.Config(
+                    quantile_router.Config(
                         **router_args, num_bins=quantile_balance_bins
                     )
                     if quantile_balance_bins is not None
-                    else TokenChoiceTopKRouter.Config(**router_args)
+                    else plain_router.Config(**router_args)
                 ),
                 routed_experts=RoutedExperts.Config(
-                    w13=GroupedLinear.Config(
+                    w13=expert_linear.Config(
                         group_size=num_experts,
                         in_features=dim,
                         out_features=moe_hidden_dim,
@@ -518,7 +556,7 @@ def build_opt_moe_layers(
                         ),
                         sharding_config=expert_sharding,
                     ),
-                    w2=GroupedLinear.Config(
+                    w2=expert_linear.Config(
                         group_size=num_experts,
                         in_features=moe_hidden_dim,
                         out_features=dim,
@@ -533,9 +571,7 @@ def build_opt_moe_layers(
                         sharding_config=expert_sharding,
                     ),
                     # All-to-all under EP, local dispatch at EP 1 (no EP mesh).
-                    token_dispatcher=AllToAllTokenDispatcher.Config(
-                        num_experts=num_experts, top_k=top_k
-                    ),
+                    token_dispatcher=dispatcher,
                     sharding_config=routed_experts_sharding_config(),
                 ),
                 shared_experts=(

@@ -14,7 +14,12 @@ expert bias), and an MTP depth; many short documents (the MTP validity mask
 and the conv's document offsets) and trailing padding. Each rank holds whole
 KV groups (4 KV heads, 2 per rank); fp32 with flex attention (the routed
 experts in bf16). The forward and the loss run under spmd_types type
-checking, as the training engine runs them."""
+checking, as the training engine runs them. After the backward the trainer's
+load-balance hook (the expert statistics, summed over TP: the router is
+token-sharded on TP under EP) updates the expert bias: by sign, and by the
+quantile solve in the "neither" case; both match the one-rank update."""
+
+import types
 
 import pytest
 import spmd_types as spmd
@@ -34,6 +39,10 @@ from torchtitan.models.base.module import Module
 from torchtitan.models.common.attention import FlexInnerAttention
 from torchtitan.models.opt_moe import build_model_config
 from torchtitan.models.opt_moe.mtp import MTPCrossEntropyLoss, roll_mtp_sequence
+from torchtitan.optimizers.moe_balance import (
+    moe_layers,
+    register_moe_load_balancing_hook,
+)
 
 TP = 2
 T = 512
@@ -49,7 +58,11 @@ ATTENTION = {
         sinks_init_fn_type="trunc_normal",
         sinks_init_std=0.5,
     ),
-    "neither": dict(gated_attention_type=None, rope=dict(dim=64, theta=10000.0)),
+    "neither": dict(
+        gated_attention_type=None,
+        rope=dict(dim=64, theta=10000.0),
+        quantile_balance_bins=64,
+    ),
 }
 # The largest |loss_tp - loss| / |loss| (fp32).
 TOL = 1e-5
@@ -119,6 +132,27 @@ def _placement(layout: spmd.SpmdType, axis: str):
     raise ValueError(f"no gradient rule for {kind} on {axis}")
 
 
+def _balance_step(model: Module, parallelism_context) -> dict:
+    """Fire the trainer's load-balance step pre-hook once (as the optimizer
+    step would) and return each MoE layer's expert bias and token EMA."""
+
+    class _Optimizers:
+        def register_step_pre_hook(self, hook):
+            self.hook = hook
+
+    optimizers = _Optimizers()
+    register_moe_load_balancing_hook(optimizers, [model], parallelism_context)
+    optimizers.hook()
+    return {
+        f"layer {i} {name}": getattr(moe, attr).detach().clone()
+        for i, moe in moe_layers([model])
+        for name, attr in (
+            ("expert bias", "expert_bias_E"),
+            ("token EMA", "tokens_per_expert_cumul"),
+        )
+    }
+
+
 def _relative(got: torch.Tensor, want: torch.Tensor) -> float:
     return ((got.float() - want.float()).norm() / want.float().norm()).item()
 
@@ -177,16 +211,21 @@ class TestTensorParallel(DTensorTestBase):
             )
             want_loss, _ = loss_fn(predictions, (labels, mtp_labels), counts)
             want_loss.backward()
+            one_rank = types.SimpleNamespace(
+                get_optional_mesh=lambda _name: None, ep_enabled=False, tp=1, cp=1
+            )
             references[case] = (
-                reference.state_dict(),
+                # a copy: the balance step below updates the expert bias in place
+                {k: v.detach().clone() for k, v in reference.state_dict().items()},
                 want_loss.detach(),
                 {n: p.grad for n, p in reference.named_parameters()},
+                _balance_step(reference, one_rank),
             )
         # every case's errors, asserted together at the end (one failure would
         # hide the rest)
         failures = []
         for case, attention in ATTENTION.items():
-            state, want_loss, want_grads = references[case]
+            state, want_loss, want_grads, want_balance = references[case]
             for sp in (False, True):
                 tag = f"{case} sp={sp}"
                 pc = ParallelismContext(
@@ -256,6 +295,11 @@ class TestTensorParallel(DTensorTestBase):
                     rel = _relative(grad, want)
                     if not rel < GRAD_TOL:
                         failures.append(f"{tag} {name} {rel:.3g}")
+                # the counts are integers: equal unless a token's top-k differs
+                for name, got in _balance_step(model, pc).items():
+                    diff = (got - want_balance[name]).abs().max().item()
+                    if diff != 0:
+                        failures.append(f"{tag} {name} max |diff| {diff:.3g}")
         if failures and dist.get_rank() == 0:
             print("\n".join(["TP mismatches:", *failures]), flush=True)
         self.assertEqual(failures, [])

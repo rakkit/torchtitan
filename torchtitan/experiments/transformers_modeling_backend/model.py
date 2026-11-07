@@ -1428,7 +1428,10 @@ class HFTransformerModel(BaseModel):
         self,
         *,
         buffer_device: torch.device | None = None,
+        init_parameters: bool = True,
     ) -> None:
+        # Always the full HF init (``init_parameters`` is ignored): HF's
+        # ``_init_weights`` also rebuilds buffers, so parameters are not skipped.
         # This method replicates the behavior of the original PreTrainedModel.init_weights,
         # but with a custom weight initialization function that skips nn.Identity modules (when PP is enabled)
 

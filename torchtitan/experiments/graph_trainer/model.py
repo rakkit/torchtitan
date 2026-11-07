@@ -25,9 +25,16 @@ from .simple_fsdp import disable_active_parametrization
 class GraphTrainerModel:
     """Model behavior shared by GraphTrainer model implementations."""
 
-    def init_states(self, *, buffer_device: torch.device | None = None) -> None:
+    def init_states(
+        self,
+        *,
+        buffer_device: torch.device | None = None,
+        init_parameters: bool = True,
+    ) -> None:
         with disable_active_parametrization():
-            super().init_states(buffer_device=buffer_device)
+            super().init_states(
+                buffer_device=buffer_device, init_parameters=init_parameters
+            )
 
     def parallelize(
         self,

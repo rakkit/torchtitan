@@ -147,28 +147,35 @@ class Module(nn.Module, Configurable):
         self,
         *,
         buffer_device: torch.device | None = None,
+        init_parameters: bool = True,
     ) -> None:
         """Initialize all states in the module tree.
 
         1. Recursively calls ``init_states`` on all direct Module children.
-        2. Calls ``self._init_self_parameters()``.
+        2. Calls ``self._init_self_parameters()`` unless ``init_parameters`` is False.
         3. Calls ``self._init_self_buffers(...)``.
 
         Args:
             buffer_device: Device for buffer initialization (e.g., RoPE, MoE).
+            init_parameters: False when a checkpoint load overwrites every
+                parameter right after (buffers such as RoPE caches are not in
+                checkpoints and are always initialized).
         """
 
         queue = list(self.children())
         while queue:
             child = queue.pop(0)
             if isinstance(child, Module):
-                child.init_states(buffer_device=buffer_device)
+                child.init_states(
+                    buffer_device=buffer_device, init_parameters=init_parameters
+                )
             else:
                 # Plain nn.Module (e.g., CheckpointWrapper, torch.compile
                 # wrappers) — look inside for Module descendants.
                 queue.extend(child.children())
 
-        self._init_self_parameters()
+        if init_parameters:
+            self._init_self_parameters()
 
         with self._preserve_buffer_spmd_types():
             self._init_self_buffers(buffer_device=buffer_device)

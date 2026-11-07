@@ -268,6 +268,7 @@ class Decoder(BaseModel):
         self,
         *,
         buffer_device: torch.device | None = None,
+        init_parameters: bool = True,
     ) -> None:
         if self.enable_weight_tying:
             # Re-tie before init: on meta device the ``__init__`` tying may not
@@ -276,7 +277,9 @@ class Decoder(BaseModel):
             # weight.
             assert self.tok_embeddings is not None and self.lm_head is not None
             self.tok_embeddings.weight = self.lm_head.weight
-        super().init_states(buffer_device=buffer_device)
+        super().init_states(
+            buffer_device=buffer_device, init_parameters=init_parameters
+        )
         # ``to_empty()`` and ``RoPE._init_self_buffers()`` give every layer its
         # own cache again; point identical RoPEs back at one tensor.
         self._tie_rope_caches()

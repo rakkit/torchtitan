@@ -48,8 +48,10 @@ class BaseModel(Module, ABC):
         DTensor-aware interception. This alias ensures they can find it.
         """
         # TODO: remove this once autoparallel has wrap_init_states
-        buffer_device = kwargs.get("buffer_device")
-        self.init_states(buffer_device=buffer_device)
+        self.init_states(
+            buffer_device=kwargs.get("buffer_device"),
+            init_parameters=kwargs.get("init_parameters", True),
+        )
 
     def preprocess_inputs(
         self,

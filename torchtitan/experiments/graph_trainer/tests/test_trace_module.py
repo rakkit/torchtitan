@@ -1958,7 +1958,7 @@ class TestTraceModels(unittest.TestCase):
                 self.attn = DeepSeekMLAAttention(attn_config)
                 self.proj = nn.Linear(dim, vocab_size)
 
-            def init_states(self, buffer_device=None):
+            def init_states(self, buffer_device=None, init_parameters=True):
                 self.attn.rope._init_self_buffers(
                     buffer_device=buffer_device or torch.device("cuda")
                 )

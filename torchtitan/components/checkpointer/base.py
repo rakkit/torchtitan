@@ -732,3 +732,21 @@ class BaseCheckpointManager(Configurable, ABC):
                     "initial_load_model_only=True has no effect without "
                     "an initial_load_path."
                 )
+
+        def loads_model_at_start(self, base_folder: str) -> bool:
+            """Whether the load at the start of training restores every model
+            parameter: a ``step-N`` folder to resume from, or a native
+            ``initial_load_path`` (both strict: a missing key fails the load).
+
+            Decided from the folder layout before the manager exists, so the
+            engine can skip parameter init (e.g. an orthogonal QR per matrix)
+            that the load overwrites; the engine raises if the load then
+            restores nothing. Hugging Face loads keep the full init.
+            """
+            folder = filesystem.join(base_folder, self.folder)
+            if filesystem.isdir(folder) and any(
+                re.fullmatch(BaseCheckpointManager._STEP_DIR_PATTERN, name)
+                for name in filesystem.listdir(folder)
+            ):
+                return True
+            return bool(self.initial_load_path) and not self.initial_load_in_hf

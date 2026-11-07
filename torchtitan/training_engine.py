@@ -458,11 +458,24 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.pp_has_first_stage = True
             self.pp_has_last_stage = True
 
+        # Parameter init (e.g. an orthogonal QR per matrix) is skipped when the
+        # checkpoint load right after restores every parameter; buffers are
+        # always initialized, and load_checkpoint raises if nothing is loaded.
+        self._parameters_await_load = (
+            not create_seed_checkpoint
+            and self.config.checkpointer is not None
+            and self.config.checkpointer.loads_model_at_start(self.output_dir)
+        )
+        if self._parameters_await_load:
+            logger.info("Skipping parameter init: the checkpoint load restores it")
         with self.parallelism_context.activate_spmd():
             for model_part in self.model_parts:
                 model_part.to_empty(device=init_device)
                 with torch.no_grad():
-                    model_part.init_weights(buffer_device=buffer_device)
+                    model_part.init_weights(
+                        buffer_device=buffer_device,
+                        init_parameters=not self._parameters_await_load,
+                    )
                 model_part.train()
 
         # With the chunked loss the model's output is the LM head's input.
@@ -999,7 +1012,16 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         checkpointer_config = self.config.checkpointer
         if checkpointer_config is None:
             return False
-        return self.checkpointer.load(step=checkpointer_config.load_step)
+        loaded = self.checkpointer.load(step=checkpointer_config.load_step)
+        if self._parameters_await_load and not loaded:
+            raise RuntimeError(
+                "Parameter init was skipped because "
+                f"{self.checkpointer.folder} holds a step-N folder or "
+                "initial_load_path is set, but no checkpoint was loaded (e.g. "
+                "only incomplete step folders): remove them or fix the path."
+            )
+        self._parameters_await_load = False
+        return loaded
 
     def save_checkpoint(self, *, last_step: bool = False) -> bool:
         if not hasattr(self, "checkpointer"):

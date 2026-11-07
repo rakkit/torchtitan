@@ -325,3 +325,26 @@ def test_model_with_conv_and_sinks_trains_one_step():
             and torch.isfinite(p.grad).all()
             and p.grad.abs().sum() > 0
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="flex attention needs CUDA")
+def test_training_and_no_grad_sinks_give_the_same_output():
+    """Training applies the sink rescale after the attention's remat region (so
+    the backward recomputes it); no-grad paths (validation, the RL generator's
+    injected hook) apply it as the attention's out_transform. Same math, so the
+    outputs are bitwise equal."""
+    cfg = _tiny(sinks_init_fn_type="trunc_normal", sinks_init_std=0.5)
+    with torch.device("meta"):
+        model = cfg.build()
+    model.to_empty(device="cuda")
+    torch.manual_seed(0)
+    with torch.no_grad():
+        model.init_states(buffer_device=torch.device("cuda"))
+    positions = torch.cat([torch.arange(100), torch.arange(156)]).cuda()
+    tokens = torch.randint(0, cfg.vocab_size, (256,), device="cuda")
+    metadata = model._get_attention_metadata(positions)
+    trained = model(tokens, positions=positions, attention_metadata=metadata)
+    with torch.no_grad():
+        scored = model(tokens, positions=positions, attention_metadata=metadata)
+    assert trained.requires_grad
+    assert torch.equal(trained.detach(), scored)

@@ -120,6 +120,12 @@ class CanonShortConv(Module):
         return canon_short_conv(x_TC, weight_C1W, conv_metadata)
 
 
+def _output_and_lse(
+    out: torch.Tensor, lse: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return out, lse
+
+
 # Attention sinks: a copy of gpt_oss's apply_attention_sink_rescale (same math),
 # compiled as its own region; opt_moe does not import gpt_oss code.
 @local_compile("opt_moe_sink_rescale", batch_invariant=True)
@@ -253,6 +259,12 @@ class GatedSWAttention(GQAttention):
             xk = self.k_norm(xk)
         if self.rope is not None:
             xq, xk = self._apply_rope(xq, xk, positions)
+        # In training the sink rescale runs after the region, as bare ops that the
+        # backward recomputes (like the gate): inside the region its output was
+        # saved beside the attention output, one more [T, H, K] per layer. The
+        # no-grad paths (validation, the RL generator, which injects its own sink
+        # hook into its attention backend) keep the rescale as out_transform.
+        sinks_after_region = self.sinks is not None and torch.is_grad_enabled()
         output = remat.region(
             self.inner_attention,
             self.remat_region_name("inner_attention"),
@@ -264,9 +276,20 @@ class GatedSWAttention(GQAttention):
             attention_metadata=attention_metadata,
             scale=self.scaling,
             enable_gqa=self.enable_gqa,
-            out_transform=self._apply_sinks if self.sinks is not None else None,
+            out_transform=(
+                _output_and_lse
+                if sinks_after_region
+                else self._apply_sinks
+                if self.sinks is not None
+                else None
+            ),
         )
-        remat.recompute_needs_tensor(output)
+        if sinks_after_region:
+            output, lse = output
+            remat.recompute_needs_tensor(output, lse)
+            output = self._apply_sinks(output, lse)
+        else:
+            remat.recompute_needs_tensor(output)
         if gate is not None:
             # The gate reads the gate projection's output with bare ops.
             remat.recompute_needs_tensor(gate)

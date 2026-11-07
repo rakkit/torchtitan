@@ -19,6 +19,7 @@ import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.checkpointer import DATALOADER
+from torchtitan.components.data.balance import NodeAttentionBalancer
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
@@ -98,6 +99,10 @@ class Trainer(Configurable):
             default_factory=HuggingFaceTokenizer.Config
         )
         dataloader: BaseDataLoader.Config = field(default_factory=BaseDataLoader.Config)
+        attention_balancer: NodeAttentionBalancer.Config | None = None
+        """Regroup each training microbatch's documents over the ranks of a node
+        so they have about equal attention work (components/data/balance.py).
+        None: the microbatches as packed."""
         validator: Validator.Config | None = None
         dump_folder: str = "./outputs"
 
@@ -128,6 +133,15 @@ class Trainer(Configurable):
                     debug=self.debug,
                     activation_remat=self.activation_remat,
                     max_num_documents=self.dataloader.max_num_documents,
+                )
+            if self.attention_balancer is not None and (
+                self.parallelism.tensor_parallel_degree > 1
+                or self.parallelism.context_parallel_degree > 1
+                or self.parallelism.pipeline_parallel_degree > 1
+            ):
+                raise ValueError(
+                    "attention_balancer regroups documents over a node's "
+                    "data-parallel ranks; it needs TP, CP and PP degree 1"
                 )
             if self.create_seed_checkpoint and (
                 self.checkpointer is None or self.checkpointer.load_only
@@ -222,6 +236,7 @@ class Trainer(Configurable):
 
     tokenizer: BaseTokenizer
     dataloader: BaseDataLoader
+    attention_balancer: NodeAttentionBalancer | None
     validator: BaseValidator
     metrics_processor: MetricsProcessor
     gradient_accumulation_steps: int
@@ -302,6 +317,14 @@ class Trainer(Configurable):
             tokenizer=self.tokenizer,
             max_context_length=config.model.max_context_length,
             num_tokens_per_microbatch=num_tokens_per_microbatch,
+        )
+        self.attention_balancer = (
+            config.attention_balancer.build(
+                model_config=config.model,
+                num_mtp_layers=config.dataloader.num_mtp_layers,
+            )
+            if config.attention_balancer is not None
+            else None
         )
 
         try:
@@ -410,6 +433,8 @@ class Trainer(Configurable):
                 # If data runs out during gradient accumulation, that
                 # entire step will not be executed.
                 raise DataloaderExhaustedError() from ex
+            if self.attention_balancer is not None:
+                microbatch = self.attention_balancer(microbatch)
             ntokens_microbatch = (
                 self.config.training.num_tokens_per_microbatch_per_dp_rank
             )

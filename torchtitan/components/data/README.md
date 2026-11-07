@@ -519,3 +519,35 @@ With effective DP greater than one, `repeat=False` is rejected because ranks can
 - effective DP degree
 
 Resume requires unchanged code, config, source contents, tokenizer, and effective DP degree.
+
+### Node-local attention balancing
+
+Each DP rank packs its own documents, so the attention work of equally long
+microbatches differs: a full-attention layer costs ~L^2 / 2 per document of
+length L, a sliding-window layer ~L * W. Every collective waits for the rank
+that drew the long documents. `Trainer.Config.attention_balancer =
+NodeAttentionBalancer.Config()` (`balance.py`; off by default) regroups each
+microbatch's document segments over the ranks of one node:
+
+```text
+one node, 4 ranks, 64 tokens each; documents written as count x length;
+cost = full-attention query-key pairs, sum of L (L + 1) / 2
+            rank 0                rank 1          rank 2               rank 3
+packed      2 x 32       1056     16 x 4   160    8 x 8        288     32 x 2   96
+balanced    1 x 32 +              1 x 32 +        4 x 8 +              4 x 8 +
+            16 x 2        576     16 x 2   576    8 x 4        224     8 x 4    224
+-> the slowest rank: 1056 -> 576
+```
+
+1. the node's ranks all-gather their microbatches (token ids, labels,
+   positions, padding mask) over Gloo;
+2. each rank runs the same deterministic assignment: segments by descending
+   cost, each to the least-loaded rank with room for it whole; a segment that
+   fits nowhere whole is cut over the ranks with room left;
+3. positions restart at 0 in every segment; the loss and routing token counts
+   are recomputed for the new rows.
+
+The step's documents, labels and loss are unchanged; only which GPU computes
+which document changes. The balancer keeps no state (resume is unaffected).
+TP, CP and PP above 1 are refused. Measured (opt_moe l40, 64k tokens per GPU,
+32k context, same nodes): +2.0% tokens/s at 16 nodes, +3.8% at 32 nodes.

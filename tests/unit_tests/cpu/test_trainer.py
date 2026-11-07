@@ -175,6 +175,7 @@ def test_microbatch_generator_preserves_labels() -> None:
                 ntokens_since_last_log=0,
                 data_loading_times=[],
             ),
+            attention_balancer=None,
         ),
     )
 

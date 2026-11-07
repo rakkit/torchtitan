@@ -178,6 +178,7 @@ def _balance_rank(rank, world, init_file, rows, out_file, balancer_config):
                 "input": new.input,
                 "labels": new.labels,
                 "positions": new.positions,
+                "padding_mask": new.padding_mask,
                 "loss_token_counts": new.loss_token_counts,
             },
             f"{out_file}.{rank}",
@@ -188,7 +189,10 @@ def _balance_rank(rank, world, init_file, rows, out_file, balancer_config):
 
 @pytest.mark.parametrize(
     "balancer_config",
-    [NodeAttentionBalancer.Config(), NodeComputeBalancer.Config(token_cost=4.0)],
+    [
+        NodeAttentionBalancer.Config(),
+        NodeComputeBalancer.Config(token_cost=4.0, row_multiple=8),
+    ],
     ids=["equal_counts", "variable_counts"],
 )
 def test_balancer_on_four_gloo_ranks_keeps_the_node_tokens(balancer_config):
@@ -202,10 +206,14 @@ def test_balancer_on_four_gloo_ranks_keeps_the_node_tokens(balancer_config):
             join=True,
         )
         results = [torch.load(f"{out}.{r}", weights_only=True) for r in range(4)]
+    # the variable rows end in a padding segment up to a multiple of 8 tokens
     pairs = sorted(
         (int(i), int(l))
         for res in results
-        for i, l in zip(res["input"], res["labels"], strict=True)
+        for i, l, pad in zip(
+            res["input"], res["labels"], res["padding_mask"], strict=True
+        )
+        if not pad
     )
     want = sorted(
         (1000 * r + i, IGNORE_INDEX if i == 63 else 1000 * r + i)
@@ -215,7 +223,11 @@ def test_balancer_on_four_gloo_ranks_keeps_the_node_tokens(balancer_config):
     assert pairs == want
     counts = [len(res["input"]) for res in results]
     if isinstance(balancer_config, NodeComputeBalancer.Config):
-        assert min(counts) < 64 <= max(counts) <= 80  # cap 1.25 x 64
+        assert all(n % 8 == 0 for n in counts)
+        tokens = [int((~res["padding_mask"]).sum()) for res in results]
+        assert min(tokens) < 64 <= max(tokens) <= 80  # cap 1.25 x 64
+        for res in results:  # padding: ignored labels
+            assert (res["labels"][res["padding_mask"]] == IGNORE_INDEX).all()
     else:
         assert counts == [64] * 4
     total = sum(int(res["loss_token_counts"]) for res in results)

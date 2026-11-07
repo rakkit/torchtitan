@@ -170,6 +170,7 @@ class NodeAttentionBalancer(Configurable):
         # every rank keeps its token count; only attention is balanced
         self.token_cost = 0.0
         self.max_tokens_ratio = 1.0
+        self.row_multiple = 1
 
     def __call__(
         self, microbatch: TokenizedTrainingMicrobatch
@@ -200,6 +201,13 @@ class NodeAttentionBalancer(Configurable):
             [rows[src][:, start : start + n] for src, start, n in mine], axis=1
         )
         out[2] = np.concatenate([np.arange(n) for _, _, n in mine])
+        pad = -out.shape[1] % self.row_multiple
+        if pad:  # one padding segment: no loss, no routing statistics
+            pad_rows = np.zeros((out.shape[0], pad), dtype=out.dtype)
+            pad_rows[1] = IGNORE_INDEX
+            pad_rows[2] = np.arange(pad)
+            pad_rows[3] = 1
+            out = np.concatenate([out, pad_rows], axis=1)
         new = torch.from_numpy(out)
         labels, positions = new[1], new[2]
         padding_mask = new[3].to(torch.bool)
@@ -243,6 +251,11 @@ class NodeComputeBalancer(NodeAttentionBalancer):
         """A rank's tokens at most this times the packed row length: its
         activation memory grows with its tokens."""
 
+        row_multiple: int = 256
+        """Each new row is padded to a multiple of this (padding: no loss, no
+        routing statistics): ChunkedLossWrapper splits a row into equal chunks
+        (8 by default) and the attention kernels tile 128 / 256 tokens."""
+
         def __post_init__(self) -> None:
             if self.token_cost <= 0:
                 raise ValueError(f"token_cost must be > 0, got {self.token_cost}")
@@ -250,6 +263,8 @@ class NodeComputeBalancer(NodeAttentionBalancer):
                 raise ValueError(
                     f"max_tokens_ratio must be >= 1, got {self.max_tokens_ratio}"
                 )
+            if self.row_multiple < 1:
+                raise ValueError(f"row_multiple must be >= 1, got {self.row_multiple}")
 
     def __init__(
         self, config: Config, *, model_config: Any, num_mtp_layers: int
@@ -259,6 +274,7 @@ class NodeComputeBalancer(NodeAttentionBalancer):
         )
         self.token_cost = config.token_cost
         self.max_tokens_ratio = config.max_tokens_ratio
+        self.row_multiple = config.row_multiple
 
 
 def attention_windows(model_config) -> list[int | None]:

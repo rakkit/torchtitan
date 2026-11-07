@@ -334,6 +334,9 @@ class OPTMoEModel(Decoder):
             # debug.spmd_typechecking refuses compile_blocks (config/validation).
             torch._dynamo.config.capture_scalar_outputs = True
             torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
+            # Past its recompile budget a block would run eager without a word
+            # under EP (no fullgraph); raise instead, as fullgraph does.
+            torch._dynamo.config.fail_on_recompile_limit_hit = True
             for block in self.layers.values():
                 # a traced backward cannot add a WGRAD into .grad in place in
                 # the GEMM epilogue (AccumulateGrad still accumulates it)

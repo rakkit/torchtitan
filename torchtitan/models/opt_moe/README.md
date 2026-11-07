@@ -191,6 +191,27 @@ A run's checkpoint becomes an HF folder with
 chat template, a generation config, safetensors files of at most 5 GB). The run's EMA weights instead (an EMA copy, `--ema_key` when the
 run kept several): `convert_opt_moe_ema_to_hf.py`, same arguments.
 
+## RL (TitanRL generator)
+
+The generator runs this model inside vLLM (`torchtitan/rl`). Decode speed at
+the l40-k8-f512 shape in bf16 on GH200, tokens / s per GPU at 256 sequences
+with 1k-token prompts:
+
+- TP 1, one generator per GPU, CUDA graphs (`FULL`): 6,190. The experts are
+  local, so the token dispatch needs no communication; a step is bound by
+  reading the expert weights (the grouped GEMMs are two thirds of it).
+- TP > 1 needs EP >= TP (upstream) and then DeepEP's CUDA-graph-compatible
+  dispatch (`TokenDispatcherTransform` with `DeepEPTokenDispatcher` and
+  `cuda_graph_compatible=True`, as `torchtitan_recipes/rl/search_r1.py`):
+  TP 2 4,750, TP 4 3,465. With the native all-to-all the generator cannot
+  capture graphs and decodes CPU-bound (~338 ms a step).
+- `max_num_batched_tokens` sizes the prefill graphs and the DeepEP buffers:
+  8,192 leaves room for the KV cache at TP 1 and TP 2 here (32,768 did not).
+
+Checked end to end (two RL steps, trainer against generator logprobs, max
+|diff| 0.0007-0.0035): TP 1 with graphs; TP 2 x EP 2 with DeepEP and graphs;
+a trainer node (FSDP 2 x TP 2 x EP 4) and two TP 2 generators on another node.
+
 ## What the optimizer study measured (13.4B tokens, batch 128, run learning rates)
 
 At 336M and 671M, against the plain model at the same lr: the element-wise

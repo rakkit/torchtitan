@@ -155,7 +155,7 @@ def opt_moe_mis_8b() -> Trainer.Config:
             # 250 GB checkpoint): ~2.4-2.9 s added per save with "async"
             # (~7 s while the previous write still runs), ~0.2-0.4 s with
             # pinned memory, at ~4 GB pinned host memory per GPU.
-            async_mode="async",
+            async_mode="async_with_pinned_mem",
         ),
         # torch_remat's default regions (code outside a region is recomputed)
         activation_remat=DefaultActivationRematConfig(),

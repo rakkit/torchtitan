@@ -19,8 +19,12 @@ conv channels, gate rows and sinks; `n_kv_heads % TP == 0`), the input gathered
 once for wqkv and the gate, wo row-parallel; the dense and shared-expert FFNs
 column / row; the MoE as upstream's (EP >= TP: it sequence-shards its tokens
 over TP); `tests/unit_tests/opt_moe/test_tensor_parallel.py` (TP 2 x EP 2 vs one
-rank, each attention case, with and without SP). DiSCO refuses TP: TP runs train
-with AdamW.
+rank, each attention case, with and without SP, forward and loss under spmd_types
+type checking). DiSCO refuses TP: TP runs train with AdamW. A from-scratch init is
+not TP-invariant: under FSDP x TP the random-normal inits of TP-sharded weights
+(embedding, lm_head, random sinks) draw through DTensor's RNG on strided shards,
+other values than without TP (orthogonal, conv and expert inits draw the full
+matrix); start TP vs no-TP comparisons from one seed checkpoint.
 
 ## Building a model
 

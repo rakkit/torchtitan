@@ -55,6 +55,15 @@ from .state_dict_adapter import OPTMoEStateDictAdapter
 _BLOCK_RECOMPILE_LIMIT = 32
 
 
+def _annotate_conv_metadata(attention_metadata: AttentionMetadataMap | None) -> None:
+    """The conv's document offsets (a ``LinearAttentionMetadata``) are nested in
+    the attention metadata, which annotate_input_spmd_types does not type: as
+    qwen3_5's GDN metadata."""
+    for metadata in (attention_metadata or {}).values():
+        if isinstance(metadata, LinearAttentionMetadata):
+            metadata.annotate_spmd_types()
+
+
 def layout_flags(parallelism: ParallelismConfig) -> dict[str, bool]:
     """What the model config's sharding depends on (data parallel does not)."""
     tp = parallelism.tensor_parallel_degree > 1
@@ -484,7 +493,7 @@ class OPTMoEModel(Decoder):
         (``roll_mtp_sequence``: never across a document or padding), CP-sharded
         with the batch, then returned as one tuple per objective."""
         if self.mtp_layers is None:
-            return super().preprocess_inputs(
+            inputs, labels, model_kwargs, loss_kwargs = super().preprocess_inputs(
                 input_dict,
                 parallelism_context=parallelism_context,
                 parallelism=parallelism,
@@ -492,6 +501,8 @@ class OPTMoEModel(Decoder):
                 global_routing_token_counts=global_routing_token_counts,
                 **kwargs,
             )
+            _annotate_conv_metadata(model_kwargs.get("attention_metadata"))
+            return inputs, labels, model_kwargs, loss_kwargs
         del kwargs
         loss_kwargs = input_dict.pop("loss_kwargs", {})
         positions = input_dict.get("positions")
@@ -537,6 +548,7 @@ class OPTMoEModel(Decoder):
         input_dict = annotate_input_spmd_types(
             parallelism_context, input_dict, input_shardings
         )
+        _annotate_conv_metadata(input_dict["attention_metadata"])
         loss_kwargs = {name: input_dict.pop(name) for name in loss_kwargs}
         inputs = (
             input_dict.pop("input"),

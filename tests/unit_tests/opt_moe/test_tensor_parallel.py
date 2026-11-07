@@ -10,8 +10,11 @@ over TP) and on one rank gives the same loss and gradients, with and without
 sequence parallelism. Each attention case (the element-wise gate, sinks,
 neither with partial RoPE) with the Canon short conv on k and v, a
 sliding-window and a full layer, a dense and an MoE layer (shared expert,
-expert bias), and an MTP depth. Each rank holds whole KV groups (4 KV heads,
-2 per rank); fp32 with flex attention (the routed experts in bf16)."""
+expert bias), and an MTP depth; many short documents (the MTP validity mask
+and the conv's document offsets) and trailing padding. Each rank holds whole
+KV groups (4 KV heads, 2 per rank); fp32 with flex attention (the routed
+experts in bf16). The forward and the loss run under spmd_types type
+checking, as the training engine runs them."""
 
 import pytest
 import spmd_types as spmd
@@ -26,6 +29,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext
+from torchtitan.distributed.spmd_types import annotate_replicated_parameters
 from torchtitan.models.base.module import Module
 from torchtitan.models.common.attention import FlexInnerAttention
 from torchtitan.models.opt_moe import build_model_config
@@ -34,7 +38,9 @@ from torchtitan.models.opt_moe.mtp import MTPCrossEntropyLoss, roll_mtp_sequence
 TP = 2
 T = 512
 V = 512
-DOCS = [200, 1, 311]
+# many short documents: the MTP validity mask and the conv offsets carry weight
+DOCS = [16] * 22 + [1] * 8 + [120]
+PAD = T - sum(DOCS)  # trailing padding: padding_mask True, labels ignored
 ATTENTION = {
     "gate": dict(gated_attention_type="element-wise"),
     "sinks": dict(
@@ -106,7 +112,11 @@ def _placement(layout: spmd.SpmdType, axis: str):
         return None
     if isinstance(kind, spmd.Shard):
         return "shard", kind.dim
-    return ("R" if kind == spmd.R else "I"), None
+    if kind == spmd.R:
+        return "R", None
+    if kind == spmd.I:
+        return "I", None
+    raise ValueError(f"no gradient rule for {kind} on {axis}")
 
 
 def _relative(got: torch.Tensor, want: torch.Tensor) -> float:
@@ -123,15 +133,22 @@ class TestTensorParallel(DTensorTestBase):
     def test_tp_matches_one_rank(self):
         # this test's worker processes only: no max-autotune (compile time)
         FlexInnerAttention.inductor_configs["max_autotune"] = False
-        positions = torch.cat([torch.arange(n) for n in DOCS]).cuda()
+        positions = torch.cat([torch.arange(n) for n in DOCS + [PAD]]).cuda()
+        padding = torch.zeros(T, dtype=torch.bool, device="cuda")
+        padding[T - PAD :] = True
         torch.manual_seed(0)
         tokens = torch.randint(0, V, (T,), device="cuda")
         labels = torch.randint(0, V, (T,), device="cuda")
+        labels[padding] = IGNORE_INDEX
         rolled, valid = roll_mtp_sequence(
-            tokens, shift=1, fill_value=0, positions_T=positions
+            tokens, shift=1, fill_value=0, positions_T=positions, padding_mask_T=padding
         )
         mtp_labels, _ = roll_mtp_sequence(
-            labels, shift=1, fill_value=IGNORE_INDEX, positions_T=positions
+            labels,
+            shift=1,
+            fill_value=IGNORE_INDEX,
+            positions_T=positions,
+            padding_mask_T=padding,
         )
         counts = torch.stack(
             [(labels != IGNORE_INDEX).sum(), (mtp_labels != IGNORE_INDEX).sum()]
@@ -152,8 +169,11 @@ class TestTensorParallel(DTensorTestBase):
             predictions = reference(
                 (tokens, rolled),
                 positions=positions,
-                attention_metadata=reference._get_attention_metadata(positions),
+                attention_metadata=reference._get_attention_metadata(
+                    positions, padding_mask=padding
+                ),
                 mtp_input_valid_masks=(valid,),
+                padding_mask=padding,
             )
             want_loss, _ = loss_fn(predictions, (labels, mtp_labels), counts)
             want_loss.backward()
@@ -191,19 +211,28 @@ class TestTensorParallel(DTensorTestBase):
                 # SPMD context would take the full weights for TP shards)
                 model = _model(parallelism, attention)
                 model.load_state_dict(state)
+                annotate_replicated_parameters(model, pc)  # as the trainer
                 with pc.activate_spmd():
                     # the sharding alone (OPTMoEModel._parallelize also lists
                     # the MTP blocks in `layers` for parallelize()'s remat /
                     # FSDP steps, which remove them again)
                     Module._parallelize(model, pc)
                     inputs, local_labels, model_kwargs, _ = model.preprocess_inputs(
-                        {"input": tokens, "labels": labels, "positions": positions},
+                        {
+                            "input": tokens,
+                            "labels": labels,
+                            "positions": positions,
+                            "padding_mask": padding,
+                        },
                         parallelism_context=pc,
                         parallelism=parallelism,
                     )
+                # the forward and the loss type-checked, as the training engine
+                with pc.activate_spmd(typechecking=True):
                     local_predictions = model(inputs, **model_kwargs)
                     loss, _ = loss_fn(local_predictions, local_labels, counts)
-                    loss.backward()
+                    with spmd.no_typecheck():
+                        loss.backward()
                 rel = _relative(loss.detach(), want_loss)
                 if not rel < TOL:
                     failures.append(f"{tag} loss {rel:.3g}")

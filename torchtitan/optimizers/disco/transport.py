@@ -92,36 +92,41 @@ class Exchange:
         self.unit_of = {u.index: u for u in units}
         self.owned = [u for u in units if owner[u.index] == rank]
         self.batches = batches_of(self.owned)
+        # Only this rank's segments: what it sends (its rows of every unit) and
+        # what it receives (every rank's rows of the units it owns), O(units +
+        # owned x world) instead of O(units x world): the set-up time grew with
+        # the rank count (12 s at 256 ranks).
         peer_rows: dict[tuple[int, int], RunList] = {}
-        for u in units:
-            coord = list(u.param.device_mesh.get_coordinate())
-            for r in range(world):
-                if (u.param_index, r) not in peer_rows:
-                    c = list(coord)
-                    c[axis] = r
-                    peer_rows[(u.param_index, r)] = rows_of_coordinate(
-                        u.param.shape, u.view, u.param, c
-                    )
-        segments = []
-        for u in units:
-            for r in range(world):
-                inter = peer_rows[(u.param_index, r)].intersect(u.rows)
-                if inter.n_rows:
-                    segments.append(
-                        _Segment(
-                            u.index,
-                            r,
-                            owner[u.index],
-                            inter.positions_within(u.rows),
-                            inter.positions_within(peer_rows[(u.param_index, r)]),
-                            inter.n_rows,
-                        )
-                    )
+
+        def rows_on(u, r: int) -> RunList:
+            if (u.param_index, r) not in peer_rows:
+                c = list(u.param.device_mesh.get_coordinate())
+                c[axis] = r
+                peer_rows[(u.param_index, r)] = rows_of_coordinate(
+                    u.param.shape, u.view, u.param, c
+                )
+            return peer_rows[(u.param_index, r)]
+
+        def segment(u, r: int) -> _Segment | None:
+            inter = rows_on(u, r).intersect(u.rows)
+            if not inter.n_rows:
+                return None
+            return _Segment(
+                u.index,
+                r,
+                owner[u.index],
+                inter.positions_within(u.rows),
+                inter.positions_within(rows_on(u, r)),
+                inter.n_rows,
+            )
+
+        sends = (segment(u, rank) for u in units)
+        recvs = (segment(u, r) for u in self.owned for r in range(world))
         self.send_segs = sorted(
-            (s for s in segments if s.src == rank), key=lambda s: (s.dst, s.unit)
+            (s for s in sends if s is not None), key=lambda s: (s.dst, s.unit)
         )
         self.recv_segs = sorted(
-            (s for s in segments if s.dst == rank), key=lambda s: (s.src, s.unit)
+            (s for s in recvs if s is not None), key=lambda s: (s.src, s.unit)
         )
         self.in_splits, self.out_splits = [0] * world, [0] * world
         for s in self.send_segs:

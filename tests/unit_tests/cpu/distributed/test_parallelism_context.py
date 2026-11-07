@@ -1194,6 +1194,43 @@ class TestNcclCtasPerAxis(unittest.TestCase):
         self.assertEqual(storage["tp"], "fake")
         self.assertEqual(storage["pp"], "fake")
 
+    @patch("torchtitan.distributed.parallelism_context.device_type", "cpu")
+    def test_zero_sm_axes_get_the_zero_cta_policy(self):
+        from unittest import mock
+
+        context = ParallelismContext(
+            dp_replicate=2,
+            dp_shard=4,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=8,
+            enable_sequence_parallel=False,
+            nccl_ctas={"dp_shard": 16},
+            nccl_zero_sm_axes=["dp_shard"],
+        )
+        world = mock.MagicMock()
+        with patch(
+            "torchtitan.distributed.parallelism_context.init_device_mesh",
+            return_value=world,
+        ):
+            try:
+                context.build_mesh()
+            except AssertionError:
+                pass
+        storage = {
+            call.args[2]: call.kwargs["backend_override"]
+            for call in world._unflatten.call_args_list
+        }[("pp", "dp_replicate", "dp_shard", "cp", "tp")]
+        backend, options = storage["dp_shard"]
+        self.assertEqual(backend, "nccl")
+        self.assertEqual(
+            options.config.cta_policy, dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
+        )
+        self.assertEqual((options.config.min_ctas, options.config.max_ctas), (16, 16))
+        self.assertNotIn("dp_replicate", storage)  # not listed: NCCL's defaults
+
     def test_config_refuses_unknown_axes_and_bad_values(self):
         from torchtitan.config import CommConfig
 
@@ -1204,3 +1241,17 @@ class TestNcclCtasPerAxis(unittest.TestCase):
             CommConfig(nccl_ctas={"dp_shard": 0})
         with self.assertRaisesRegex(ValueError, "sm_carveout"):
             CommConfig(sm_carveout=-1)
+        with self.assertRaisesRegex(ValueError, "nccl_zero_sm_axes: unknown mesh axes"):
+            CommConfig(nccl_zero_sm_axes=["shard"])
+
+    def test_zero_sm_dp_shard_needs_fsdp_symmetric_memory(self):
+        from torchtitan.config import CommConfig
+        from torchtitan.config.parallelism import ParallelismConfig
+        from torchtitan.training_engine import TrainingEngine
+
+        comm = CommConfig(nccl_zero_sm_axes=["dp_shard"])
+        with self.assertRaisesRegex(ValueError, "fsdp_symm_mem_scope"):
+            TrainingEngine.Config(comm=comm)
+        TrainingEngine.Config(
+            comm=comm, parallelism=ParallelismConfig(fsdp_symm_mem_scope="all")
+        )

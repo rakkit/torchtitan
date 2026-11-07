@@ -177,6 +177,13 @@ GH200 nodes, tokens / s / GPU, one process each:
 - the site's VBOOST slider (JSC: `sbatch --comment="NVIDIA_VBOOST_SLIDER=1"`)
   on top: 11,681-11,689 / 11,828-11,837 (steps 20 / 30). Sliders 3 and 4 run
   GEMMs slower than 0.
+- `comm.nccl_zero_sm_axes=["dp_shard"]` with `parallelism.fsdp_symm_mem_scope="all"`
+  (NCCL >= 2.30): FSDP's all-gather runs on copy engines inside a node and a CPU
+  RMA proxy between nodes, holding no SMs; the reduce-scatter keeps its CTAs and
+  the carveout. l44 q32 top 8 E256, 16k context, FA4, balancer, same 16 nodes:
+  12,459-12,528 vs 12,257-12,341 (+1.6%, +1.6 GiB peak); symmetric memory alone
+  -1.4% (NCCL's symmetric reduce-scatter kernel); without the carveout -2.3%.
+  Measured with the policy set NCCL-wide (`NCCL_CTA_POLICY=2`).
 - HSDP 2 x 16 nodes = FSDP over 32 nodes (~10.3k): the replica all-reduce
   costs ~0; the loss from 16 to 32 nodes is the slowest rank's attention: a
   rank's packed documents set its causal-attention work (flex attention per

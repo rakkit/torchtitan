@@ -165,6 +165,15 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
 
         def __post_init__(self) -> None:
             if (
+                "dp_shard" in self.comm.nccl_zero_sm_axes
+                and self.parallelism.fsdp_symm_mem_scope is None
+            ):
+                raise ValueError(
+                    'comm.nccl_zero_sm_axes ["dp_shard"] needs '
+                    "parallelism.fsdp_symm_mem_scope: the zero-SM all-gather runs "
+                    "only on FSDP buffers in NCCL symmetric windows"
+                )
+            if (
                 self.debug.spmd_typechecking
                 and self.parallelism.pipeline_parallel_degree > 1
             ):
@@ -345,6 +354,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             topology,
             dump_folder=self.output_dir,
             nccl_ctas=config.comm.nccl_ctas
+            if config.comm.backend == "default"
+            else None,
+            nccl_zero_sm_axes=config.comm.nccl_zero_sm_axes
             if config.comm.backend == "default"
             else None,
         )

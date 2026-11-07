@@ -158,6 +158,14 @@ class CommConfig:
     running collective does not wait for the SMs NCCL holds. 0 = off; usually
     the largest ``nccl_ctas`` value."""
 
+    nccl_zero_sm_axes: list[str] = field(default_factory=list)
+    """Mesh axes whose NCCL communicator uses the zero-SM CTA policy
+    (``NCCL_CTA_POLICY_ZERO``, NCCL >= 2.30): its all-gathers on symmetric-memory
+    buffers run on copy engines inside a node and a CPU RMA proxy between nodes,
+    holding no SMs; reductions still run kernels (``nccl_ctas`` still applies).
+    For FSDP: ``["dp_shard"]`` with ``parallelism.fsdp_symm_mem_scope`` (FSDP's
+    buffers in NCCL windows). Real NCCL process groups only."""
+
     backend: CommBackend = "default"
     """Communication topology used for training or distributed debugging.
 
@@ -178,12 +186,16 @@ class CommConfig:
 
     def __post_init__(self) -> None:
         axes = {"pp", "dp_replicate", "dp_shard", "cp", "tp", "dp", "ep", "edp_shard"}
-        unknown = set(self.nccl_ctas) - axes
-        if unknown:
-            raise ValueError(
-                f"comm.nccl_ctas: unknown mesh axes {sorted(unknown)}; "
-                f"known: {sorted(axes)}"
-            )
+        for name, listed in (
+            ("nccl_ctas", self.nccl_ctas),
+            ("nccl_zero_sm_axes", self.nccl_zero_sm_axes),
+        ):
+            unknown = set(listed) - axes
+            if unknown:
+                raise ValueError(
+                    f"comm.{name}: unknown mesh axes {sorted(unknown)}; "
+                    f"known: {sorted(axes)}"
+                )
         if any(n < 1 for n in self.nccl_ctas.values()):
             raise ValueError(f"comm.nccl_ctas values must be >= 1: {self.nccl_ctas}")
         if self.sm_carveout < 0:

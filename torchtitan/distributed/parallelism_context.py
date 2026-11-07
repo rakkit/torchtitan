@@ -96,11 +96,17 @@ def unfold_dp_axes(axes: Iterable[MeshAxisName | str]) -> list[str]:
     ]
 
 
-def _nccl_with_ctas(ctas: int) -> tuple[str, dist.ProcessGroupNCCL.Options]:
-    """An NCCL backend override whose communicator always runs ``ctas`` CTAs."""
+def _nccl_options(
+    ctas: int | None, zero_sm: bool
+) -> tuple[str, dist.ProcessGroupNCCL.Options]:
+    """An NCCL backend override: the communicator always runs ``ctas`` CTAs
+    (None: NCCL's choice) and, with ``zero_sm``, the zero-SM CTA policy."""
     options = dist.ProcessGroupNCCL.Options()
-    options.config.min_ctas = ctas
-    options.config.max_ctas = ctas
+    if ctas is not None:
+        options.config.min_ctas = ctas
+        options.config.max_ctas = ctas
+    if zero_sm:
+        options.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
     return ("nccl", options)
 
 
@@ -118,6 +124,8 @@ class ParallelismContext:
     enable_sequence_parallel: bool
     nccl_ctas: dict[str, int] = field(default_factory=dict)
     """Fixed NCCL CTA count per mesh axis (``CommConfig.nccl_ctas``)."""
+    nccl_zero_sm_axes: list[str] = field(default_factory=list)
+    """Mesh axes with NCCL's zero-SM CTA policy (``CommConfig.nccl_zero_sm_axes``)."""
     _real_pp_group_for_fake_spmd: dist.ProcessGroup | None = None
     # Cache by axis name(s); DeviceMesh equality is by identity, so reuse the
     # same object instead of re-slicing a submesh on every lookup.
@@ -140,6 +148,7 @@ class ParallelismContext:
         *,
         dump_folder: str,
         nccl_ctas: dict[str, int] | None = None,
+        nccl_zero_sm_axes: list[str] | None = None,
     ) -> ParallelismContext:
         """Construct the parallelism context from config and topology."""
         parallelism_context = cls(
@@ -152,6 +161,7 @@ class ParallelismContext:
             world_size=topology.world_size,
             enable_sequence_parallel=parallelism_config.enable_sequence_parallel,
             nccl_ctas=dict(nccl_ctas or {}),
+            nccl_zero_sm_axes=list(nccl_zero_sm_axes or []),
             _real_pp_group_for_fake_spmd=topology.real_pp_group_for_fake_spmd,
         )
         if parallelism_config.save_parallelism_folder is not None:
@@ -302,8 +312,12 @@ class ParallelismContext:
             for axis, degree in zip(axis_names, axis_degrees, strict=True):
                 if not self._axis_is_active(axis, degree):
                     backend_override[axis] = "fake"
-                elif axis in self.nccl_ctas and degree > 1:
-                    backend_override[axis] = _nccl_with_ctas(self.nccl_ctas[axis])
+                elif degree > 1 and (
+                    axis in self.nccl_ctas or axis in self.nccl_zero_sm_axes
+                ):
+                    backend_override[axis] = _nccl_options(
+                        self.nccl_ctas.get(axis), axis in self.nccl_zero_sm_axes
+                    )
 
             return world_mesh._unflatten(
                 0,

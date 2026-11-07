@@ -142,6 +142,13 @@ def _cross_corr(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     return _row_normalise(X) @ _row_normalise(Y).T
 
 
+def _zero_diagonal(x: torch.Tensor) -> torch.Tensor:
+    """`x` with its diagonal set to 0, out of place (`fill_diagonal_` has no
+    vmap batching rule; the stacked expert path vmaps these functions)."""
+    eye = torch.eye(x.shape[-1], dtype=torch.bool, device=x.device)
+    return torch.where(eye, torch.zeros((), dtype=x.dtype, device=x.device), x)
+
+
 def _offdiag(A: torch.Tensor) -> torch.Tensor:
     return A - torch.diag_embed(torch.diagonal(A))
 
@@ -175,8 +182,7 @@ def _row_dominance(A: torch.Tensor, m: int) -> torch.Tensor:
     # precision instead of correctly coming out small.
     abs_A = A.abs()
     diagonal = torch.diagonal(abs_A)
-    off_A = abs_A.clone()
-    off_A.fill_diagonal_(0)
+    off_A = _zero_diagonal(abs_A)
     off_mean = off_A.sum(dim=1) / max(m - 1, 1)
     return _dominance_ratio(diagonal, off_mean)
 
@@ -196,10 +202,8 @@ def _offdiag_stats(
     # `max` is unaffected because `ax` is non-negative -- if every off-diagonal
     # is 0 the true max is 0 anyway.
     count = max(m * m - m, 1)
-    ax = C.abs()
-    ax.fill_diagonal_(0)
-    sq = C.square()
-    sq.fill_diagonal_(0)
+    ax = _zero_diagonal(C.abs())
+    sq = _zero_diagonal(C.square())
     return ax.sum() / count, (sq.sum() / count).sqrt(), ax.max()
 
 
@@ -209,8 +213,7 @@ def _cross_summary(C_XY: torch.Tensor, m: int) -> dict[str, torch.Tensor]:
     # `row_sum - diagonal`'s catastrophic cancellation under high diagonal
     # dominance.
     abs_C = C_XY.abs()
-    off_C = abs_C.clone()
-    off_C.fill_diagonal_(0)
+    off_C = _zero_diagonal(abs_C)
     off_mean = off_C.sum(dim=1) / max(m - 1, 1)
     specificity = _dominance_ratio(diagonal.abs(), off_mean)
     indices = torch.arange(m, device=C_XY.device)
@@ -364,11 +367,40 @@ def _safe_sym_eigvalsh(A: torch.Tensor) -> torch.Tensor:
     # possibly-slightly-different unsymmetrized A. Matches
     # _safe_psd_eigh/_safe_psd_eigvalsh's ordering, which already got this
     # right.
-    A_sym = 0.5 * (A + A.T)
-    scale = A_sym.abs().amax()
-    if scale == 0:
-        return torch.zeros(A.shape[0], device=A.device, dtype=A.dtype)
-    return torch.linalg.eigvalsh(A_sym / scale) * scale
+    A_scaled, scale, _ = _scaled_symmetric(A)
+    return torch.linalg.eigvalsh(A_scaled) * scale[..., None]
+
+
+def _scaled_symmetric(
+    A: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The symmetric part of each matrix of a `[..., n, n]` stack over its
+    max-abs entry, that scale, and the all-zero mask. A zero matrix is masked
+    (scale 1 in the division), not branched on: no host sync."""
+    A_sym = 0.5 * (A + A.transpose(-2, -1))
+    scale = A_sym.abs().amax(dim=(-2, -1))
+    zero = scale == 0
+    return A_sym / torch.where(zero, 1.0, scale)[..., None, None], scale, zero
+
+
+def _psd_eigh(G: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ascending eigenpairs of each PSD matrix of a `[..., n, n]` stack from
+    one rescaled, symmetrized `eigh` (raises `_LinAlgError` as `eigh` does);
+    a zero matrix gives zeros and the identity."""
+    A, scale, zero = _scaled_symmetric(G)
+    values, vectors = torch.linalg.eigh(A)
+    eye = torch.eye(G.shape[-1], device=G.device, dtype=G.dtype)
+    return (
+        values.clamp_min(0) * scale[..., None],
+        torch.where(zero[..., None, None], eye, vectors),
+    )
+
+
+def _psd_eigvalsh(G: torch.Tensor) -> torch.Tensor:
+    """Descending eigenvalues of each PSD matrix of a `[..., n, n]` stack
+    from one rescaled, symmetrized `eigvalsh` (raises as `eigvalsh` does)."""
+    A, scale, _ = _scaled_symmetric(G)
+    return torch.linalg.eigvalsh(A).clamp_min(0).flip(-1) * scale[..., None]
 
 
 def _safe_psd_eigh(
@@ -385,19 +417,22 @@ def _safe_psd_eigh(
     dimension rather than collapsing it away via the Gram product), so it
     must stay unevaluated unless the fallback path is actually taken.
     """
-    G_sym = 0.5 * (G + G.T)
-    scale = G_sym.abs().amax()
-    n = G_sym.shape[0]
-    if scale == 0:
-        return (
-            torch.zeros(n, device=G.device, dtype=G.dtype),
-            torch.eye(n, device=G.device, dtype=G.dtype),
-        )
     try:
-        values, vectors = torch.linalg.eigh(G_sym / scale)
-        return values.clamp_min(0) * scale, vectors
+        return _psd_eigh(G)
     except torch._C._LinAlgError:
         return _gram_eigh_from_factor(factor())
+
+
+def _safe_psd_eigh_many(
+    Gs: list[torch.Tensor], factors: list[Callable[[], torch.Tensor]]
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """`_safe_psd_eigh` of same-shape matrices in one batched `eigh` (one
+    host sync for all); if it raises, each matrix takes `_safe_psd_eigh`."""
+    try:
+        values, vectors = _psd_eigh(torch.stack(Gs))
+    except torch._C._LinAlgError:
+        return [_safe_psd_eigh(G, f) for G, f in zip(Gs, factors, strict=True)]
+    return list(zip(values.unbind(0), vectors.unbind(0), strict=True))
 
 
 def _safe_psd_eigvalsh(
@@ -408,16 +443,21 @@ def _safe_psd_eigvalsh(
     values only. Same try-cheap-eigh-first-fall-back-to-SVD-of-factor
     strategy as `_safe_psd_eigh`, and the same lazy-`factor` contract.
     """
-    G_sym = 0.5 * (G + G.T)
-    scale = G_sym.abs().amax()
-    n = G_sym.shape[0]
-    if scale == 0:
-        return torch.zeros(n, device=G.device, dtype=G.dtype)
     try:
-        values = torch.linalg.eigvalsh(G_sym / scale)
-        return values.clamp_min(0).flip(0) * scale
+        return _psd_eigvalsh(G)
     except torch._C._LinAlgError:
         return _svd_eigenvalues(factor())
+
+
+def _safe_psd_eigvalsh_many(
+    Gs: list[torch.Tensor], factors: list[Callable[[], torch.Tensor]]
+) -> list[torch.Tensor]:
+    """`_safe_psd_eigvalsh` of same-shape matrices in one batched
+    `eigvalsh`; if it raises, each matrix takes `_safe_psd_eigvalsh`."""
+    try:
+        return list(_psd_eigvalsh(torch.stack(Gs)).unbind(0))
+    except torch._C._LinAlgError:
+        return [_safe_psd_eigvalsh(G, f) for G, f in zip(Gs, factors, strict=True)]
 
 
 @dataclass
@@ -647,20 +687,37 @@ def _level2_metrics(
 ) -> tuple[dict[str, torch.Tensor], _Level2Extras]:
     m = core.m
 
-    gwm_asc, UWm_asc = _safe_psd_eigh(core.G_Wm, lambda: core.W_before)
-    gwp_asc, UWp_asc = _safe_psd_eigh(core.G_Wp, lambda: core.W_after)
-    gv_asc, UV_asc = _safe_psd_eigh(core.G_V, lambda: core.V_raw)
-    gu_asc, UU_asc = _safe_psd_eigh(core.G_U, lambda: core.U_actual)
+    # The four Grams (and below the four correlations) share one shape: one
+    # batched eigensolve each instead of four.
+    (
+        (gwm_asc, UWm_asc),
+        (gwp_asc, UWp_asc),
+        (gv_asc, UV_asc),
+        (gu_asc, UU_asc),
+    ) = _safe_psd_eigh_many(
+        [core.G_Wm, core.G_Wp, core.G_V, core.G_U],
+        [
+            lambda: core.W_before,
+            lambda: core.W_after,
+            lambda: core.V_raw,
+            lambda: core.U_actual,
+        ],
+    )
 
     gwm, UWm = gwm_asc.flip(0), UWm_asc.flip(1)
     gwp, UWp = gwp_asc.flip(0), UWp_asc.flip(1)
     gv, UV = gv_asc.flip(0), UV_asc.flip(1)
     gu, UU = gu_asc.flip(0), UU_asc.flip(1)
 
-    cwm = _safe_psd_eigvalsh(core.C_Wm, lambda: core.Wm_hat)
-    cwp = _safe_psd_eigvalsh(core.C_Wp, lambda: core.Wp_hat)
-    cv = _safe_psd_eigvalsh(core.C_V, lambda: core.V_hat)
-    cu = _safe_psd_eigvalsh(core.C_U, lambda: core.U_hat)
+    cwm, cwp, cv, cu = _safe_psd_eigvalsh_many(
+        [core.C_Wm, core.C_Wp, core.C_V, core.C_U],
+        [
+            lambda: core.Wm_hat,
+            lambda: core.Wp_hat,
+            lambda: core.V_hat,
+            lambda: core.U_hat,
+        ],
+    )
 
     k = min(topk, m)
 
@@ -788,8 +845,10 @@ def _level3_metrics(
     # succeeds) is only actually computed on the rare fallback path.
     K_V = GW_inv_sqrt @ core.G_V @ GW_inv_sqrt
     K_U = GW_inv_sqrt @ core.G_U @ GW_inv_sqrt
-    eig_KV = _safe_psd_eigvalsh(K_V, lambda: GW_inv_sqrt @ core.V_raw)
-    eig_KU = _safe_psd_eigvalsh(K_U, lambda: GW_inv_sqrt @ core.U_actual)
+    eig_KV, eig_KU = _safe_psd_eigvalsh_many(
+        [K_V, K_U],
+        [lambda: GW_inv_sqrt @ core.V_raw, lambda: GW_inv_sqrt @ core.U_actual],
+    )
 
     # J = GW_inv_sqrt @ delta_GW @ GW_inv_sqrt is genuinely indefinite
     # (delta_GW is a difference of two PSD matrices), so the factor trick
@@ -1075,3 +1134,29 @@ def calculate_gram_metrics(
     if level >= 3:
         out.update(_level3_metrics(core, eps, extras))
     return out
+
+
+def calculate_gram_metrics_stacked(
+    W_before: torch.Tensor,
+    V_raw: torch.Tensor,
+    W_after: torch.Tensor,
+    level: int = 0,
+    eps: float = _DEFAULT_GRAM_EPS,
+    topk: int = _DEFAULT_GRAM_TOPK,
+) -> dict[str, torch.Tensor]:
+    """`calculate_gram_metrics` of every unit of `[E, m, n]` stacks (an
+    expert parameter's local experts) in one `vmap` pass: batched GEMMs and
+    eigensolves over the E units instead of E sequential passes. Every value
+    gains a leading `[E]` dim; `{}` where a single unit's call returns `{}`.
+    If a batched eigensolve raises, each unit runs alone (its own fallback)."""
+    if level <= 0 or W_before.ndim != 3 or W_before.shape[1] < 2:
+        return {}
+
+    def one(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> dict:
+        return calculate_gram_metrics(a, b, c, level=level, eps=eps, topk=topk)
+
+    try:
+        return torch.vmap(one)(W_before, V_raw, W_after)
+    except torch._C._LinAlgError:
+        per = [one(a, b, c) for a, b, c in zip(W_before, V_raw, W_after, strict=True)]
+        return {k: torch.stack([p[k] for p in per]) for k in per[0]}

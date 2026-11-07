@@ -23,7 +23,7 @@ from torchtitan.distributed.utils import (
 )
 
 from ..helpers import gram_helper, norm_helper, power_iteration
-from ..helpers.gram_helper import calculate_gram_metrics
+from ..helpers.gram_helper import calculate_gram_metrics, calculate_gram_metrics_stacked
 from ..helpers.norm_helper import calculate_norm, calculate_norm_batched
 from ..helpers.radial_helper import calculate_radial_metrics, SpectralInputs
 
@@ -34,22 +34,34 @@ ROW_METRIC_NAMES = [
 ]
 
 
+_ROW_QUANTILE_POINTS: dict[torch.device, torch.Tensor] = {}
+
+
+def _row_quantile_points(device: torch.device) -> torch.Tensor:
+    """ROW_QUANTILES on `device`, built once: a host-to-device copy per call
+    synchronizes the host."""
+    if device not in _ROW_QUANTILE_POINTS:
+        _ROW_QUANTILE_POINTS[device] = torch.tensor(ROW_QUANTILES, device=device)
+    return _ROW_QUANTILE_POINTS[device]
+
+
 def row_metrics(W_before, W_after) -> list[torch.Tensor]:
     """Quantiles over a unit's stored rows (a Linear's output channels, a
     table's tokens) of the row norms after the step and of each row's angle,
     in chord form `2 asin(|w/|w| - w'/|w'|| / 2)` (fp32 `acos` cannot resolve
-    the ~1e-3 rad of one step). Zeros for a vector."""
-    if W_before.ndim != 2:
+    the ~1e-3 rad of one step). A stack of units `[E, m, n]` gives each
+    quantile per unit (`[E]`). Zeros for a vector."""
+    if W_before.ndim < 2:
         return [W_before.new_zeros((), dtype=torch.float32)] * len(ROW_METRIC_NAMES)
     tiny = torch.finfo(torch.float32).tiny
     a, b = W_before.float(), W_after.float()
     nb = b.norm(dim=-1)
     chord = (a / a.norm(dim=-1, keepdim=True).clamp_min(tiny)) - (
-        b / nb[:, None].clamp_min(tiny)
+        b / nb[..., None].clamp_min(tiny)
     )
     angle = 2 * torch.asin((chord.norm(dim=-1) / 2).clamp(max=1.0))
-    q = torch.tensor(ROW_QUANTILES, device=a.device)
-    return list(torch.quantile(nb, q)) + list(torch.quantile(angle, q))
+    q = _row_quantile_points(a.device)
+    return list(torch.quantile(nb, q, dim=-1)) + list(torch.quantile(angle, q, dim=-1))
 
 
 def pseudo_post_update_weight(w, u, lr, decay):
@@ -290,8 +302,11 @@ class MetricSink:
         return out
 
     def _fill_gram(self, out: UnitValues, W, G_raw, pseudo_w) -> None:
+        g = calculate_gram_metrics(W, G_raw, pseudo_w, level=self.opt.gram_level)
+        self._set_gram(out, g, W=W)
+
+    def _set_gram(self, out: UnitValues, g: dict, *, W) -> None:
         opt = self.opt
-        g = calculate_gram_metrics(W, G_raw, pseudo_w, level=opt.gram_level)
         if not g:  # degenerate unit (fewer than two rows): zeros, fixed arity
             zero = opt._get_cached_zero_scalar(W.device)
             out.gram = [zero] * len(opt.gram_scalar_names)
@@ -332,11 +347,19 @@ class MetricSink:
             radial = calculate_radial_metrics(
                 p_local, pw_all, state_local, spectral=spectral, batch_ndim=1
             )
+            rows = row_metrics(p_local, pw_all)  # one pass over the stack
+            gram = (
+                calculate_gram_metrics_stacked(
+                    p_local, g_raw, pw_all, level=opt.gram_level
+                )
+                if opt.gram_level > 0
+                else None
+            )
             for e, out in enumerate(vals):
                 out.radial = [radial[n][e] for n in opt.radial_names]
-                out.rows = row_metrics(p_local[e], pw_all[e])
-                if opt.gram_level > 0:
-                    self._fill_gram(out, p_local[e], g_raw[e], pw_all[e])
+                out.rows = [r[e] for r in rows]
+                if gram is not None:
+                    self._set_gram(out, {k: v[e] for k, v in gram.items()}, W=p_local)
             results[key] = vals
         return results
 

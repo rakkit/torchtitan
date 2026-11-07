@@ -128,6 +128,33 @@ state wiped between steps 126-223 ulps. Before the k / v-only change (the q / k
 
 ## Speed
 
-To be measured: block FP8 (TP 1) and bf16 (TP 2) prefill / decode on one GH200
-at a 41.4B / 3.05B-active shape, with the k / v conv (fused prologue and not),
-the earlier q / k / v conv, and no conv (11-06 bench job).
+One GH200 node, vLLM 1.0.0.dev20261030, CUDA graphs, random-token prompts
+(prefix caching off), 257 generated tokens; median of 3 fresh processes
+(`bench_vllm_decode.py` in the user's configs). Block FP8 =
+`--quantization fp8_per_block` at TP 1; bf16 at TP 2. Decode in tokens / s
+over the whole engine, prefill in prompt tokens / s.
+
+The conv's cost (41.4B total / 3.05B active: 40 layers, 256 experts top 6 of
+width 640, gate):
+
+| attention prologue | FP8 decode B 1 / B 256 (1k prompt) | FP8 prefill B 1 (8k) | bf16 decode B 1 / B 256 | bf16 prefill B 1 (8k) |
+|---|---|---|---|---|
+| no conv | 245 / 10,264 | 65,497 | 264 / 11,820 | 75,827 |
+| k / v conv, fused prologue (this plugin) | 243 / 10,187 | 62,689 | 261 / 11,720 | 73,277 |
+| k / v conv, unfused | 233 / 10,130 | 64,034 | 248 / 11,666 | 73,703 |
+| q / k / v conv (removed) | 214 / 9,934 | 59,884 | 232 / 11,512 | 64,849 |
+
+The k / v conv with the fused prologue costs ~1% of decode and ~3-4% of long
+prefill.
+
+Two candidate shapes (k / v conv, gate): 40 layers, 256 experts top 8 of
+width 512 (l40-k8-f512) is faster than 48 layers of width 384 (l48-k8-f384) in
+every cell: block FP8 decode B 1 243 vs 208 (+17%), B 256 11,368 vs 10,715
+(+6%), 32k-token prompts B 16 1,478 vs 1,342 (+10%); prefill +8 to +21%; bf16
+TP 2 decode B 256 13,620 vs 13,184 (+3%).
+
+DeepGEMM (block FP8, l40-k8-f512, TP 1): for the linears
+(`VLLM_USE_DEEP_GEMM=1 VLLM_MOE_USE_DEEP_GEMM=0`) prefill +5 to +7%, decode
+B 16 +7 to +9%, B 1 -2%; for the MoE as well (vLLM's defaults once DeepGEMM
+imports) prefill +18 to +22% but decode -14 to -24%: serve with
+`VLLM_MOE_USE_DEEP_GEMM=0`.

@@ -265,6 +265,7 @@ def build_opt_moe_layers(
     router_init_fn_type: str = "scion_normal_output",
     router_init_std: float = 1.0,
     num_mtp_layers: int = 0,
+    enable_tp: bool,
     enable_sp: bool,
     enable_ep: bool,
     enable_cp: bool,
@@ -438,6 +439,7 @@ def build_opt_moe_layers(
             attention["v_conv"] = conv(n_kv_heads * head_dim)
         if attention_sinks:
             attention["attention_sinks"] = True
+            attention["sinks_after_region"] = not (enable_tp or enable_cp)
             attention["param_init"] = {
                 "sinks": make_param_init(sinks_init_fn_type, sinks_init_std)
             }
@@ -614,6 +616,7 @@ def _opt_moe_config(
         ),
         **layer_settings,
         num_mtp_layers=num_mtp_layers,
+        enable_tp=flags["tp"],
         enable_sp=flags["sp"],
         enable_ep=flags["ep"],
         enable_cp=flags["cp"],

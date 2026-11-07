@@ -170,6 +170,13 @@ class GatedSWAttention(GQAttention):
         """A learned logit per head in the softmax denominator (gpt-oss), the
         parameter ``sinks``, initialized from ``param_init["sinks"]``; not with
         ``gate_proj``."""
+        sinks_after_region: bool = True
+        """In training, the sink rescale runs after the inner-attention remat
+        region, so the backward recomputes it instead of saving its output (one
+        ``[T, H, K]`` per layer). Set by the layer builder: False under TP or
+        CP, whose inner-attention wrappers take one output tensor; there the
+        rescale stays the region's ``out_transform``.
+        TODO: (output, lse) through the CP and TP inner-attention wrappers."""
 
         def __post_init__(self) -> None:
             GQAttention.Config.__post_init__(self)
@@ -206,6 +213,7 @@ class GatedSWAttention(GQAttention):
         self.sinks = (
             nn.Parameter(torch.empty(self.n_heads)) if config.attention_sinks else None
         )
+        self.sinks_after_region = config.sinks_after_region
 
     def param_layouts(self) -> dict:
         """The fused wqkv is three units (q / k / v rows interleaved per KV group)."""
@@ -264,7 +272,11 @@ class GatedSWAttention(GQAttention):
         # saved beside the attention output, one more [T, H, K] per layer. The
         # no-grad paths (validation, the RL generator, which injects its own sink
         # hook into its attention backend) keep the rescale as out_transform.
-        sinks_after_region = self.sinks is not None and torch.is_grad_enabled()
+        sinks_after_region = (
+            self.sinks is not None
+            and self.sinks_after_region
+            and torch.is_grad_enabled()
+        )
         output = remat.region(
             self.inner_attention,
             self.remat_region_name("inner_attention"),

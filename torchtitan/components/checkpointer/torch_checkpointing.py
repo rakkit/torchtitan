@@ -226,6 +226,10 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             it programmatically.
     """
 
+    # Automatic loading never selects a final Hugging Face export: Hugging Face
+    # loading has not landed in torch_checkpointing yet.
+    _RESUMABLE_MARKER = TORCH_CHECKPOINTING_METADATA_FILE_NAME
+
     @dataclass(kw_only=True, slots=True)
     class Config(BaseCheckpointManager.Config):
         pass
@@ -452,17 +456,6 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             self._prewarmed = True
 
         return True
-
-    def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
-        """Whether automatic loading may select ``checkpoint_dir``.
-
-        Unlike ``_is_valid_checkpoint``, this excludes final Hugging Face exports.
-        Hugging Face checkpoint loading has not landed in torch_checkpointing yet,
-        so automatic loading cannot select those exports.
-        """
-        return self._storage.isfile(
-            filesystem.join(checkpoint_dir, TORCH_CHECKPOINTING_METADATA_FILE_NAME)
-        )
 
     def _is_hf_checkpoint(self, checkpoint_dir: str, item_key: str) -> bool:
         return any(

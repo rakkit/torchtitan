@@ -46,7 +46,7 @@ class _LossCapture:
         self.ntokens_since_last_log = 0
         self.loss: float | None = None
 
-    def log_validation(self, *, loss: float, step: int) -> None:
+    def log_validation(self, *, loss: float, step: int, tag: str | None = None) -> None:
         self.loss = float(loss)
 
 

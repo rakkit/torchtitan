@@ -87,7 +87,10 @@ class EvaluationTotals:
 
 @dataclass(slots=True)
 class EvaluationRuntime:
-    """A DDP-only inference runtime built without a :class:`Trainer`."""
+    """A DDP-only inference runtime built without a :class:`Trainer`.
+
+    ``build`` leaves the parameters uninitialized: call ``load_checkpoint``
+    before ``evaluate``."""
 
     config: Trainer.Config
     device: torch.device
@@ -162,7 +165,11 @@ class EvaluationRuntime:
         )
         model.to_empty(device=device)
         with torch.no_grad():
-            cast(BaseModel, model).init_states(buffer_device=None)
+            # Parameters come from load_checkpoint (a strict load of every one):
+            # only the buffers (RoPE caches) are initialized here.
+            cast(BaseModel, model).init_states(
+                buffer_device=None, init_parameters=False
+            )
 
         amp_context = contextlib.nullcontext()
         return cls(

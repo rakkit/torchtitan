@@ -1016,9 +1016,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         if self._parameters_await_load and not loaded:
             raise RuntimeError(
                 "Parameter init was skipped because "
-                f"{self.checkpointer.folder} holds a step-N folder or "
-                "initial_load_path is set, but no checkpoint was loaded (e.g. "
-                "only incomplete step folders): remove them or fix the path."
+                f"{self.checkpointer.folder} holds a complete step-N checkpoint, "
+                "load_step or initial_load_path is set, but no checkpoint was "
+                "loaded."
             )
         self._parameters_await_load = False
         return loaded

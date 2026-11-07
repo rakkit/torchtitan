@@ -133,6 +133,8 @@ class CheckpointManager(BaseCheckpointManager):
 
     """
 
+    _RESUMABLE_MARKER = ".metadata"
+
     @dataclass(kw_only=True, slots=True)
     class Config(BaseCheckpointManager.Config):
         async_mode: Literal["disabled", "async", "async_with_pinned_mem"] = "disabled"
@@ -572,9 +574,6 @@ class CheckpointManager(BaseCheckpointManager):
         assert save_future is not None
         self.save_future = None
         save_future.result()
-
-    def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
-        return self._storage.isfile(filesystem.join(checkpoint_dir, ".metadata"))
 
     def _is_valid_checkpoint(self, checkpoint_dir: str) -> bool:
         return self._is_resumable_checkpoint(checkpoint_dir) or (

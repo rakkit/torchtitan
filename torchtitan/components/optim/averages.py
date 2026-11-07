@@ -263,6 +263,18 @@ class WeightAverages(OptimizersContainer):
             all_params.extend(p for _, p in named)
         self._post_init(all_params)
 
+    @torch.no_grad()
+    def reseed(self) -> None:
+        """Every average (and row length) becomes the current weights'; for a
+        load that did not restore the averages (a model-only start, or none)."""
+        for holder, named in zip(self.optimizers, self._named):
+            for _, p in named:
+                st = holder.state[p]
+                for i in range(len(self.gammas)):
+                    st[f"avg_{i}"].copy_(p.detach())
+                    if self._modes[id(p)] == "rows":
+                        st[f"rows_{i}"].copy_(_row_lengths(p))
+
     def mode_of(self, fqn: str) -> str:
         return next((m for r, m in self._renorm if r.search(fqn)), "none")
 

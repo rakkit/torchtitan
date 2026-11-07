@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, ClassVar, Literal, Protocol, runtime_checkable
 
 import torch
 import torch.distributed as dist
@@ -381,6 +381,11 @@ class BaseCheckpointManager(Configurable, ABC):
             # restored (excluded, or a model_only load).
             if EMA in self.states and EMA not in states:
                 self.states[EMA].load_state_dict({})
+            # The same for other weight-derived state (weight averages): built
+            # over skipped-init memory when the load restores the model only.
+            for key, state in self.states.items():
+                if key not in states and hasattr(state, "reseed"):
+                    state.reseed()
             GarbageCollector.collect("GC collection for checkpoint loading.")
             logger.info(
                 "Finished loading the checkpoint in %.2f seconds.",
@@ -516,10 +521,16 @@ class BaseCheckpointManager(Configurable, ABC):
         and exports left by older TorchTitan versions.
         """
 
-    @abstractmethod
+    _RESUMABLE_MARKER: ClassVar[str]
+    """The file a save writes last in a step folder: a folder holding it is a
+    completed checkpoint in this manager's native format."""
+
     def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
         """Whether ``checkpoint_dir`` is a completed checkpoint in this manager's
         native format, which every non-Hugging Face load requires."""
+        return self._storage.isfile(
+            filesystem.join(checkpoint_dir, self._RESUMABLE_MARKER)
+        )
 
     def _find_load_step(self, folder: str = "", max_step: int | None = None) -> int:
         """The highest step in ``folder`` that can actually be loaded.
@@ -735,17 +746,27 @@ class BaseCheckpointManager(Configurable, ABC):
 
         def loads_model_at_start(self, base_folder: str) -> bool:
             """Whether the load at the start of training restores every model
-            parameter: a ``step-N`` folder to resume from, or a native
-            ``initial_load_path`` (both strict: a missing key fails the load).
+            parameter: a completed ``step-N`` checkpoint to resume from, an
+            explicit ``load_step``, or a native ``initial_load_path`` (all
+            strict: a missing key or folder fails the load).
 
             Decided from the folder layout before the manager exists, so the
             engine can skip parameter init (e.g. an orthogonal QR per matrix)
             that the load overwrites; the engine raises if the load then
-            restores nothing. Hugging Face loads keep the full init.
+            restores nothing. A step folder without the completion marker (a
+            save that never finished) does not count, as for the load itself.
+            Hugging Face loads keep the full init.
             """
+            if self.load_step != -1:
+                return True
             folder = filesystem.join(base_folder, self.folder)
+            assert self._owner is not None
+            marker = self._owner._RESUMABLE_MARKER
             if filesystem.isdir(folder) and any(
                 re.fullmatch(BaseCheckpointManager._STEP_DIR_PATTERN, name)
+                and filesystem.isfile(
+                    filesystem.join(filesystem.join(folder, name), marker)
+                )
                 for name in filesystem.listdir(folder)
             ):
                 return True

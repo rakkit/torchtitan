@@ -857,18 +857,33 @@ class TestCheckpointManager(unittest.TestCase):
         cfg.initial_load_path = path1
         cfg.folder = "new_checkpoints"
         self.trainer_config.dump_folder = self.test_folder
+
+        class Reseedable:  # weight-derived state, as WeightAverages
+            count = 0
+
+            def state_dict(self):
+                return {"x": torch.zeros(1)}
+
+            def load_state_dict(self, state_dict):
+                pass
+
+            def reseed(self):
+                self.count += 1
+
+        averages = Reseedable()
         manager2 = CheckpointManager(
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             ema=self.ema,
-            extra_states=self.states,
+            extra_states={**self.states, "averages": averages},
             config=self.trainer_config.checkpointer,
             sd_adapter=None,
             base_folder=self.trainer_config.dump_folder,
         )
         r1 = manager2.load(step=-1)
         self.assertTrue(r1)
+        self.assertEqual(averages.count, 1)  # model-only: reseeded
         mock_load.assert_called_once()
         _, kwargs1 = mock_load.call_args
         self.assertEqual(kwargs1.get("checkpoint_id"), path1)
@@ -880,6 +895,7 @@ class TestCheckpointManager(unittest.TestCase):
         manager2.initial_load_path = None
         r2 = manager2.load(step=2)
         self.assertTrue(r2)
+        self.assertEqual(averages.count, 1)  # restored by the full load
         self.assertEqual(mock_load.call_count, 2)
         args2, kwargs2 = mock_load.call_args_list[1]
         self.assertEqual(kwargs2.get("checkpoint_id"), step2_dir)
@@ -1275,6 +1291,48 @@ class TestCheckpointManager(unittest.TestCase):
         manager.save(curr_step=1)
         manager.save(curr_step=2, last_step=True)
         manager.load(step=1)
+
+
+class TestLoadsModelAtStart(unittest.TestCase):
+    """Skip-init decides from COMPLETE checkpoints only: an interrupted first
+    save leaves a step folder without metadata, and the restart must init."""
+
+    def _check(self, config_cls, marker: str) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            config = config_cls()
+            self.assertFalse(config.loads_model_at_start(base))
+            step = os.path.join(base, config.folder, "step-10")
+            os.makedirs(step)
+            self.assertFalse(config.loads_model_at_start(base))
+            open(os.path.join(step, marker), "w").close()
+            self.assertTrue(config.loads_model_at_start(base))
+            self.assertTrue(config_cls(load_step=20).loads_model_at_start(base))
+
+    def test_dcp_needs_metadata(self):
+        self._check(CheckpointManager.Config, ".metadata")
+
+    def test_torch_checkpointing_needs_its_marker(self):
+        from torchtitan.components.checkpointer.torch_checkpointing import (
+            TORCH_CHECKPOINTING_METADATA_FILE_NAME,
+            TorchCheckpointingManager,
+        )
+
+        self._check(
+            TorchCheckpointingManager.Config, TORCH_CHECKPOINTING_METADATA_FILE_NAME
+        )
+
+    def test_initial_load_path(self):
+        with tempfile.TemporaryDirectory() as base:
+            self.assertTrue(
+                CheckpointManager.Config(
+                    initial_load_path="/abs/step-5"
+                ).loads_model_at_start(base)
+            )
+            self.assertFalse(
+                CheckpointManager.Config(
+                    initial_load_path="/abs/hf", initial_load_in_hf=True
+                ).loads_model_at_start(base)
+            )
 
 
 class TestConfigPostInit(unittest.TestCase):

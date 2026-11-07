@@ -380,3 +380,30 @@ def test_exported_averages_are_the_scored_ones(tmp_path):
             assert torch.equal(got[n], x.float()), (g, n)
     with pytest.raises(ValueError, match="export_steps"):
         WeightAverages.Config(gammas=[], export_steps=[3])
+
+
+def test_reseed_takes_the_loaded_weights():
+    """Built over uninitialized (here NaN) weights, as with skip-init before a
+    model-only load: reseed() after the load makes every average and row length
+    the loaded weights', and the averages stay finite."""
+    model = Toy()
+    with torch.no_grad():
+        for p in model.parameters():
+            p.fill_(float("nan"))
+    avg = WeightAverages(
+        _cfg(gammas=[1.0], renorm=[["qkv", "rows"]]), model_parts=[model]
+    )
+    gen = torch.Generator().manual_seed(3)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.copy_(torch.randn(p.shape, generator=gen))
+    avg.reseed()
+    state = avg.optimizers[0].state
+    for p in model.parameters():
+        assert torch.equal(state[p]["avg_0"], p.detach().float())
+    assert torch.equal(
+        state[model.qkv.weight]["rows_0"],
+        model.qkv.weight.detach().float().norm(dim=-1, keepdim=True),
+    )
+    _run(avg, model, 3)
+    assert all(torch.isfinite(state[p]["avg_0"]).all() for p in model.parameters())

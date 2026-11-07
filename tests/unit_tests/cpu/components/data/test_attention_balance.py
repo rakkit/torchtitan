@@ -5,10 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 """Node-local attention balancing: the assignment keeps every token exactly
-once and every row's length, cuts only what fits nowhere whole, and lowers the
-largest per-rank attention cost; the balancer on 4 Gloo ranks returns rows
-whose union is the node's tokens with their labels, positions restarting at
-every segment."""
+once and every row's length (variable counts: within the cap), cuts only what
+fits nowhere whole, and lowers the largest per-rank cost; both balancers on 4
+Gloo ranks return rows whose union is the node's tokens with their labels,
+positions restarting at every segment."""
 
 import os
 import tempfile
@@ -22,6 +22,7 @@ import torch.multiprocessing as mp
 from torchtitan.components.data.balance import (
     assign_segments,
     NodeAttentionBalancer,
+    NodeComputeBalancer,
     segment_attention_cost,
     split_segments,
 )
@@ -105,7 +106,47 @@ def test_assignment_is_deterministic():
     assert assign_segments(rows, WINDOWS) == assign_segments(rows, WINDOWS)
 
 
-def _balance_rank(rank, world, init_file, rows, out_file):
+def _total_cost(pieces, token_cost):
+    return [
+        float(
+            sum(
+                segment_attention_cost(np.array([n]), WINDOWS)[0] + token_cost * n
+                for _, _, n in rank
+            )
+        )
+        for rank in pieces
+    ]
+
+
+def test_variable_counts_move_short_documents_off_the_long_document_rank():
+    # with equal counts the rank holding the 60-token document stays the
+    # slowest whatever it keeps; with variable counts it keeps fewer tokens
+    rows = [_row([60, 4]), _row([4] * 16), _row([8] * 8), _row([2] * 32)]
+    token_cost = 4.0
+    equal = assign_segments(rows, WINDOWS)
+    variable = assign_segments(rows, WINDOWS, token_cost=token_cost, max_tokens=80)
+    counts = [sum(n for _, _, n in rank) for rank in variable]
+    assert sum(counts) == 4 * 64 and max(counts) <= 80
+    covered = sorted(
+        (src, start + i)
+        for rank in variable
+        for src, start, n in rank
+        for i in range(n)
+    )
+    assert covered == [(r, i) for r in range(4) for i in range(64)]
+    long_rank = next(i for i, rank in enumerate(variable) if (0, 0, 60) in rank)
+    assert counts[long_rank] < 64
+    assert max(_total_cost(variable, token_cost)) < max(_total_cost(equal, token_cost))
+
+
+def test_compute_balancer_config_refuses_no_token_cost():
+    with pytest.raises(ValueError, match="token_cost"):
+        NodeComputeBalancer.Config(token_cost=0.0)
+    with pytest.raises(ValueError, match="max_tokens_ratio"):
+        NodeComputeBalancer.Config(token_cost=1.0, max_tokens_ratio=0.5)
+
+
+def _balance_rank(rank, world, init_file, rows, out_file, balancer_config):
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world
     )
@@ -113,7 +154,7 @@ def _balance_rank(rank, world, init_file, rows, out_file):
         from torchtitan.config.parallelism import ParallelismConfig
         from torchtitan.models.llama3 import build_model_config
 
-        balancer = NodeAttentionBalancer.Config().build(
+        balancer = balancer_config.build(
             model_config=build_model_config(
                 "debugmodel", parallelism=ParallelismConfig()
             ),
@@ -145,11 +186,21 @@ def _balance_rank(rank, world, init_file, rows, out_file):
         dist.destroy_process_group()
 
 
-def test_balancer_on_four_gloo_ranks_keeps_the_node_tokens():
+@pytest.mark.parametrize(
+    "balancer_config",
+    [NodeAttentionBalancer.Config(), NodeComputeBalancer.Config(token_cost=4.0)],
+    ids=["equal_counts", "variable_counts"],
+)
+def test_balancer_on_four_gloo_ranks_keeps_the_node_tokens(balancer_config):
     rows = [_row([60, 4]), _row([4] * 16), _row([8] * 8), _row([2] * 32)]
     with tempfile.TemporaryDirectory() as tmp:
         init_file, out = os.path.join(tmp, "init"), os.path.join(tmp, "out")
-        mp.spawn(_balance_rank, args=(4, init_file, rows, out), nprocs=4, join=True)
+        mp.spawn(
+            _balance_rank,
+            args=(4, init_file, rows, out, balancer_config),
+            nprocs=4,
+            join=True,
+        )
         results = [torch.load(f"{out}.{r}", weights_only=True) for r in range(4)]
     pairs = sorted(
         (int(i), int(l))
@@ -162,7 +213,11 @@ def test_balancer_on_four_gloo_ranks_keeps_the_node_tokens():
         for i in range(64)
     )
     assert pairs == want
-    assert all(len(res["input"]) == 64 for res in results)
+    counts = [len(res["input"]) for res in results]
+    if isinstance(balancer_config, NodeComputeBalancer.Config):
+        assert min(counts) < 64 <= max(counts) <= 80  # cap 1.25 x 64
+    else:
+        assert counts == [64] * 4
     total = sum(int(res["loss_token_counts"]) for res in results)
     assert total == 4 * 63
     for res in results:

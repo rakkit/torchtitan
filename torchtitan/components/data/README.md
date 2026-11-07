@@ -568,3 +568,26 @@ The step's documents, labels and loss are unchanged; only which GPU computes
 which document changes. The balancer keeps no state (resume is unaffected).
 TP, CP and PP above 1 are refused. Measured (opt_moe l40, 64k tokens per GPU,
 32k context, same nodes): +2.0% tokens/s at 16 nodes, +3.8% at 32 nodes.
+
+With equal counts, a rank holding one long document stays the slowest whatever
+else it keeps (at 64k context, opt_moe l44: no gain). `NodeComputeBalancer`
+lets the token counts differ: a segment costs its attention pairs plus
+`token_cost` per token (GEMMs, norms and routing scale with tokens), so that
+rank keeps fewer short documents and the others take them, each at most
+`max_tokens_ratio` x the row length (activation memory grows with tokens):
+
+```text
+4 ranks x 64k tokens, 64k context, one 46k-token document (k = 1024; opt_moe l44,
+step 30 of a 16-node run; ms = the recipe's fitted cost model)
+equal counts     46k doc + 18k short  5913 ms | 64k  5028 | 64k  5020 | 64k  5017
+variable counts  46k doc +  9k short  5245 ms | 67k  5245 | 67k  5245 | 67k  5244
+```
+
+`token_cost` is the recipe's measured ratio, from one profiled step: (compute
+time - attention time) / tokens over attention time / query-key pairs (pairs
+summed over the layers, as `segment_attention_cost` counts them). A FLOP count
+misses remat and glue (it gives ~0.56 x the measured ratio for opt_moe l44,
+which costs about a quarter of the gain); a wrong value balances less, it
+never changes what is trained. The loss is normalized by the global token
+count, so variable rows leave it unchanged; compiled blocks run with a dynamic
+token dimension (one more graph per block type).

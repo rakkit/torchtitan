@@ -14,8 +14,9 @@ recipe's w2 remat. One GPU, fp32.
   inside dynamo's recompile budget: a 6-layer run failed with "Dynamo recompile
   limit exceeded" at its first training step after validation. Each block type
   compiles a training graph, a no_grad validation graph and a dynamic-shape
-  training graph (a microbatch with another document count): 11 entries here,
-  over torch's default limit of 8 (this test fails with it).
+  training graph (a microbatch with other document and token counts, as
+  NodeComputeBalancer's rows): 11 entries here, over torch's default limit of 8
+  (this test fails with it); a third token count reuses the dynamic graph.
 - The compiled blocks match eager blocks in the same setup (FSDP, the w2
   remat; its eager path through the MTP block read a remat placeholder): the
   loss and every gradient of the accumulated step, and the validation logits. Dense feed-forwards here: an MoE
@@ -44,9 +45,10 @@ from torchtitan.models.opt_moe import build_model_config
 from torchtitan.models.opt_moe.mtp import roll_mtp_sequence
 
 T, T_VAL, V = 512, 384, 512
-# the two accumulated microbatches pack different document counts (as real
-# data does): the second one recompiles every block type with dynamic shapes
-DOCS, DOCS_2, DOCS_VAL = [200, 1, 311], [100, 412], [384]
+# the accumulated microbatches pack different document and token counts (real
+# data; NodeComputeBalancer's variable rows): the second one recompiles every
+# block type with dynamic shapes, the third reuses that graph
+DOCS, DOCS_2, DOCS_3, DOCS_VAL = [200, 1, 311], [100, 348], [60, 500], [384]
 # The largest |compiled - eager| / |eager| (fp32: the compiled blocks fuse and
 # reorder the same ops).
 TOL = 1e-4
@@ -176,7 +178,8 @@ class TestCompileBlocks(DTensorTestBase):
     @with_comms
     def test_training_with_validation_stays_in_the_recompile_budget(self):
         pc, _, model = self._models(moe=True)
-        train, val = [_batch(DOCS, 1), _batch(DOCS_2, 2)], _batch(DOCS_VAL, 3)
+        train = [_batch(DOCS, 1), _batch(DOCS_2, 2), _batch(DOCS_3, 4)]
+        val = _batch(DOCS_VAL, 3)
         with pc.activate_spmd():
             for _ in range(3):
                 for batch in train:

@@ -26,6 +26,15 @@ segments so each keeps the same token count with about equal attention work:
 The step's documents, labels and loss are unchanged; only which rank computes
 which document changes (and the rare extra cut). Off by default
 (``Trainer.Config.attention_balancer``).
+
+With equal token counts, a rank holding one long document stays the slowest
+whatever the others hold. `NodeComputeBalancer` lets the counts differ: a
+segment's cost is its attention pairs plus its tokens' cost, so that rank gets
+fewer short documents and the others more (up to a cap). Example, 4 ranks x 64k
+tokens at 64k context, one 46k document (k = 1024)::
+
+    equal counts:    [46k doc + 18k short | 64k short | 64k short | 64k short]
+    variable counts: [46k doc +  9k short | 67k short | 67k short | 67k short]
 """
 
 from __future__ import annotations
@@ -73,22 +82,33 @@ def split_segments(positions: np.ndarray) -> np.ndarray:
 
 
 def assign_segments(
-    rows_positions: Sequence[np.ndarray], windows: Sequence[int | None]
+    rows_positions: Sequence[np.ndarray],
+    windows: Sequence[int | None],
+    *,
+    token_cost: float = 0.0,
+    max_tokens: int | None = None,
 ) -> list[list[tuple[int, int, int]]]:
     """The new rows of a group, as ``(source row, start, length)`` pieces per
-    rank. Every row keeps its token count (all rows are equally long). Ties
-    are broken by (source row, start), so every rank computes the same
-    assignment."""
+    rank. A segment costs its attention pairs plus ``token_cost`` per token;
+    segments by descending cost, each to the rank with the least cost that has
+    room for it whole (``max_tokens`` per rank; ``None``: the row length, so
+    every row keeps its token count -- all rows are equally long). Ties are
+    broken by (source row, start), so every rank computes the same assignment."""
     num_rows = len(rows_positions)
-    capacity = len(rows_positions[0])
+    row_length = len(rows_positions[0])
+    capacity = row_length if max_tokens is None else max_tokens
+    assert capacity >= row_length, (capacity, row_length)
+
+    def cost(lengths: np.ndarray) -> np.ndarray:
+        return segment_attention_cost(lengths, windows) + token_cost * lengths
+
     segments = []
     for row, positions in enumerate(rows_positions):
         starts = split_segments(positions)
         lengths = np.diff(np.concatenate([starts, [len(positions)]]))
-        costs = segment_attention_cost(lengths, windows)
         segments += [
             (-c, row, int(s), int(n))
-            for c, s, n in zip(costs.tolist(), starts, lengths, strict=True)
+            for c, s, n in zip(cost(lengths).tolist(), starts, lengths, strict=True)
         ]
     segments.sort()
     room = [capacity] * num_rows
@@ -111,10 +131,10 @@ def assign_segments(
             take = min(left, room[r])
             pieces[r].append((row, offset, take))
             room[r] -= take
-            load[r] += segment_attention_cost(np.array([take]), windows)[0]
+            load[r] += cost(np.array([take]))[0]
             left -= take
             offset += take
-    assert all(r == 0 for r in room), room
+    assert sum(room) == num_rows * (capacity - row_length), room
     return pieces
 
 
@@ -147,6 +167,9 @@ class NodeAttentionBalancer(Configurable):
         self.size = dist.get_world_size(self.group)
         self.windows = attention_windows(model_config)
         self.num_mtp_layers = num_mtp_layers
+        # every rank keeps its token count; only attention is balanced
+        self.token_cost = 0.0
+        self.max_tokens_ratio = 1.0
 
     def __call__(
         self, microbatch: TokenizedTrainingMicrobatch
@@ -167,7 +190,12 @@ class NodeAttentionBalancer(Configurable):
         gathered = [torch.empty_like(local) for _ in range(self.size)]
         dist.all_gather(gathered, local, group=self.group)
         rows = [g.numpy() for g in gathered]
-        mine = assign_segments([row[2] for row in rows], self.windows)[self.rank]
+        mine = assign_segments(
+            [row[2] for row in rows],
+            self.windows,
+            token_cost=self.token_cost,
+            max_tokens=int(self.max_tokens_ratio * local.shape[1]),
+        )[self.rank]
         out = np.concatenate(
             [rows[src][:, start : start + n] for src, start, n in mine], axis=1
         )
@@ -191,6 +219,46 @@ class NodeAttentionBalancer(Configurable):
             loss_token_counts=loss_token_counts,
             routing_token_counts=routing_token_counts,
         )
+
+
+class NodeComputeBalancer(NodeAttentionBalancer):
+    """As `NodeAttentionBalancer`, but a rank's token count may change: each
+    segment also carries its tokens' cost (GEMMs, norms, routing: the same per
+    token), so the rank that drew a long document keeps fewer other tokens.
+    The node's tokens, every document and the loss (normalized by the global
+    token count) are unchanged. Rows change length from step to step, so a
+    compiled block runs with a dynamic token dimension (automatic dynamic
+    shapes give it one graph after the first change)."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(NodeAttentionBalancer.Config):
+        token_cost: float
+        """One token's cost in attention query-key pairs summed over the
+        layers: from one profiled step of the recipe, (compute time - attention
+        time) / tokens divided by attention time / pairs (pairs as
+        `segment_attention_cost` counts them). A wrong value balances less, it
+        never changes what is trained."""
+
+        max_tokens_ratio: float = 1.25
+        """A rank's tokens at most this times the packed row length: its
+        activation memory grows with its tokens."""
+
+        def __post_init__(self) -> None:
+            if self.token_cost <= 0:
+                raise ValueError(f"token_cost must be > 0, got {self.token_cost}")
+            if self.max_tokens_ratio < 1:
+                raise ValueError(
+                    f"max_tokens_ratio must be >= 1, got {self.max_tokens_ratio}"
+                )
+
+    def __init__(
+        self, config: Config, *, model_config: Any, num_mtp_layers: int
+    ) -> None:
+        super().__init__(
+            config, model_config=model_config, num_mtp_layers=num_mtp_layers
+        )
+        self.token_cost = config.token_cost
+        self.max_tokens_ratio = config.max_tokens_ratio
 
 
 def attention_windows(model_config) -> list[int | None]:

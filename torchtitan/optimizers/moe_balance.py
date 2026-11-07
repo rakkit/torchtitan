@@ -187,8 +187,13 @@ def fused_hier_reduce_loss_stats(
 
     # Entropy: SUM (the caller divides by the summed counted tokens).
     all_entropies.copy_(out_ent.to(all_entropies.dtype))
-    # Load-balance loss: SUM, matching upstream's `collect_aux_loss_metrics`.
-    # Each rank holds its own token share, so the sum IS the global value.
+    # Load-balance loss: SUM over DP, matching upstream's
+    # `collect_aux_loss_metrics` (reduce_mesh "dp": each DP rank holds its own
+    # token share). The aux loss already reduced its statistics over CP and TP
+    # (aux_loss._reduce_token_partials), so every CP rank holds the same value
+    # and the `loss` mesh's SUM counted it CP times.
+    if loss_mesh is not None:
+        out_lb = out_lb / parallelism_context.cp
     all_load_balance_losses.copy_(out_lb.to(all_load_balance_losses.dtype))
 
 

@@ -68,12 +68,14 @@ Neither needs random access, and neither reads a row group twice.
 """
 
 from __future__ import annotations
+
 import logging
 
 import random
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import grain.python as grain
 
@@ -82,9 +84,11 @@ from torchtitan.components.data.parquet_manifest import (
     check_freshness,
     MANIFEST_FILENAME,
     read_manifest,
+    redeal_spans,
     RowSpan,
     sharing_factor,
     split_spans_for_interleave,
+    unread_spans,
     validate_column,
 )
 from torchtitan.components.data.types import DatasetIterationPolicy
@@ -160,11 +164,7 @@ class _ParquetStream(grain.IterDataset):
     ) -> None:
         super().__init__()
         self._dir = Path(config.path)
-        manifest_path = (
-            Path(config.manifest_path)
-            if config.manifest_path
-            else self._dir / MANIFEST_FILENAME
-        )
+        manifest_path = _manifest_path(config)
         if not manifest_path.is_file():
             raise FileNotFoundError(
                 f"No manifest at {manifest_path}. Build it with:\n"
@@ -225,23 +225,19 @@ class _ParquetStream(grain.IterDataset):
                 world,
             )
 
-        # At high DP a rank's whole range can sit inside one row group, which would make
-        # BOTH shuffle mechanisms no-ops (permuting a list of one, and a width capped at
-        # the span count). Subdivide so the interleave has something to work with.
-        if self._reshuffle_spans and len(self._spans) < config.num_concurrent_spans:
-            split = split_spans_for_interleave(self._spans, config.num_concurrent_spans)
-            if rank == 0 and len(split) != len(self._spans):
-                logger.info(
-                    "%s: rank share is %d span(s) at dp_world_size=%d; split into %d so "
-                    "span permutation and interleaving still mix. Sub-spans of one row "
-                    "group each decode from its start, so the group is decompressed "
-                    "more than once per epoch.",
-                    self._dir.name,
-                    len(self._spans),
-                    world,
-                    len(split),
-                )
-            self._spans = split
+        split = _interleave_spans(self._spans, config)
+        if rank == 0 and len(split) != len(self._spans):
+            logger.info(
+                "%s: rank share is %d span(s) at dp_world_size=%d; split into %d so "
+                "span permutation and interleaving still mix. Sub-spans of one row "
+                "group each decode from its start, so the group is decompressed "
+                "more than once per epoch.",
+                self._dir.name,
+                len(self._spans),
+                world,
+                len(split),
+            )
+        self._spans = split
 
         if rank == 0:
             logger.info(
@@ -312,29 +308,28 @@ class _ParquetSpanIterator(grain.DatasetIterator):
         # so re-records the directory mtime. So pin the shape the cursor was taken
         # against.
         self._fingerprint = [len(self._base_spans), self._rows_per_epoch]
+        # The current epoch's spans when a data-parallel degree change re-dealt the
+        # rest of the pass (None: the epoch's own permutation); later epochs are
+        # this rank's normal passes.
+        self._remainder: list[RowSpan] | None = None
         self._start_epoch(0)
 
     # -- span order -----------------------------------------------------------
     def _epoch_spans(self, epoch: int) -> list[RowSpan]:
-        """Span order for one pass. Derived purely from (seed, epoch), so every rank
-        reproduces it on resume without storing the permutation."""
-        if not self._reshuffle_spans:
-            return list(self._base_spans)
-        # Epoch 0 is permuted too. Exempting it made the first pass the one pass whose
-        # concurrent spans were adjacent on disk (slots take spans in order), so the
-        # very epoch every short run consists of had the weakest mixing. Disk order has
-        # no special status here -- the corpora are pre-shuffled -- and
-        # reshuffle_spans_per_epoch=False remains the way to ask for it.
-        spans = list(self._base_spans)
-        # Multiply-and-add rather than hash((seed, epoch)): tuple hashing of ints is
-        # stable today but is an implementation detail, and this is reproduced on every
-        # resume.
-        random.Random(self._seed * 1_000_003 + epoch).shuffle(spans)
-        return spans
+        return _epoch_order(
+            self._base_spans,
+            seed=self._seed,
+            epoch=epoch,
+            reshuffle=self._reshuffle_spans,
+        )
 
     def _start_epoch(self, epoch: int) -> None:
         self._epoch = epoch
-        self._spans = self._epoch_spans(epoch)
+        self._spans = (
+            list(self._remainder)
+            if self._remainder is not None
+            else self._epoch_spans(epoch)
+        )
         self._next_span = 0
         self._draw_index = 0
         self._draws: list[int] = []
@@ -385,7 +380,7 @@ class _ParquetSpanIterator(grain.DatasetIterator):
                 row_groups=[span.row_group],
                 columns=self._columns,
             )
-        except (FileNotFoundError, OSError, IndexError) as exc:
+        except (OSError, IndexError) as exc:
             raise RuntimeError(
                 f"{self._dir}: failed to read row group {span.row_group} of "
                 f"{span.shard} ({type(exc).__name__}: {exc}). The manifest is out of "
@@ -428,6 +423,7 @@ class _ParquetSpanIterator(grain.DatasetIterator):
                     raise StopIteration
                 # Exhaustion policy: loop the dataset and keep its weight, so the
                 # configured mixture ratio holds for the whole stage.
+                self._remainder = None
                 self._start_epoch(self._epoch + 1)
                 continue
             cursor = self._slots[slot]
@@ -457,12 +453,27 @@ class _ParquetSpanIterator(grain.DatasetIterator):
             # epoch instead would make `data_docs/{alias}` saw-tooth back to zero every
             # time a small corpus wrapped -- exactly the corpora that wrap most often.
             "next_index": self._emitted,
+            "seed": self._seed,
             "spans_fingerprint": list(self._fingerprint),
+            "remainder": (
+                None
+                if self._remainder is None
+                else [[s.shard, s.row_group, s.start, s.stop] for s in self._remainder]
+            ),
         }
 
     def set_state(self, state: dict[str, Any]) -> None:
         # The span permutation and the draw sequence are pure functions of
-        # (seed, epoch [, block]), so both are recomputed rather than stored.
+        # (seed, epoch [, block]), so both are recomputed rather than stored; a
+        # re-dealt remainder is stored (it depends on the old ranks' cursors).
+        remainder = state.get("remainder")
+        self._remainder = (
+            None if remainder is None else [RowSpan(*r) for r in remainder]
+        )
+        # The saved slots index the span order of the seed they were taken under, so
+        # a stream rebuilt with another seed (a changed loader seed) keeps the
+        # cursor's; a DP-degree re-deal also rebuilds each old rank's order from it.
+        self._seed = int(state["seed"])
         self._start_epoch(int(state.get("epoch", 0)))
         slots = state.get("slots")
         if slots is None:
@@ -490,4 +501,114 @@ class _ParquetSpanIterator(grain.DatasetIterator):
         self._draw_index = int(state["draw_index"])
         self._emitted = int(state.get("next_index", 0))
 
+
 logger = logging.getLogger(__name__)
+
+
+def _manifest_path(config: ParquetStreamSource.Config) -> Path:
+    if config.manifest_path:
+        return Path(config.manifest_path)
+    return Path(config.path) / MANIFEST_FILENAME
+
+
+def _interleave_spans(
+    spans: list[RowSpan], config: ParquetStreamSource.Config
+) -> list[RowSpan]:
+    """At high DP a rank's whole range can sit inside one row group, which would make
+    BOTH shuffle mechanisms no-ops (permuting a list of one, and a width capped at the
+    span count). Subdivide so the interleave has something to work with."""
+    if config.reshuffle_spans_per_epoch and len(spans) < config.num_concurrent_spans:
+        return split_spans_for_interleave(spans, config.num_concurrent_spans)
+    return spans
+
+
+def _epoch_order(
+    spans: list[RowSpan], *, seed: int, epoch: int, reshuffle: bool
+) -> list[RowSpan]:
+    """Span order for one pass. Derived purely from (seed, epoch), so every rank
+    reproduces it on resume without storing the permutation."""
+    if not reshuffle:
+        return list(spans)
+    # Epoch 0 is permuted too. Exempting it made the first pass the one pass whose
+    # concurrent spans were adjacent on disk (slots take spans in order), so the very
+    # epoch every short run consists of had the weakest mixing. Disk order has no
+    # special status here -- the corpora are pre-shuffled -- and
+    # reshuffle_spans_per_epoch=False remains the way to ask for it.
+    spans = list(spans)
+    # Multiply-and-add rather than hash((seed, epoch)): tuple hashing of ints is stable
+    # today but is an implementation detail, and this is reproduced on every resume.
+    random.Random(seed * 1_000_003 + epoch).shuffle(spans)
+    return spans
+
+
+def redealt_state(
+    config: ParquetStreamSource.Config,
+    old_states: list[dict[str, Any]],
+    *,
+    dp_rank: int,
+    dp_world_size: int,
+    fresh_state: dict[str, Any],
+) -> dict[str, Any]:
+    """This rank's stream state after a data-parallel degree change.
+
+    `old_states` are the old ranks' iterator states, in old-rank order. The rows they
+    had not read in their current pass are dealt to the `dp_world_size` new ranks in
+    contiguous chunks (`redeal_spans`); this rank reads its chunk as the rest of the
+    pass, then its own share of the next passes (`remainder_state`). If the old ranks
+    were in different passes, the new pass number is the latest one. `fresh_state`: a
+    just-built iterator's state of this rank."""
+    manifest = read_manifest(_manifest_path(config))
+    old_world = len(old_states)
+    unread: list[RowSpan] = []
+    for old_rank, state in enumerate(old_states):
+        base = _interleave_spans(
+            assign_row_spans(manifest, old_rank, old_world), config
+        )
+        if [len(base), sum(s.num_rows for s in base)] != list(
+            state["spans_fingerprint"]
+        ):
+            raise ValueError(
+                f"{config.path}: old rank {old_rank} of {old_world} read "
+                f"{state['spans_fingerprint']} spans / rows, but the corpus now gives it "
+                f"{len(base)} / {sum(s.num_rows for s in base)}; the corpus or "
+                "num_concurrent_spans changed since the checkpoint"
+            )
+        if state["remainder"] is not None:
+            spans = [RowSpan(*r) for r in state["remainder"]]
+        else:
+            spans = _epoch_order(
+                base,
+                seed=int(state["seed"]),
+                epoch=int(state["epoch"]),
+                reshuffle=config.reshuffle_spans_per_epoch,
+            )
+        unread += unread_spans(spans, state["slots"], int(state["next_span"]))
+    emitted = sum(int(state["next_index"]) for state in old_states)
+    share = emitted // dp_world_size + (1 if dp_rank < emitted % dp_world_size else 0)
+    return remainder_state(
+        fresh_state,
+        redeal_spans(unread, dp_world_size)[dp_rank],
+        epoch=max(int(state["epoch"]) for state in old_states),
+        emitted=share,
+    )
+
+
+def remainder_state(
+    fresh_state: dict[str, Any], remainder: list[RowSpan], *, epoch: int, emitted: int
+) -> dict[str, Any]:
+    """The iterator state that reads `remainder` (re-dealt after a data-parallel
+    degree change) as the rest of pass `epoch`, then this rank's normal passes.
+    `fresh_state`: a just-built iterator's state (its slot count and corpus
+    fingerprint); `emitted`: the documents this rank counts as already read."""
+    width = len(fresh_state["slots"])
+    opened = min(width, len(remainder))
+    return {
+        **fresh_state,
+        "epoch": epoch,
+        "slots": [{"span_index": i, "row_in_span": 0} for i in range(opened)]
+        + [None] * (width - opened),
+        "next_span": opened,
+        "draw_index": 0,
+        "next_index": emitted,
+        "remainder": [[s.shard, s.row_group, s.start, s.stop] for s in remainder],
+    }

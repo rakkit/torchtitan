@@ -208,8 +208,11 @@ def test_state_is_plain_integers(tmp_path):
         "next_span",
         "draw_index",
         "next_index",
+        "seed",
         "spans_fingerprint",
+        "remainder",
     }
+    assert state["remainder"] is None, "set only by a DP-degree re-deal"
     assert state["next_index"] == 7, "next_index counts documents emitted"
     for key in ("epoch", "next_span", "draw_index", "next_index"):
         assert isinstance(state[key], int)
@@ -379,3 +382,34 @@ def test_resuming_into_a_changed_corpus_is_refused(tmp_path: Path):
     second = iter(_source(root, repeat=True))
     with pytest.raises(ValueError, match="corpus changed since the checkpoint"):
         second.set_state(state)
+
+
+@pytest.mark.parametrize("width", [1, 3])
+def test_a_redealt_remainder_is_read_once_then_normal_passes(tmp_path, width):
+    """After a DP-degree change a rank reads its re-dealt remainder as the rest of
+    the pass (resumable mid-way), then its own share in the next passes."""
+    from torchtitan.components.data.parquet_manifest import RowSpan
+    from torchtitan.components.data.parquet_stream import remainder_state
+
+    root = _corpus(tmp_path / "ds", shards=2, groups=2, rows=8)  # 32 rows, 4 groups
+    remainder = [
+        RowSpan("part-00000.parquet", 1, 3, 8),
+        RowSpan("part-00001.parquet", 0, 0, 4),
+    ]
+    want = [f"row-{i:06d}" for i in [*range(11, 16), *range(16, 20)]]
+    fresh = iter(_source(root, repeat=True, num_concurrent_spans=width))
+    state = remainder_state(fresh.get_state(), remainder, epoch=2, emitted=40)
+    it = iter(_source(root, repeat=True, num_concurrent_spans=width))
+    it.set_state(state)
+    head = [next(it)["text"] for _ in range(4)]
+    mid = it.get_state()
+    assert mid["remainder"] is not None and mid["epoch"] == 2
+    resumed = iter(_source(root, repeat=True, num_concurrent_spans=width))
+    resumed.set_state(mid)
+    tail = [next(resumed)["text"] for _ in range(5)]
+    assert sorted(head + tail) == want
+    after = [next(resumed)["text"] for _ in range(32)]  # the next pass: every row
+    assert sorted(after) == [f"row-{i:06d}" for i in range(32)]
+    state = resumed.get_state()
+    assert state["remainder"] is None and state["epoch"] == 3
+    assert state["next_index"] == 40 + 9 + 32

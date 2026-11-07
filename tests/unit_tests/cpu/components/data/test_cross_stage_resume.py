@@ -277,3 +277,89 @@ def test_stage_two_resumes_through_dcp(tmp_path):
     cursors = dict(zip(stage2_ids, [cursor_position(p) for p in resumed]))
     assert {k: cursors[k] for k in stage1_ids} == saved
     assert all(cursors[k] == 0 for k in ("F", "G", "H", "I"))
+
+
+def _rank_loader(tmp_path: Path, ids: list[str], rank: int, world: int):
+    specs = [
+        DatasetSpec(alias=i, path=str(tmp_path / i))
+        if (tmp_path / i).exists()
+        else DatasetSpec(alias=i, path=_corpus(tmp_path / i, i, 256))
+        for i in ids
+    ]
+    config = make_pretrain_dataloader_config(
+        specs,
+        shuffle=False,
+        repeat=True,
+        seed=0,
+        num_prefetch_microbatches=1,
+        read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=1),
+    )
+    return KeyedMixDataLoader(
+        config,
+        dp_world_size=world,
+        dp_rank=rank,
+        tokenizer=FakeTokenizer(),
+        max_context_length=8,
+        num_tokens_per_microbatch=16,
+    )
+
+
+def _load_like_the_checkpointer(loader, checkpoint_id: str) -> None:
+    from torchtitan.components.checkpointer import DATALOADER
+    from torchtitan.components.checkpointer.dcp import CheckpointManager
+
+    checkpointer = CheckpointManager.__new__(CheckpointManager)
+    checkpointer._load_checkpoint(
+        {DATALOADER: loader}, checkpoint_id, from_hf=False, from_quantized=False
+    )
+
+
+def test_a_dp_degree_change_redeals_every_old_rank_through_the_checkpointer(tmp_path):
+    """3 data-parallel ranks checkpoint, the job resumes on 2: each new rank loads
+    all 3 old rank items and reads its share of the rows the old ranks left
+    unread in the pass; a same-degree resume still reads only its own item."""
+    from torchtitan.components.data.keyed_mix_state import stream_state
+
+    ids = ["A", "B"]
+    merged, unread = {}, {alias: 0 for alias in ids}
+    for rank, batches in enumerate((3, 7, 5)):
+        loader = _rank_loader(tmp_path, ids, rank, 3)
+        _consume(loader, batches)
+        state = loader.state_dict()
+        merged.update(state)
+        for alias, cursor in _rank_state_of(state, rank)["datasets"].items():
+            stream = stream_state(cursor)
+            assert stream["epoch"] == 0
+            unread[alias] += stream["spans_fingerprint"][1] - stream["next_index"]
+        loader.close()
+    checkpoint_id = str(tmp_path / "ckpt")
+    dcp.save({"dataloader": merged}, checkpoint_id=checkpoint_id, no_dist=True)
+
+    remainder = {alias: 0 for alias in ids}
+    for rank in range(2):
+        loader = _rank_loader(tmp_path, ids, rank, 2)
+        _load_like_the_checkpointer(loader, checkpoint_id)
+        assert set(loader.state_dict()) == {
+            "version",
+            "dp_world_size",
+            f"dp_rank_{rank}",
+        }
+        parents = find_mix_node(loader._iterator.get_state())["parents"]
+        for alias, cursor in zip(ids, parents):
+            stream = stream_state(cursor)
+            remainder[alias] += sum(
+                stop - start for _, _, start, stop in stream["remainder"]
+            )
+        _consume(loader, 2)
+        loader.close()
+    assert remainder == unread
+
+    same = _rank_loader(tmp_path, ids, 1, 3)
+    same.request_saved_ranks(["dp_rank_0", "dp_rank_1", "dp_rank_2"])
+    assert set(same.state_dict()) == {"version", "dp_world_size", "dp_rank_1"}
+    _load_like_the_checkpointer(same, checkpoint_id)
+    same.close()
+
+
+def _rank_state_of(checkpoint: dict, rank: int) -> dict:
+    return pickle.loads(checkpoint[f"dp_rank_{rank}"])

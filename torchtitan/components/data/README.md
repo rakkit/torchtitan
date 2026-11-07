@@ -520,6 +520,23 @@ With effective DP greater than one, `repeat=False` is rejected because ranks can
 
 Resume requires unchanged code, config, source contents, tokenizer, and effective DP degree.
 
+The exception is `KeyedMixDataLoader` (`make_pretrain_dataloader_config`, parquet
+stream sources): it resumes on another effective DP degree, e.g. a later stage with
+more HSDP replicas. The checkpointer sees the saved rank items in the checkpoint
+metadata and every new rank loads all of them (`request_saved_ranks`); per dataset,
+the rows each old rank had not read in its current pass are re-dealt over the new
+ranks in contiguous, balanced chunks (`parquet_stream.redealt_state`):
+
+```text
+3 old ranks, 63 rows, mid-pass:   r0 read 5 / 21, r1 0 / 21, r2 13 / 21  -> 44 unread
+resume on 2 ranks:                new r0 reads 22 of them, new r1 the other 22
+then                              each new rank's own share of the next passes
+```
+
+Every row of the pass is read exactly once. The packer's partial document and the
+mix's draw counter of the old ranks are dropped (the mix restarts with this rank's
+fresh state); same-degree resumes read only their own item and stay exact.
+
 ### Node-local attention balancing
 
 Each DP rank packs its own documents, so the attention work of equally long

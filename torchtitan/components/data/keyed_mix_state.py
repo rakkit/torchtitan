@@ -229,3 +229,24 @@ def cursor_position(cursor: Any) -> int:
         f"its parent state something outside {_PARENT_KEYS}. Add it there rather than "
         "letting the per-dataset document counts silently read zero."
     )
+
+
+def stream_state(cursor: Any) -> dict[str, Any]:
+    """The parquet stream's own state inside a dataset cursor (the dict carrying
+    ``spans_fingerprint``), found along the parent chain as in `cursor_position`.
+    Returned by reference: writing into it edits the cursor."""
+    seen = 0
+    while isinstance(cursor, dict) and seen < 32:  # bounded: states are shallow
+        if "spans_fingerprint" in cursor:
+            return cursor
+        for key in _PARENT_KEYS:
+            if key in cursor:
+                cursor = cursor[key]
+                break
+        else:
+            break
+        seen += 1
+    raise ValueError(
+        "no parquet stream state in a dataset cursor: re-dealing the cursors after a "
+        "data-parallel degree change needs parquet stream sources"
+    )

@@ -16,9 +16,11 @@ Everything else -- rank keying, the DP-degree guard, iteration -- is inherited u
 
 from __future__ import annotations
 
+import copy
 import logging
 import pickle
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Annotated, Any
 
@@ -26,12 +28,16 @@ import tyro
 
 from torchtitan.components.data.keyed_mix_state import (
     documents_consumed,
+    find_mix_node,
     from_keyed,
+    RestorePlan,
+    stream_state,
     to_keyed,
 )
 from torchtitan.components.data.loader import GrainDataLoader
+from torchtitan.components.data.parquet_stream import ParquetStreamSource, redealt_state
 
-KEYED_STATE_VERSION = 3
+KEYED_STATE_VERSION = 4
 
 
 class KeyedMixDataLoader(GrainDataLoader):
@@ -50,6 +56,11 @@ class KeyedMixDataLoader(GrainDataLoader):
 
     def __init__(self, config: Config, **kwargs: Any) -> None:
         super().__init__(config, **kwargs)
+        self._dp_rank = kwargs["dp_rank"]
+        self._dataset_config = config.dataset
+        # Old ranks' items the next load reads (set by the checkpointer; see
+        # `request_saved_ranks`).
+        self._saved_rank_ids: tuple[str, ...] = ()
         self._dataset_ids = list(config.dataset_ids)
         self._dataset_weights = list(config.dataset_weights)
         if self._dataset_weights and len(self._dataset_weights) != len(
@@ -75,7 +86,17 @@ class KeyedMixDataLoader(GrainDataLoader):
             to_keyed(state[self._rank_id], self._dataset_ids)
         )
         state["version"] = KEYED_STATE_VERSION
+        for rank_id in self._saved_rank_ids:
+            state.setdefault(rank_id, b"")
         return state
+
+    def request_saved_ranks(self, rank_ids: Sequence[str]) -> None:
+        """The checkpointer, before a load, names the rank items the checkpoint
+        holds. After a data-parallel degree change every rank re-deals all old
+        ranks' cursors, so the next load asks for all of them; with the same degree
+        each rank reads only its own item."""
+        if len(rank_ids) != self._dp_world_size:
+            self._saved_rank_ids = tuple(rank_ids)
 
     def mixing_weights(self) -> dict[str, float]:
         """Configured weight per dataset, normalized to sum to 1.
@@ -106,6 +127,7 @@ class KeyedMixDataLoader(GrainDataLoader):
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self._saved_rank_ids = ()  # requested for this load only
         if not state_dict:
             return
         version = state_dict.get("version")
@@ -115,20 +137,19 @@ class KeyedMixDataLoader(GrainDataLoader):
                 f"{KEYED_STATE_VERSION}: start the stage fresh."
             )
         if state_dict["dp_world_size"] != self._dp_world_size:
-            raise ValueError(
-                "cannot resume after changing the effective data-parallel degree"
+            restored_state, plan = self._redealt(state_dict)
+        else:
+            if not state_dict.get(self._rank_id):
+                raise ValueError(
+                    f"checkpoint is missing dataloader state for {self._rank_id}"
+                )
+            # Capture the untouched state first: it is the correct "fresh" cursor for
+            # any dataset this stage adds, in whatever shape the transform stack
+            # produces.
+            fresh_state = self._iterator.get_state()
+            restored_state, plan = from_keyed(
+                pickle.loads(state_dict[self._rank_id]), self._dataset_ids, fresh_state
             )
-        if self._rank_id not in state_dict:
-            raise ValueError(
-                f"checkpoint is missing dataloader state for {self._rank_id}"
-            )
-
-        # Capture the untouched state first: it is the correct "fresh" cursor for any
-        # dataset this stage adds, in whatever shape the transform stack produces.
-        fresh_state = self._iterator.get_state()
-        restored_state, plan = from_keyed(
-            pickle.loads(state_dict[self._rank_id]), self._dataset_ids, fresh_state
-        )
         # Log on every rank's rank 0 only; a wrong stage config should be visible at
         # step 0 rather than inferred from a loss curve later.
         if self._rank_id == "dp_rank_0":
@@ -145,6 +166,86 @@ class KeyedMixDataLoader(GrainDataLoader):
         except Exception:
             self.close()
             raise
+
+    def _redealt(
+        self, state_dict: dict[str, Any]
+    ) -> tuple[dict[str, Any], RestorePlan]:
+        """This rank's iterator state after a data-parallel degree change: per
+        dataset, the rows every old rank had not read in its current pass are
+        re-dealt over the new ranks (`redealt_state`). The packer's partial
+        document and the mix's draw counter of the old ranks are dropped: the mix
+        and its weights restart from this rank's fresh state."""
+        old_world = int(state_dict["dp_world_size"])
+        old = []
+        for rank in range(old_world):
+            item = state_dict.get(f"dp_rank_{rank}")
+            if not item:
+                raise ValueError(
+                    f"resuming {old_world} data-parallel ranks' dataloader state on "
+                    f"{self._dp_world_size} needs every old rank's state; dp_rank_{rank} "
+                    "was not loaded (the checkpointer requests them all)"
+                )
+            old.append(pickle.loads(item)["datasets"])
+        sources = _parquet_sources(self._dataset_config)
+        # deepcopy: get_state() can return the iterator's internal dicts by reference.
+        state = copy.deepcopy(self._iterator.get_state())
+        node = find_mix_node(state)
+        if node is None:
+            raise ValueError(
+                "no per-dataset cursors found in the fresh dataloader state"
+            )
+        restored = []
+        for index, alias in enumerate(self._dataset_ids):
+            if any(alias not in cursors for cursors in old):
+                continue
+            target = stream_state(node["parents"][index])
+            redealt = redealt_state(
+                sources[alias],
+                [stream_state(cursors[alias]) for cursors in old],
+                dp_rank=self._dp_rank,
+                dp_world_size=self._dp_world_size,
+                fresh_state=target,
+            )
+            target.clear()
+            target.update(redealt)
+            restored.append(alias)
+        node["index"] = 0
+        saved = {alias for cursors in old for alias in cursors}
+        plan = RestorePlan(
+            restored=tuple(restored),
+            fresh=tuple(i for i in self._dataset_ids if i not in restored),
+            orphaned=tuple(sorted(saved - set(self._dataset_ids))),
+        )
+        if self._rank_id == "dp_rank_0":
+            logger.info(
+                "dataloader: %d data-parallel ranks' unread rows re-dealt over %d",
+                old_world,
+                self._dp_world_size,
+            )
+        return state, plan
+
+
+def _parquet_sources(dataset_config: Any) -> dict[str, ParquetStreamSource.Config]:
+    """Each mix child's parquet source config, by alias: the keyed mix inside the
+    packing configs (`make_pretrain_dataloader_config`)."""
+    node = dataset_config
+    while not hasattr(node, "aliases"):
+        node = getattr(node, "dataset", None)
+        if node is None:
+            raise ValueError(
+                "re-dealing after a data-parallel degree change needs the keyed "
+                "dataset mix (make_pretrain_dataloader_config)"
+            )
+    sources = {}
+    for alias, item in zip(node.aliases, node.datasets):
+        source = getattr(item.dataset, "source", None)
+        if not isinstance(source, ParquetStreamSource.Config):
+            raise ValueError(
+                f"dataset {alias!r}: re-dealing after a data-parallel degree change "
+                "needs a parquet stream source"
+            )
+        sources[alias] = source
+    return sources
 
 
 logger = logging.getLogger(__name__)

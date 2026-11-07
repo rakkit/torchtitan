@@ -34,6 +34,7 @@ from torchtitan.tools.garbage_collector import GarbageCollector
 
 from .base import (
     BaseCheckpointManager,
+    DATALOADER,
     EMA,
     export_state_dict,
     LR_SCHEDULER,
@@ -408,6 +409,24 @@ class CheckpointManager(BaseCheckpointManager):
             )
             states[MODEL].load_state_dict(state_dict)
         else:
+            # Imported here: components.data imports the checkpointer (a cycle).
+            from torchtitan.components.data.keyed_loader import KeyedMixDataLoader
+
+            loader = states.get(DATALOADER)
+            if isinstance(loader, KeyedMixDataLoader):
+                # After a data-parallel degree change every rank re-deals all old
+                # ranks' cursors: tell the loader which rank items the checkpoint has.
+                saved = dcp.FileSystemReader(checkpoint_id).read_metadata()
+                prefix = f"{DATALOADER}.dp_rank_"
+                loader.request_saved_ranks(
+                    sorted(
+                        {
+                            key[len(DATALOADER) + 1 :].split(".")[0]
+                            for key in saved.state_dict_metadata
+                            if key.startswith(prefix)
+                        }
+                    )
+                )
             dcp.load(state_dict, checkpoint_id=checkpoint_id)
 
             # TODO: Since we flatten the model states in state_dict, we need to

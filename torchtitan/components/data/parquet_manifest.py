@@ -272,6 +272,58 @@ def assign_row_spans(
     return row_spans_for_range(manifest, start, stop)
 
 
+def unread_spans(
+    epoch_spans: list[RowSpan], slots: list[dict[str, int] | None], next_span: int
+) -> list[RowSpan]:
+    """The rows of one epoch a stream has not read yet: the rest of each open
+    slot's span (``row_in_span`` on), then the spans it has not opened
+    (``epoch_spans[next_span:]``, in the epoch's order)."""
+    out = []
+    for slot in slots:
+        if slot is None:
+            continue
+        span = epoch_spans[slot["span_index"]]
+        if slot["row_in_span"] < span.num_rows:
+            out.append(
+                RowSpan(
+                    span.shard,
+                    span.row_group,
+                    span.start + slot["row_in_span"],
+                    span.stop,
+                )
+            )
+    return out + list(epoch_spans[next_span:])
+
+
+def redeal_spans(spans: list[RowSpan], dp_world_size: int) -> list[list[RowSpan]]:
+    """`spans` (in order) dealt to `dp_world_size` ranks as contiguous chunks of
+    `rank_row_range` sizes, a span split where a chunk ends: the remainder of an
+    epoch re-dealt after a data-parallel degree change."""
+    total = sum(span.num_rows for span in spans)
+    out: list[list[RowSpan]] = []
+    it, current, offset = iter(spans), None, 0
+    for rank in range(dp_world_size):
+        start, stop = rank_row_range(total, rank, dp_world_size)
+        need, chunk = stop - start, []
+        while need:
+            if current is None or offset == current.num_rows:
+                current, offset = next(it), 0
+                continue
+            take = min(need, current.num_rows - offset)
+            chunk.append(
+                RowSpan(
+                    current.shard,
+                    current.row_group,
+                    current.start + offset,
+                    current.start + offset + take,
+                )
+            )
+            offset += take
+            need -= take
+        out.append(chunk)
+    return out
+
+
 def split_spans_for_interleave(spans: list[RowSpan], target: int) -> list[RowSpan]:
     """Subdivide spans so a rank has at least `target` of them to interleave.
 

@@ -102,13 +102,14 @@ class TestRecipePaths(DTensorTestBase):
         model_cfg["n_kv_heads"] = n_kv_heads
         cfg = harness.trainer_config(model_cfg, **FSDP)
         groups = copy.deepcopy(opt_moe_mis_8b().optim.optimizer.groups)
-        # The orthogonaliser is svd on every device: the reference steps one
-        # unit at a time while a rank steps its local experts as one stack, and
-        # gram_polar_express (the recipe's; quack's fp16 kernels, CUDA only)
-        # rounds a tall unit differently in a stack than alone (~2e-3 of |O|),
-        # which is the kernel's precision, not the path. svd is batch-invariant,
-        # so this checks the path exactly; the kernel's own accuracy is
-        # test_gram_polar_express_rank's.
+        # Without update_tol the orthogonaliser is svd on every device: the
+        # reference steps one unit at a time while a rank steps its local
+        # experts as one stack, and gram_polar_express (the recipe's; quack's
+        # fp16 kernels, CUDA only) rounds a tall unit differently in a stack
+        # than alone (~2e-3 of |O|), which is the kernel's precision, not the
+        # path. svd is batch-invariant, so this checks the path exactly; the
+        # kernel's own accuracy is test_gram_polar_express_rank's. With
+        # update_tol the recipe's orthogonaliser stays (the stacked call).
         if update_tol is None:
             args = groups["default"]["args"]
             args["compute"] = "svd"
@@ -250,9 +251,10 @@ class TestRecipePaths(DTensorTestBase):
     def test_fsdp4_moe_with_the_recipes_gram_polar_express(self):
         """The production orthogonaliser in its stacked call (a rank's local
         experts as one stack; the reference one unit at a time): its fp16
-        kernels round a unit in a stack differently (measured: under 1% of
-        the step's update), a stacking bug moves it by about the whole
-        update."""
+        kernels round a unit in a stack differently (measured: 0.63% of the
+        step's update), while stacking bugs move it far more (measured with
+        the quack kernels: two experts swapped 1.3-1.5 of the update, one
+        Polar Express iteration less ~0.4)."""
         if self.device_type == "cpu":
             self.skipTest("gram_polar_express runs quack's CUDA kernels")
         self._check(n_kv_heads=2, update_tol=2e-2)

@@ -160,6 +160,8 @@ class Validator(BaseValidator):
     # The fixed validation slice: (shard, skip, take) per microbatch run of this
     # rank, from the config's slice fields; None reads the validation loader.
     plan: list[tuple[int, int, int]] | None = None
+    # This rank's microbatches of the slice once read (it is the same each time).
+    _slice_cache: list[TrainingMicrobatch] | None = None
 
     def __init__(
         self,
@@ -233,22 +235,29 @@ class Validator(BaseValidator):
             )
 
     def _slice_microbatches(self) -> Iterator[TrainingMicrobatch]:
-        """This rank's microbatches of the fixed slice, in order."""
-        cfg = self.config
-        for shard, skip, take in self.plan:
-            loader = self.dl_config.build(
-                dp_world_size=cfg.slice_shards,
-                dp_rank=shard,
-                tokenizer=self.tokenizer,
-                max_context_length=self.seq_len,
-                num_tokens_per_microbatch=cfg.slice_microbatch * self.seq_len,
-            )
-            it = iterate_and_close_dataloader(loader)
-            for _ in range(skip):
-                next(it)
-            for _ in range(take):
-                yield next(it)
-            it.close()
+        """This rank's microbatches of the fixed slice, in order: read at the
+        first validation (skipping the shard's sequences in front of this
+        rank's run), then replayed from host memory, since the slice is the
+        same at every validation and scoring only reads the microbatches."""
+        cache = self._slice_cache
+        if cache is None:
+            cfg = self.config
+            cache = []
+            for shard, skip, take in self.plan:
+                loader = self.dl_config.build(
+                    dp_world_size=cfg.slice_shards,
+                    dp_rank=shard,
+                    tokenizer=self.tokenizer,
+                    max_context_length=self.seq_len,
+                    num_tokens_per_microbatch=cfg.slice_microbatch * self.seq_len,
+                )
+                it = iterate_and_close_dataloader(loader)
+                for _ in range(skip):
+                    next(it)
+                cache.extend(next(it) for _ in range(take))
+                it.close()
+            self._slice_cache = cache
+        yield from cache
 
     def should_validate(self, step: int, total_steps: int | None = None) -> bool:
         """Return whether validation is scheduled or eval capture is pending.

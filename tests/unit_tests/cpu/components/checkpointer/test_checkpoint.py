@@ -462,6 +462,8 @@ class TestCheckpointManager(unittest.TestCase):
             base_folder=self.trainer_config.dump_folder,
         )
         self.assertFalse(manager.load(step=-1))
+        # read by the trainer after any load (averages.start_from_gamma)
+        self.assertFalse(manager.loaded_from_initial_path)
         mock_logger.info.assert_any_call(
             "No checkpoint was provided, this is a fresh start."
         )

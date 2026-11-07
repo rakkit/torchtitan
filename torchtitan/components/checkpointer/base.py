@@ -254,6 +254,9 @@ class BaseCheckpointManager(Configurable, ABC):
 
     _STEP_DIR_PATTERN = r"step-(0|[1-9]\d*)"
 
+    loaded_from_initial_path: bool = False
+    """Whether the last ``load`` was a first start from ``initial_load_path``."""
+
     @staticmethod
     def _validate_extra_state_keys(extra_states: dict[str, Any]) -> None:
         """Reject workflow state keys owned by the checkpoint manager."""

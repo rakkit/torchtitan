@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-opt-moe"
 version = "0.5.5"
-description = "vLLM plugin: torchtitan's opt_moe HF checkpoints (q / k / v short conv, sinks, gate, sigmoid MoE)"
+description = "vLLM plugin: torchtitan's opt_moe HF checkpoints (k / v short conv, sinks, gate, sigmoid MoE)"
 requires-python = ">=3.11"
 # The model uses vLLM's Inkling conv-state backend and kernel (vllm.models.inkling), internals
 # that change between builds: the build it was checked with.

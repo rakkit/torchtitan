@@ -160,6 +160,30 @@ GPU at steps 20 / 30 / 40; the 0.5.4 tree, which compiled every block: 16.7k /
   bitwise; without remat a 2-layer step equals block compile's, so the rest is
   the eager glue replayed by the remat.
 
+## Communication
+
+Measured at the 30B target shape (l40, 256 x 512 experts top 8, k / v conv,
+gate, 64k tokens per GPU, 32k context, fp32 gradient reduce), FSDP over 16
+GH200 nodes, tokens / s / GPU, one process each:
+
+- `comm.nccl_ctas={"dp_shard": 16}`: FSDP's all-gather / reduce-scatter
+  communicator runs 16 CTAs. NCCL's own choice is 4 per GPU (~75 GB/s per
+  node); 16 and 32 reach ~93 GB/s and tie (64k: 10,549-10,565 vs
+  10,476-10,512; 8 CTAs 10,084-10,207; 4 CTAs 8,557-8,629).
+- `comm.sm_carveout=16`: cuBLAS GEMMs and Inductor's persistent kernels use
+  SMs - 16, so a GEMM beside a running collective does not wait for the SMs
+  NCCL holds (an expert grouped GEMM ran 40% slower beside a 32-CTA
+  all-gather without it): 11,063-11,069 (+4.9%); HSDP 2 x 16 nodes +3-4%.
+- the site's VBOOST slider (JSC: `sbatch --comment="NVIDIA_VBOOST_SLIDER=1"`)
+  on top: 11,681-11,689 / 11,828-11,837 (steps 20 / 30). Sliders 3 and 4 run
+  GEMMs slower than 0.
+- HSDP 2 x 16 nodes = FSDP over 32 nodes (~10.3k): the replica all-reduce
+  costs ~0; the loss from 16 to 32 nodes is the slowest rank's attention: a
+  rank's packed documents set its causal-attention work (flex attention per
+  rank at 16 nodes median 0.58 s, max 1.45 s per step) and every collective
+  waits for the slowest rank. 16k context at 32 nodes: 11,355-11,375 vs
+  10,389-10,450 at 32k.
+
 ## HF export
 
 `state_dict_adapter.py` maps every native tensor to its HF name and back

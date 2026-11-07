@@ -9,7 +9,7 @@
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim import LRSchedulersContainer
-from torchtitan.config import DebugConfig, PrecisionConfig, TrainingConfig
+from torchtitan.config import CommConfig, DebugConfig, PrecisionConfig, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
 from torchtitan.models.opt_moe import build_model_config
@@ -149,16 +149,20 @@ def opt_moe_mis_8b() -> Trainer.Config:
             # the master weights).
             last_save_model_only=False,
             export_dtype="float32",
-            # Upstream defaults to "disabled" -- a synchronous save on the
-            # training thread. "async" stages to CPU and uploads from a
-            # background thread instead. Not the pinned-mem variant: that
-            # additionally spawns a process and holds a pinned copy of the
-            # local shard PER RANK, which is not worth it unmeasured.
+            # "async" stages to CPU and writes from a thread in the training
+            # process; "async_with_pinned_mem" writes from its own process and
+            # keeps a pinned host copy of the rank's shard. Measured (16 nodes,
+            # 250 GB checkpoint): ~2.4-2.9 s added per save with "async"
+            # (~7 s while the previous write still runs), ~0.2-0.4 s with
+            # pinned memory, at ~4 GB pinned host memory per GPU.
             async_mode="async",
         ),
         # torch_remat's default regions (code outside a region is recomputed)
         activation_remat=DefaultActivationRematConfig(),
         parallelism=parallelism,
+        # FSDP's collectives at a fixed 16 CTAs and 16 SMs kept free for them
+        # (README "Communication").
+        comm=CommConfig(nccl_ctas={"dp_shard": 16}, sm_carveout=16),
         # scripts/checkpoint_conversion/convert_to_hf.py reconstructs the model
         # spec from this file, so opt_moe runs always write it.
         debug=DebugConfig(save_config_file="job_config.json"),

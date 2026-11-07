@@ -341,8 +341,18 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 pipeline_parallel_degree=config.parallelism.pipeline_parallel_degree,
             )
         self.parallelism_context = ParallelismContext.from_config(
-            config.parallelism, topology, dump_folder=self.output_dir
+            config.parallelism,
+            topology,
+            dump_folder=self.output_dir,
+            nccl_ctas=config.comm.nccl_ctas
+            if config.comm.backend == "default"
+            else None,
         )
+        if config.comm.sm_carveout:
+            torch._C._set_sm_carveout_experimental(config.comm.sm_carveout)
+            logger.info(
+                "SM carveout for communication: %d SMs", config.comm.sm_carveout
+            )
         # DeviceMesh subgroups do not inherit the world group's timeout.
         dist_utils.set_pg_timeouts(
             timeout=timedelta(seconds=config.comm.init_timeout_seconds),

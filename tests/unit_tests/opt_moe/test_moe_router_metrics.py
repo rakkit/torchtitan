@@ -12,6 +12,8 @@ Producer: ``OptMoE`` and its router's buffers. Consumer:
 
 import types
 
+import pytest
+
 import torch
 import torch.nn as nn
 
@@ -69,9 +71,13 @@ def _run_bias_hook(
     moe_kw: dict | None = None,
     batches: list | None = None,
     paddings: list | None = None,
+    device: str = "cpu",
+    steps: int = 1,
 ) -> list:
     """Drive the real step pre-hook over `gas` microbatches (or `batches`,
-    with optional padding masks) and return the MoE layers it updated."""
+    with optional padding masks), `steps` times, and return the MoE layers it
+    updated. On CUDA every step after the first runs the hook in the sync
+    debug mode "error": a host sync there raises."""
     import torch.nn as nn
 
     class _Blk(nn.Module):
@@ -106,7 +112,7 @@ def _run_bias_hook(
     torch.manual_seed(0)
     if moe_kw is None:
         moe_kw = dict(aux_loss=dict(loss_type="microbatch_wise", coeff=1e-3))
-    moes = [_moe(**moe_kw) for _ in range(2)]
+    moes = [_moe(**moe_kw).to(device) for _ in range(2)]
     for m in moes:
         m.train()
     opt = _StubOptimizers()
@@ -118,16 +124,23 @@ def _run_bias_hook(
         ),
     )
     if batches is None:
-        batches = [torch.randn(64, 32) for _ in range(gas)]
+        batches = [torch.randn(64, 32, device=device) for _ in range(gas)]
     if paddings is None:
         paddings = [None] * len(batches)
-    den = torch.tensor(float(sum(b.shape[0] for b in batches)))
-    for b, pad in zip(batches, paddings):
-        for m in moes:
-            m(b, padding_mask_T=pad, aux_loss_denominator=den)
-    if arm:
-        opt.arm_moe_publish()
-    opt.fire()
+    den = torch.tensor(float(sum(b.shape[0] for b in batches)), device=device)
+    for step in range(steps):
+        for b, pad in zip(batches, paddings):
+            for m in moes:
+                m(b, padding_mask_T=pad, aux_loss_denominator=den)
+        if arm:
+            opt.arm_moe_publish()
+        if step and device != "cpu":
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            opt.fire()
+        finally:
+            if device != "cpu":
+                torch.cuda.set_sync_debug_mode("default")
     return moes
 
 
@@ -140,6 +153,21 @@ def test_published_load_balance_loss_is_gradient_accumulation_invariant():
     }
     lo, hi = min(seen.values()), max(seen.values())
     assert hi / lo < 1.05, f"published metric should be gas-invariant, got {seen}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize(
+    "moe_kw",
+    [
+        dict(aux_loss=dict(loss_type="microbatch_wise", coeff=1e-3)),
+        dict(quantile_balance_bins=128),
+    ],
+)
+def test_unarmed_step_hook_never_syncs_the_host(moe_kw):
+    """An off-cadence step's hook only queues GPU work: a host sync there
+    (e.g. a blocking host-to-device copy) holds the CPU until the backward
+    ends and the next launches start late."""
+    _run_bias_hook(1, arm=False, moe_kw=moe_kw, device="cuda", steps=2)
 
 
 def test_unarmed_step_updates_the_bias_without_publishing():

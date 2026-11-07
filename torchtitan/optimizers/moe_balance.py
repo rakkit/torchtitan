@@ -270,6 +270,19 @@ def register_moe_load_balancing_hook(
             "sign, spectral, rms, and their *_zero_mean variants."
         )
 
+    # The layers' top_k on the device, built once: a host-to-device copy
+    # synchronizes the stream, and in this pre-step hook that held the CPU
+    # until the backward finished every step (no launch run-ahead).
+    top_k_divisors: dict[tuple, torch.Tensor] = {}
+
+    def _top_k_divisor(top_ks: list[int], like: torch.Tensor) -> torch.Tensor:
+        key = (tuple(top_ks), like.dtype, like.device)
+        if key not in top_k_divisors:
+            top_k_divisors[key] = torch.tensor(
+                top_ks, dtype=like.dtype, device=like.device
+            )
+        return top_k_divisors[key]
+
     def _update_expert_bias(
         model_parts: list[nn.Module],
         parallelism_context: ParallelismContext,
@@ -353,9 +366,7 @@ def register_moe_load_balancing_hook(
         layer_means = layer_sums / num_experts  # [L, 1]
         # The mean gate entropy per counted token: each token is counted top_k
         # times in tokens_per_expert_E.
-        counted_tokens = layer_sums.squeeze(1) / torch.tensor(
-            top_ks, dtype=layer_sums.dtype, device=layer_sums.device
-        )
+        counted_tokens = layer_sums.squeeze(1) / _top_k_divisor(top_ks, layer_sums)
         all_entropies = all_entropies / counted_tokens.clamp_min(1.0)
 
         # Per-layer EMA: ema = beta * ema + (1 - beta) * step_counts. State, so

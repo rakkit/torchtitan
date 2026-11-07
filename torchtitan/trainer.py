@@ -509,12 +509,14 @@ class Trainer(Configurable):
         )
         sl.log_trace_scalar({"local_valid_tokens": int(local_main_loss_token_count)})
         num_loss_objectives = local_loss_token_counts.numel()
+        # non_blocking: a blocking host-to-device copy waits for the previous
+        # step's optimizer and ends the CPU's launch run-ahead
         global_token_counts = torch.cat(
             (
                 local_loss_token_counts.reshape(-1),
                 local_routing_token_counts.reshape(-1),
             )
-        ).to(engine.device)
+        ).to(engine.device, non_blocking=True)
         if parallelism_context.dp_enabled:
             global_token_counts = dist_utils.dist_sum_tensor(
                 global_token_counts, parallelism_context.get_mesh("dp")

@@ -8,8 +8,8 @@
 hundred): one load per row, k max / argmax passes in registers. torch.topk
 (sbtopk) took 1.4 ms per layer at 64k tokens x 256 experts in the l44 profile
 (0.9 ms alone; this kernel 0.13 ms).
-Values descending; equal values: lowest index first (torch.topk leaves that
-order unspecified). No autograd: the routers use the indices (and the scores for
+Values descending, NaN first (as torch.topk); equal values: lowest index first
+(torch.topk leaves that order unspecified); always K distinct indices. No autograd: the routers use the indices (and the scores for
 statistics only)."""
 
 import torch
@@ -36,13 +36,28 @@ def _row_topk_kernel(
         mask=row_ok[:, None] & (cols[None, :] < E),
         other=-float("inf"),
     )
+    # NaN ranks highest, as in torch.topk; chosen and padding columns are
+    # tracked apart from the values, so a row with fewer than K finite scores
+    # (or all NaN) still yields K distinct indices
+    keys = tl.where(x != x, float("inf"), x)
+    taken = tl.broadcast_to(cols[None, :] >= E, (BLOCK_ROWS, E_POW2))
     for k in tl.static_range(K):
         value, index = tl.max(
-            x, axis=1, return_indices=True, return_indices_tie_break_left=True
+            tl.where(taken, -float("inf"), keys),
+            axis=1,
+            return_indices=True,
+            return_indices_tie_break_left=True,
         )
-        tl.store(values_ptr + rows * K + k, value, mask=row_ok)
+        first_free = tl.min(tl.where(taken, E_POW2, cols[None, :]), axis=1)
+        index = tl.where(value == -float("inf"), first_free, index)
+        chosen = cols[None, :] == index[:, None]
+        tl.store(
+            values_ptr + rows * K + k,
+            tl.sum(tl.where(chosen, x, 0.0), axis=1),
+            mask=row_ok,
+        )
         tl.store(indices_ptr + rows * K + k, index.to(tl.int64), mask=row_ok)
-        x = tl.where(cols[None, :] == index[:, None], -float("inf"), x)
+        taken = taken | chosen
 
 
 @torch.library.custom_op("torchtitan::row_topk", mutates_args=())

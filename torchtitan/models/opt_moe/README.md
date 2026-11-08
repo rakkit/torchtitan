@@ -11,9 +11,30 @@ modules and their Configs; `flavors.py` builds the complete, sharded config;
 (`amphione` and the other DiSCO rules) is `torchtitan/optimizers/readme.md`.
 
 Parallelism: FSDP / HSDP, TP (with or without SP), EP (upstream's dispatchers) and
-CP (all-gather K/V, flex or varlen, with the conv, the sinks and the gate; the
-conv's first `W - 1` taps of each rank's fragments come from the ranks that hold
-those tokens; `tests/unit_tests/opt_moe/test_context_parallel.py`). TP on
+CP with the conv, the sinks and the gate (the conv's first `W - 1` taps of each
+rank's fragments come from the ranks that hold those tokens). CP has two forms,
+`build_model_config(..., cp_attention=...)`:
+
+```text
+CP 4, a 256k row                     all_gather_kv (default)        ulysses
+each rank's q                        64k tokens, all heads          256k tokens, heads / 4
+each rank's k / v                    all 256k tokens gathered       256k tokens, KV heads / 4
+communication per attention layer    all-gather k / v (+ backward    all-to-all q, k, v and the output
+                                     reduce-scatter)
+load balancing for causal masks      head-tail balancer             none needed (every rank sees
+                                                                    every token)
+limits                               -                              n_heads, n_kv_heads % CP == 0;
+                                                                    contiguous shards
+```
+
+Under `ulysses` the sinks rescale runs on each rank's heads with their slice of
+the sink logits (`tests/unit_tests/opt_moe/test_context_parallel.py`: CP 4 vs one
+rank, both forms, flex / varlen / flex_flash). Under varlen `all_gather_kv` the
+sliding-window layers gather only the last `window - 1` K / V rows of every
+rank's chunks (the halo a chunk's first queries see), not the whole sequence.
+`compile_blocks` works with `all_gather_kv` (its gather has a functional-collective
+path when compiling: 256k on one node, 6 layers, +7% over eager blocks); with
+`ulysses` it is refused (the all-to-all does not trace yet). TP on
 upstream's helpers: each rank holds whole KV groups (their q heads, k, v, k / v
 conv channels, gate rows and sinks; `n_kv_heads % TP == 0`), the input gathered
 once for wqkv and the gate, wo row-parallel; the dense and shared-expert FFNs

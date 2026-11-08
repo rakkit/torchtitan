@@ -913,6 +913,7 @@ def build_model_config(
     seq_len: int | None = None,
     rope_length: int | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
+    cp_attention: Literal["all_gather_kv", "ulysses"] = "all_gather_kv",
     **overrides: Any,
 ) -> OPTMoEModel.Config:
     """The complete, sharded config of ``flavor`` for ``parallelism``, with the
@@ -920,7 +921,11 @@ def build_model_config(
     name). ``seq_len``: the training context (default: the flavor's);
     ``rope_length``: a longer RoPE cache (validation sequences); ``converters``:
     model config converters applied to the result (e.g. TitanRL's fp32
-    lm_head)."""
+    lm_head); ``cp_attention``: under CP, every rank's queries against the
+    all-gathered K / V (``all_gather_kv``, with a load balancer for causal
+    masks) or the whole sequence for ``heads / cp`` heads after an all-to-all
+    (``ulysses``: needs the q and KV head counts divisible by CP, contiguous
+    shards)."""
     if flavor not in MODEL_FLAVORS:
         raise ValueError(
             f"Unknown opt_moe flavor {flavor!r}; available: {', '.join(MODEL_FLAVORS)}"
@@ -933,29 +938,32 @@ def build_model_config(
         **copy.deepcopy(overrides),
     )
     if parallelism.context_parallel_degree > 1:
-        # the CP versions of the inner attentions (all-gather K/V)
         from torchtitan.config.transform.context_parallel import (
             ContextParallelTransform,
         )
-        from torchtitan.models.common.attention.cp_attention import (
-            AllGatherKVFlexInnerAttention,
-            AllGatherKVSlidingWindowFlexInnerAttention,
-            AllGatherKVSlidingWindowVarlenInnerAttention,
-            AllGatherKVVarlenInnerAttention,
-        )
+        from torchtitan.models.common.attention import cp_attention as cp
 
-        ContextParallelTransform(
-            inner_attention_map={
-                FlexInnerAttention: AllGatherKVFlexInnerAttention,
-                SlidingWindowFlexInnerAttention: (
-                    AllGatherKVSlidingWindowFlexInnerAttention
-                ),
-                VarlenInnerAttention: AllGatherKVVarlenInnerAttention,
-                SlidingWindowVarlenInnerAttention: (
-                    AllGatherKVSlidingWindowVarlenInnerAttention
-                ),
+        if cp_attention == "ulysses":
+            if parallelism.tensor_parallel_degree > 1:
+                # the heads are TP-sharded before Ulysses shards them over CP;
+                # nothing tests the two together (the sinks slice per CP rank)
+                raise ValueError("cp_attention 'ulysses' with TP is not supported")
+            inner_attention_map = {
+                FlexInnerAttention: cp.UlyssesFlexInnerAttention,
+                SlidingWindowFlexInnerAttention: cp.UlyssesSlidingWindowFlexInnerAttention,
+                VarlenInnerAttention: cp.UlyssesVarlenInnerAttention,
+                SlidingWindowVarlenInnerAttention: cp.UlyssesSlidingWindowVarlenInnerAttention,
             }
-        ).transform(config)
+        else:
+            inner_attention_map = {
+                FlexInnerAttention: cp.AllGatherKVFlexInnerAttention,
+                SlidingWindowFlexInnerAttention: cp.AllGatherKVSlidingWindowFlexInnerAttention,
+                VarlenInnerAttention: cp.AllGatherKVVarlenInnerAttention,
+                SlidingWindowVarlenInnerAttention: cp.AllGatherKVSlidingWindowVarlenInnerAttention,
+            }
+        ContextParallelTransform(inner_attention_map=inner_attention_map).transform(
+            config
+        )
     if converters is not None:
         validate_converter_compatibility(converters)
         for c in converters:

@@ -15,6 +15,7 @@ from typing import Any, cast, TYPE_CHECKING
 
 import spmd_types as spmd
 import torch
+import torch.distributed._functional_collectives as funcol
 from spmd_types import SpmdType
 
 # TODO(acisseJZhong): Move these implementations into TorchTitan to avoid
@@ -50,6 +51,25 @@ __all__ = [
 _TOKEN_DIM = 0
 
 
+class _CompiledCPAllGather(torch.autograd.Function):
+    """``spmd.redistribute(S(0) -> R)`` for compiled code: an all-gather along
+    the token dim forward, a reduce-scatter (sum, in ``reduce_dtype``) backward.
+    TODO: spmd_types' collectives read ``x.grad_fn``, which dynamo cannot trace
+    ("Tensor with grad_fn()"), so CP inside compiled blocks takes this path."""
+
+    @staticmethod
+    def forward(ctx, x, group_name: str, reduce_dtype: torch.dtype):
+        ctx.group_name, ctx.reduce_dtype, ctx.dtype = group_name, reduce_dtype, x.dtype
+        return funcol.wait_tensor(funcol.all_gather_tensor(x, _TOKEN_DIM, group_name))
+
+    @staticmethod
+    def backward(ctx, grad):
+        grad = funcol.reduce_scatter_tensor(
+            grad.to(ctx.reduce_dtype).contiguous(), "sum", _TOKEN_DIM, ctx.group_name
+        )
+        return funcol.wait_tensor(grad).to(ctx.dtype), None, None
+
+
 def cp_all_gather_tensors(
     tensors: tuple[torch.Tensor, ...],
     *,
@@ -59,6 +79,11 @@ def cp_all_gather_tensors(
     cp_group = spmd_mesh_group(MeshAxisName.CP)
     if cp_group is None:
         raise RuntimeError("CP attention requires an active multi-rank CP mesh axis.")
+    if torch.compiler.is_compiling():
+        return tuple(
+            _CompiledCPAllGather.apply(t, cp_group.group_name, reduce_dtype)
+            for t in tensors
+        )
     return tuple(
         spmd.redistribute(
             tensor,

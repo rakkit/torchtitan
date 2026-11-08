@@ -353,6 +353,92 @@ class AllGatherKVVarlen(
             window_size=varlen_metadata.window_size,
         )
 
+    def _forward_window_halo(
+        self,
+        q_THK: torch.Tensor,
+        k_THK: torch.Tensor,
+        v_THV: torch.Tensor,
+        *,
+        attention_metadata: AllGatherKVVarlenAttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Sliding-window CP: each rank all-gathers only the last ``left`` K/V
+        rows of every rank's chunks, and runs each local chunk against
+        [its predecessor chunk's halo; its own K/V]. Chunks in global order:
+        contiguous shards hold chunk r; head-tail shards hold chunks r and
+        2 cp - 1 - r, whose predecessors are rank r - 1's head chunk and rank
+        r + 1's tail chunk (the last rank: its own head chunk)."""
+        assert isinstance(self, VarlenInnerAttention)
+        cp_group = spmd_mesh_group(MeshAxisName.CP)
+        assert cp_group is not None
+        cp_rank, cp_size = dist.get_rank(cp_group), cp_group.size()
+        left = attention_metadata.window_size[0]
+        head_tail = attention_metadata.inverse_permutation is not None
+        num_chunks = 2 if head_tail else 1
+        chunk_len = q_THK.shape[0] // num_chunks
+        assert chunk_len >= left, (chunk_len, left)
+        # [num_chunks * left] rows per rank: the end of each local chunk
+        with spmd.no_typecheck():
+            tails = [
+                torch.cat(
+                    [
+                        x[(c + 1) * chunk_len - left : (c + 1) * chunk_len]
+                        for c in range(num_chunks)
+                    ]
+                )
+                for x in (k_THK, v_THV)
+            ]
+        if spmd.is_type_checking():
+            for tail, x in zip(tails, (k_THK, v_THV), strict=True):
+                spmd.assert_type_like(tail, x)
+        halo_k, halo_v = cp_all_gather_tensors(
+            tuple(tails), reduce_dtype=self.reduce_dtype
+        )
+
+        def halo(x_THK: torch.Tensor, rank: int, chunk: int) -> torch.Tensor:
+            start = (rank * num_chunks + chunk) * left
+            return x_THK[start : start + left]
+
+        varlen_forward = self._forward_varlen
+
+        def run_chunk(index: int, q_start: int, prev: tuple[int, int] | None):
+            q_chunk = q_THK[index * chunk_len : (index + 1) * chunk_len]
+            k_chunk = k_THK[index * chunk_len : (index + 1) * chunk_len]
+            v_chunk = v_THV[index * chunk_len : (index + 1) * chunk_len]
+            # No predecessor (the sequence start): an empty halo slice, so the
+            # gathered halos stay in this rank's autograd graph and its
+            # backward joins the reduce-scatter every other rank runs.
+            with spmd.no_typecheck():
+                prev_k = halo(halo_k, *prev) if prev is not None else halo_k[:0]
+                prev_v = halo(halo_v, *prev) if prev is not None else halo_v[:0]
+                k_chunk = torch.cat((prev_k, k_chunk))
+                v_chunk = torch.cat((prev_v, v_chunk))
+            if spmd.is_type_checking():
+                # as the full gather's slices: the K/V of this chunk's range
+                spmd.assert_type_like(k_chunk, halo_k)
+                spmd.assert_type_like(v_chunk, halo_v)
+            kv_start = q_start - (left if prev is not None else 0)
+            metadata = self._chunk_metadata(
+                attention_metadata,
+                q_start=q_start,
+                end=q_start + chunk_len,
+                kv_start=kv_start,
+            )
+            return varlen_forward(
+                q_chunk, k_chunk, v_chunk, attention_metadata=metadata, **kwargs
+            )
+
+        if not head_tail:
+            return run_chunk(
+                0, cp_rank * chunk_len, (cp_rank - 1, 0) if cp_rank else None
+            )
+        head_out = run_chunk(
+            0, cp_rank * chunk_len, (cp_rank - 1, 0) if cp_rank else None
+        )
+        tail_prev = (cp_rank + 1, 1) if cp_rank < cp_size - 1 else (cp_rank, 0)
+        tail_out = run_chunk(1, (2 * cp_size - 1 - cp_rank) * chunk_len, tail_prev)
+        return torch.cat((head_out, tail_out))
+
     def forward(
         self,
         q_THK: torch.Tensor,
@@ -368,12 +454,19 @@ class AllGatherKVVarlen(
                 f"but got {type(attention_metadata).__name__}."
             )
         assert isinstance(self, VarlenInnerAttention)
+        left = attention_metadata.window_size[0]
+        if left != -1:
+            # Sliding window: a chunk needs only its own K/V and the previous
+            # `left` tokens (the end of the chunk before it): gather those
+            # halos, not the whole sequence.
+            return self._forward_window_halo(
+                q_THK, k_THK, v_THV, attention_metadata=attention_metadata, **kwargs
+            )
         k_THK, v_THV = cp_all_gather_tensors(
             (k_THK, v_THV),
             reduce_dtype=self.reduce_dtype,
         )
 
-        left = attention_metadata.window_size[0]
         # A chunk needs at most one document length of earlier keys.
         max_document_length = attention_metadata.max_k
         max_lookback = (

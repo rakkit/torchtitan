@@ -11,8 +11,10 @@ start from the tokens before them, exchanged across the ranks), attention sinks
 (all-gather K/V: every local query sees every key it attends to, so the
 log-sum-exp the sinks rescale is complete), the element-wise gate, a
 sliding-window and a full layer. Documents cross the ranks' token ranges;
-contiguous sharding and head-tail load balancing; the flex (fp32) and varlen
-(bf16: FlashAttention has no fp32) backends."""
+contiguous sharding and head-tail load balancing, and Ulysses (heads sharded
+over CP; the sinks rescale on each rank's heads); the flex (fp32),
+varlen and flex_flash (FA4 through flex; bf16: FlashAttention has no fp32)
+backends."""
 
 import pytest
 import torch
@@ -38,19 +40,57 @@ T = 1024
 DOCS = [300, 1, 450, 273]
 MAX_DOCUMENTS = 8
 # backend -> (dtype, the largest |g_cp - g| / |g| per parameter and for the loss)
-BACKENDS = {"flex": (torch.float32, 1e-5), "varlen": (torch.bfloat16, 2e-2)}
+BACKENDS = {
+    "flex": (torch.float32, 1e-5),
+    "varlen": (torch.bfloat16, 2e-2),
+    "flex_flash": (torch.bfloat16, 2e-2),
+}
 # The largest per-token cross-entropy difference CP vs one rank (nats): a bug at
 # a shard or document edge moves a few tokens by O(0.1 - 1), which a
 # whole-tensor norm above can dilute. Measured (4 GPUs, 11-06): flex fp32
 # 4.8e-7 / 9.5e-7, varlen bf16 5.0e-4 (without / with the head-tail balancer);
 # the bounds are 10x those.
-TOKEN_TOL = {"flex": 1e-5, "varlen": 5e-3}
+TOKEN_TOL = {"flex": 1e-5, "varlen": 5e-3, "flex_flash": 5e-3}
 
 
-def _model(parallelism: ParallelismConfig, backend: str, dtype: torch.dtype):
+# attention -> its CP cases (cp_attention, load balancer): the all-gather K/V
+# (contiguous and head-tail) and Ulysses (heads sharded over CP: contiguous
+# shards only; the sinks rescale on this rank's heads). 4 KV heads: Ulysses
+# needs them divisible by CP.
+CASES = (
+    ("gate", (("ulysses", None),)),
+    (
+        "sinks",
+        (
+            ("ulysses", None),
+            ("all_gather_kv", None),
+            ("all_gather_kv", HeadTailCPLoadBalancer.Config()),
+        ),
+    ),
+)
+
+
+def _model(
+    parallelism: ParallelismConfig,
+    backend: str,
+    dtype: torch.dtype,
+    *,
+    attention: str,
+    cp_attention: str = "all_gather_kv",
+):
+    attention_kwargs = (
+        dict(
+            attention_sinks=True,
+            sinks_init_fn_type="trunc_normal",
+            sinks_init_std=0.5,
+        )
+        if attention == "sinks"
+        else dict(gated_attention_type="element-wise")
+    )
     cfg = build_model_config(
         "mis-8b-proxy",
         parallelism=parallelism,
+        cp_attention=cp_attention,
         seq_len=T,
         n_layers=2,
         swa_pattern="SF",
@@ -61,11 +101,9 @@ def _model(parallelism: ParallelismConfig, backend: str, dtype: torch.dtype):
         n_dense_layers=2,
         dense_hidden_dim=512,
         conv_kernel_size=4,
-        attention_sinks=True,
-        sinks_init_fn_type="trunc_normal",
-        sinks_init_std=0.5,
-        # sinks, not the gate (one or neither): the sinks need the full lse
         num_mtp_layers=1,
+        n_kv_heads=4,
+        **attention_kwargs,
     )
     with torch.device("meta"):
         model = cfg.build()
@@ -79,10 +117,11 @@ def _relative(got: torch.Tensor, want: torch.Tensor) -> float:
     return ((got.float() - want.float()).norm() / want.float().norm()).item()
 
 
-# Every rank compiles FlexAttention (max_autotune: forward and backward, full and
-# sliding-window) for two backends and two shardings: more than the harness's
-# default 300 s per test.
-TIMEOUT_OVERRIDE["test_cp_matches_one_rank"] = 1500
+# One test per backend: every rank compiles FlexAttention (max_autotune: forward
+# and backward, full and sliding-window) for each attention case and sharding,
+# more than the harness's default 300 s per test.
+for _backend in BACKENDS:
+    TIMEOUT_OVERRIDE[f"test_cp_matches_one_rank_{_backend}"] = 1500
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < CP, reason=f"needs {CP} GPUs")
@@ -92,7 +131,19 @@ class TestContextParallel(DTensorTestBase):
         return CP
 
     @with_comms
-    def test_cp_matches_one_rank(self):
+    def test_cp_matches_one_rank_flex(self):
+        self._cp_matches_one_rank("flex")
+
+    @with_comms
+    def test_cp_matches_one_rank_varlen(self):
+        self._cp_matches_one_rank("varlen")
+
+    @with_comms
+    def test_cp_matches_one_rank_flex_flash(self):
+        self._cp_matches_one_rank("flex_flash")
+
+    def _cp_matches_one_rank(self, backend: str):
+        dtype, tol = BACKENDS[backend]
         pc = ParallelismContext(
             dp_replicate=1,
             dp_shard=1,
@@ -108,9 +159,9 @@ class TestContextParallel(DTensorTestBase):
         torch.manual_seed(0)
         tokens = torch.randint(0, 512, (T,), device="cuda")
         labels = torch.randint(0, 512, (T,), device="cuda")
-        for backend, (dtype, tol) in BACKENDS.items():
+        for attention, cases in CASES:
             torch.manual_seed(0)
-            reference = _model(ParallelismConfig(), backend, dtype)
+            reference = _model(ParallelismConfig(), backend, dtype, attention=attention)
             with torch.no_grad():  # every conv tap off its init value
                 for name, p in reference.named_parameters():
                     if "_conv." in name:
@@ -144,13 +195,24 @@ class TestContextParallel(DTensorTestBase):
                 reduction="none",
                 ignore_index=IGNORE_INDEX,
             )
-            for balancer in (None, HeadTailCPLoadBalancer.Config()):
-                with self.subTest(backend=backend, load_balancer=balancer):
+            for cp_attention, balancer in cases:
+                with self.subTest(
+                    backend=backend,
+                    attention=attention,
+                    cp_attention=cp_attention,
+                    load_balancer=balancer,
+                ):
                     parallelism = ParallelismConfig(
                         context_parallel_degree=CP,
                         context_parallel_load_balancer=balancer,
                     )
-                    model = _model(parallelism, backend, dtype)
+                    model = _model(
+                        parallelism,
+                        backend,
+                        dtype,
+                        attention=attention,
+                        cp_attention=cp_attention,
+                    )
                     model.load_state_dict(reference.state_dict())
                     with pc.activate_spmd():
                         # the token index rides along as a loss kwarg: sharded

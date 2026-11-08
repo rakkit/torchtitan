@@ -21,7 +21,7 @@ from torchtitan.models.common.attention import (
     local_head_split,
     VarlenAttentionMetadata,
 )
-from torchtitan.models.common.attention.cp_attention import CPInnerAttention
+from torchtitan.models.common.attention.cp_attention import CPInnerAttention, Ulysses
 from torchtitan.models.common.attention.cp_linear_attention import (
     ContextParallelLinearAttentionMetadata,
     prepare_cp_linear_attention_metadata,
@@ -213,6 +213,9 @@ class GatedSWAttention(GQAttention):
         self.sinks = (
             nn.Parameter(torch.empty(self.n_heads)) if config.attention_sinks else None
         )
+        # Ulysses CP runs the inner attention (and the in-region sink rescale) on
+        # this CP rank's contiguous heads / cp heads: the rescale takes their slice.
+        self.sinks_heads_sharded = isinstance(self.inner_attention, Ulysses)
         # The sliding-window layers' attention is its own remat region, so a policy
         # can recompute it (cheap at the window size) and keep the full layers'
         # saved: "*inner_attention_swa*" selects it, "*inner_attention*" both.
@@ -363,7 +366,14 @@ class GatedSWAttention(GQAttention):
         )
 
     def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
-        return apply_attention_sink_rescale(out, lse, self.sinks)
+        sinks = self.sinks
+        if self.sinks_heads_sharded:
+            # each head's sink gradient comes from one CP rank; FSDP's reduce over
+            # the CP ranks sums the slices
+            heads = lse.shape[-1]
+            start = torch.distributed.get_rank(spmd_mesh_group(MeshAxisName.CP)) * heads
+            sinks = sinks[start : start + heads]
+        return apply_attention_sink_rescale(out, lse, sinks)
 
     def _apply_rope(
         self,

@@ -154,6 +154,25 @@ def validate_model_training_config(
             "model.compile_blocks=False (the local_compile regions apply), or "
             "use a full-recompute activation_remat."
         )
+    if (
+        getattr(model, "compile_blocks", False)
+        and parallelism.context_parallel_degree > 1
+    ):
+        from torchtitan.models.common.attention.cp_attention import Ulysses
+
+        # Ulysses' all-to-all is spmd_types' redistribute, which reads
+        # x.grad_fn: Dynamo cannot trace it ("Tensor with grad_fn()"); the
+        # all-gather K / V form has a compiled path (cp_all_gather_tensors).
+        if any(
+            isinstance(cfg, Ulysses.Config)
+            for layer in getattr(model, "layers", [])
+            for _, cfg, _, _ in layer.traverse(Ulysses.Config)
+        ):
+            raise ValueError(
+                "model.compile_blocks with Ulysses CP is not supported (its "
+                "all-to-all does not trace). Use cp_attention='all_gather_kv' or "
+                "model.compile_blocks=False."
+            )
 
     validate_context_parallel(model, parallelism)
 

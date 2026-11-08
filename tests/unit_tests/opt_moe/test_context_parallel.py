@@ -26,9 +26,12 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 )
 
 from torchtitan.components.loss import IGNORE_INDEX
+from torchtitan.config import PrecisionConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext
+from torchtitan.distributed.activation_remat import ActivationRematConfig
 from torchtitan.distributed.context_parallel import HeadTailCPLoadBalancer
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.models.opt_moe import build_model_config
 from torchtitan.models.opt_moe.mtp import MTPCrossEntropyLoss, roll_mtp_sequence
 
@@ -122,6 +125,10 @@ def _relative(got: torch.Tensor, want: torch.Tensor) -> float:
 # more than the harness's default 300 s per test.
 for _backend in BACKENDS:
     TIMEOUT_OVERRIDE[f"test_cp_matches_one_rank_{_backend}"] = 1500
+TIMEOUT_OVERRIDE["test_compiled_blocks_keep_their_graphs_on_new_layouts"] = 1500
+# Layouts after the warm-up one (DOCS): one document (each rank's chunk is a
+# single piece), and other counts and lengths.
+NEW_LAYOUTS = ([T], [100, 900, 24], [512, 512])
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < CP, reason=f"needs {CP} GPUs")
@@ -269,3 +276,78 @@ class TestContextParallel(DTensorTestBase):
                         self.assertLess(
                             _relative(grad, want_grads[name]), tol, msg=name
                         )
+
+    @with_comms
+    def test_compiled_blocks_keep_their_graphs_on_new_layouts(self):
+        """The 256k recipe's path (compile_blocks, varlen, all-gather K/V with
+        the head-tail balancer, the conv): each rank's document metadata
+        (offsets, longest document, conv routing) changes with the batch. A
+        layout that compiles a new graph on one rank stalls every other rank
+        in a collective (seen at 256k: one rank recompiling for ~12 s)."""
+        pc = ParallelismContext(
+            dp_replicate=1,
+            dp_shard=1,
+            cp=CP,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=CP,
+            enable_sequence_parallel=False,
+        )
+        pc.build_mesh()
+        parallelism = ParallelismConfig(
+            context_parallel_degree=CP,
+            context_parallel_load_balancer=HeadTailCPLoadBalancer.Config(),
+        )
+        cfg = build_model_config(
+            "mis-8b-proxy",
+            parallelism=parallelism,
+            seq_len=T,
+            n_layers=2,
+            swa_pattern="SF",
+            rope_pattern=None,
+            attn_backend="varlen",
+            vocab_size=512,
+            n_dense_layers=2,
+            dense_hidden_dim=512,
+            conv_kernel_size=4,
+            num_mtp_layers=0,
+            n_kv_heads=4,
+            gated_attention_type="element-wise",
+        )
+        cfg.compile_blocks = True
+        with torch.device("meta"):
+            model = cfg.build()
+        model.parallelize(
+            parallelism_context=pc,
+            precision=PrecisionConfig(param_dtype="bfloat16", reduce_dtype="float32"),
+            parallelism=parallelism,
+            local_compile=LocalCompileConfig(regions=[]),
+            activation_remat=ActivationRematConfig(
+                save_regions=["*"], recompute_regions=["*inner_attention_swa*"]
+            ),
+            dump_folder="",
+        )
+        model.to_empty(device="cuda")
+        torch.manual_seed(0)
+        with torch.no_grad(), pc.activate_spmd():
+            model.init_states(buffer_device=torch.device("cuda"))
+
+        def step(docs):
+            positions = torch.cat([torch.arange(n) for n in docs]).cuda()
+            tokens = torch.randint(0, 512, (T,), device="cuda")
+            with pc.activate_spmd():
+                inputs, _, model_kwargs, _ = model.preprocess_inputs(
+                    {"input": tokens, "labels": tokens, "positions": positions},
+                    parallelism_context=pc,
+                    parallelism=parallelism,
+                    max_num_documents=None,
+                )
+                prediction = model(inputs, **model_kwargs)  # no MTP: one output
+                prediction.float().mean().backward()
+
+        for _ in range(2):
+            step(DOCS)
+        with torch._dynamo.config.patch(error_on_recompile=True):
+            for docs in NEW_LAYOUTS:
+                step(docs)

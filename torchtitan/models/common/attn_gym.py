@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from attn_gym.linear.context_parallel import (
         _ContextParallelChunk,
         context_parallel_conv_history,
+        ContextParallelPlan,
         ContextParallelRouting,
     )
     from attn_gym.linear.gdn.context_parallel import context_parallel_gdn
@@ -70,6 +71,7 @@ __all__ = [
     "context_parallel_conv_history",
     "context_parallel_gdn",
     "context_parallel_kda",
+    "ContextParallelPlan",
     "ContextParallelRouting",
     "gate_transform",
     "gather_attn",
@@ -106,6 +108,7 @@ _EXPORTS = {
     "context_parallel_conv_history": "attn_gym.linear.context_parallel",
     "context_parallel_gdn": "attn_gym.linear.gdn.context_parallel",
     "context_parallel_kda": "attn_gym.linear.kda.context_parallel",
+    "ContextParallelPlan": "attn_gym.linear.context_parallel",
     "ContextParallelRouting": "attn_gym.linear.context_parallel",
     "gate_transform": "attn_gym.linear._delta_rule.gate",
     "gather_attn": "attn_gym.sparse.gather_attn",

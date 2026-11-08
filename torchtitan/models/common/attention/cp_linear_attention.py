@@ -18,6 +18,7 @@ from torchtitan.distributed.spmd_types import spmd_mesh_group
 
 from torchtitan.models.common.attn_gym import (
     _ContextParallelChunk,
+    ContextParallelPlan,
     ContextParallelRouting,
     is_missing_kernel,
 )
@@ -123,16 +124,24 @@ def prepare_cp_linear_attention_metadata(
             f"{family} metadata preparation requires an active multi-rank CP "
             "mesh axis."
         )
-    routing = ContextParallelRouting.from_fragments(
-        cu_seqlens_global=cu_seqlens_global,
-        fragments=get_token_fragments(
-            cu_seqlens_global[-1],
-            cp_size=group.size(),
-            permutation=permutation,
+    plan = ContextParallelPlan.from_fragments(
+        cu_seqlens_global,
+        get_token_fragments(
+            cu_seqlens_global[-1], cp_size=group.size(), permutation=permutation
         ),
-        cp_rank=dist.get_rank(group),
-        device=device,
-        conv_history=attention_metadata.num_conv_history_tokens,
+        dist.get_rank(group),
+    )
+    # The routing's segment dim is this rank's document-piece count: padded to
+    # at least 2, or a rank whose chunk is one piece compiles its own graph
+    # (size 1 specializes) while the other ranks wait in collectives.
+    routing = ContextParallelRouting(
+        **vars(
+            plan.routing(
+                device,
+                max_subsequences=max(2, len(plan.cu_seqlens) - 1),
+                conv_history=attention_metadata.num_conv_history_tokens,
+            )
+        )
     )
     return ContextParallelLinearAttentionMetadata(
         varlen=attention_metadata.varlen,

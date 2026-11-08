@@ -53,8 +53,14 @@ from .state_dict_adapter import OPTMoEStateDictAdapter
 # graph a new document count triggers); 32 leaves room for more block types
 # (MTP, NoPE).
 _BLOCK_RECOMPILE_LIMIT = 32
-# torch.compiler.config.dynamic_sources entry: VarlenAttentionMetadata's ints
-_VARLEN_MAX_SOURCES = r".*\.max_[qk]$"
+# torch.compiler.config.dynamic_sources entries: the per-rank document
+# metadata (VarlenAttentionMetadata's ints and offsets, the CP conv routing's
+# per-segment tensors), dynamic from the first compile
+_PER_RANK_METADATA_SOURCES = (
+    r".*\.max_[qk]$",
+    r".*\.cu_seq_[qk]$",
+    r".*\.cp_routing\.(cu_seqlens|entry_sources|exit_sources|terminal|conv_sources)$",
+)
 
 
 def _annotate_conv_metadata(attention_metadata: AttentionMetadataMap | None) -> None:
@@ -339,14 +345,14 @@ class OPTMoEModel(Decoder):
             # Past its recompile budget a block would run eager without a word
             # under EP (no fullgraph); raise instead, as fullgraph does.
             torch._dynamo.config.fail_on_recompile_limit_hit = True
-            # Varlen document lengths differ per rank and step; traced as
-            # constants, one rank recompiles on its first new value while the
-            # others wait in collectives (the 256k / SFT step stalls).
-            sources = torch.compiler.config.dynamic_sources
-            if _VARLEN_MAX_SOURCES not in sources:
-                torch.compiler.config.dynamic_sources = ",".join(
-                    s for s in (sources, _VARLEN_MAX_SOURCES) if s
-                )
+            # Document metadata differs per rank and step; traced static, one
+            # rank recompiles on its first new value while the others wait in
+            # collectives (the 256k / SFT step stalls).
+            sources = torch.compiler.config.dynamic_sources.split(",")
+            torch.compiler.config.dynamic_sources = ",".join(
+                [s for s in sources if s]
+                + [s for s in _PER_RANK_METADATA_SOURCES if s not in sources]
+            )
             for block in self.layers.values():
                 # a traced backward cannot add a WGRAD into .grad in place in
                 # the GEMM epilogue (AccumulateGrad still accumulates it)

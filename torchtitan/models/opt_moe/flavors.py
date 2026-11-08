@@ -277,7 +277,6 @@ def build_opt_moe_layers(
     enable_tp: bool,
     enable_sp: bool,
     enable_ep: bool,
-    enable_cp: bool,
 ) -> list[OPTMoETransformerBlock.Config]:
     """The sharded per-layer ``OPTMoETransformerBlock`` configs: the
     ``n_layers`` decoder layers, then ``num_mtp_layers`` blocks for the MTP
@@ -314,9 +313,6 @@ def build_opt_moe_layers(
     takes the depth divisor too with ``init_gate_as_residual``. The token
     dispatcher: all-to-all under EP, local dispatch without (DeepEP / HybridEP:
     upstream's ``TokenDispatcherTransform`` on the recipe).
-
-    ``enable_cp``: the attention runs under Context Parallel (all-gather K/V,
-    flex or varlen).
     """
     if gated_attention_type not in (None, "element-wise"):
         raise ValueError(
@@ -448,7 +444,7 @@ def build_opt_moe_layers(
             attention["v_conv"] = conv(n_kv_heads * head_dim)
         if attention_sinks:
             attention["attention_sinks"] = True
-            attention["sinks_after_region"] = not (enable_tp or enable_cp)
+            attention["sinks_after_region"] = not enable_tp
             attention["param_init"] = {
                 "sinks": make_param_init(sinks_init_fn_type, sinks_init_std)
             }
@@ -655,7 +651,6 @@ def _opt_moe_config(
         enable_tp=flags["tp"],
         enable_sp=flags["sp"],
         enable_ep=flags["ep"],
-        enable_cp=flags["cp"],
     )
     n_layers = len(blocks) - num_mtp_layers
     layers = blocks[:n_layers]

@@ -54,6 +54,15 @@ __all__ = [
 _TOKEN_DIM = 0
 _HEAD_DIM = 1
 
+
+def _cat_outputs(first, second):
+    """Concatenate two query chunks' attention outputs along tokens; an
+    out_transform may return (output, lse) pairs."""
+    if isinstance(first, tuple):
+        return tuple(torch.cat(pair) for pair in zip(first, second, strict=True))
+    return torch.cat((first, second))
+
+
 _GlobalAttentionMetadataT = TypeVar("_GlobalAttentionMetadataT")
 _LocalAttentionMetadataT = TypeVar("_LocalAttentionMetadataT")
 
@@ -437,7 +446,7 @@ class AllGatherKVVarlen(
         )
         tail_prev = (cp_rank + 1, 1) if cp_rank < cp_size - 1 else (cp_rank, 0)
         tail_out = run_chunk(1, (2 * cp_size - 1 - cp_rank) * chunk_len, tail_prev)
-        return torch.cat((head_out, tail_out))
+        return _cat_outputs(head_out, tail_out)
 
     def forward(
         self,
@@ -514,7 +523,7 @@ class AllGatherKVVarlen(
             tail_start = global_len - (cp_rank + 1) * chunk_len
             head_out_THV = run_chunk(q_THK[:chunk_len], head_start)
             tail_out_THV = run_chunk(q_THK[chunk_len:], tail_start)
-            out_THV = torch.cat((head_out_THV, tail_out_THV))
+            out_THV = _cat_outputs(head_out_THV, tail_out_THV)
         if kwargs.get("out_transform") is None and spmd.is_type_checking():
             spmd.assert_type(
                 out_THV,
@@ -613,13 +622,19 @@ class UlyssesInnerAttention(Ulysses[_GlobalAttentionMetadataT]):
         )
         # super() follows the concrete class MRO to its inner attention.
         out_THV = super().forward(q_THK, k_THK, v_THV, **kwargs)
-        # Back to sharded tokens: (T, H/cp, V) -> (T/cp, H, V).
-        return spmd.redistribute(
-            out_THV,
-            cp_group,
-            src=spmd.S(_HEAD_DIM),
-            dst=spmd.S(_TOKEN_DIM),
+        # Back to sharded tokens: (T, H/cp, V) -> (T/cp, H, V); an
+        # out_transform may return (output, lse), lse [T, H/cp] -> [T/cp, H].
+        outputs = out_THV if isinstance(out_THV, tuple) else (out_THV,)
+        outputs = tuple(
+            spmd.redistribute(
+                x,
+                cp_group,
+                src=spmd.S(_HEAD_DIM),
+                dst=spmd.S(_TOKEN_DIM),
+            )
+            for x in outputs
         )
+        return outputs if isinstance(out_THV, tuple) else outputs[0]
 
 
 class UlyssesFlexInnerAttention(

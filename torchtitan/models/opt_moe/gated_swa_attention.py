@@ -173,10 +173,11 @@ class GatedSWAttention(GQAttention):
         sinks_after_region: bool = True
         """In training, the sink rescale runs after the inner-attention remat
         region, so the backward recomputes it instead of saving its output (one
-        ``[T, H, K]`` per layer). Set by the layer builder: False under TP or
-        CP, whose inner-attention wrappers take one output tensor; there the
-        rescale stays the region's ``out_transform``.
-        TODO: (output, lse) through the CP and TP inner-attention wrappers."""
+        ``[T, H, K]`` per layer). Set by the layer builder: False under TP,
+        whose inner-attention wrapper takes one output tensor; there the
+        rescale stays the region's ``out_transform`` (the CP wrappers pass
+        ``(output, lse)`` through).
+        TODO: (output, lse) through the TP inner-attention wrapper."""
 
         def __post_init__(self) -> None:
             GQAttention.Config.__post_init__(self)
@@ -302,7 +303,7 @@ class GatedSWAttention(GQAttention):
             out_transform=(
                 _output_and_lse
                 if sinks_after_region
-                else self._apply_sinks
+                else self._apply_sinks_in_region
                 if self.sinks is not None
                 else None
             ),
@@ -366,6 +367,13 @@ class GatedSWAttention(GQAttention):
         )
 
     def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+        return apply_attention_sink_rescale(out, lse, self.sinks)
+
+    def _apply_sinks_in_region(
+        self, out: torch.Tensor, lse: torch.Tensor
+    ) -> torch.Tensor:
+        """The rescale as the inner attention's out_transform (without grad,
+        or under TP): under Ulysses CP it sees this rank's heads only."""
         sinks = self.sinks
         if self.sinks_heads_sharded:
             # each head's sink gradient comes from one CP rank; FSDP's reduce over

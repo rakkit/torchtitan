@@ -31,11 +31,13 @@ def _cfg(n_layers: int, residual_scale: str):
 def _model(n_layers: int, residual_scale: str, seed: int = 0):
     with torch.device("meta"):
         model = _cfg(n_layers, residual_scale).build()
+    # fp64 before to_empty / init_states: torchtitan buffers keep their dtype after
+    model.double()
     model.to_empty(device="cpu")
     torch.manual_seed(seed)
     with torch.no_grad():
         model.init_states(buffer_device=torch.device("cpu"))
-    return model.double()
+    return model
 
 
 class _CausalSDPA(torch.nn.Module):

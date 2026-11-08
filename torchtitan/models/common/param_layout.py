@@ -170,8 +170,66 @@ def qkv_units(
     )
 
 
+def decoder_param_layouts(model: nn.Module) -> dict[str, ParamLayout]:
+    """What every parameter of a ``Decoder`` is, keyed by FQN: the common modules'
+    facts (fused SwiGLU ``w13``, fused ``wqkv``, the MoE router gate, routed
+    expert batches), each module's own ``param_layouts()`` where it declares one,
+    the two vocabulary matrices (one parameter when tied: the embedding's), and
+    the rest by rank."""
+    from torchtitan.models.common.attention.attention import QKVLinear
+    from torchtitan.models.common.feed_forward import DenseFeedForward
+    from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
+
+    layouts: dict[str, ParamLayout] = {}
+    for module_name, module in model.named_modules():
+        prefix = f"{module_name}." if module_name else ""
+        if isinstance(module, DenseFeedForward):
+            w13 = module.w13.weight  # [2, F, D]: w1 and w3 stacked
+            units = stacked_units(("w1", "w3"), w13.shape[-2], w13.shape[-1])
+            layouts[f"{prefix}w13.weight"] = ParamLayout("matrix", units=units)
+            continue
+        if isinstance(module, TokenChoiceTopKRouter):  # the gate's rows: experts
+            layouts[f"{prefix}gate.weight"] = ParamLayout("router")
+            continue
+        if isinstance(module, QKVLinear):  # rows per KV group: q heads, k, v
+            w = module.wqkv.weight
+            n_kv_heads = w.shape[0] // (module.r_dim * module.head_dim)
+            units = qkv_units(
+                module.heads_per_kv * n_kv_heads,
+                n_kv_heads,
+                module.head_dim,
+                w.shape[-1],
+            )
+            layouts[f"{prefix}wqkv.weight"] = ParamLayout("matrix", units=units)
+            continue
+        declare = getattr(module, "param_layouts", None)
+        if module is model or declare is None:
+            continue
+        for param_name, layout in declare().items():
+            layouts[f"{prefix}{param_name}"] = layout
+    for module in model.modules():
+        if isinstance(module, RoutedExperts):
+            w13 = module.w13.weight
+            slots = stacked_units(("w1", "w3"), w13.shape[-2], w13.shape[-1])
+            layouts[named(model, w13)] = ParamLayout("expert_batch", units=slots)
+            layouts[named(model, module.w2.weight)] = ParamLayout("expert_batch")
+    embedding = getattr(model, "tok_embeddings", None)
+    lm_head = getattr(model, "lm_head", None)
+    if embedding is not None:  # PP stages hold one or neither
+        layouts[named(model, embedding.weight)] = ParamLayout("embedding")
+    if lm_head is not None and (
+        embedding is None or lm_head.weight is not embedding.weight
+    ):
+        layouts[named(model, lm_head.weight)] = ParamLayout("unembedding")
+    for name, p in model.named_parameters():
+        if name not in layouts:
+            layouts[name] = by_rank(p.shape)
+    return layouts
+
+
 __all__ = [
     "by_rank",
+    "decoder_param_layouts",
     "KINDS",
     "named",
     "ParamLayout",

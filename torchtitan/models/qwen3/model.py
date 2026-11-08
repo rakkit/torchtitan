@@ -18,6 +18,7 @@ from torchtitan.models.common.attention import (
 )
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.param_layout import decoder_param_layouts
 from .state_dict_adapter import Qwen3StateDictAdapter
 
 
@@ -112,3 +113,8 @@ class Qwen3Model(Decoder):
 
     def __init__(self, config: Config):
         super().__init__(config)
+
+    def param_layouts(self) -> dict:
+        """What every parameter is, for optimizers that need more than its shape
+        (DiSCO; see `models/common/param_layout.py`)."""
+        return decoder_param_layouts(self)

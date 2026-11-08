@@ -33,16 +33,10 @@ from torchtitan.models.common.attention import (
 from torchtitan.models.common.attention.linear_attention import LinearAttentionMetadata
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
-from torchtitan.models.common.feed_forward import DenseFeedForward
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.moe import MoE, RoutedExperts, TokenChoiceTopKRouter
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.common.param_layout import (
-    by_rank,
-    named,
-    ParamLayout,
-    stacked_units,
-)
+from torchtitan.models.common.param_layout import decoder_param_layouts
 from .gated_swa_attention import ShortConvDocuments
 from .mtp import roll_mtp_sequence
 from .state_dict_adapter import OPTMoEStateDictAdapter
@@ -255,45 +249,9 @@ class OPTMoEModel(Decoder):
 
     def param_layouts(self) -> dict:
         """What every parameter is, keyed by FQN (see
-        `models/common/param_layout.py`): modules declare what only they know
-        (expert batches, fused projections, the router gate), the model the two
-        vocabulary matrices, and the rest is stated by rank."""
-        layouts = {}
-        for module_name, module in self.named_modules():
-            # Upstream's modules, declared here.
-            if isinstance(module, DenseFeedForward):
-                w13 = module.w13.weight  # [2, F, D]: w1 and w3 stacked
-                units = stacked_units(("w1", "w3"), w13.shape[-2], w13.shape[-1])
-                layouts[f"{module_name}.w13.weight"] = ParamLayout(
-                    "matrix", units=units
-                )
-                continue
-            if isinstance(module, TokenChoiceTopKRouter):  # the gate's rows: experts
-                layouts[f"{module_name}.gate.weight"] = ParamLayout("router")
-                continue
-            declare = getattr(module, "param_layouts", None)
-            if module is self or declare is None:
-                continue
-            for param_name, layout in declare().items():
-                layouts[
-                    f"{module_name}.{param_name}" if module_name else param_name
-                ] = layout
-        for module in self.modules():
-            if isinstance(module, RoutedExperts):  # upstream's: declared here
-                w13 = module.w13.weight
-                slots = stacked_units(("w1", "w3"), w13.shape[-2], w13.shape[-1])
-                layouts[named(self, w13)] = ParamLayout("expert_batch", units=slots)
-                layouts[named(self, module.w2.weight)] = ParamLayout("expert_batch")
-        for module, kind in (
-            (self.tok_embeddings, "embedding"),
-            (self.lm_head, "unembedding"),
-        ):
-            if module is not None:  # PP stages hold one or neither
-                layouts[named(self, module.weight)] = ParamLayout(kind)
-        for name, p in self.named_parameters():
-            if name not in layouts:
-                layouts[name] = by_rank(p.shape)
-        return layouts
+        `models/common/param_layout.py`): the shared decoder declaration; the
+        gated SWA attention adds its fused wqkv units and k / v convs."""
+        return decoder_param_layouts(self)
 
     def parallelize(self, *, parallelism: ParallelismConfig, **kwargs):
         """Upstream's lifecycle, after checking that the model config was built

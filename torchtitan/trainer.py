@@ -21,7 +21,10 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.components.checkpointer import DATALOADER
 from torchtitan.components.data.balance import NodeAttentionBalancer
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
+
+from torchtitan.components.data.multimodal.vision_processor import VisionProcessor
 from torchtitan.components.data.types import TrainingMicrobatch
+from torchtitan.components.loss import combine_loss_metrics
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validator import BaseValidator, Validator
 from torchtitan.config import (
@@ -98,6 +101,11 @@ class Trainer(Configurable):
         tokenizer: BaseTokenizer.Config = field(
             default_factory=HuggingFaceTokenizer.Config
         )
+        vision_processor: VisionProcessor.Config | None = None
+        """The model's image and video preprocessing, e.g.
+        ``VisionProcessor.Config(**QWEN3_5_VISION_PROCESSOR_KWARGS)`` with the
+        settings next to the model's special tokens. Built once and handed to
+        the dataloader, like the tokenizer. None: no image or video inputs."""
         dataloader: BaseDataLoader.Config = field(default_factory=BaseDataLoader.Config)
         attention_balancer: NodeAttentionBalancer.Config | None = None
         """Regroup each training microbatch's documents over the ranks of a node
@@ -235,6 +243,7 @@ class Trainer(Configurable):
     engine_cls: type[TrainingEngine] = TrainingEngine
 
     tokenizer: BaseTokenizer
+    vision_processor: VisionProcessor | None
     dataloader: BaseDataLoader
     attention_balancer: NodeAttentionBalancer | None
     validator: BaseValidator
@@ -308,6 +317,11 @@ class Trainer(Configurable):
         )
 
         self.tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
+        self.vision_processor = (
+            config.vision_processor.build()
+            if config.vision_processor is not None
+            else None
+        )
         num_tokens_per_microbatch = (
             config.training.num_tokens_per_microbatch_per_dp_rank
         )
@@ -317,6 +331,7 @@ class Trainer(Configurable):
             tokenizer=self.tokenizer,
             max_context_length=config.model.max_context_length,
             num_tokens_per_microbatch=num_tokens_per_microbatch,
+            vision_processor=self.vision_processor,
         )
         self.attention_balancer = (
             config.attention_balancer.build(
@@ -386,6 +401,7 @@ class Trainer(Configurable):
                 dp_world_size=dp_degree,
                 dp_rank=dp_rank,
                 tokenizer=self.tokenizer,
+                vision_processor=self.vision_processor,
                 parallelism_context=parallelism_context,
                 loss_fn=engine.loss_fn,
                 metrics_processor=self.metrics_processor,
@@ -556,8 +572,24 @@ class Trainer(Configurable):
                 {"global_valid_tokens": int(global_main_loss_token_count)}
             )
 
+            # Combine loss metrics over microbatches and loss-mesh ranks; under PP,
+            # ranks without the last stage have none.
+            # TODO(#4202): migrate loss-metric collection to the distributed
+            # tensor logging framework once it lands.
+            loss_mesh = parallelism_context.get_optional_mesh("loss")
+            loss_metrics = {
+                key: float(value.item())
+                for key, value in combine_loss_metrics(
+                    (
+                        microbatch_metrics
+                        for group_metrics in forward_backward_result.loss_metrics
+                        for microbatch_metrics in group_metrics
+                    ),
+                    mesh=loss_mesh,
+                ).items()
+            }
+
             if parallelism_context.dp_cp_enabled:
-                loss_mesh = parallelism_context.get_mesh("loss")
 
                 # For global_avg_loss, we want the average loss across all ranks:
                 # accumulated_loss = local_loss_sum / global_valid_tokens
@@ -602,50 +634,11 @@ class Trainer(Configurable):
                 global_avg_loss = global_max_loss = float(accumulated_loss.item())
                 global_ntokens_seen = engine.ntokens_seen
 
-            # The loss function's own metrics (e.g. the MTP loss's terms), with
-            # ChunkedLossWrapper's suffix rule: mean / fraction keys are
-            # normalized as the loss, so they sum over the microbatches and the
-            # loss mesh; "/max" and "/min" keys take their max / min.
-            loss_fn_metrics: dict[str, torch.Tensor] = {}
-            for group_metrics in forward_backward_result.loss_metrics:
-                for microbatch_metrics in group_metrics:
-                    for key, value in microbatch_metrics.items():
-                        value = value.detach().float()
-                        if key not in loss_fn_metrics:
-                            loss_fn_metrics[key] = value
-                        elif key.endswith("/max"):
-                            loss_fn_metrics[key] = torch.maximum(
-                                loss_fn_metrics[key], value
-                            )
-                        elif key.endswith("/min"):
-                            loss_fn_metrics[key] = torch.minimum(
-                                loss_fn_metrics[key], value
-                            )
-                        else:
-                            loss_fn_metrics[key] = loss_fn_metrics[key] + value
-            loss_fn_logged = {}
-            for key, value in sorted(loss_fn_metrics.items()):
-                if not parallelism_context.dp_cp_enabled:
-                    loss_fn_logged[key] = float(value.item())
-                elif key.endswith("/min"):
-                    loss_fn_logged[key] = -dist_utils.dist_max(
-                        -value, parallelism_context.get_mesh("loss")
-                    )
-                else:
-                    reduce = (
-                        dist_utils.dist_max
-                        if key.endswith("/max")
-                        else dist_utils.dist_sum
-                    )
-                    loss_fn_logged[key] = reduce(
-                        value, parallelism_context.get_mesh("loss")
-                    )
-
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
             **collect_aux_loss_metrics(parallelism_context),
-            **loss_fn_logged,
+            **loss_metrics,
         }
         # No None guard: "nothing to report" is the null object's empty
         # dicts, not a missing attribute.

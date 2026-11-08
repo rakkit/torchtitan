@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 """Validation logs at the step whose training metrics were just logged. With a
-real offline W&B run, both must reach that step's row (a committed row drops
-later writes to its step), and the last row must survive `close`."""
+real offline W&B run, both must reach that training step (each `log` call is
+its own row keyed by `trainer/step`), and the last row must survive `close`."""
 
 import glob
 import json
@@ -34,7 +34,7 @@ def _history(log_dir):
                 ("/".join(i.nested_key) or i.key): json.loads(i.value_json)
                 for i in rec.history.item
             }
-            rows.setdefault(int(row["_step"]), {}).update(row)
+            rows.setdefault(int(row["trainer/step"]), {}).update(row)
     return rows
 
 

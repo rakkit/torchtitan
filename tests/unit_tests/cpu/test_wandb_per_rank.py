@@ -25,6 +25,9 @@ class _FakeWandb(types.ModuleType):
     def init(self, **kwargs):
         self.kwargs = kwargs
 
+    def define_metric(self, *args, **kwargs):
+        pass
+
 
 @pytest.fixture
 def wandb(monkeypatch):
@@ -49,19 +52,34 @@ def test_one_logger_keeps_the_launchers_run(wandb, monkeypatch, tmp_path):
 def test_each_rank_gets_its_own_run_in_one_group(wandb, monkeypatch, tmp_path):
     monkeypatch.setenv("WANDB_NAME", "run-7")
     monkeypatch.setenv("WANDB_RUN_ID", "run-7")
-    metrics.WandBLogger(metrics.WandBLogger.Config(), log_dir=str(tmp_path), rank=3, default_group="dump")
+    metrics.WandBLogger(
+        metrics.WandBLogger.Config(),
+        log_dir=str(tmp_path),
+        rank=3,
+        default_group="dump",
+    )
     assert _run(wandb) == ("run-7-rank3", "run-7-rank3", "run-7")
 
 
 def test_the_launchers_group_wins(wandb, monkeypatch, tmp_path):
     monkeypatch.setenv("WANDB_NAME", "run-7")
     monkeypatch.setenv("WANDB_RUN_GROUP", "run")
-    metrics.WandBLogger(metrics.WandBLogger.Config(), log_dir=str(tmp_path), rank=0, default_group="dump")
+    metrics.WandBLogger(
+        metrics.WandBLogger.Config(),
+        log_dir=str(tmp_path),
+        rank=0,
+        default_group="dump",
+    )
     assert _run(wandb) == (None, "run-7-rank0", "run")
 
 
 def test_without_launcher_names_the_dump_folder_groups(wandb, tmp_path):
-    metrics.WandBLogger(metrics.WandBLogger.Config(), log_dir=str(tmp_path), rank=1, default_group="dump")
+    metrics.WandBLogger(
+        metrics.WandBLogger.Config(),
+        log_dir=str(tmp_path),
+        rank=1,
+        default_group="dump",
+    )
     assert _run(wandb) == (None, "dump-rank1", "dump")
 
 

@@ -70,7 +70,7 @@ def test_dapo_truncated_is_gradient_is_capped_ratio_times_advantage() -> None:
     )
     pred = logits.clone().requires_grad_(True)
     loss, metrics = DAPOLoss.Config(truncated_is_cap=cap).build()(
-        pred=pred, generator_logprobs=trainer_logprobs + shift, **kwargs
+        logits=pred, generator_logprobs=trainer_logprobs + shift, **kwargs
     )
     loss.backward()
     ref = logits.clone().requires_grad_(True)
@@ -83,7 +83,7 @@ def test_dapo_truncated_is_gradient_is_capped_ratio_times_advantage() -> None:
     grads = []
     for config in (DAPOLoss.Config(truncated_is_cap=cap), DAPOLoss.Config()):
         pred = logits.clone().requires_grad_(True)
-        config.build()(pred=pred, generator_logprobs=trainer_logprobs, **kwargs)[
+        config.build()(logits=pred, generator_logprobs=trainer_logprobs, **kwargs)[
             0
         ].backward()
         grads.append(pred.grad)
@@ -113,7 +113,7 @@ def test_dapo_mismatch_mask_drops_only_far_tokens_gradient() -> None:
     for beta in (None, 2.0):
         pred = logits.clone().requires_grad_(True)
         loss, metrics = DAPOLoss.Config(mismatch_mask_ratio=beta).build()(
-            pred=pred, **kwargs
+            logits=pred, **kwargs
         )
         loss.backward()
         grads[beta] = pred.grad

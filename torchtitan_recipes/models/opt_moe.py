@@ -141,6 +141,9 @@ def opt_moe_mis_8b() -> Trainer.Config:
             # with the host). Without EP the local dispatch has no host sync;
             # graphs on there are not measured yet.
             disable_accelerator_graphs=True,
+            # Under SLURM: stop and save a full checkpoint 15 min before the walltime
+            # (the final save of ~250 GB plus exit), so a restart loses no steps.
+            stop_before_walltime_s=900.0,
         ),
         checkpointer=CheckpointManager.Config(
             interval=50,

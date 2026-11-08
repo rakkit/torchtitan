@@ -45,6 +45,7 @@ from torchtitan.observability.data_consumption import (
 )
 from torchtitan.observability.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.optimizers.container import DiSCOOptimizersContainer
+from torchtitan.tools.utils import slurm_job_end_time
 from torchtitan.training_engine import TrainingEngine
 
 
@@ -68,6 +69,53 @@ def logs_metrics_locally(metrics) -> bool:
         and metrics.save_for_all_ranks
         and bool(metrics.loggers)
     )
+
+
+class _WalltimeStop:
+    """``training.stop_before_walltime_s``: every ``stop_check_interval`` steps, stop if the
+    SLURM job's remaining time is below that many of the longest recent step plus the
+    margin. Global rank 0 reads the end time; one MAX all-reduce on every rank at the same
+    steps shares its decision, so all ranks stop (and save) at the same step."""
+
+    def __init__(self, config, device: torch.device) -> None:
+        self.margin_s = config.training.stop_before_walltime_s
+        self.interval = config.training.stop_check_interval
+        self.device = device
+        self.recent_step_s: list[float] = []
+        self.job_end_time = None
+        if self.margin_s is None:
+            return
+        if self.interval < 1:
+            raise ValueError("training.stop_check_interval must be >= 1")
+        checkpointer = config.checkpointer
+        if checkpointer is None or checkpointer.last_save_model_only:
+            raise ValueError(
+                "training.stop_before_walltime_s needs a checkpointer with "
+                "last_save_model_only=False (the stop saves the full state)"
+            )
+        if torch.distributed.get_rank() == 0:
+            self.job_end_time = slurm_job_end_time()
+            if self.job_end_time is None:
+                logger.warning("stop_before_walltime_s: not a SLURM job, no stop")
+
+    def record_step(self, seconds: float) -> None:
+        self.recent_step_s = [*self.recent_step_s[-(self.interval - 1) :], seconds]
+
+    def should_stop(self, num_steps_this_process: int) -> bool:
+        # Same steps on every rank: the step count and the window fill are global.
+        if (
+            self.margin_s is None
+            or not self.recent_step_s
+            or num_steps_this_process % self.interval != 0
+        ):
+            return False
+        stop = self.job_end_time is not None and (
+            self.job_end_time - time.time()
+            < self.interval * max(self.recent_step_s) + self.margin_s
+        )
+        flag = torch.tensor([float(stop)], device=self.device)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        return bool(flag.item())
 
 
 class Trainer(Configurable):
@@ -697,12 +745,14 @@ class Trainer(Configurable):
 
         logger.info(f"Training starts at step {engine.num_completed_steps + 1}")
 
+        walltime_stop = _WalltimeStop(config, engine.device)
         engine.start_profiler()
         try:
             data_iterator = self.microbatch_generator(self.dataloader)
             while self.should_continue_training():
                 current_step = engine.num_completed_steps + 1
                 sl.set_step(current_step, relative_step=current_step - loaded_step)
+                step_start = time.monotonic()
 
                 with sl.log_trace_span("step"):
                     try:
@@ -711,9 +761,19 @@ class Trainer(Configurable):
                         logger.warning("Ran out of data; last step was canceled.")
                         break
 
+                    stop = walltime_stop.should_stop(
+                        engine.num_completed_steps - loaded_step
+                    )
                     engine.save_checkpoint(
                         last_step=(engine.num_completed_steps == config.training.steps)
+                        or stop
                     )
+                    if stop:
+                        logger.warning(
+                            f"Stopping after step {engine.num_completed_steps} before the "
+                            "walltime; its checkpoint is saved"
+                        )
+                        break
 
                     if config.validator is not None and self.validator.should_validate(
                         engine.num_completed_steps,
@@ -739,6 +799,9 @@ class Trainer(Configurable):
                             ),
                             parallelism_context=engine.parallelism_context,
                         )
+                # The first step of a process (compile, warmup) is not a step time.
+                if engine.num_completed_steps - loaded_step > 1:
+                    walltime_stop.record_step(time.monotonic() - step_start)
         finally:
             # The entry point also calls close() for checkpoint and graph
             # cleanup; close the profiler here so direct train() callers get

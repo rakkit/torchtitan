@@ -60,6 +60,15 @@ class TrainingConfig:
     steps: int = 10000
     """How many train steps to run"""
 
+    stop_before_walltime_s: float | None = None
+    """Under SLURM, stop in time to save: every ``stop_check_interval`` steps, when the
+    job's remaining time is below that many of the longest recent step plus this margin
+    (the checkpoint save and shutdown), save a full checkpoint now and stop. All ranks
+    agree through one all-reduce, so they stop at the same step. None: off."""
+
+    stop_check_interval: int = 10
+    """Steps between ``stop_before_walltime_s`` checks (each costs one host sync)."""
+
     disable_accelerator_graphs: bool = False
     """
     Disable accelerator graph capture and replay for the forward and backward

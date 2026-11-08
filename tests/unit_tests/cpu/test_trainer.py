@@ -1707,3 +1707,55 @@ def test_pp_gradient_accumulation_finalization_policy(
         call.kwargs["finalize_gradients"] for call in pp_forward_backward.call_args_list
     ] == expected_finalize_gradients
     assert loss_metrics == [[{}], [{}]]
+
+
+def test_walltime_stop_saves_in_time_on_every_rank_together() -> None:
+    """training.stop_before_walltime_s: stops when the remaining time drops below
+    interval x the longest recent step + the margin, only on check steps (the all-reduce
+    every rank joins); refuses a model-only final save (not resumable)."""
+    import os
+    import socket
+    import time
+
+    import torch.distributed as dist
+
+    from torchtitan.trainer import _WalltimeStop
+
+    def config(**checkpointer):
+        return SimpleNamespace(
+            training=SimpleNamespace(
+                stop_before_walltime_s=100.0, stop_check_interval=2
+            ),
+            checkpointer=SimpleNamespace(last_save_model_only=False, **checkpointer),
+        )
+
+    created = not dist.is_initialized()
+    if created:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(port)
+        dist.init_process_group("gloo", rank=0, world_size=1)
+    try:
+        with patch(
+            "torchtitan.trainer.slurm_job_end_time", return_value=time.time() + 1000
+        ):
+            stop = _WalltimeStop(config(), torch.device("cpu"))
+        assert not stop.should_stop(2)  # no step time yet
+        stop.record_step(50.0)
+        stop.record_step(20.0)
+        assert not stop.should_stop(2)  # 1000 s left >= 2 x 50 + 100
+        stop.job_end_time = time.time() + 150
+        assert not stop.should_stop(3)  # not a check step
+        assert stop.should_stop(4)  # 150 s left < 2 x 50 + 100
+        stop.record_step(10.0)
+        stop.record_step(10.0)  # the 50 s step left the window
+        assert not stop.should_stop(6)  # 150 s left >= 2 x 10 + 100
+        with pytest.raises(ValueError, match="last_save_model_only=False"):
+            bad = config()
+            bad.checkpointer.last_save_model_only = True
+            _WalltimeStop(bad, torch.device("cpu"))
+    finally:
+        if created:
+            dist.destroy_process_group()

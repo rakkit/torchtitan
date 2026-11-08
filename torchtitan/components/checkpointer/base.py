@@ -644,8 +644,10 @@ class BaseCheckpointManager(Configurable, ABC):
         initial_load_in_hf_quantized: bool = False
         """Whether the initial Hugging Face checkpoint uses quantized keys."""
 
-        last_save_model_only: bool = True
-        """Whether the final checkpoint contains only model state."""
+        last_save_model_only: bool = False
+        """Whether the final checkpoint contains only model state. False (ours; upstream
+        True): the final save holds the full training state, so a run stopped there,
+        e.g. before the walltime, resumes."""
 
         last_save_in_hf: bool = False
         """Whether the final model-only checkpoint uses Hugging Face safetensors."""

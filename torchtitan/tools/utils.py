@@ -296,3 +296,23 @@ def set_default_dtype(dtype: torch.dtype) -> Generator[None, None, None]:
         yield
     finally:
         torch.set_default_dtype(old_dtype)
+
+
+def slurm_job_end_time() -> float | None:
+    """The SLURM job's end time in epoch seconds; None outside SLURM."""
+    if end := os.environ.get("SLURM_JOB_END_TIME"):
+        return float(end)
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if job_id is None:
+        return None
+    end = subprocess.run(
+        ["squeue", "-h", "-j", job_id, "-o", "%e"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    ).stdout.strip()
+    # squeue prints the cluster's local time, the clock time.time() reads
+    import datetime
+
+    return datetime.datetime.fromisoformat(end).timestamp()

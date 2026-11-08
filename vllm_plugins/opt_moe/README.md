@@ -20,12 +20,12 @@ architecture the folder's `config.json` names.
 Per decoder layer, two caches:
 
 ```
-x -> RMSNorm -> qkv_proj -> [q|k|v] -> x + conv(x)   <- conv state: the last W - 1 raw
-                                     on k and v         k / v of each sequence
+x -> RMSNorm -> qkv_proj -> [q|gate|k|v] -> x + conv(x)   <- conv state: the last W - 1 raw
+                                          on k and v         k / v of each sequence
                             -> qk-norm -> RoPE (none on NoPE layers, partial RoPE)
                             -> Attention              <- KV cache (sinks, per-layer
                                                         sliding window)
-                            -> * sigmoid(gate_proj(x)) -> o_proj -> residual
+                            -> * sigmoid(gate) -> o_proj -> residual
   -> RMSNorm -> SwiGLU FFN (first layers) or sigmoid MoE (+ score-correction
      bias for the choice, renormalized top-k, scaling, shared expert) -> residual
 ```
@@ -146,6 +146,13 @@ width 640, gate):
 
 The k / v conv with the fused prologue costs ~1% of decode and ~3-4% of long
 prefill.
+
+The element-wise gate's rows ride in `qkv_proj` (one GEMM; per TP rank
+`[q | gate | k | v]`). Gate vs sinks (44 layers, q 32, 256 experts top 8 of
+width 512, k / v conv, block FP8 TP 1, 3 alternated runs): decode B 1 238 vs 247
+(-3%), B 16 1,801 vs 1,824 (-1%), B 256 10,898 vs 11,094 (-2%), 32k prompts B 1
+229 vs 235; prefill 70k vs 75k tok/s at 1k (-7%). With a separate gate GEMM
+decode B 1 was 218.
 
 Two candidate shapes (k / v conv, gate): 40 layers, 256 experts top 8 of
 width 512 (l40-k8-f512) is faster than 48 layers of width 384 (l48-k8-f384) in

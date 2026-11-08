@@ -86,6 +86,11 @@ class VLLMCanonShortConv(CanonShortConv, MambaBase):
         # vLLM populates this via the KV-cache allocator: (conv_state,).
         self.kv_cache = (torch.tensor([]),)
         self.prefix = f"model.layers.{config.layer_idx}.attention.short_conv"
+        # The layer reaches its vLLM state through a custom op keyed by this CPU tensor, not by the prefix string: a
+        # per-block compile guards string values (one graph per layer) but only the dtype / shape of tensors.
+        self.layer_idx_cpu = torch.tensor(
+            config.layer_idx, dtype=torch.int64, device="cpu"
+        )
         compilation_config = vllm_config.compilation_config
         if self.prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate short conv layer name: {self.prefix}")
@@ -118,7 +123,9 @@ class VLLMCanonShortConv(CanonShortConv, MambaBase):
         if conv_metadata is not None:
             raise ValueError("vLLM manages the sequences; no conv metadata expected")
         out_TC = x_TC.clone()  # rows no sequence owns pass through (graph replays)
-        self._forward(x_TC, weight_C1W.squeeze(1).to(x_TC.dtype), out_TC)
+        torch.ops.torchtitan_rl.canon_short_conv(
+            x_TC, weight_C1W.squeeze(1).to(x_TC.dtype), out_TC, self.layer_idx_cpu
+        )
         return out_TC
 
     @eager_break_during_capture
@@ -164,6 +171,25 @@ class VLLMCanonShortConv(CanonShortConv, MambaBase):
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
         ).squeeze(0)
+
+
+@torch.library.custom_op("torchtitan_rl::canon_short_conv", mutates_args=("out_TC",))
+def _canon_short_conv(
+    x_TC: torch.Tensor,
+    weight_CW: torch.Tensor,
+    out_TC: torch.Tensor,
+    layer_idx: torch.Tensor,
+) -> None:
+    """The conv of layer ``layer_idx`` (a CPU scalar): opaque to dynamo, eager under CUDA graph capture."""
+    layer = get_forward_context().no_compile_layers[
+        f"model.layers.{int(layer_idx)}.attention.short_conv"
+    ]
+    layer._forward(x_TC, weight_CW, out_TC)
+
+
+@_canon_short_conv.register_fake
+def _(x_TC, weight_CW, out_TC, layer_idx) -> None:
+    return None
 
 
 def _short_conv_shape(attention_cfg: GatedSWAttention.Config) -> tuple[int, int]:

@@ -259,3 +259,24 @@ def test_microbatch_moves_loss_kwargs_with_the_model_inputs() -> None:
     }
     for value in input_dict["loss_kwargs"].values():
         assert value.device.type == "meta"
+
+
+def test_microbatch_packs_routing_replay_per_input_token() -> None:
+    batcher = Batcher.Config().build(
+        num_tokens_per_microbatch_per_dp_rank=8,
+        max_context_length=8,
+        num_prompts_per_train_step=1,
+        dp_degree=1,
+        pad_id=0,
+        temperature=1.0,
+    )
+    samples = _make_samples([3, 2])
+    for index, sample in enumerate(samples):
+        # one row per input token (token_ids[:-1]); 2 layers x top 2
+        num_inputs = len(sample.token_ids) - 1
+        sample.routed_experts = np.full((num_inputs, 2, 2), 10 + index, dtype=np.uint8)
+    microbatch = batcher._pack_training_samples(samples)
+
+    routed = microbatch.as_input_dict()["routed_experts"]
+    assert routed.shape == (8, 2, 2) and routed.dtype == torch.int16
+    assert routed[:, 0, 0].tolist() == [10, 10, 10, 11, 11, -1, -1, -1]

@@ -7,13 +7,14 @@
 """Model config helpers shared by the RL recipes."""
 
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any, cast, Literal
 
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import (
     FreezeMoERoutingTransform,
     LMHeadFP32OutputConverter,
     ModelConfigTransform,
+    RoutingReplayTransform,
     transform_model_config_,
 )
 from torchtitan.models.common.decoder import Decoder
@@ -29,6 +30,7 @@ def build_rl_model_configs(
     fp32_lm_head: bool = True,
     # TODO: consider enabling router training, but with a lower lr
     freeze_moe_routing: bool = True,
+    routing_replay: Literal["off", "measure", "replay"] = "off",
     **kwargs: Any,
 ) -> tuple[Decoder.Config, Decoder.Config]:
     """Build the ``(trainer, generator)`` model configs of an RL recipe.
@@ -42,6 +44,9 @@ def build_rl_model_configs(
         freeze_moe_routing  frozen router gate and expert bias, no aux loss
                             (FreezeMoERoutingTransform), so trainer and generator
                             expert choices don't drift apart
+    Optional: routing_replay "measure" | "replay" (RoutingReplayTransform): the
+    generator records each token's experts; the trainer counts how often its
+    router agrees, and with "replay" routes the generator's experts (R3).
     Per-role transforms go through ``apply_transforms(config.generator, ...)``.
     """
     if fp32_lm_head:
@@ -58,6 +63,8 @@ def build_rl_model_configs(
     transforms: list[ModelConfigTransform] = []
     if freeze_moe_routing:
         transforms.append(FreezeMoERoutingTransform())
+    if routing_replay != "off":
+        transforms.append(RoutingReplayTransform(routing_replay))
     # A transform may return a new root (e.g. LoRA), so keep what it returns.
     trainer_model, generator_model = (
         cast(Decoder.Config, transform_model_config_(model_config, transforms))

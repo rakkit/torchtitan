@@ -57,6 +57,9 @@ class TrainingSample:
     """[L] generator logprobs; 0.0 where loss_mask is False."""
     advantage: np.ndarray  # float32
     """[L] advantage on assistant tokens, 0.0 elsewhere."""
+    routed_experts: np.ndarray | None = None
+    """Routing replay: [L - 1, num_layers, top_k] the generator's experts of each
+    token as an input (the last token is never one); None: off."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,16 +94,28 @@ class _SampleInProgress:
     loss_mask: list[np.ndarray] = field(default_factory=list)
     logprobs: list[np.ndarray] = field(default_factory=list)
     advantage: list[np.ndarray] = field(default_factory=list)
+    routed_experts: list[np.ndarray] | None = field(default_factory=list)
+    """None once a turn has no routing (routing replay off)."""
 
     def to_training_sample(self) -> TrainingSample:
+        token_ids = np.concatenate(self.token_ids, dtype=np.int64)
+        routed_experts = None
+        if self.routed_experts:
+            routed_experts = np.concatenate(self.routed_experts)
+            if len(routed_experts) != len(token_ids) - 1:
+                raise ValueError(
+                    f"{self.rollout_id.to_string()}: routing of {len(routed_experts)} "
+                    f"tokens for {len(token_ids)} tokens (expected one fewer)"
+                )
         return TrainingSample(
             rollout_id=self.rollout_id,
             min_policy_version=self.min_policy_version,
             max_policy_version=self.max_policy_version,
-            token_ids=np.concatenate(self.token_ids, dtype=np.int64),
+            token_ids=token_ids,
             loss_mask=np.concatenate(self.loss_mask),
             logprobs=np.concatenate(self.logprobs, dtype=np.float32),
             advantage=np.concatenate(self.advantage),
+            routed_experts=routed_experts,
         )
 
 
@@ -376,6 +391,23 @@ class TrainingSampleBuilder(Configurable):
             # Append this turn's chunks: prompt delta (untrained) + completion (trained).
             num_delta = len(prompt_delta)
             num_completion = len(rollout_turn.completion_token_ids)
+            # Routing replay: this turn's request routed tokens [0, end - 1); the sample
+            # has [0, start) from earlier turns (start = 0 for a new sample, else the
+            # previous turn's end - 1: its last completion token is routed here).
+            if rollout_turn.routed_experts is None:
+                sample_in_progress.routed_experts = None
+            elif sample_in_progress.routed_experts is not None:
+                end = rollout_turn.num_prompt_tokens + num_completion
+                if len(rollout_turn.routed_experts) != end - 1:
+                    raise ValueError(
+                        f"rollout {rollout.group_id}/rollout={rollout.rollout_id}: turn "
+                        f"{turn_idx} has routing of {len(rollout_turn.routed_experts)} "
+                        f"tokens for {end} tokens (expected one fewer)"
+                    )
+                start = 0 if not sample_in_progress.token_ids else prompt_prefix_len - 1
+                sample_in_progress.routed_experts.append(
+                    rollout_turn.routed_experts[start : end - 1]
+                )
             sample_in_progress.token_ids += [
                 prompt_delta,
                 rollout_turn.completion_token_ids,

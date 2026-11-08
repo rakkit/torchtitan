@@ -43,6 +43,7 @@ from torchtitan.rl.generator.vllm.registry import (
     TORCHTITAN_WORKER_CLS,
     vllm_attention_backend,
 )
+from torchtitan.rl.generator.vllm.routing_replay import records_routed_experts
 from torchtitan.rl.generator.vllm.session_kv_holder import VLLMSessionKVHolder
 from torchtitan.rl.generator.vllm.stat_logger import (
     StatLoggerContext,
@@ -267,6 +268,9 @@ class VLLMEngine(GenerationEngine):
             skip_tokenizer_init=True,
         )
         engine_kwargs["max_model_len"] = model.max_context_length
+        if records_routed_experts(model):
+            # Routing replay: return each request's experts per token and layer.
+            engine_kwargs["enable_return_routed_experts"] = True
         # Return logprobs of the distribution vLLM samples from (after temperature). vLLM's default
         # returns the raw model's logprobs, before temperature.
         engine_kwargs["logprobs_mode"] = "processed_logprobs"
@@ -501,6 +505,7 @@ def _finished_request(request_output: RequestOutput) -> FinishedRequest:
         token_logprobs=list(completion_output.logprobs.logprobs),
         finish_reason=completion_output.finish_reason,
         metrics_inputs=_extract_request_metrics_inputs(request_output),
+        routed_experts=completion_output.routed_experts,
     )
 
 

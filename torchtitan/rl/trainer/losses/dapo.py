@@ -195,6 +195,16 @@ class DAPOLoss(Loss[torch.Tensor]):
                     global_loss_token_counts,
                 ),
                 "bit_wise/logprob_diff/max": diff_for_metrics.abs().max(),
+                # k3 = r - 1 - log r (as expm1: exact at r ~ 1), r = p_trainer / q_generator: per token >= 0, an
+                # unbiased estimate of KL(q || p) over the sampled tokens (k1 above can
+                # average to ~0 while the engines disagree).
+                "bit_wise/kl_k3/mean": _normalize(
+                    (
+                        (torch.special.expm1(log_ratio) - log_ratio).float()
+                        * effective_loss_mask
+                    ).sum(),
+                    global_loss_token_counts,
+                ),
                 "loss/mismatch_masked_frac": _normalize(
                     (effective_loss_mask & ~gradient_mask).float().sum(),
                     global_loss_token_counts,

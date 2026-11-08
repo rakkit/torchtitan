@@ -202,6 +202,32 @@ def test_rewrite_that_keeps_a_prefix_branches_then_continues() -> None:
     assert (second.min_policy_version, second.max_policy_version) == (1, 2)
 
 
+def test_routing_replay_takes_each_token_from_the_request_that_forwarded_it() -> None:
+    # As above; turn t's request routes its tokens 0 .. end - 2 (the last sampled token is
+    # never forwarded), recorded as 100 * t + position. A new sample takes its first turn's
+    # routing from 0; a continuing turn from the previous turn's end - 1, the previous
+    # completion's last token, which this turn's prefill forwarded.
+    rollout = _scored_rollout(
+        [
+            _turn(prompt_token_ids=[1, 2], completion_token_ids=[4], version=1),
+            _turn(prompt_token_ids=[1, 2, 7], completion_token_ids=[5], version=1),
+            _turn(
+                prompt_token_ids=[1, 2, 7, 5, 9], completion_token_ids=[6], version=2
+            ),
+        ],
+        reward=0.5,
+        advantage=0.1,
+    )
+    for t, rollout_turn in enumerate(rollout.turns):
+        end = rollout_turn.num_prompt_tokens + len(rollout_turn.completion_token_ids)
+        rollout_turn.routed_experts = (100 * t + np.arange(end - 1)).astype(np.uint8)[
+            :, None, None
+        ]
+    first, second = rollout_to_training_samples(rollout)
+    assert first.routed_experts[:, 0, 0].tolist() == [0, 1]
+    assert second.routed_experts[:, 0, 0].tolist() == [100, 101, 102, 203, 204]
+
+
 @pytest.mark.parametrize(
     "prompt_prefix_len, prompt_delta_token_ids",
     [

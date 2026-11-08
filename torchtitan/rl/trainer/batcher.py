@@ -845,6 +845,17 @@ class Batcher(Configurable):
         def pad(key: str, num_tokens: int) -> np.ndarray:
             return np.full(num_tokens, pad_values[key], dtype=_DTYPES[key])
 
+        # Routing replay: [T, num_layers, top_k] generator experts per input token,
+        # -1 on padding (the trainer's router keeps its own choice there).
+        replays = {sample.routed_experts is not None for sample in training_samples}
+        if len(replays) > 1:
+            raise ValueError("routing replay: some samples carry routing, some do not")
+        routed_experts: list[np.ndarray] | None = [] if True in replays else None
+
+        def pad_routing(num_tokens: int) -> np.ndarray:
+            _, num_layers, top_k = training_samples[0].routed_experts.shape
+            return np.full((num_tokens, num_layers, top_k), -1, dtype=np.int16)
+
         # Shift labels/logits and pad to per_sample_pad_multiple.
         for training_sample in training_samples:
             sample = {
@@ -865,6 +876,11 @@ class Batcher(Configurable):
             # extend row
             for key in keys:
                 packed_fields[key] += [sample[key], pad(key, sample_len - unpadded_len)]
+            if routed_experts is not None:
+                routed_experts += [
+                    training_sample.routed_experts.astype(np.int16),
+                    pad_routing(sample_len - unpadded_len),
+                ]
             positions.append(np.arange(sample_len, dtype=np.int64))
             padding_mask.append(np.arange(sample_len) >= unpadded_len)
 
@@ -874,6 +890,8 @@ class Batcher(Configurable):
         if pad_len > 0:
             for key in keys:
                 packed_fields[key].append(pad(key, pad_len))
+            if routed_experts is not None:
+                routed_experts.append(pad_routing(pad_len))
             positions.append(np.arange(pad_len, dtype=np.int64) % self.seq_len)
             padding_mask.append(np.ones(pad_len, dtype=bool))
 
@@ -906,6 +924,13 @@ class Batcher(Configurable):
             padding_mask=padding_mask_tensor,
             loss_token_counts=loss_token_counts,
             routing_token_counts=routing_token_counts,
+            model_kwargs=(
+                {}
+                if routed_experts is None
+                else {
+                    "routed_experts": torch.from_numpy(np.concatenate(routed_experts))
+                }
+            ),
         )
 
     def _padding_fraction(

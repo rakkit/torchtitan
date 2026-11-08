@@ -145,7 +145,7 @@ def test_forward_backward_uses_global_token_count() -> None:
         device=torch.device("cpu"),
         num_completed_steps=0,
         garbage_collector=SimpleNamespace(run=MagicMock()),
-        optim=SimpleNamespace(zero_grad=MagicMock()),
+        optim=SimpleNamespace(zero_grad=MagicMock(), optimizers=None),
         config=SimpleNamespace(
             training=SimpleNamespace(
                 disable_accelerator_graphs=True,
@@ -237,6 +237,8 @@ def test_forward_backward_accumulates_microbatch_metrics(rdma: bool) -> None:
             model_config=SimpleNamespace(mtp_layers=None),
             device=torch.device("cpu"),
             pp_has_last_stage=True,
+            model_parts=[],
+            optim=SimpleNamespace(optimizers=None),
         )
         engine.forward_backward = MagicMock(
             return_value=ForwardBackwardResult(
@@ -338,7 +340,9 @@ def test_forward_backward_rejects_a_misplaced_rdma_microbatch(
     batch_index: int, dp_rank: int, microbatch_index: int
 ) -> None:
     trainer = object.__new__(Trainer)
-    trainer.engine = SimpleNamespace(num_completed_steps=0)
+    trainer.engine = SimpleNamespace(
+        num_completed_steps=0, model_parts=[], optim=SimpleNamespace(optimizers=None)
+    )
     trainer.config = Trainer.Config(model=MagicMock())
     trainer.dp_rank = 1
     trainer._num_rdma_batches_read = 0
@@ -376,7 +380,12 @@ def _rl_microbatch(token: int) -> TrainingMicrobatch:
 def test_forward_backward_without_last_pipeline_stage_returns_no_metrics() -> None:
     async def run() -> None:
         trainer = object.__new__(Trainer)
-        engine = SimpleNamespace(num_completed_steps=0, pp_has_last_stage=False)
+        engine = SimpleNamespace(
+            num_completed_steps=0,
+            pp_has_last_stage=False,
+            model_parts=[],
+            optim=SimpleNamespace(optimizers=None),
+        )
         engine.forward_backward = MagicMock(
             return_value=ForwardBackwardResult(
                 loss=torch.tensor(-1.0), loss_metrics=[[{}, {}], [{}, {}]], num_flops=0
@@ -427,11 +436,12 @@ def test_optim_step_advances_profiler_and_reports_aux_loss_metrics() -> None:
         )
         engine = SimpleNamespace(
             optim=SimpleNamespace(
+                optimizers=None,
                 lr_schedulers=SimpleNamespace(
                     get_metrics=MagicMock(
                         return_value={"lr/AdamW/0": 0.25, "lr/AdamW/1": 0.125}
                     )
-                )
+                ),
             ),
             parallelism_context=SimpleNamespace(
                 non_data_parallel_size=1,

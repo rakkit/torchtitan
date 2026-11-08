@@ -24,9 +24,11 @@ from torchtitan.config.validation import validate_model_training_config
 from torchtitan.distributed import maybe_apply_numa_binding, utils as dist_utils
 from torchtitan.models.base.model import BaseModel
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
+from torchtitan.models.common.moe import TokenChoiceTopKRouter
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.observability.metrics import compute_training_performance_metrics
+from torchtitan.optimizers.container import DiSCOOptimizersContainer
 from torchtitan.rl.controller.metrics import combine_microbatch_metrics
 from torchtitan.rl.trainer.batcher import TrainingMicrobatch
 from torchtitan.rl.trainer.rdma_microbatch import (
@@ -250,6 +252,30 @@ class Trainer(Configurable):
         )
         return out
 
+    def _disco_optimizers(self) -> DiSCOOptimizersContainer | None:
+        """The engine's optimizer container if it is DiSCO's (AdamW runs have upstream's)."""
+        optimizers = self.engine.optim.optimizers
+        return optimizers if isinstance(optimizers, DiSCOOptimizersContainer) else None
+
+    def _take_routing_replay_stats(self) -> tuple[torch.Tensor, int] | None:
+        """Sum and reset the routers' routing replay counts (see
+        ``TokenChoiceTopKRouter``): ``([replayed, same expert set, shared experts],
+        top_k)``; None without routing replay."""
+        routers = [
+            module
+            for part in self.engine.model_parts
+            for module in part.modules()
+            if isinstance(module, TokenChoiceTopKRouter)
+            and module.routing_replay != "off"
+        ]
+        if not routers:
+            return None
+        with torch.no_grad():
+            stats_3 = torch.stack([r.routing_replay_stats_3 for r in routers]).sum(0)
+            for router in routers:
+                router.routing_replay_stats_3.zero_()
+        return stats_3, routers[0].top_k
+
     @sl.log_trace_span("forward_backward")
     async def forward_backward(
         self,
@@ -287,6 +313,12 @@ class Trainer(Configurable):
         )
         engine = self.engine
         self._step_compute_start = time.perf_counter()
+        disco = self._disco_optimizers()
+        if disco is not None:
+            # DiSCO computes its metrics inside step(): arm every RL step (~1e2 steps).
+            disco.begin_step(
+                engine.num_completed_steps + 1, should_log=True, is_final_step=False
+            )
         microbatches = [
             microbatch for group in microbatch_groups for microbatch in group
         ]
@@ -322,6 +354,7 @@ class Trainer(Configurable):
             global_routing_token_counts=global_routing_token_counts,
         )
         self._num_flops = result.num_flops
+        routing_replay_3 = self._take_routing_replay_stats()
         if not engine.pp_has_last_stage:
             return None
         microbatch_metrics: list[dict[str, float]] = []
@@ -343,6 +376,18 @@ class Trainer(Configurable):
                 )
 
         metrics = combine_microbatch_metrics(microbatch_metrics)
+        if routing_replay_3 is not None:
+            # Over (token, MoE layer) pairs; under PP the last stage's layers only.
+            stats_3, top_k = routing_replay_3
+            totals = self._reduce_forward_backward_metrics(
+                sum_reduced_metrics={str(i): stats_3[i] for i in range(3)},
+                max_reduced_metrics={},
+            )
+            num_routed = max(totals["0"], 1.0)
+            metrics["routing_replay/same_experts_frac"] = totals["1"] / num_routed
+            metrics["routing_replay/expert_overlap_frac"] = totals["2"] / (
+                num_routed * top_k
+            )
         if uses_rdma:
             # The slowest rank's total read time this step, hidden or not (max over the loss mesh).
             read_microbatches_s = torch.tensor(
@@ -372,6 +417,19 @@ class Trainer(Configurable):
         lr_metrics = engine.optim.lr_schedulers.get_metrics()
 
         grad_norm = engine.optim_step()
+        disco = self._disco_optimizers()
+        disco_metrics = (
+            {}
+            if disco is None
+            else {
+                f"trainer/{key}": float(value)
+                for key, value in disco.collect_metrics(
+                    engine.num_completed_steps
+                ).items()
+                if isinstance(value, (int, float))
+                or (isinstance(value, torch.Tensor) and value.numel() == 1)
+            }
+        )
         self._mark_model_state_dict_ready_for_push()
         self._resume_state.value = resume_state
 
@@ -413,6 +471,7 @@ class Trainer(Configurable):
             policy_version=self.policy_version,
             metrics={
                 "trainer/grad_norm/mean": float(grad_norm.item()),
+                **disco_metrics,
                 **{f"trainer/{key}": value for key, value in lr_metrics.items()},
                 "trainer/policy_version": float(self.policy_version),
                 "trainer/tokens_per_second": performance["tokens_per_second"],

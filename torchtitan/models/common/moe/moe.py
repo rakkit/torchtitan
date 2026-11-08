@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import cast, Protocol
+from typing import cast, Literal, Protocol
 
 import spmd_types as spmd
 
@@ -203,6 +203,11 @@ class TokenChoiceTopKRouter(Module):
         freeze_gate: bool = False
         """Keep ``gate.weight`` (and ``gate.bias``, if any) at their loaded values: no gradient,
         no optimizer state. The gate's input still gets gradients."""
+        routing_replay: Literal["off", "measure", "replay"] = "off"
+        """RL routing replay (R3, https://arxiv.org/abs/2510.11370). Not "off": the RL
+        generator records each token's experts and the trainer passes them as
+        ``routed_experts_TK``; "measure" counts how often they agree with this router's
+        choice, "replay" also routes them."""
 
     def __init__(self, config: Config):
         super().__init__()
@@ -215,11 +220,19 @@ class TokenChoiceTopKRouter(Module):
         self.route_norm = config.route_norm
         self.route_norm_epsilon = config.route_norm_epsilon
         self.route_scale = config.route_scale
+        self.routing_replay = config.routing_replay
         self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
         # tokens_per_expert_E will be used to track expert usage and to update the expert bias for load balancing
         self.register_buffer(
             "tokens_per_expert_E",
             torch.zeros(config.num_experts, dtype=torch.float32),
+            persistent=False,
+        )
+        # Routing replay (R3): [replayed tokens, tokens whose replayed expert set is the
+        # one this router picks, replayed experts this router also picks]; see forward.
+        self.register_buffer(
+            "routing_replay_stats_3",
+            torch.zeros(3, dtype=torch.float32),
             persistent=False,
         )
 
@@ -231,6 +244,9 @@ class TokenChoiceTopKRouter(Module):
             self.num_experts,
             dtype=torch.float32,
             device=buffer_device,
+        )
+        self.routing_replay_stats_3 = torch.zeros(
+            3, dtype=torch.float32, device=buffer_device
         )
 
     def _select_experts(
@@ -246,6 +262,46 @@ class TokenChoiceTopKRouter(Module):
             scores_for_choice_TE, k=self.top_k, dim=-1, sorted=False
         ).indices
 
+    def _replay_routing(
+        self,
+        topk_expert_ids_TK: torch.Tensor,
+        routed_experts_TK: torch.Tensor,
+        padding_mask_T: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """With "replay", the replayed experts where the generator routed the token
+        and this router's elsewhere; counts how often the two agree
+        (``routing_replay_stats_3``) in both modes."""
+        replay_TK = routed_experts_TK.to(topk_expert_ids_TK.dtype)
+        replayed_T = replay_TK[:, 0] >= 0
+        if not remat.is_recomputing():
+            with torch.no_grad():
+                counted_T = (
+                    replayed_T
+                    if padding_mask_T is None
+                    else replayed_T & ~padding_mask_T
+                )
+                same_set_T = (
+                    topk_expert_ids_TK.sort(dim=-1).values
+                    == replay_TK.sort(dim=-1).values
+                ).all(dim=-1)
+                shared_T = (
+                    (topk_expert_ids_TK.unsqueeze(-1) == replay_TK.unsqueeze(-2))
+                    .any(dim=-1)
+                    .sum(dim=-1)
+                )
+                self.routing_replay_stats_3.add_(
+                    torch.stack(
+                        [
+                            counted_T.sum(),
+                            (same_set_T & counted_T).sum(),
+                            (shared_T * counted_T).sum(),
+                        ]
+                    ).float()
+                )
+        if self.routing_replay == "measure":
+            return topk_expert_ids_TK
+        return torch.where(replayed_T.unsqueeze(-1), replay_TK, topk_expert_ids_TK)
+
     def forward(
         self,
         x_TD: torch.Tensor,
@@ -253,6 +309,7 @@ class TokenChoiceTopKRouter(Module):
         *,
         padding_mask_T: torch.Tensor | None = None,
         aux_loss_denominator: torch.Tensor | None = None,
+        routed_experts_TK: torch.Tensor | None = None,
         **router_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -260,6 +317,10 @@ class TokenChoiceTopKRouter(Module):
             x_TD: Input ``(T, D)``.
             expert_bias_E: Optional load-balancing bias ``(E,)``.
             padding_mask_T: Boolean ``(T,)`` mask that is true for padding.
+            routed_experts_TK: Routing replay (R3, https://arxiv.org/abs/2510.11370):
+                the experts the RL generator picked per token ``(T, K)``, ``-1`` where
+                it routed nothing (this router's choice is kept there). The routing
+                scores are still this router's, gathered at the replayed experts.
 
         Returns:
             topk_scores_TK: Routing scores ``(T, K)``.
@@ -295,6 +356,14 @@ class TokenChoiceTopKRouter(Module):
             padding_mask_T=padding_mask_T,
             **router_kwargs,
         )
+        if routed_experts_TK is not None:
+            if self.routing_replay == "off":
+                raise ValueError("routed_experts_TK given, but routing_replay is off")
+            # The replay merge reads the saved routing decision with bare ops.
+            remat.recompute_needs_tensor(topk_expert_ids_TK)
+            topk_expert_ids_TK = self._replay_routing(
+                topk_expert_ids_TK, routed_experts_TK, padding_mask_T
+            )
         remat.recompute_needs_tensor(topk_expert_ids_TK)
         # The expert bias is only used for routing. The gating value is
         # still derived from the original scores.
@@ -797,12 +866,14 @@ class MoE(FeedForward):
         *,
         padding_mask_T: torch.Tensor | None = None,
         aux_loss_denominator: torch.Tensor | None = None,
+        routed_experts_TK: torch.Tensor | None = None,
         **router_kwargs,
     ) -> torch.Tensor:
         """
         Args:
             x_TD: Input ``(T, D)``.
             padding_mask_T: Boolean ``(T,)`` mask that is true for padding.
+            routed_experts_TK: Routing replay ``(T, K)``; see ``TokenChoiceTopKRouter``.
 
         Returns:
             Output ``(T, D)``.
@@ -816,6 +887,10 @@ class MoE(FeedForward):
             routed_x_TD,
             routed_padding_mask_T,
         ) = self._maybe_shard_routed_branch_inputs_across_tp(x_TD, padding_mask_T)
+        if routed_experts_TK is not None:
+            router_kwargs[
+                "routed_experts_TK"
+            ] = self._maybe_shard_routed_experts_across_tp(routed_experts_TK)
 
         # topk scores and expert IDs have shape (T, K); the routing map (T, E)
         # marks the experts each token is routed to (built inside the router).
@@ -912,6 +987,24 @@ class MoE(FeedForward):
                 backward_options={"op_dtype": padding_mask_T.dtype},
             )
         return x_TD, padding_mask_T
+
+    def _maybe_shard_routed_experts_across_tp(
+        self, routed_experts_TK: torch.Tensor
+    ) -> torch.Tensor:
+        """Routing replay ids enter replicated across TP and follow the routed
+        tokens, as the padding mask."""
+        if spmd_sparse_mesh() is None:
+            return routed_experts_TK
+        tp_group = spmd_mesh_group(MeshAxisName.TP)
+        if tp_group is None:
+            return routed_experts_TK
+        return spmd.redistribute(
+            routed_experts_TK,
+            tp_group,
+            src=spmd.R,
+            dst=spmd.S(0),
+            backward_options={"op_dtype": routed_experts_TK.dtype},
+        )
 
     def _maybe_zero_fill_routed_output_to_tp_partial(
         self, routed_output_TD: torch.Tensor

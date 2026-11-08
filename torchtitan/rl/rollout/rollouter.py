@@ -512,6 +512,7 @@ class RolloutWorker(Configurable):
                         min_policy_version=completion.min_policy_version,
                         max_policy_version=completion.max_policy_version,
                         metrics=completion.metrics,
+                        routed_experts=completion.routed_experts,
                     )
                 )
 

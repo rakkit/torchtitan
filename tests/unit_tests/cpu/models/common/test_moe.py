@@ -192,6 +192,76 @@ class TestMoE(unittest.TestCase):
             torch.tensor([[0, 1], [2, 3], [0, 1], [2, 3]]),
         )
 
+    def test_router_replays_generator_experts(self):
+        """Routing replay (R3): replayed tokens use the given experts, gated by this
+        router's renormalized softmax at them; ``-1`` rows keep the router's top-k;
+        padding is left out of the agreement counts."""
+        torch.manual_seed(0)
+        router = TokenChoiceTopKRouter.Config(
+            num_experts=8,
+            gate=HiMidLoLinear.Config(in_features=4, out_features=8),
+            score_func=Softmax.Config(),
+            top_k=2,
+            route_norm=True,
+            routing_replay="replay",
+        ).build()
+        weight_ED = torch.randn(8, 4)
+        with torch.no_grad():
+            router.gate.weight.copy_(weight_ED)
+        router.routing_replay_stats_3.zero_()
+        x_TD = torch.randn(6, 4)
+        probs_TE = torch.softmax(x_TD @ weight_ED.T, dim=-1)
+        own_TK = probs_TE.topk(2, dim=-1).indices
+        replay_TK = torch.full((6, 2), -1, dtype=torch.int16)
+        replay_TK[0] = own_TK[0].flip(0)  # same set, other order
+        replay_TK[1] = torch.stack([own_TK[1, 0], (own_TK[1] + 1).max() % 8])
+        replay_TK[2] = torch.tensor(
+            [(own_TK[2] + 2).max() % 8, (own_TK[2] + 3).max() % 8]
+        )
+        replay_TK[3] = own_TK[3]  # padding: replayed, not counted
+        padding_mask_T = torch.tensor([False, False, False, True, False, False])
+
+        scores_TK, ids_TK, routing_map_TE = router(
+            x_TD.requires_grad_(),
+            padding_mask_T=padding_mask_T,
+            routed_experts_TK=replay_TK,
+        )
+
+        expected_ids_TK = torch.where(replay_TK[:, :1] >= 0, replay_TK.long(), own_TK)
+        torch.testing.assert_close(ids_TK, expected_ids_TK)
+        picked_TK = probs_TE.gather(-1, expected_ids_TK)
+        torch.testing.assert_close(
+            scores_TK, picked_TK / picked_TK.sum(-1, keepdim=True), rtol=1e-5, atol=1e-6
+        )
+        self.assertTrue(routing_map_TE.gather(-1, expected_ids_TK).all())
+        self.assertEqual(int(routing_map_TE.sum()), 12)
+        shared = [
+            len(set(own_TK[t].tolist()) & set(replay_TK[t].tolist())) for t in range(3)
+        ]
+        torch.testing.assert_close(
+            router.routing_replay_stats_3,
+            torch.tensor([3.0, float(sum(n == 2 for n in shared)), float(sum(shared))]),
+        )
+        # The gate's gradient flows through the replayed experts' scores.
+        coef_TK = torch.randn(6, 2)
+        (scores_TK * coef_TK).sum().backward()
+        ref_weight_ED = weight_ED.clone().requires_grad_()
+        ref_TK = torch.softmax(x_TD.detach() @ ref_weight_ED.T, dim=-1).gather(
+            -1, expected_ids_TK
+        )
+        ((ref_TK / ref_TK.sum(-1, keepdim=True)) * coef_TK).sum().backward()
+        torch.testing.assert_close(
+            router.gate.weight.grad, ref_weight_ED.grad, rtol=1e-4, atol=1e-6
+        )
+        # "measure" keeps this router's experts and counts the same agreement.
+        stats_3 = router.routing_replay_stats_3.clone()
+        router.routing_replay = "measure"
+        _, measured_ids_TK, _ = router(
+            x_TD.detach(), padding_mask_T=padding_mask_T, routed_experts_TK=replay_TK
+        )
+        torch.testing.assert_close(measured_ids_TK, own_TK)
+        torch.testing.assert_close(router.routing_replay_stats_3, 2 * stats_3)
+
     def test_routed_experts_use_configured_activation(self):
         """Routed experts build and execute their configured binary activation."""
         activation_fn = SiTUGLU.Config(beta=4.0, linear_beta=25.0)

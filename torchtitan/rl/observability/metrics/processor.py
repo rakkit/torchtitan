@@ -74,6 +74,10 @@ class MetricsProcessor(Configurable):
                 # Printed so batch-invariance is visible in logs even with no
                 # TensorBoard/W&B backend (e.g. the CI batch-invariant E2E test).
                 "bit_wise/logprob_diff/max",
+                # trainer-vs-generator mismatch: KL(generator || trainer) per sampled token,
+                # and with routing replay how often the two engines pick the same experts.
+                "bit_wise/kl_k3/mean",
+                "routing_replay/",
             ]
         )
         """Regex search patterns selecting console keys for train log lines.

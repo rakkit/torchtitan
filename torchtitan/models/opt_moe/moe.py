@@ -83,17 +83,28 @@ class OptMoE(MoE):
         *,
         padding_mask_T: torch.Tensor | None = None,
         aux_loss_denominator: torch.Tensor | None = None,
+        routed_experts_TK: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Upstream's ``MoE.forward`` plus the gate entropy."""
         (
             routed_x_TD,
             routed_padding_mask_T,
         ) = self._maybe_shard_routed_branch_inputs_across_tp(x_TD, padding_mask_T)
+        router_kwargs = (
+            {}
+            if routed_experts_TK is None
+            else {
+                "routed_experts_TK": self._maybe_shard_routed_experts_across_tp(
+                    routed_experts_TK
+                )
+            }
+        )
         topk_scores_TK, topk_expert_ids_TK, routing_map_TE = self.router(
             routed_x_TD,
             self.expert_bias_E,
             padding_mask_T=routed_padding_mask_T,
             aux_loss_denominator=aux_loss_denominator,
+            **router_kwargs,
         )
         if self.track_router_metrics and self.training and not remat.is_recomputing():
             with torch.no_grad():

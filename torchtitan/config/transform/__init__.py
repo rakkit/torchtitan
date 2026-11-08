@@ -23,6 +23,7 @@ from .quantization import (
     QuantizationConverter,
 )
 from .relations import TransformRelations
+from .routing_replay import RoutingReplayTransform
 from .token_dispatcher import TokenDispatcherTransform
 
 __all__ = [
@@ -36,6 +37,7 @@ __all__ = [
     "TokenDispatcherTransform",
     "BatchInvariantFlexConverter",
     "FreezeMoERoutingTransform",
+    "RoutingReplayTransform",
     "LMHeadFP32OutputConverter",
     "LoRATransform",
     "MXFP8GroupedLinearConverter",

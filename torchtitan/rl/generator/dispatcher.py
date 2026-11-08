@@ -288,6 +288,7 @@ class RequestDispatcher:
                     token_logprobs=finished.token_logprobs,
                     finish_reason=finished.finish_reason,
                     metrics=metrics,
+                    routed_experts=finished.routed_experts,
                 )
             )
             # Free the request's reserved load on its DP rank so load-aware

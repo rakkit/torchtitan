@@ -57,6 +57,10 @@ from torchtitan.rl.generator.engine import ModelStateDictLoadMode
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.vllm.fp8 import fp8_modules
 from torchtitan.rl.generator.vllm.registry import uses_compressed_mla_cache
+from torchtitan.rl.generator.vllm.routing_replay import (
+    install_routed_experts_capture,
+    records_routed_experts,
+)
 from torchtitan.tools.utils import set_default_dtype
 
 
@@ -556,6 +560,14 @@ class VLLMModelWrapper(Module):
                 new_param.__dict__.setdefault(name, value)
             torch.utils.swap_tensors(param, new_param)
         self.model._skip_lm_head = True
+        if records_routed_experts(self.config):
+            if training_parallelism.tensor_parallel_degree > 1 or (
+                training_parallelism.expert_parallel_degree > 1
+            ):
+                raise ValueError(
+                    "routing replay records the generator's experts at TP 1 / EP 1 only"
+                )
+            install_routed_experts_capture(self.model)
         if getattr(self.model, "vision_encoder", None) is not None:
             self.model.vision_encoder = None
 

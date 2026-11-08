@@ -79,6 +79,11 @@ def test_dapo_truncated_is_gradient_is_capped_ratio_times_advantage() -> None:
     (-(weight * advantages * logp).sum() / 8).backward()
     torch.testing.assert_close(pred.grad, ref.grad)
     assert metrics["loss/tis_capped_frac"] == 2 / 8  # exp(1.5), exp(0.9) > 2
+    # k3 KL(generator || trainer) over the sampled tokens, d = log p - log q = -shift
+    d = -shift
+    torch.testing.assert_close(
+        metrics["bit_wise/kl_k3/mean"], ((torch.special.expm1(d) - d).sum() / 8).float()
+    )
 
     grads = []
     for config in (DAPOLoss.Config(truncated_is_cap=cap), DAPOLoss.Config()):

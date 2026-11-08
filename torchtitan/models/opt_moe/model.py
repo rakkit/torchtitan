@@ -31,7 +31,11 @@ from torchtitan.models.common.attention import (
     create_varlen_metadata_for_document,
 )
 from torchtitan.models.common.attention.linear_attention import LinearAttentionMetadata
-from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.decoder import (
+    Decoder,
+    layer_routed_experts,
+    TransformerBlock,
+)
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE
@@ -120,10 +124,12 @@ class OPTMoETransformerBlock(TransformerBlock):
         conv_metadata: LinearAttentionMetadata | None = None,
         padding_mask: torch.Tensor | None = None,
         aux_loss_denominator: torch.Tensor | None = None,
+        routed_experts_TK: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``x``: ``[T, D]``; ``conv_metadata``: the attention short conv's
         document offsets; ``padding_mask`` (True: not counted): upstream's
-        padding mask, the tokens the MoE leaves out of its balance statistics."""
+        padding mask, the tokens the MoE leaves out of its balance statistics;
+        ``routed_experts_TK``: routing replay (RL), see ``TokenChoiceTopKRouter``."""
         _attn_out = self.attention(
             self.attention_norm(x),
             attention_metadata,
@@ -142,6 +148,7 @@ class OPTMoETransformerBlock(TransformerBlock):
                 h_normed,
                 padding_mask_T=padding_mask,
                 aux_loss_denominator=aux_loss_denominator,
+                routed_experts_TK=routed_experts_TK,
             )
         else:
             mlp_output = self.feed_forward(h_normed)
@@ -553,6 +560,7 @@ class OPTMoEModel(Decoder):
         *,
         padding_mask: torch.Tensor | None = None,
         aux_loss_denominators: torch.Tensor | None = None,
+        routed_experts: torch.Tensor | None = None,
     ):
         """Upstream's ``Decoder.forward`` plus the residual statistics and,
         with MTP, the MTP depths after the main stack.
@@ -566,6 +574,8 @@ class OPTMoEModel(Decoder):
             mtp_input_valid_masks: Per MTP depth, where its rolled token is real.
             padding_mask: Upstream's padding mask (True: padding), the tokens
                 the MoE leaves out of its balance statistics.
+            routed_experts: Routing replay (RL) ``[T, num_layers, K]``, ``-1``
+                where the generator routed nothing; block ``i`` reads ``[:, i]``.
 
         Returns:
             The logits (hidden states with ``_skip_lm_head``); with MTP a tuple,
@@ -616,7 +626,7 @@ class OPTMoEModel(Decoder):
             if attention_metadata is None
             else attention_metadata.get(ShortConvDocuments)
         )
-        for layer in self.layers.values():
+        for layer_id, layer in self.layers.items():
             meta = (
                 None
                 if attention_metadata is None
@@ -629,6 +639,7 @@ class OPTMoEModel(Decoder):
                 conv_metadata=conv_metadata,
                 padding_mask=padding_mask,
                 aux_loss_denominator=aux_loss_denominator,
+                **layer_routed_experts(routed_experts, layer_id),
             )
             if rows is not None:
                 with torch.no_grad():

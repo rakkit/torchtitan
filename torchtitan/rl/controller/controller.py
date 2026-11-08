@@ -132,6 +132,7 @@ from torchtitan.rl.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.trainer.batcher import Batcher, TrainerStepBatch
 from torchtitan.rl.trainer.trainer import Trainer
 from torchtitan.tools.garbage_collector import GarbageCollector
+from torchtitan.tools.utils import slurm_job_end_time
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,18 @@ class AsyncLoopConfig(Configurable.Config):
     )
     batcher: Batcher.Config = field(default_factory=Batcher.Config)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+
+    stop_before_walltime_s: float | None = None
+    """Under SLURM, stop in time to save. Before each optimizer step, when the job's
+    remaining time is below the longest step so far plus this margin (the checkpoint
+    save and shutdown), that step is the last: it saves a checkpoint (as the final
+    step does) and training stops without the final validation. A resume then loses
+    no optimizer step; rollouts in flight are regenerated (their prompts were not
+    committed). None: off."""
+
+    stop_file: str | None = None
+    """When this file exists before an optimizer step, that step is the last, as with
+    ``stop_before_walltime_s`` (a manual graceful stop). None: off."""
 
     def __post_init__(self) -> None:
         if self.num_prompts_per_train_step < 1:
@@ -368,6 +381,18 @@ class Controller(Configurable):
                 raise ValueError(
                     f"num_generators must be at least 1, got {self.num_generators}"
                 )
+            if (
+                self.async_loop.stop_before_walltime_s is not None
+                or self.async_loop.stop_file is not None
+            ):
+                # An early stop saves through the final-step save, which must hold
+                # the full training state for the resume.
+                checkpointer = self.trainer.checkpointer
+                if checkpointer is None or checkpointer.last_save_model_only:
+                    raise ValueError(
+                        "async_loop.stop_before_walltime_s / stop_file need "
+                        "trainer.checkpointer with last_save_model_only=False"
+                    )
             if self.generator.checkpointer is not None:
                 raise ValueError(
                     "Generator checkpoint must be disabled in the RL loop "
@@ -458,6 +483,7 @@ class Controller(Configurable):
         self.batcher: Any | None = None
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
         self.start_step = 0
+        self._stopped_early = False
         self.metrics_processor: m.MetricsProcessor = config.metrics.build(
             log_dir=config.dump_folder,
             job_config=config.to_dict(),
@@ -931,6 +957,8 @@ class Controller(Configurable):
                 *background_tasks, trainer_task, return_exceptions=True
             )
 
+        if self._stopped_early:
+            return
         # Post-training validation (held-out eval after the final step).
         post_validation = await self._validate_and_log(step=num_training_steps)
         self._log_reward_delta(pre_validation, post_validation)
@@ -1112,7 +1140,14 @@ class Controller(Configurable):
         # The previous step's push and pull, each returning its wall time; None before the first.
         push_task: asyncio.Task[float] | None = None
         pull_task: asyncio.Task[float] | None = None
+        job_end_time = (
+            slurm_job_end_time()
+            if self.config.async_loop.stop_before_walltime_s is not None
+            else None
+        )
+        longest_step_s = 0.0
         for step in range(self.start_step + 1, num_training_steps + 1):
+            step_start = time.monotonic()
             sl.set_step(step)  # propagate the step counter to the actors
             with sl.log_trace_span("sync_log_step"):
                 await self.trainer.all_ranks.sync_log_step.call(step)
@@ -1209,10 +1244,13 @@ class Controller(Configurable):
                     # batcher includes every consumed group ID here, including
                     # metric-only zero-std groups excluded from model inputs.
                     self._rollouter.commit_training_sample_ids(packed.group_ids)
+                    stop_reason = self._early_stop_reason(job_end_time, longest_step_s)
                     optimizer_result = self._get_rank_0_value(
                         await self.trainer.all_ranks.optim_step.call(
                             resume_state=self._rollouter.state_dict(),
-                            last_step=(step == num_training_steps),
+                            last_step=(
+                                step == num_training_steps or stop_reason is not None
+                            ),
                         )
                     )
                 self._trainer_policy_version = optimizer_result.policy_version
@@ -1271,11 +1309,35 @@ class Controller(Configurable):
                         ),
                     ],
                 )
+            longest_step_s = max(longest_step_s, time.monotonic() - step_start)
+            if stop_reason is not None:
+                logger.warning(
+                    f"Stopping after step {step} ({stop_reason}); its checkpoint is saved"
+                )
+                self._stopped_early = True
+                break
 
         # Finish the last push and pull so generators hold the final weights for post-validation.
         if push_task is not None:
             await push_task
             await pull_task
+
+    def _early_stop_reason(
+        self, job_end_time: float | None, longest_step_s: float
+    ) -> str | None:
+        """Why the coming optimizer step must be the last; None: it need not."""
+        async_loop = self.config.async_loop
+        if async_loop.stop_file is not None and os.path.exists(async_loop.stop_file):
+            return f"stop file {async_loop.stop_file}"
+        if job_end_time is not None:
+            assert async_loop.stop_before_walltime_s is not None
+            remaining_s = job_end_time - time.time()
+            if remaining_s < longest_step_s + async_loop.stop_before_walltime_s:
+                return (
+                    f"{remaining_s:.0f} s of walltime left, longest step "
+                    f"{longest_step_s:.0f} s + margin {async_loop.stop_before_walltime_s:.0f} s"
+                )
+        return None
 
     async def _push_model_state_dict(self) -> float:
         """Push the trainer's model state dict to TorchStore; returns its wall time in seconds."""

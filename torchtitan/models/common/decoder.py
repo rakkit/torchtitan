@@ -47,6 +47,16 @@ logger = logging.getLogger(__name__)
 
 # TODO: we can unify the TransformerBlock impl across all models when
 # there is no special logic for each model.
+def layer_routed_experts(
+    routed_experts: torch.Tensor | None, layer_id: str
+) -> dict[str, torch.Tensor]:
+    """Block ``layer_id``'s routing replay kwargs: none without replay, so blocks
+    of models that do not support it are called as before."""
+    if routed_experts is None:
+        return {}
+    return {"routed_experts_TK": routed_experts[:, int(layer_id)]}
+
+
 class TransformerBlock(Module):
     """Base class for all language model transformer blocks.
 
@@ -323,7 +333,10 @@ class Decoder(BaseModel):
         *,
         padding_mask: torch.Tensor | None = None,
         aux_loss_denominators: torch.Tensor | None = None,
+        routed_experts: torch.Tensor | None = None,
     ):
+        """``routed_experts``: routing replay (RL) ``[T, num_layers, K]``, ``-1`` where
+        the generator routed nothing; block ``i`` gets ``routed_experts_TK=[:, i]``."""
         # positions is listed before attention_metadata so AutoParallel's input_fn,
         # which returns (tokens, positions) and binds them positionally, maps
         # positions to the right parameter (it would otherwise land in the
@@ -335,7 +348,7 @@ class Decoder(BaseModel):
             aux_loss_denominator = (
                 None if aux_loss_denominators is None else aux_loss_denominators[0]
             )
-        for layer in self.layers.values():
+        for layer_id, layer in self.layers.items():
             layer_attention_metadata = (
                 None
                 if attention_metadata is None
@@ -347,6 +360,7 @@ class Decoder(BaseModel):
                 positions,
                 padding_mask=padding_mask,
                 aux_loss_denominator=aux_loss_denominator,
+                **layer_routed_experts(routed_experts, layer_id),
             )
 
         h = self.norm(h) if self.norm is not None else h

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
+
 
 @dataclass(kw_only=True, slots=True)
 class SamplingConfig:
@@ -99,3 +101,6 @@ class FinishedRequest:
     token_logprobs: list[float]  # [generated_tokens], of each sampled token
     finish_reason: str | None
     metrics_inputs: RequestMetricsInputs
+    routed_experts: np.ndarray | None = None
+    """Routing replay: the experts of each forwarded token, ``[prompt + generated - 1,
+    num_layers, top_k]`` (the last sampled token is never forwarded); None: off."""

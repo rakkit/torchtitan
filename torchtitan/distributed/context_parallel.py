@@ -40,9 +40,12 @@ if TYPE_CHECKING:
 __all__ = [
     "cp_all_gather_tensors",
     "ContextParallelLoadBalancer",
+    "document_cp_fragments",
+    "DocumentCPLoadBalancer",
     "HeadTailCPLoadBalancer",
     "PTRRFlexAttentionCPLoadBalancer",
     "get_cp_input_seq_len",
+    "MAX_CP_RANK_FRAGMENTS",
     "get_token_fragments",
     "shard_tensors",
     "supports_cp_inner_attention",
@@ -143,6 +146,123 @@ class HeadTailCPLoadBalancer(ContextParallelLoadBalancer):
         return permutation
 
 
+# Most token ranges a CP rank holds under a load-balancing permutation
+# (head-tail: 2; DocumentCPLoadBalancer: 4). Rank-local tables are sized by it,
+# so every layout gives the compiled blocks the same shapes.
+MAX_CP_RANK_FRAGMENTS = 4
+
+
+def document_cp_fragments(
+    cu_seqlens: list[int],
+    *,
+    cp_size: int,
+    min_document_length: int,
+) -> list[list[tuple[int, int]]]:
+    """Each CP rank's global token ranges ``[start, stop)`` (ascending) under
+    `DocumentCPLoadBalancer`'s layout of one row with document offsets
+    ``cu_seqlens``: the longest document, if at least ``min_document_length``
+    tokens, is cut into 2 x CP chunks (rank r: chunks r and 2 CP - 1 - r); the
+    other tokens are dealt in row order, filling each rank to T / CP tokens."""
+    num_tokens = cu_seqlens[-1]
+    if num_tokens % cp_size:
+        raise ValueError(
+            f"The token count ({num_tokens}) must be divisible by the CP degree "
+            f"({cp_size})."
+        )
+    lengths = [b - a for a, b in zip(cu_seqlens[:-1], cu_seqlens[1:])]
+    pieces: list[list[tuple[int, int]]] = [[] for _ in range(cp_size)]
+    rest = [(0, num_tokens)]
+    longest = max(range(len(lengths)), key=lengths.__getitem__, default=None)
+    if longest is not None and lengths[longest] >= min_document_length:
+        start, stop = cu_seqlens[longest], cu_seqlens[longest + 1]
+        n = 2 * cp_size
+        bounds = [start + j * (stop - start) // n for j in range(n + 1)]
+        for rank in range(cp_size):
+            for chunk in (rank, n - 1 - rank):
+                pieces[rank].append((bounds[chunk], bounds[chunk + 1]))
+        rest = [(0, start), (stop, num_tokens)]
+    room = [num_tokens // cp_size - sum(b - a for a, b in p) for p in pieces]
+    rank = 0
+    for a, b in rest:
+        while a < b:
+            while room[rank] == 0:
+                rank += 1
+            take = min(b - a, room[rank])
+            pieces[rank].append((a, a + take))
+            room[rank] -= take
+            a += take
+    fragments = []
+    for p in pieces:
+        merged: list[tuple[int, int]] = []
+        for a, b in sorted(x for x in p if x[0] < x[1]):
+            if merged and merged[-1][1] == a:
+                merged[-1] = (merged[-1][0], b)
+            else:
+                merged.append((a, b))
+        fragments.append(merged)
+    return fragments
+
+
+class DocumentCPLoadBalancer(ContextParallelLoadBalancer):
+    """Balance packed documents: head-tail inside the longest document.
+
+    Head-tail over the whole row balances a row that is one document. With
+    packed documents it does not: the rank whose chunks hold the late part of
+    a long document does most of the attention (at 256k, CP 4, opt_moe l44:
+    one rank 5.8 s of attention vs 4.3 s on its group's lightest). Here the
+    row's longest document is cut into 2 x CP chunks, rank r taking chunks r
+    and 2 CP - 1 - r, and every other token is dealt in row order as
+    contiguous runs, T / CP tokens per rank::
+
+        row:     [A: short docs][D: long doc, chunks d0..d7][B: short docs]
+        CP 4:    rank r holds d_r, d_(7-r) and a quarter of A + B in row order
+
+    The layout follows each step's document offsets (read on the host).
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        """Configuration for document-aware context-parallel load balancing."""
+
+        min_document_length: int = 8192
+        """A row whose longest document is shorter stays contiguous: its
+        attention work per token is about even."""
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        seq_len: int,
+        attention_metadata: Any,
+    ) -> None:
+        from torchtitan.models.common.attention import VarlenAttentionMetadata
+
+        if not isinstance(attention_metadata, VarlenAttentionMetadata):
+            raise ValueError(
+                "Document CP load balancing requires VarlenAttentionMetadata, "
+                f"but got {type(attention_metadata).__name__}."
+            )
+        cp_group = spmd_mesh_group(MeshAxisName.CP)
+        if cp_group is None:
+            raise RuntimeError(
+                "CP load balancing requires an active multi-rank CP mesh axis."
+            )
+        self.fragments = document_cp_fragments(
+            attention_metadata.cu_seq_q.tolist(),
+            cp_size=cp_group.size(),
+            min_document_length=config.min_document_length,
+        )
+        assert sum(b - a for f in self.fragments for a, b in f) == seq_len
+        self.device = attention_metadata.cu_seq_q.device
+
+    def generate_permutation(self) -> torch.Tensor:
+        """The ranks' token ranges in rank order."""
+        index = torch.cat(
+            [torch.arange(a, b) for fragments in self.fragments for a, b in fragments]
+        )
+        return index.to(self.device).unsqueeze(0)
+
+
 class PTRRFlexAttentionCPLoadBalancer(ContextParallelLoadBalancer):
     """Balance FlexAttention tokens with PTRR.
 
@@ -206,6 +326,7 @@ def supports_cp_inner_attention(
             AllGatherKVMLAFlexAttention,
             AllGatherKVVarlen,
         ),
+        DocumentCPLoadBalancer: (AllGatherKVVarlen,),
         PTRRFlexAttentionCPLoadBalancer: (
             AllGatherKVFlexInnerAttention,
             AllGatherKVSlidingWindowFlexInnerAttention,

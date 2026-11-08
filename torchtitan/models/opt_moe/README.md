@@ -21,7 +21,7 @@ each rank's q                        64k tokens, all heads          256k tokens,
 each rank's k / v                    all 256k tokens gathered       256k tokens, KV heads / 4
 communication per attention layer    all-gather k / v (+ backward    all-to-all q, k, v and the output
                                      reduce-scatter)
-load balancing for causal masks      head-tail balancer             none needed (every rank sees
+load balancing for causal masks      head-tail / document balancer  none needed (every rank sees
                                                                     every token)
 limits                               -                              n_heads, n_kv_heads % CP == 0;
                                                                     contiguous shards
@@ -32,6 +32,21 @@ the sink logits (`tests/unit_tests/opt_moe/test_context_parallel.py`: CP 4 vs on
 rank, both forms, flex / varlen / flex_flash). Under varlen `all_gather_kv` the
 sliding-window layers gather only the last `window - 1` K / V rows of every
 rank's chunks (the halo a chunk's first queries see), not the whole sequence.
+
+Packed documents unbalance head-tail: the rank whose chunks hold a long
+document's late tokens does most of its attention (256k, CP 4, l44, one step:
+4.3 / 5.8 / 4.9 / 4.7 s of attention on one group's ranks). With varlen,
+`DocumentCPLoadBalancer` (`parallelism.context_parallel_load_balancer`) cuts
+the row's longest document head-tail and deals the rest in contiguous runs:
+
+```text
+row:   [A: short docs][D: long doc, chunks d0..d7][B: short docs]     CP 4
+rank r holds d_r, d_(7-r) and a quarter of A + B (row order), T / 4 tokens
+```
+
+Each rank runs one varlen call over its document pieces; a piece's keys are
+gathered by index from the all-gathered K / V (sliding window: from its own rows
+and every rank's range tails).
 `compile_blocks` works with `all_gather_kv` (its gather has a functional-collective
 path when compiling: 256k on one node, 6 layers, +7% over eager blocks); with
 `ulysses` it is refused (the all-to-all does not trace yet). TP on

@@ -11,7 +11,8 @@ start from the tokens before them, exchanged across the ranks), attention sinks
 (all-gather K/V: every local query sees every key it attends to, so the
 log-sum-exp the sinks rescale is complete), the element-wise gate, a
 sliding-window and a full layer. Documents cross the ranks' token ranges;
-contiguous sharding and head-tail load balancing, and Ulysses (heads sharded
+contiguous sharding, head-tail and document load balancing (varlen: the longest
+document head-tail, the rest in contiguous runs), and Ulysses (heads sharded
 over CP; the sinks rescale on each rank's heads); the flex (fp32),
 varlen and flex_flash (FA4 through flex; bf16: FlashAttention has no fp32)
 backends."""
@@ -30,7 +31,10 @@ from torchtitan.config import PrecisionConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.activation_remat import ActivationRematConfig
-from torchtitan.distributed.context_parallel import HeadTailCPLoadBalancer
+from torchtitan.distributed.context_parallel import (
+    DocumentCPLoadBalancer,
+    HeadTailCPLoadBalancer,
+)
 from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.models.opt_moe import build_model_config
 from torchtitan.models.opt_moe.mtp import MTPCrossEntropyLoss, roll_mtp_sequence
@@ -60,14 +64,18 @@ TOKEN_TOL = {"flex": 1e-5, "varlen": 5e-3, "flex_flash": 5e-3}
 # (contiguous and head-tail) and Ulysses (heads sharded over CP: contiguous
 # shards only; the sinks rescale on this rank's heads). 4 KV heads: Ulysses
 # needs them divisible by CP.
+# The document balancer runs with varlen only (the other backends skip it); its
+# minimum splits DOCS' 450-token document.
+DOCUMENT_BALANCER = DocumentCPLoadBalancer.Config(min_document_length=256)
 CASES = (
-    ("gate", (("ulysses", None),)),
+    ("gate", (("ulysses", None), ("all_gather_kv", DOCUMENT_BALANCER))),
     (
         "sinks",
         (
             ("ulysses", None),
             ("all_gather_kv", None),
             ("all_gather_kv", HeadTailCPLoadBalancer.Config()),
+            ("all_gather_kv", DOCUMENT_BALANCER),
         ),
     ),
 )
@@ -126,6 +134,9 @@ def _relative(got: torch.Tensor, want: torch.Tensor) -> float:
 for _backend in BACKENDS:
     TIMEOUT_OVERRIDE[f"test_cp_matches_one_rank_{_backend}"] = 1500
 TIMEOUT_OVERRIDE["test_compiled_blocks_keep_their_graphs_on_new_layouts"] = 1500
+TIMEOUT_OVERRIDE[
+    "test_compiled_blocks_keep_their_graphs_on_new_document_layouts"
+] = 1500
 # Layouts after the warm-up one (DOCS): one document (each rank's chunk is a
 # single piece), and other counts and lengths.
 NEW_LAYOUTS = ([T], [100, 900, 24], [512, 512])
@@ -203,6 +214,8 @@ class TestContextParallel(DTensorTestBase):
                 ignore_index=IGNORE_INDEX,
             )
             for cp_attention, balancer in cases:
+                if balancer is DOCUMENT_BALANCER and backend != "varlen":
+                    continue
                 with self.subTest(
                     backend=backend,
                     attention=attention,
@@ -284,6 +297,15 @@ class TestContextParallel(DTensorTestBase):
         (offsets, longest document, conv routing) changes with the batch. A
         layout that compiles a new graph on one rank stalls every other rank
         in a collective (seen at 256k: one rank recompiling for ~12 s)."""
+        self._compiled_blocks_on_new_layouts(HeadTailCPLoadBalancer.Config())
+
+    @with_comms
+    def test_compiled_blocks_keep_their_graphs_on_new_document_layouts(self):
+        """As above with the document balancer: the token ranges, the pieces
+        and their K/V rows change with every batch too."""
+        self._compiled_blocks_on_new_layouts(DOCUMENT_BALANCER)
+
+    def _compiled_blocks_on_new_layouts(self, balancer):
         pc = ParallelismContext(
             dp_replicate=1,
             dp_shard=1,
@@ -297,7 +319,7 @@ class TestContextParallel(DTensorTestBase):
         pc.build_mesh()
         parallelism = ParallelismConfig(
             context_parallel_degree=CP,
-            context_parallel_load_balancer=HeadTailCPLoadBalancer.Config(),
+            context_parallel_load_balancer=balancer,
         )
         cfg = build_model_config(
             "mis-8b-proxy",

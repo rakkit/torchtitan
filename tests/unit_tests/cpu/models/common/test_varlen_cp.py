@@ -6,9 +6,9 @@
 
 """Tests for K/V all-gather varlen context parallelism."""
 
+import contextlib
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import NamedTuple
 from unittest import mock
 
 import spmd_types as spmd
@@ -21,6 +21,10 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 from torchtitan.distributed.accelerator_graph import AcceleratorGraphInputSpec
+from torchtitan.distributed.context_parallel import (
+    document_cp_fragments,
+    get_token_fragments,
+)
 from torchtitan.distributed.spmd_types import set_current_spmd_mesh
 from torchtitan.models.common.attention import (
     cp_attention,
@@ -42,24 +46,139 @@ def _metadata(offsets: list[int]) -> VarlenAttentionMetadata:
     )
 
 
-class TestAllGatherKVVarlenPreparation(TestCase):
-    def test_restores_head_tail_order(self) -> None:
-        permutation = _HeadTailLoadBalancer(
-            8, 2, torch.device("cpu")
-        )._generate_indices()
-        metadata = AllGatherKVVarlen.prepare_cp_metadata(
-            _metadata([0, 3, 7, 8]), permutation=permutation
+def _layouts(offsets: list[int], *, cp_size: int) -> dict:
+    """Each rank's global token ranges under head-tail and the document
+    layout (the longest document split per document)."""
+    num_tokens = offsets[-1]
+    head_tail = _HeadTailLoadBalancer(
+        num_tokens, cp_size, torch.device("cpu")
+    )._generate_indices()
+    return {
+        "head_tail": get_token_fragments(
+            num_tokens, cp_size=cp_size, permutation=head_tail
+        ),
+        "document": document_cp_fragments(
+            offsets, cp_size=cp_size, min_document_length=8
+        ),
+    }
+
+
+def _check_pieces(test, offsets, fragments, window) -> None:
+    num_tokens, cp_size = offsets[-1], len(fragments)
+    local = [[g for a, b in ranges for g in range(a, b)] for ranges in fragments]
+    tails = []
+    for rank in range(cp_size):
+        _, _, _, tail_index = cp_attention._fragment_pieces(
+            offsets, fragments, cp_rank=rank, window=window
         )
-        reordered = torch.arange(8).index_select(0, permutation[0])
+        if tail_index is not None:
+            tails += [local[rank][i] for i in tail_index.tolist()]
+    for rank in range(cp_size):
+        cu_q, cu_k, rows, _ = cp_attention._fragment_pieces(
+            offsets, fragments, cp_rank=rank, window=window
+        )
+        # the key source: the gathered rows (full) or [local; tails] (window)
+        source = (
+            [g for ranks in local for g in ranks] if window < 0 else local[rank] + tails
+        )
+        test.assertEqual(int(cu_q[-1]), num_tokens // cp_size)
+        for i in range(len(cu_q) - 1):
+            queries = local[rank][cu_q[i] : cu_q[i + 1]]
+            keys = [source[j] for j in rows[cu_k[i] : cu_k[i + 1]]]
+            first, last = queries[0], queries[-1]
+            test.assertEqual(queries, list(range(first, last + 1)))
+            doc_start = max(o for o in offsets if o <= first)
+            key_start = doc_start if window < 0 else max(doc_start, first - window)
+            test.assertEqual(keys, list(range(key_start, last + 1)))
+
+
+def _reference_varlen(q, k, v, *, attention_metadata, **kwargs):
+    """Varlen attention in fp64, causal aligned to each sequence's last key."""
+    meta = attention_metadata
+    left = meta.window_size[0]
+    out = torch.zeros_like(q)
+    cu_q, cu_k = meta.cu_seq_q.tolist(), meta.cu_seq_k.tolist()
+    for i in range(len(cu_q) - 1):
+        qs, ks = q[cu_q[i] : cu_q[i + 1]], k[cu_k[i] : cu_k[i + 1]]
+        vs = v[cu_k[i] : cu_k[i + 1]]
+        if not len(qs):
+            continue
+        lq, lk = len(qs), len(ks)
+        pos_q = torch.arange(lq).unsqueeze(1) + (lk - lq)
+        pos_k = torch.arange(lk).unsqueeze(0)
+        allowed = pos_k <= pos_q
+        if left >= 0:
+            allowed &= pos_k >= pos_q - left
+        scores = torch.einsum("qhd,khd->hqk", qs, ks).masked_fill(~allowed, -torch.inf)
+        out[cu_q[i] : cu_q[i + 1]] = torch.einsum(
+            "hqk,khd->qhd", scores.softmax(-1), vs
+        )
+    return out
+
+
+@contextlib.contextmanager
+def _emulated_cp_rank(*, rank: int, cp_size: int, gather=None):
+    """Run cp_attention as CP rank ``rank`` of ``cp_size`` in one process;
+    ``gather`` stands in for the K/V all-gather."""
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            mock.patch.object(
+                cp_attention,
+                "spmd_mesh_group",
+                return_value=SimpleNamespace(size=lambda: cp_size),
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(cp_attention.dist, "get_rank", return_value=rank)
+        )
+        if gather is not None:
+            stack.enter_context(
+                mock.patch.object(cp_attention, "cp_all_gather_tensors", gather)
+            )
+        yield
+
+
+class TestDocumentLayout(TestCase):
+    def test_longest_document_head_tail_rest_contiguous(self) -> None:
+        # CP 2: the 80-token document in 4 chunks of 20 (rank 0: chunks 0 and
+        # 3, rank 1: chunks 1 and 2); the other 48 tokens in row order, 24 each
+        offsets = [0, 10, 30, 110, 128]
+        fragments = document_cp_fragments(offsets, cp_size=2, min_document_length=64)
         self.assertEqual(
-            reordered.index_select(0, metadata.inverse_permutation), torch.arange(8)
+            fragments,
+            [[(0, 24), (30, 50), (90, 110)], [(24, 30), (50, 90), (110, 128)]],
         )
+        for cp_size in (2, 4):
+            fragments = document_cp_fragments(
+                offsets, cp_size=cp_size, min_document_length=64
+            )
+            covered = sorted(g for f in fragments for a, b in f for g in range(a, b))
+            self.assertEqual(covered, list(range(128)))
+            for ranges in fragments:
+                self.assertEqual(sum(b - a for a, b in ranges), 128 // cp_size)
+                self.assertLessEqual(len(ranges), 4)
+        # no document long enough: contiguous shards
+        self.assertEqual(
+            document_cp_fragments(offsets, cp_size=2, min_document_length=81),
+            [[(0, 64)], [(64, 128)]],
+        )
+
+
+class TestAllGatherKVVarlenPreparation(TestCase):
+    def test_pieces_hold_each_querys_keys(self) -> None:
+        # every local query row lands in exactly one piece whose keys are its
+        # document's rows up to it (the last window + 1 with a sliding window)
+        offsets = [0, 3, 20, 28, 32]
+        for name, fragments in _layouts(offsets, cp_size=2).items():
+            for window in (-1, 3):
+                with self.subTest(layout=name, window=window):
+                    _check_pieces(self, offsets, fragments, window)
 
     def test_builds_chunk_metadata(self) -> None:
         metadata = AllGatherKVVarlen.prepare_cp_metadata(
             _metadata([0, 3, 7, 8]), permutation=None
         )
-        self.assertIsNone(metadata.inverse_permutation)
+        self.assertIsNone(metadata.pieces)
         for kv_start, expected_k in ((0, [0, 3, 6, 6]), (2, [0, 1, 4, 4])):
             with self.subTest(kv_start=kv_start):
                 chunk = AllGatherKVVarlen._chunk_metadata(
@@ -135,12 +254,13 @@ class TestVarlenMetadataCudaGraphInputs(TestCase):
                         if head_tail
                         else None
                     )
-                    captured_metadata = AllGatherKVVarlen.prepare_cp_metadata(
-                        captured_metadata, permutation=permutation
-                    )
-                    rebuilt_metadata = AllGatherKVVarlen.prepare_cp_metadata(
-                        rebuilt_metadata, permutation=permutation
-                    )
+                    with _emulated_cp_rank(rank=0, cp_size=2):
+                        captured_metadata = AllGatherKVVarlen.prepare_cp_metadata(
+                            captured_metadata, permutation=permutation
+                        )
+                        rebuilt_metadata = AllGatherKVVarlen.prepare_cp_metadata(
+                            rebuilt_metadata, permutation=permutation
+                        )
                 spec = AcceleratorGraphInputSpec({"metadata": captured_metadata})
                 captured = spec.flatten({"metadata": captured_metadata})
                 rebuilt = spec.flatten({"metadata": rebuilt_metadata})
@@ -148,123 +268,84 @@ class TestVarlenMetadataCudaGraphInputs(TestCase):
                     spec.unflatten(rebuilt), {"metadata": rebuilt_metadata}
                 )
                 tensors = [leaf for leaf in captured if isinstance(leaf, torch.Tensor)]
-                self.assertEqual(len(tensors), 3 if head_tail else 2)
+                # offsets; with a permutation also the pieces' offsets and K/V rows
+                self.assertEqual(len(tensors), 5 if head_tail else 2)
                 for first, second in zip(captured, rebuilt, strict=True):
                     if not isinstance(first, torch.Tensor):
                         self.assertEqual(first, second)
 
 
-class _ForwardCase(NamedTuple):
-    head_tail: bool
-    window: tuple[int, int]
-    kv_ranges: tuple[tuple[int, int], ...]
-    rank: int = 0
-
-
 class TestKVAllGatherVarlenInnerAttention(TestCase):
-    def test_forward_uses_bounded_shared_kv_views(self) -> None:
-        dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=8)
-        self.addCleanup(dist.destroy_process_group)
-        mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("dp", "cp", "tp"))
-        seq_len = 8
-        cases = (
-            _ForwardCase(head_tail=True, window=(-1, 0), kv_ranges=((0, 2), (2, 8))),
-            _ForwardCase(head_tail=True, window=(10, 0), kv_ranges=((0, 2), (2, 8))),
-            _ForwardCase(head_tail=True, window=(2, 0), kv_ranges=((0, 2), (4, 8))),
-            _ForwardCase(head_tail=False, window=(-1, 0), kv_ranges=((0, 8),), rank=1),
-            _ForwardCase(head_tail=False, window=(2, 0), kv_ranges=((2, 8),), rank=1),
-        )
-        with set_current_spmd_mesh(mesh):
-            for case in cases:
-                with self.subTest(case=case):
-                    config = (
-                        AllGatherKVVarlenInnerAttention.Config()
-                        if case.window == (-1, 0)
-                        else AllGatherKVSlidingWindowVarlenInnerAttention.Config(
-                            sliding_window_size=case.window[0] + 1
-                        )
-                    )
-                    attention = config.build()
-                    permutation = (
-                        _HeadTailLoadBalancer(
-                            seq_len, 2, torch.device("cpu")
-                        )._generate_indices()
-                        if case.head_tail
-                        else None
-                    )
-                    metadata = AllGatherKVVarlen.prepare_cp_metadata(
-                        replace(_metadata([0, 3, 7, 8]), window_size=case.window),
-                        permutation=permutation,
-                    )
-                    q_THK = torch.randn(seq_len // 2, 1, 4)
-                    k_THK = torch.arange(seq_len * 4).view(seq_len, 1, 4).float()
-                    v_THV = k_THK + 100
-                    gathered_k_THK, gathered_v_THV = k_THK, v_THV
-                    if permutation is not None:
-                        gathered_k_THK = k_THK.index_select(0, permutation[0])
-                        gathered_v_THV = v_THV.index_select(0, permutation[0])
-                    chunk_len = q_THK.shape[0] // len(case.kv_ranges)
-                    outputs = [torch.randn(chunk_len, 1, 4) for _ in case.kv_ranges]
-                    spmd.assert_type(
-                        (q_THK, *outputs),
-                        spmd.PartitionSpec(("dp", "cp"), "tp", None),
-                        spmd.V,
-                    )
-                    spmd.assert_type(
-                        (gathered_k_THK, gathered_v_THV),
-                        spmd.R,
-                        {"dp": spmd.V, "tp": spmd.V},
-                        partition_spec=spmd.PartitionSpec("dp", "tp", None),
-                    )
-                    with typecheck(), mock.patch.object(
-                        cp_attention,
-                        "cp_all_gather_tensors",
-                        return_value=(gathered_k_THK, gathered_v_THV),
-                    ), mock.patch.object(
-                        VarlenInnerAttention,
-                        "_forward_varlen",
-                        autospec=True,
-                        side_effect=outputs,
-                    ) as inner_forward, mock.patch.object(
-                        cp_attention,
-                        "spmd_mesh_group",
-                        return_value=SimpleNamespace(size=lambda: 2),
-                    ), mock.patch.object(
-                        cp_attention.dist,
-                        "get_rank",
-                        return_value=case.rank,
-                    ):
-                        actual = attention(
-                            q_THK,
-                            torch.empty(0),
-                            torch.empty(0),
-                            attention_metadata=metadata,
-                        )
-                    self.assertEqual(actual, torch.cat(outputs))
-                    calls = inner_forward.call_args_list
-                    self.assertEqual(len(calls), len(case.kv_ranges))
-                    for index, (call, (start, end)) in enumerate(
-                        zip(calls, case.kv_ranges)
-                    ):
-                        self.assertEqual(
-                            call.args[1],
-                            q_THK[index * chunk_len : (index + 1) * chunk_len],
-                        )
-                        self.assertEqual(call.args[2], k_THK[start:end])
-                        self.assertEqual(call.args[3], v_THV[start:end])
-                        self.assertEqual(
-                            call.kwargs["attention_metadata"].window_size, case.window
-                        )
-                        for arg_index in (2, 3):
-                            self.assertEqual(
-                                call.args[arg_index].untyped_storage().data_ptr(),
-                                calls[0].args[arg_index].untyped_storage().data_ptr(),
+    def test_matches_reference_attention_on_every_rank(self) -> None:
+        # CP 2 emulated in one process: each rank's output equals the global
+        # attention at its tokens, for contiguous, head-tail and document
+        # layouts, full and sliding-window attention (fp64 reference kernel)
+        offsets, cp_size = [0, 3, 20, 28, 32], 2
+        num_tokens, local = offsets[-1], offsets[-1] // cp_size
+        torch.manual_seed(0)
+        q, k, v = (torch.randn(num_tokens, 2, 4, dtype=torch.float64) for _ in range(3))
+        layouts = {
+            "contiguous": [[(r * local, (r + 1) * local)] for r in range(cp_size)]
+        }
+        layouts.update(_layouts(offsets, cp_size=cp_size))
+        for name, fragments in layouts.items():
+            ids = [
+                torch.tensor([g for a, b in f for g in range(a, b)]) for f in fragments
+            ]
+            permutation = None if name == "contiguous" else torch.cat(ids).unsqueeze(0)
+            for window in (-1, 3):
+                metadata = replace(_metadata(offsets), window_size=(window, 0))
+                expected = _reference_varlen(q, k, v, attention_metadata=metadata)
+                prepared = []
+                for rank in range(cp_size):
+                    with _emulated_cp_rank(rank=rank, cp_size=cp_size):
+                        prepared.append(
+                            AllGatherKVVarlen.prepare_cp_metadata(
+                                metadata, permutation=permutation
                             )
-                    if not case.head_tail:
-                        self.assertEqual(
-                            calls[0].args[2].untyped_storage().data_ptr(),
-                            k_THK.untyped_storage().data_ptr(),
                         )
+
+                def gather(tensors, *, reduce_dtype, _window=window, _prep=prepared):
+                    out = []
+                    for x, full in zip(tensors, (k, v), strict=False):
+                        parts = []
+                        for rank in range(cp_size):
+                            rows = full[ids[rank]]
+                            if x.shape[0] == local:  # whole local shards
+                                parts.append(rows)
+                            elif _prep[rank].tail_index is not None:
+                                parts.append(rows[_prep[rank].tail_index])
+                            else:  # contiguous halo: each shard's last rows
+                                parts.append(rows[local - _window :])
+                        out.append(torch.cat(parts))
+                    return tuple(out)
+
+                config = (
+                    AllGatherKVVarlenInnerAttention.Config()
+                    if window == -1
+                    else AllGatherKVSlidingWindowVarlenInnerAttention.Config(
+                        sliding_window_size=window + 1
+                    )
+                )
+                attention = config.build()
+                for rank in range(cp_size):
+                    with self.subTest(layout=name, window=window, rank=rank):
+                        with _emulated_cp_rank(
+                            rank=rank, cp_size=cp_size, gather=gather
+                        ), mock.patch.object(
+                            VarlenInnerAttention,
+                            "_forward_varlen",
+                            lambda self, q, k, v, **kw: _reference_varlen(
+                                q, k, v, **kw
+                            ),
+                        ):
+                            actual = attention(
+                                q[ids[rank]],
+                                k[ids[rank]],
+                                v[ids[rank]],
+                                attention_metadata=prepared[rank],
+                            )
+                        torch.testing.assert_close(actual, expected[ids[rank]])
 
 
 if __name__ == "__main__":

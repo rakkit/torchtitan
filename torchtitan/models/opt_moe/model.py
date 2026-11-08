@@ -54,12 +54,14 @@ from .state_dict_adapter import OPTMoEStateDictAdapter
 # (MTP, NoPE).
 _BLOCK_RECOMPILE_LIMIT = 32
 # torch.compiler.config.dynamic_sources entries: the per-rank document
-# metadata (VarlenAttentionMetadata's ints and offsets, the CP conv routing's
-# per-segment tensors), dynamic from the first compile
+# metadata (VarlenAttentionMetadata's ints and offsets, the varlen CP pieces'
+# K/V rows, the CP conv routing's per-segment tensors), dynamic from the first
+# compile
 _PER_RANK_METADATA_SOURCES = (
     r".*\.max_[qk]$",
     r".*\.cu_seq_[qk]$",
     r".*\.cp_routing\.(cu_seqlens|entry_sources|exit_sources|terminal|conv_sources)$",
+    r".*\.kv_index$",
 )
 
 

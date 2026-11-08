@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, fields
 from typing import Generic, Literal, TypeVar
 
+import numpy as np
 import spmd_types as spmd
 
 import torch
@@ -20,7 +21,11 @@ import torch.distributed as dist
 from torch.export import register_dataclass
 
 from torchtitan.config import TORCH_DTYPE_MAP
-from torchtitan.distributed.context_parallel import cp_all_gather_tensors
+from torchtitan.distributed.context_parallel import (
+    cp_all_gather_tensors,
+    get_token_fragments,
+    MAX_CP_RANK_FRAGMENTS,
+)
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
 
@@ -53,14 +58,6 @@ __all__ = [
 
 _TOKEN_DIM = 0
 _HEAD_DIM = 1
-
-
-def _cat_outputs(first, second):
-    """Concatenate two query chunks' attention outputs along tokens; an
-    out_transform may return (output, lse) pairs."""
-    if isinstance(first, tuple):
-        return tuple(torch.cat(pair) for pair in zip(first, second, strict=True))
-    return torch.cat((first, second))
 
 
 _GlobalAttentionMetadataT = TypeVar("_GlobalAttentionMetadataT")
@@ -271,12 +268,97 @@ class AllGatherKVSlidingWindowFlexInnerAttention(
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AllGatherKVVarlenAttentionMetadata(VarlenAttentionMetadata):
-    """Global document offsets and optional K/V reordering indices."""
+    """Global document offsets; with a CP permutation, this rank's query pieces
+    (``pieces``: one varlen sequence per document piece of each local token
+    range) and the K/V rows of each piece (``kv_index`` into the gathered K/V,
+    or for a sliding window into [local K/V; the gathered fragment tails], the
+    local rows each rank publishes being ``tail_index``)."""
 
-    inverse_permutation: torch.Tensor | None
+    pieces: VarlenAttentionMetadata | None
+    kv_index: torch.Tensor | None
+    tail_index: torch.Tensor | None
 
 
 register_dataclass(AllGatherKVVarlenAttentionMetadata)
+
+
+def _fragment_pieces(
+    cu_seqlens: list[int],
+    fragments: list[list[tuple[int, int]]],
+    *,
+    cp_rank: int,
+    window: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    """Host-side piece layout for `AllGatherKVVarlen` under a permutation:
+    (cu_seq_q, cu_seq_k, kv_index, tail_index). Every local token range is cut
+    at document starts into pieces; a piece's keys are its document's tokens
+    up to its last query (the last ``window + 1`` with a sliding window), so one
+    varlen call with bottom-right causal alignment covers every piece.
+
+    Full attention reads the keys from the gathered K/V (rank-major: rank r's
+    ranges at r x T / CP). A sliding window gathers only each range's last
+    ``window`` rows (right-aligned in ``window``-row slots, `MAX_CP_RANK_FRAGMENTS`
+    per rank) and reads [local rows; gathered tails]: the ``window`` keys
+    before a range start are always in the tails of the ranges before it."""
+    num_tokens = cu_seqlens[-1]
+    cp_size = len(fragments)
+    local = num_tokens // cp_size
+    if max(len(f) for f in fragments) > MAX_CP_RANK_FRAGMENTS:
+        raise ValueError(
+            f"A CP permutation gives a rank more than {MAX_CP_RANK_FRAGMENTS} token "
+            "ranges; varlen K/V all-gather CP supports at most that many."
+        )
+    cu = np.asarray(cu_seqlens, dtype=np.int64)
+    source = np.full(num_tokens, -1, dtype=np.int64)
+    tail_index = None
+    if window < 0:
+        for rank, ranges in enumerate(fragments):  # gathered rows, rank-major
+            offset = rank * local
+            for a, b in ranges:
+                source[a:b] = np.arange(offset, offset + b - a)
+                offset += b - a
+    else:
+        slot = window
+        for rank, ranges in enumerate(fragments):
+            for f, (a, b) in enumerate(ranges):
+                n = min(slot, b - a)
+                start = local + (rank * MAX_CP_RANK_FRAGMENTS + f + 1) * slot - n
+                source[b - n : b] = np.arange(start, start + n)
+        tail_index = np.zeros(MAX_CP_RANK_FRAGMENTS * slot, dtype=np.int64)
+        offset = 0
+        for f, (a, b) in enumerate(fragments[cp_rank]):
+            n = min(slot, b - a)
+            tail_index[(f + 1) * slot - n : (f + 1) * slot] = np.arange(
+                offset + b - a - n, offset + b - a
+            )
+            offset += b - a
+    q_lengths, k_lengths, kv_rows = [], [], []
+    offset = 0
+    for a, b in fragments[cp_rank]:
+        first = int(np.searchsorted(cu, a, side="right")) - 1
+        for doc in range(first, len(cu) - 1):
+            s, e = int(cu[doc]), int(cu[doc + 1])
+            if s >= b:
+                break
+            qa, qb = max(a, s), min(b, e)
+            if qb <= qa:
+                continue
+            ks = s if window < 0 else max(s, qa - window)
+            if window < 0:
+                rows = source[ks:qb]
+            else:  # before the range: the tails; inside it: local rows
+                inside = max(ks, a)
+                rows = np.concatenate(
+                    [source[ks:inside], np.arange(offset + inside - a, offset + qb - a)]
+                )
+            assert (rows >= 0).all(), (a, b, ks, qb)
+            q_lengths.append(qb - qa)
+            k_lengths.append(qb - ks)
+            kv_rows.append(rows)
+        offset += b - a
+    cu_q = np.concatenate([[0], np.cumsum(q_lengths)]).astype(np.int32)
+    cu_k = np.concatenate([[0], np.cumsum(k_lengths)]).astype(np.int32)
+    return cu_q, cu_k, np.concatenate(kv_rows), tail_index
 
 
 class AllGatherKVVarlen(
@@ -307,26 +389,46 @@ class AllGatherKVVarlen(
             raise ValueError("K/V all-gather varlen CP requires a causal window.")
         if attention_metadata.cu_seq_k is not attention_metadata.cu_seq_q:
             raise ValueError("Varlen K/V all-gather CP supports only self-attention.")
-        inverse_permutation = None
+        pieces = kv_index = tail_index = None
         if permutation is not None:
-            # A permutation must come from global head-tail load balancing.
             if permutation.ndim != 2 or permutation.shape[0] != 1:
                 raise ValueError(
-                    "Head-tail varlen CP requires a permutation with shape (1, seq_len)."
+                    "Varlen K/V all-gather CP requires a permutation with shape "
+                    "(1, seq_len)."
                 )
-            seq_len = permutation.shape[1]
-            inverse_permutation = torch.empty_like(permutation[0])
-            inverse_permutation[permutation[0]] = torch.arange(
-                seq_len,
-                device=permutation.device,
-                dtype=permutation.dtype,
+            group = spmd_mesh_group(MeshAxisName.CP)
+            assert group is not None
+            cu_seqlens = attention_metadata.cu_seq_q.tolist()
+            device = attention_metadata.cu_seq_q.device
+            cu_q, cu_k, rows, tails = _fragment_pieces(
+                cu_seqlens,
+                get_token_fragments(
+                    cu_seqlens[-1], cp_size=group.size(), permutation=permutation
+                ),
+                cp_rank=dist.get_rank(group),
+                window=left,
             )
+            pieces = VarlenAttentionMetadata(
+                cu_seq_q=torch.from_numpy(cu_q).to(device),
+                cu_seq_k=torch.from_numpy(cu_k).to(device),
+                # the local row count, a bound on every piece: the varlen
+                # dispatcher branches on max_q (<= 128, == 1), and a rank whose
+                # longest piece crossed 128 would recompile alone
+                max_q=int(cu_q[-1]),
+                max_k=int(np.diff(cu_k).max()),
+                window_size=attention_metadata.window_size,
+            )
+            kv_index = torch.from_numpy(rows).to(device)
+            if tails is not None:
+                tail_index = torch.from_numpy(tails).to(device)
         return AllGatherKVVarlenAttentionMetadata(
             **{
                 field.name: getattr(attention_metadata, field.name)
                 for field in fields(VarlenAttentionMetadata)
             },
-            inverse_permutation=inverse_permutation,
+            pieces=pieces,
+            kv_index=kv_index,
+            tail_index=tail_index,
         )
 
     @staticmethod
@@ -371,32 +473,19 @@ class AllGatherKVVarlen(
         attention_metadata: AllGatherKVVarlenAttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:
-        """Sliding-window CP: each rank all-gathers only the last ``left`` K/V
-        rows of every rank's chunks, and runs each local chunk against
-        [its predecessor chunk's halo; its own K/V]. Chunks in global order:
-        contiguous shards hold chunk r; head-tail shards hold chunks r and
-        2 cp - 1 - r, whose predecessors are rank r - 1's head chunk and rank
-        r + 1's tail chunk (the last rank: its own head chunk)."""
+        """Sliding-window CP with contiguous shards: each rank all-gathers only
+        the last ``left`` K/V rows of every rank's shard and runs its shard
+        against [the previous rank's rows; its own K/V]."""
         assert isinstance(self, VarlenInnerAttention)
         cp_group = spmd_mesh_group(MeshAxisName.CP)
         assert cp_group is not None
-        cp_rank, cp_size = dist.get_rank(cp_group), cp_group.size()
+        cp_rank = dist.get_rank(cp_group)
         left = attention_metadata.window_size[0]
-        head_tail = attention_metadata.inverse_permutation is not None
-        num_chunks = 2 if head_tail else 1
-        chunk_len = q_THK.shape[0] // num_chunks
+        chunk_len = q_THK.shape[0]
         assert chunk_len >= left, (chunk_len, left)
-        # [num_chunks * left] rows per rank: the end of each local chunk
+        # [left] rows per rank: the end of its shard
         with spmd.no_typecheck():
-            tails = [
-                torch.cat(
-                    [
-                        x[(c + 1) * chunk_len - left : (c + 1) * chunk_len]
-                        for c in range(num_chunks)
-                    ]
-                )
-                for x in (k_THK, v_THV)
-            ]
+            tails = [x[chunk_len - left : chunk_len] for x in (k_THK, v_THV)]
         if spmd.is_type_checking():
             for tail, x in zip(tails, (k_THK, v_THV), strict=True):
                 spmd.assert_type_like(tail, x)
@@ -404,49 +493,62 @@ class AllGatherKVVarlen(
             tuple(tails), reduce_dtype=self.reduce_dtype
         )
 
-        def halo(x_THK: torch.Tensor, rank: int, chunk: int) -> torch.Tensor:
-            start = (rank * num_chunks + chunk) * left
-            return x_THK[start : start + left]
-
-        varlen_forward = self._forward_varlen
-
-        def run_chunk(index: int, q_start: int, prev: tuple[int, int] | None):
-            q_chunk = q_THK[index * chunk_len : (index + 1) * chunk_len]
-            k_chunk = k_THK[index * chunk_len : (index + 1) * chunk_len]
-            v_chunk = v_THV[index * chunk_len : (index + 1) * chunk_len]
-            # No predecessor (the sequence start): an empty halo slice, so the
-            # gathered halos stay in this rank's autograd graph and its
-            # backward joins the reduce-scatter every other rank runs.
-            with spmd.no_typecheck():
-                prev_k = halo(halo_k, *prev) if prev is not None else halo_k[:0]
-                prev_v = halo(halo_v, *prev) if prev is not None else halo_v[:0]
-                k_chunk = torch.cat((prev_k, k_chunk))
-                v_chunk = torch.cat((prev_v, v_chunk))
-            if spmd.is_type_checking():
-                # as the full gather's slices: the K/V of this chunk's range
-                spmd.assert_type_like(k_chunk, halo_k)
-                spmd.assert_type_like(v_chunk, halo_v)
-            kv_start = q_start - (left if prev is not None else 0)
-            metadata = self._chunk_metadata(
-                attention_metadata,
-                q_start=q_start,
-                end=q_start + chunk_len,
-                kv_start=kv_start,
-            )
-            return varlen_forward(
-                q_chunk, k_chunk, v_chunk, attention_metadata=metadata, **kwargs
-            )
-
-        if not head_tail:
-            return run_chunk(
-                0, cp_rank * chunk_len, (cp_rank - 1, 0) if cp_rank else None
-            )
-        head_out = run_chunk(
-            0, cp_rank * chunk_len, (cp_rank - 1, 0) if cp_rank else None
+        # The first rank has no predecessor: an empty halo slice, so the
+        # gathered halos stay in its autograd graph and its backward joins the
+        # reduce-scatter every other rank runs.
+        q_start = cp_rank * chunk_len
+        with spmd.no_typecheck():
+            prev = slice((cp_rank - 1) * left, cp_rank * left) if cp_rank else slice(0)
+            k_chunk = torch.cat((halo_k[prev], k_THK))
+            v_chunk = torch.cat((halo_v[prev], v_THV))
+        if spmd.is_type_checking():
+            # as the full gather's slices: the K/V of this chunk's range
+            spmd.assert_type_like(k_chunk, halo_k)
+            spmd.assert_type_like(v_chunk, halo_v)
+        metadata = self._chunk_metadata(
+            attention_metadata,
+            q_start=q_start,
+            end=q_start + chunk_len,
+            kv_start=q_start - (left if cp_rank else 0),
         )
-        tail_prev = (cp_rank + 1, 1) if cp_rank < cp_size - 1 else (cp_rank, 0)
-        tail_out = run_chunk(1, (2 * cp_size - 1 - cp_rank) * chunk_len, tail_prev)
-        return _cat_outputs(head_out, tail_out)
+        return self._forward_varlen(
+            q_THK, k_chunk, v_chunk, attention_metadata=metadata, **kwargs
+        )
+
+    def _forward_pieces(
+        self,
+        q_THK: torch.Tensor,
+        k_THK: torch.Tensor,
+        v_THV: torch.Tensor,
+        *,
+        attention_metadata: AllGatherKVVarlenAttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        """A permuted layout (`_fragment_pieces`): one varlen call over this
+        rank's document pieces, their keys gathered by ``kv_index`` from the
+        all-gathered K/V (full attention) or from [local K/V; every rank's
+        range tails] (sliding window)."""
+        assert isinstance(self, VarlenInnerAttention)
+        assert attention_metadata.pieces is not None
+        tail_index = attention_metadata.tail_index
+        if tail_index is None:
+            k_src, v_src = cp_all_gather_tensors(
+                (k_THK, v_THV), reduce_dtype=self.reduce_dtype
+            )
+        else:
+            with spmd.no_typecheck():
+                tails = tuple(x.index_select(0, tail_index) for x in (k_THK, v_THV))
+            halo_k, halo_v = cp_all_gather_tensors(
+                tails, reduce_dtype=self.reduce_dtype
+            )
+            with spmd.no_typecheck():
+                k_src, v_src = torch.cat((k_THK, halo_k)), torch.cat((v_THV, halo_v))
+        with spmd.no_typecheck():
+            k_buf = k_src.index_select(0, attention_metadata.kv_index)
+            v_buf = v_src.index_select(0, attention_metadata.kv_index)
+        return self._forward_varlen(
+            q_THK, k_buf, v_buf, attention_metadata=attention_metadata.pieces, **kwargs
+        )
 
     def forward(
         self,
@@ -464,66 +566,38 @@ class AllGatherKVVarlen(
             )
         assert isinstance(self, VarlenInnerAttention)
         left = attention_metadata.window_size[0]
-        if left != -1:
-            # Sliding window: a chunk needs only its own K/V and the previous
-            # `left` tokens (the end of the chunk before it): gather those
+        if attention_metadata.pieces is not None:
+            out_THV = self._forward_pieces(
+                q_THK, k_THK, v_THV, attention_metadata=attention_metadata, **kwargs
+            )
+        elif left != -1:
+            # Sliding window: a shard needs only its own K/V and the previous
+            # `left` tokens (the end of the shard before it): gather those
             # halos, not the whole sequence.
             return self._forward_window_halo(
                 q_THK, k_THK, v_THV, attention_metadata=attention_metadata, **kwargs
             )
-        k_THK, v_THV = cp_all_gather_tensors(
-            (k_THK, v_THV),
-            reduce_dtype=self.reduce_dtype,
-        )
-
-        # A chunk needs at most one document length of earlier keys.
-        max_document_length = attention_metadata.max_k
-        max_lookback = (
-            max_document_length if left == -1 else min(left, max_document_length)
-        )
-        cp_group = spmd_mesh_group(MeshAxisName.CP)
-        assert cp_group is not None
-        cp_rank = dist.get_rank(cp_group)
-        varlen_forward = self._forward_varlen
-
-        def run_chunk(q_chunk_THK: torch.Tensor, q_start: int) -> torch.Tensor:
-            end = q_start + q_chunk_THK.shape[0]
-            kv_start = max(0, q_start - max_lookback)
-            metadata = self._chunk_metadata(
-                attention_metadata,
-                q_start=q_start,
-                end=end,
-                kv_start=kv_start,
+        else:
+            # No load balancer: Q is one contiguous shard; it needs at most one
+            # document length of earlier keys.
+            k_THK, v_THV = cp_all_gather_tensors(
+                (k_THK, v_THV), reduce_dtype=self.reduce_dtype
             )
-            return varlen_forward(
-                q_chunk_THK,
+            cp_group = spmd_mesh_group(MeshAxisName.CP)
+            assert cp_group is not None
+            q_start = dist.get_rank(cp_group) * q_THK.shape[0]
+            end = q_start + q_THK.shape[0]
+            kv_start = max(0, q_start - attention_metadata.max_k)
+            metadata = self._chunk_metadata(
+                attention_metadata, q_start=q_start, end=end, kv_start=kv_start
+            )
+            out_THV = self._forward_varlen(
+                q_THK,
                 k_THK[kv_start:end],
                 v_THV[kv_start:end],
                 attention_metadata=metadata,
                 **kwargs,
             )
-
-        inverse_permutation = attention_metadata.inverse_permutation
-        if inverse_permutation is None:
-            # No load balancer: Q is one contiguous shard.
-            out_THV = run_chunk(q_THK, cp_rank * q_THK.shape[0])
-        else:
-            # Head-tail load balancer.
-            gathered_k_THK, gathered_v_THV = k_THK, v_THV
-            with spmd.no_typecheck():
-                k_THK = gathered_k_THK.index_select(0, inverse_permutation)
-                v_THV = gathered_v_THV.index_select(0, inverse_permutation)
-            if spmd.is_type_checking():
-                spmd.assert_type_like(k_THK, gathered_k_THK)
-                spmd.assert_type_like(v_THV, gathered_v_THV)
-
-            chunk_len = q_THK.shape[0] // 2
-            head_start = cp_rank * chunk_len
-            global_len = q_THK.shape[0] * cp_group.size()
-            tail_start = global_len - (cp_rank + 1) * chunk_len
-            head_out_THV = run_chunk(q_THK[:chunk_len], head_start)
-            tail_out_THV = run_chunk(q_THK[chunk_len:], tail_start)
-            out_THV = _cat_outputs(head_out_THV, tail_out_THV)
         if kwargs.get("out_transform") is None and spmd.is_type_checking():
             spmd.assert_type(
                 out_THV,

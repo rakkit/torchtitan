@@ -12,7 +12,10 @@ import spmd_types as spmd
 import torch
 import torch.distributed as dist
 
-from torchtitan.distributed.context_parallel import get_token_fragments
+from torchtitan.distributed.context_parallel import (
+    get_token_fragments,
+    MAX_CP_RANK_FRAGMENTS,
+)
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
 
@@ -133,11 +136,14 @@ def prepare_cp_linear_attention_metadata(
     )
     # The routing's segment dim is this rank's document-piece count: padded to
     # at least 2, or a rank whose chunk is one piece compiles its own graph
-    # (size 1 specializes) while the other ranks wait in collectives.
+    # (size 1 specializes) while the other ranks wait in collectives. Under a
+    # permutation its per-range tables take the fixed range cap: a layout's
+    # range count changes from batch to batch (DocumentCPLoadBalancer).
     routing = ContextParallelRouting(
         **vars(
             plan.routing(
                 device,
+                slots=None if permutation is None else MAX_CP_RANK_FRAGMENTS,
                 max_subsequences=max(2, len(plan.cu_seqlens) - 1),
                 conv_history=attention_metadata.num_conv_history_tokens,
             )

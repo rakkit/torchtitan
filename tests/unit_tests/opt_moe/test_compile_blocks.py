@@ -56,7 +56,7 @@ TIMEOUT_OVERRIDE["test_training_with_validation_matches_eager"] = 1500
 TIMEOUT_OVERRIDE["test_training_with_validation_stays_in_the_recompile_budget"] = 1500
 
 
-def _config(*, moe: bool):
+def _config(*, moe: bool, **overrides):
     return build_model_config(
         "mis-8b-proxy",
         parallelism=ParallelismConfig(),
@@ -79,6 +79,7 @@ def _config(*, moe: bool):
         # compiled rounding cannot flip a token's top-k
         router_init_fn_type="scaled_orthogonal",
         router_init_std=4.0,
+        **overrides,
     )
 
 
@@ -125,10 +126,10 @@ class TestCompileBlocks(DTensorTestBase):
     def world_size(self) -> int:
         return 1
 
-    def _models(self, *, moe: bool):
+    def _models(self, *, moe: bool, **overrides):
         torch.manual_seed(0)
         with torch.device("meta"):
-            reference = _config(moe=moe).build()
+            reference = _config(moe=moe, **overrides).build()
         reference.to_empty(device="cuda")
         with torch.no_grad():
             reference.init_states(buffer_device=torch.device("cuda"))
@@ -144,13 +145,17 @@ class TestCompileBlocks(DTensorTestBase):
             enable_sequence_parallel=False,
         )
         pc.build_mesh()
-        model = self._parallelized(pc, reference, moe=moe, compile_blocks=True)
+        model = self._parallelized(
+            pc, reference, moe=moe, compile_blocks=True, **overrides
+        )
         return pc, reference, model
 
-    def _parallelized(self, pc, reference, *, moe: bool, compile_blocks: bool):
+    def _parallelized(
+        self, pc, reference, *, moe: bool, compile_blocks: bool, **overrides
+    ):
         """``reference``'s weights in the recipe's setup: FSDP, the w2 remat,
         compile_blocks on or off."""
-        cfg = _config(moe=moe)
+        cfg = _config(moe=moe, **overrides)
         cfg.compile_blocks = compile_blocks
         with torch.device("meta"):
             model = cfg.build()
@@ -185,6 +190,20 @@ class TestCompileBlocks(DTensorTestBase):
                 for batch in train:
                     _loss(model, batch).backward()
                 _validation_logits(model, val)
+
+    @with_comms
+    def test_varlen_document_lengths_do_not_recompile(self):
+        # The varlen backend takes the longest document as an int. Under CP a
+        # rank's value can stay fixed for many steps (clamped to its chunk);
+        # its first new value recompiled that rank's blocks while every other
+        # rank waited in a collective (12 s steps at 256k).
+        pc, _, model = self._models(moe=False, attn_backend="varlen")
+        with pc.activate_spmd():
+            for _ in range(2):
+                _loss(model, _batch([256, 256], 1)).backward()
+            with torch._dynamo.config.patch(error_on_recompile=True):
+                for docs in ([100, 412], [12, 500]):
+                    _loss(model, _batch(docs, 2)).backward()
 
     @with_comms
     def test_training_with_validation_matches_eager(self):

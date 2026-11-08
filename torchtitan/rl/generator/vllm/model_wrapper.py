@@ -544,8 +544,19 @@ class VLLMModelWrapper(Module):
             # TODO: Consider an init_non_persistent_buffers contract on the
             # Decoder / Model class so buffer-only init does not need this
             # spmd context.
+            # Without a checkpoint (the RL loop) every parameter comes from the
+            # trainer's first push before any rollout, and load_model_state_dict
+            # raises on an unfilled one: only buffers need their init (the full
+            # parameter init took 68 s on one GPU at a 37B opt_moe). Zeros, not
+            # uninitialized memory, for vLLM's start-up forward passes.
+            init_parameters = checkpointer_config is not None
             with self.parallelism_context.activate_spmd():
-                self.model.init_weights(buffer_device=None)
+                self.model.init_weights(
+                    buffer_device=None, init_parameters=init_parameters
+                )
+            if not init_parameters:
+                for param in self.model.parameters():
+                    param.zero_()
         self._initialize_dist_moe_runtime(
             dist_moe_runtime,
             vllm_config.scheduler_config.max_num_batched_tokens,

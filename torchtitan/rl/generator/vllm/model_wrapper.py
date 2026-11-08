@@ -55,11 +55,35 @@ from torchtitan.models.opt_moe.gated_swa_attention import GatedSWAttention
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
 from torchtitan.rl.generator.engine import ModelStateDictLoadMode
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
+from torchtitan.rl.generator.vllm.fp8 import fp8_modules
 from torchtitan.rl.generator.vllm.registry import uses_compressed_mla_cache
 from torchtitan.tools.utils import set_default_dtype
 
 
 logger = init_logger(__name__)
+
+
+def _check_generator_kernels(
+    model_config, parallelism: InferenceParallelismConfig
+) -> None:
+    """vLLM's fused experts and the block-FP8 linears read whole, unsharded weights
+    and do not follow batch-invariant numerics."""
+    from torchtitan.rl.generator.vllm.fp8 import BlockFP8InferenceLinear
+    from torchtitan.rl.generator.vllm.moe import VLLMFusedRoutedExperts
+
+    for config_cls in (VLLMFusedRoutedExperts.Config, BlockFP8InferenceLinear.Config):
+        if not any(True for _ in model_config.traverse(config_cls)):
+            continue
+        name = config_cls.__qualname__.split(".")[0]
+        if (
+            parallelism.tensor_parallel_degree > 1
+            or parallelism.expert_parallel_degree > 1
+        ):
+            raise ValueError(
+                f"{name} needs a generator without tensor or expert parallelism"
+            )
+        if is_in_batch_invariant_mode():
+            raise ValueError(f"{name} does not follow batch-invariant numerics")
 
 
 def _replace_vllm_layer_configs(model_config):
@@ -365,6 +389,26 @@ def _unshard_and_free_sharded_params(module: FSDPModule) -> None:
             free_storage(sharded_data)
 
 
+def _fp8_modules_by_group(
+    model: nn.Module, groups: list[tuple[FSDPModule, list[tuple[str, Any]]]]
+) -> dict[FSDPModule, list[nn.Module]]:
+    """The FP8 modules whose bf16 source parameters each FSDP load group holds.
+
+    Must run while every group is sharded (source parameters = sharded parameters).
+    """
+    group_of_param = {
+        id(fsdp_param.sharded_param): module
+        for module, keyed_params in groups
+        for _, fsdp_param in keyed_params
+    }
+    by_group: dict[FSDPModule, list[nn.Module]] = {module: [] for module, _ in groups}
+    for fp8_module in fp8_modules(model):
+        owners = {group_of_param[id(p)] for p in fp8_module.fp8_source_params()}
+        assert len(owners) == 1, f"{fp8_module} spans {len(owners)} FSDP groups"
+        by_group[owners.pop()].append(fp8_module)
+    return by_group
+
+
 def _fsdp_load_groups(
     model: nn.Module,
 ) -> tuple[list[tuple[FSDPModule, list[tuple[str, Any]]]], list[str]]:
@@ -458,6 +502,7 @@ class VLLMModelWrapper(Module):
         training_parallelism = parallelism.to_training()
         model_config = copy.deepcopy(model_config)
         self.config = _replace_vllm_layer_configs(model_config)
+        _check_generator_kernels(self.config, parallelism)
 
         # Build ParallelismContext from the translated ParallelismConfig so TP/EP
         # sharding sees the same mesh shape as vLLM. The DP axis is represented
@@ -573,6 +618,9 @@ class VLLMModelWrapper(Module):
             _patch_vllm_all_reduce()
 
         self._fsdp_load_groups, self._buffer_keys = _fsdp_load_groups(self.model)
+        self._fp8_modules_by_group = _fp8_modules_by_group(
+            self.model, self._fsdp_load_groups
+        )
         if model_state_dict_load_mode == "gpu_fetch":
             # gpu_fetch writes into the sharded parameter itself, not a quantized
             # parameter's high-precision _tensor.
@@ -603,6 +651,10 @@ class VLLMModelWrapper(Module):
         for module in self.model.modules():
             if isinstance(module, FSDPModule):
                 _unshard_and_free_sharded_params(module)
+        # The FP8 modules quantize their unsharded bf16 weights and free them, so
+        # the profiling sees (and the KV cache gets) the FP8-only footprint.
+        for module in fp8_modules(self.model):
+            module.requantize(free_source=True)
 
     def load_model_state_dict(
         self, fetch: Callable[[dict[str, torch.Tensor]], Iterable[str]]
@@ -660,6 +712,9 @@ class VLLMModelWrapper(Module):
                 except Exception as e:
                     error = e
             _unshard_and_free_sharded_params(module)
+            # Per group: only one group's bf16 copy of the FP8 weights is live.
+            for fp8_module in self._fp8_modules_by_group[module]:
+                fp8_module.requantize(free_source=True)
         if error is not None:
             raise error
         # Buffers load after every FSDP collective, so a failure here cannot hang

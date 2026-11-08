@@ -35,6 +35,7 @@ from torchtitan.rl.generator.vllm.attention.mla import (
     VLLMMLAAttention,
     VLLMMLAInnerAttention,
 )
+from torchtitan.rl.generator.vllm.fp8 import BlockFP8InferenceLinear, fp8_modules
 from torchtitan.rl.generator.vllm.model_wrapper import (
     _replace_vllm_layer_configs,
     VLLMModelWrapper,
@@ -213,6 +214,9 @@ class _Wrapper:
         self._fsdp_load_groups, self._buffer_keys = model_wrapper._fsdp_load_groups(
             model
         )
+        self._fp8_modules_by_group = model_wrapper._fp8_modules_by_group(
+            model, self._fsdp_load_groups
+        )
 
 
 def _copy_from(new_state_dict: dict[str, torch.Tensor]):
@@ -296,6 +300,50 @@ def test_load_model_state_dict_fetches_params_in_their_own_dtype(tmp_path) -> No
         assert fetched_dtypes["A_log"] == torch.float32
         assert model.A_log.equal(new_state_dict["A_log"].full_tensor())
         assert model.layer.weight.equal(new_state_dict["layer.weight"].full_tensor())
+    finally:
+        dist.destroy_process_group()
+
+
+def test_load_model_state_dict_requantizes_fp8_weights_and_frees_bf16(
+    tmp_path,
+) -> None:
+    """Each load re-quantizes a block-FP8 linear from the NEW weight into the same
+    buffers (CUDA graphs read them) and frees the bf16 source, which FSDP
+    re-allocates at the next unshard; a stale FP8 copy would decode silently."""
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1
+    )
+    try:
+        model = nn.Module()
+        model.layer = BlockFP8InferenceLinear.Config(
+            in_features=256, out_features=128, bias=False
+        ).build()
+        model.layer.to(torch.bfloat16)
+        mesh = init_device_mesh("cpu", (1,))
+        fully_shard(model.layer, mesh=mesh, reshard_after_forward=False)
+        fully_shard(model, mesh=mesh, reshard_after_forward=False)
+        model.set_keep_unsharded_storage(True)
+        sharded_weight = model.state_dict()["layer.weight"]
+        wrapper = _Wrapper(model)
+        for module in model.modules():  # as after the initial load
+            if isinstance(module, FSDPModule):
+                model_wrapper._unshard_and_free_sharded_params(module)
+        for module in fp8_modules(model):
+            module.requantize(free_source=True)
+        fp8_ptr = model.layer._weight_fp8.data_ptr()
+
+        for _ in range(2):
+            new_weight = torch.randn_like(sharded_weight)
+            wrapper.load_model_state_dict(_copy_from({"layer.weight": new_weight}))
+            # e4m3 round-to-nearest: <= 2^-4 relative for normals, plus half the
+            # subnormal step (2^-10 of the block scale)
+            scale = model.layer._weight_scale.view(1, 1, 2, 1)
+            dequantized = model.layer._weight_fp8.float().view(1, 128, 2, 128) * scale
+            expected = new_weight.full_tensor().float().view(1, 128, 2, 128)
+            bound = 2**-4 * expected.abs() + 2**-10 * scale
+            assert ((dequantized - expected).abs() <= bound).all()
+            assert model.layer.weight.untyped_storage().size() == 0
+            assert model.layer._weight_fp8.data_ptr() == fp8_ptr
     finally:
         dist.destroy_process_group()
 

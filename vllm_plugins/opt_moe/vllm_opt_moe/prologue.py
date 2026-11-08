@@ -188,6 +188,7 @@ def _norm_rope_store(
 def _prologue_kernel(
     qkv_ptr,
     stride_qkv_t,
+    kv_col0,
     conv_w_ptr,
     q_norm_w_ptr,
     k_norm_w_ptr,
@@ -264,8 +265,8 @@ def _prologue_kernel(
         slots = tl.load(slot_ptr + tokens, mask=row_mask, other=-1)
         qstart = tl.load(qstart_ptr + tokens, mask=row_mask, other=0)
         valid = row_mask & (slots >= 0)
-        k_col = H * K + g * K
-        v_col = H * K + G * K + g * K
+        k_col = kv_col0 + g * K
+        v_col = kv_col0 + G * K + g * K
         # k by slices: the norm needs the whole head, RoPE pairs a with b
         ka = _conv_slice(
             qkv_ptr,
@@ -427,8 +428,9 @@ def attention_prologue(
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """q ``[T, H K]``, k / v ``[T, G K]`` (contiguous) from the projection
-    output ``qkv_TC`` ``[T, (H + 2 G) K]`` (any token stride); ``rope_dim`` 0:
-    no RoPE (NoPE layer)."""
+    output ``qkv_TC``: ``[T, (H + 2 G) K]``, or ``[T, (2 H + 2 G) K]`` with the
+    element-wise gate's rows between q and k (k / v are its last ``2 G K``
+    columns; any token stride); ``rope_dim`` 0: no RoPE (NoPE layer)."""
     T = qkv_TC.shape[0]
     H, G, K = num_heads, num_kv_heads, head_dim
     q = torch.empty((T, H * K), dtype=qkv_TC.dtype, device=qkv_TC.device)
@@ -447,6 +449,7 @@ def attention_prologue(
     _prologue_kernel[grid](
         qkv_TC,
         qkv_TC.stride(0),
+        qkv_TC.shape[1] - 2 * G * K,
         conv_weight_CW,
         q_norm_weight if weight else qkv_TC,
         k_norm_weight if weight else qkv_TC,

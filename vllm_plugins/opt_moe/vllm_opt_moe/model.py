@@ -20,7 +20,7 @@ layer (``prologue.py``: positions addressed, the same path for prefill / decode 
 speculative tokens, CUDA-graph safe). The ops follow the HF model's
 transformers forward: q / k / v -> x + conv(x) on k / v -> qk-norm -> RoPE (none on
 NoPE layers, partial when ``dim`` < head_dim) -> attention -> the element-wise
-gate sigmoid(gate_proj(x)) -> o_proj; RMSNorm blocks with the per-layer
+gate sigmoid(x W_gate) (its rows in qkv_proj) -> o_proj; RMSNorm blocks with the per-layer
 residual scales; the first ``first_k_dense_replace`` layers a SwiGLU FFN, the
 rest a sigmoid-routed MoE with the score-correction bias for the choice and a
 shared expert. The MTP depths are not served (``num_nextn_predict_layers`` is
@@ -49,7 +49,6 @@ from vllm.model_executor.layers.fused_moe.layer import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -227,10 +226,13 @@ class OptMoeAttention(nn.Module):
         self.total_kv_heads = config.num_key_value_heads
         self.head_dim = k
         self.q_size, self.kv_size = self.n_heads * k, self.n_kv_heads * k
+        # the element-wise gate's rows ride in qkv_proj as extra q heads (one
+        # GEMM; per rank [q | gate | k | v], _load_weights interleaves them)
+        self.gate_in_qkv = config.attention_gate == "element-wise"
         self.qkv_proj = QKVParallelLinear(
             d,
             k,
-            config.num_attention_heads,
+            config.num_attention_heads * (2 if self.gate_in_qkv else 1),
             config.num_key_value_heads,
             bias=False,
             quant_config=quant_config,
@@ -256,17 +258,6 @@ class OptMoeAttention(nn.Module):
         affine, eps = config.norm_has_weight, config.rms_norm_eps
         self.q_norm = RMSNorm(k, eps=eps, has_weight=affine) if config.qk_norm else None
         self.k_norm = RMSNorm(k, eps=eps, has_weight=affine) if config.qk_norm else None
-        self.gate_proj = (
-            ColumnParallelLinear(
-                d,
-                config.num_attention_heads * k,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.gate_proj",
-            )
-            if config.attention_gate == "element-wise"
-            else None
-        )
         rope = config.rope_layers[layer_idx]
         self.rotary_emb = (
             None
@@ -316,6 +307,9 @@ class OptMoeAttention(nn.Module):
 
     def forward(self, positions: torch.Tensor, x_TD: torch.Tensor) -> torch.Tensor:
         qkv, _ = self.qkv_proj(x_TD)
+        q_size, gate = self.q_size, None
+        if self.gate_in_qkv:
+            gate = qkv[:, q_size : 2 * q_size]
         if self.conv_state is not None:
             # one launch: the k / v conv on its state, qk-norm, RoPE
             norm = self.q_norm
@@ -335,7 +329,8 @@ class OptMoeAttention(nn.Module):
                 1e-6 if norm is None else norm.variance_epsilon,
             )
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q = qkv[:, :q_size]
+            k, v = qkv[:, qkv.shape[1] - 2 * self.kv_size :].split(self.kv_size, dim=-1)
             if self.q_norm is not None:
                 t = q.shape[0]
                 q = self.q_norm(q.reshape(t, -1, self.head_dim)).reshape(t, -1)
@@ -343,8 +338,7 @@ class OptMoeAttention(nn.Module):
             if self.rotary_emb is not None:
                 q, k = self.rotary_emb(positions, q, k)
         out = self.attn(q, k, v)
-        if self.gate_proj is not None:
-            gate, _ = self.gate_proj(x_TD)
+        if gate is not None:
             out = (out.float() * torch.sigmoid(gate.float())).to(out.dtype)
         out, _ = self.o_proj(out)
         return out
@@ -651,8 +645,29 @@ def _load_weights(model: nn.Module, weights, *, keep) -> set[str]:
         get_tensor_model_parallel_rank(),
     )
     loaded = set()
+    # attention layers whose qkv_proj carries the element-wise gate: their q and
+    # gate weights wait for each other, then load as one q shard, interleaved
+    # per TP rank (each rank's slice = its q heads, then its gate heads)
+    gated = {
+        name for name, m in model.named_modules() if getattr(m, "gate_in_qkv", False)
+    }
+    pending: dict[str, dict[str, torch.Tensor]] = {}
     for name, w in weights:
         if not keep(name):
+            continue
+        attn = name.rsplit(".", 2)[0]
+        if attn in gated and name.endswith((".q_proj.weight", ".gate_proj.weight")):
+            parts = pending.setdefault(attn, {})
+            parts["gate" if name.endswith(".gate_proj.weight") else "q"] = w
+            if len(parts) == 2:
+                q, g = parts["q"], parts["gate"]
+                del pending[attn]
+                fused = torch.cat(
+                    [t for r in range(tp) for t in (q.chunk(tp)[r], g.chunk(tp)[r])]
+                )
+                key = f"{attn}.qkv_proj.weight"
+                params[key].weight_loader(params[key], fused, "q")
+                loaded.add(key)
             continue
         if name.endswith((".self_attn.k_conv.weight", ".self_attn.v_conv.weight")):
             key = name.rsplit(".", 2)[0] + ".conv_weight"
@@ -681,6 +696,8 @@ def _load_weights(model: nn.Module, weights, *, keep) -> set[str]:
                 param = params[name]
                 getattr(param, "weight_loader", default_weight_loader)(param, w)
                 loaded.add(name)
+    if pending:
+        raise ValueError(f"q / gate weights without their pair: {sorted(pending)}")
     return loaded
 
 

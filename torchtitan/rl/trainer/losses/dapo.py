@@ -71,7 +71,18 @@ class DAPOLoss(Loss[torch.Tensor]):
         gradient (they still count in the loss denominator). For rollouts whose numerics
         differ from the trainer's (FP8 generators, stale weights). None keeps every token."""
 
+        truncated_is_cap: float | None = None
+        """Truncated importance sampling (TIS; FP8-RL, https://arxiv.org/abs/2601.18150, cap
+        2): each token's gradient is ``min(p_trainer / p_generator, cap) * advantage *
+        grad log p_trainer``, with the trainer's weights before this optimizer step as the
+        proximal policy (one optimizer step per batch), in place of the clipped ratio.
+        Combines with ``mismatch_mask_ratio``. None keeps DAPO's clipped ratio."""
+
         def __post_init__(self) -> None:
+            if self.truncated_is_cap is not None and self.truncated_is_cap <= 0.0:
+                raise ValueError(
+                    f"truncated_is_cap must be > 0, got {self.truncated_is_cap}"
+                )
             if self.mismatch_mask_ratio is not None and self.mismatch_mask_ratio <= 1.0:
                 raise ValueError(
                     f"mismatch_mask_ratio must be > 1, got {self.mismatch_mask_ratio}"
@@ -82,6 +93,7 @@ class DAPOLoss(Loss[torch.Tensor]):
         self.ratio_clip_high = config.ratio_clip_high
         self.global_vocab_size = config.global_vocab_size
         self.mismatch_mask_ratio = config.mismatch_mask_ratio
+        self.truncated_is_cap = config.truncated_is_cap
 
     def __call__(
         self,
@@ -133,7 +145,14 @@ class DAPOLoss(Loss[torch.Tensor]):
         clipped_ratio = torch.clamp(
             ratio, 1 - self.ratio_clip_low, 1 + self.ratio_clip_high
         )
-        token_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
+        if self.truncated_is_cap is None:
+            token_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
+        else:
+            # value 1, gradient grad log p_trainer, weighted by the capped generator ratio
+            weight = torch.clamp(ratio.detach(), max=self.truncated_is_cap)
+            token_loss = (
+                -weight * advantages * torch.exp(log_ratio - log_ratio.detach())
+            )
 
         gradient_mask = effective_loss_mask
         if self.mismatch_mask_ratio is not None:
@@ -186,5 +205,10 @@ class DAPOLoss(Loss[torch.Tensor]):
                     global_loss_token_counts,
                 ),
             }
+            if self.truncated_is_cap is not None:
+                metrics["loss/tis_capped_frac"] = _normalize(
+                    ((ratio > self.truncated_is_cap) & gradient_mask).float().sum(),
+                    global_loss_token_counts,
+                )
 
         return loss, metrics

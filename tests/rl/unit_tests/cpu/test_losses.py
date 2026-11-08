@@ -48,6 +48,48 @@ def test_dapo_loss_matches_vllm_tempered_logprobs_bitwise() -> None:
     assert metrics["bit_wise/logprob_diff/max"] == 0
 
 
+def test_dapo_truncated_is_gradient_is_capped_ratio_times_advantage() -> None:
+    """TIS (truncated_is_cap): each token's gradient is min(p_trainer / p_generator, cap)
+    * advantage * grad log p_trainer / N (from the equation, not the code), and with
+    the generator equal to the trainer it is DAPO's gradient."""
+    torch.manual_seed(0)
+    logits = torch.randn(8, 16, dtype=torch.float64)
+    labels = torch.randint(0, 16, (8,))
+    trainer_logprobs = logits.log_softmax(-1).gather(-1, labels[:, None]).squeeze(-1)
+    shift = torch.tensor(
+        [-1.5, -0.3, 0.0, 0.4, 1.0, -0.9, 0.2, 0.0], dtype=torch.float64
+    )
+    advantages = torch.linspace(-1.0, 1.0, 8, dtype=torch.float64)
+    cap = 2.0
+    kwargs = dict(
+        labels=labels,
+        global_loss_token_counts=torch.tensor(8),
+        temperature=torch.ones(8, dtype=torch.float64),
+        advantages=advantages,
+        loss_mask=torch.ones(8, dtype=torch.bool),
+    )
+    pred = logits.clone().requires_grad_(True)
+    loss, metrics = DAPOLoss.Config(truncated_is_cap=cap).build()(
+        pred=pred, generator_logprobs=trainer_logprobs + shift, **kwargs
+    )
+    loss.backward()
+    ref = logits.clone().requires_grad_(True)
+    weight = torch.clamp(torch.exp(-shift), max=cap)
+    logp = ref.log_softmax(-1).gather(-1, labels[:, None]).squeeze(-1)
+    (-(weight * advantages * logp).sum() / 8).backward()
+    torch.testing.assert_close(pred.grad, ref.grad)
+    assert metrics["loss/tis_capped_frac"] == 2 / 8  # exp(1.5), exp(0.9) > 2
+
+    grads = []
+    for config in (DAPOLoss.Config(truncated_is_cap=cap), DAPOLoss.Config()):
+        pred = logits.clone().requires_grad_(True)
+        config.build()(pred=pred, generator_logprobs=trainer_logprobs, **kwargs)[
+            0
+        ].backward()
+        grads.append(pred.grad)
+    torch.testing.assert_close(grads[0], grads[1])
+
+
 def test_dapo_mismatch_mask_drops_only_far_tokens_gradient() -> None:
     """IcePop (mismatch_mask_ratio): a token whose trainer / generator ratio is
     outside [1 / beta, beta] gives no gradient; the others keep today's gradient,

@@ -11,10 +11,11 @@ Each FP8 module keeps its bf16 parameters as the weight sync's load target and
 an e4m3 copy with one fp32 scale per 128 x 128 block (per expert for the
 experts). ``requantize`` refreshes the copy in place after a load and can free
 the bf16 storage, which FSDP re-allocates at the next unshard; the forward reads
-only the FP8 copy. Activations are quantized per 1 x 128 group; the GEMMs are
-vLLM's Triton block-scaled kernels (the DeepSeek-V3 / FP8-RL format,
-https://arxiv.org/abs/2601.18150). The LM head, routers, embeddings and norms
-stay bf16.
+only the FP8 copy. Activations are quantized per 1 x 128 group (the DeepSeek-V3
+/ FP8-RL format, https://arxiv.org/abs/2601.18150); the linears run DeepGEMM's
+block-scaled GEMM (on GH200 3-3.6x faster than vLLM's Triton kernel, which has
+no tuned configs there), the experts vLLM's fused_experts. The LM head,
+routers, embeddings and norms stay bf16.
 
 Weight copy, at 128 x 128 blocks::
 
@@ -126,23 +127,33 @@ class BlockFP8InferenceLinear(Linear):
         weight: torch.Tensor,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
+        # registers torch.ops.vllm.fp8_gemm_nt_op (compile- and CUDA-graph-safe)
+        import vllm.model_executor.kernels.linear.scaled_mm.deep_gemm  # noqa: F401
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             per_token_group_quant_fp8,
-            w8a8_triton_block_scaled_mm,
         )
 
         del weight, bias
         if self._weight_fp8 is None:
             raise RuntimeError("BlockFP8InferenceLinear used before requantize()")
+        if input.dtype != torch.bfloat16:
+            raise ValueError(f"DeepGEMM writes bf16 outputs, got a {input.dtype} input")
         x_TI = input.reshape(-1, input.shape[-1])
-        x_q, x_scale = per_token_group_quant_fp8(x_TI, _BLOCK)
-        out_TO = w8a8_triton_block_scaled_mm(
-            x_q,
-            self._weight_fp8,
-            x_scale,
-            self._weight_scale,
-            [_BLOCK, _BLOCK],
-            output_dtype=input.dtype,
+        x_q, x_scale = per_token_group_quant_fp8(
+            x_TI,
+            _BLOCK,
+            column_major_scales=True,
+            tma_aligned_scales=True,
+            use_ue8m0=False,
+        )
+        out_TO = torch.empty(
+            (x_TI.shape[0], self._weight_fp8.shape[0]),
+            dtype=torch.bfloat16,
+            device=input.device,
+        )
+        # use_deep_gemm_e8m0=False: our exact fp32 block scales, no power-of-2 rounding
+        torch.ops.vllm.fp8_gemm_nt_op(
+            x_q, x_scale, self._weight_fp8, self._weight_scale, out_TO, False
         )
         return out_TO.reshape(*input.shape[:-1], out_TO.shape[-1])
 

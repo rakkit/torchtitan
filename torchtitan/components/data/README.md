@@ -591,3 +591,16 @@ which costs about a quarter of the gain); a wrong value balances less, it
 never changes what is trained. The loss is normalized by the global token
 count, so variable rows leave it unchanged; compiled blocks run with a dynamic
 token dimension (one more graph per block type).
+
+Measured (opt_moe l44, 16 nodes, 64k tokens per GPU, same nodes, step 20):
+
+```text
+context   equal counts   variable counts   change   reserved memory
+32k       12,602         12,841            +1.9%    77.9 -> 86.7 GiB
+16k       13,284         13,184            -0.8%    77.8 -> 83.0 GiB
+```
+
+At 32k the slowest rank's compute drops 5,654 -> 5,507 ms (traces of every
+rank); what is left is per-rank expert load and noise, which no regrouping of
+documents reaches, and variable rows cost about 1% by themselves. Use it where
+long documents dominate (32k context and longer), not at 16k.

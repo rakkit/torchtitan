@@ -46,3 +46,36 @@ def test_dapo_loss_matches_vllm_tempered_logprobs_bitwise() -> None:
     )
 
     assert metrics["bit_wise/logprob_diff/max"] == 0
+
+
+def test_dapo_mismatch_mask_drops_only_far_tokens_gradient() -> None:
+    """IcePop (mismatch_mask_ratio): a token whose trainer / generator ratio is
+    outside [1 / beta, beta] gives no gradient; the others keep today's gradient,
+    and the denominator is unchanged."""
+    torch.manual_seed(0)
+    logits = torch.randn(8, 16)
+    labels = torch.randint(0, 16, (8,))
+    trainer_logprobs = logits.log_softmax(-1).gather(-1, labels[:, None]).squeeze(-1)
+    # tokens 0 and 1 far from the generator (ratio e^2 and e^-2), the rest equal
+    shift = torch.zeros(8)
+    shift[0], shift[1] = -2.0, 2.0
+    kwargs = dict(
+        labels=labels,
+        global_loss_token_counts=torch.tensor(8),
+        generator_logprobs=trainer_logprobs + shift,
+        temperature=torch.ones(8),
+        advantages=torch.linspace(-1.0, 1.0, 8),
+        loss_mask=torch.ones(8, dtype=torch.bool),
+    )
+    grads = {}
+    for beta in (None, 2.0):
+        pred = logits.clone().requires_grad_(True)
+        loss, metrics = DAPOLoss.Config(mismatch_mask_ratio=beta).build()(
+            pred=pred, **kwargs
+        )
+        loss.backward()
+        grads[beta] = pred.grad
+    assert metrics["loss/mismatch_masked_frac"] == 2 / 8
+    assert torch.equal(grads[2.0][:2], torch.zeros_like(grads[2.0][:2]))
+    assert torch.equal(grads[2.0][2:], grads[None][2:])
+    assert grads[None][:2].abs().sum() > 0

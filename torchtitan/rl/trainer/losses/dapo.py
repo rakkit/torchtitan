@@ -65,10 +65,23 @@ class DAPOLoss(Loss[torch.Tensor]):
         """Full vocabulary size from the model spec, set when building RL configs.
         Leave unset for batch-invariant mode to retain the full-gather path."""
 
+        mismatch_mask_ratio: float | None = None
+        """IcePop (GLM-5, https://arxiv.org/abs/2602.15763; their beta 2.0): tokens whose
+        trainer / generator probability ratio lies outside ``[1 / beta, beta]`` give no
+        gradient (they still count in the loss denominator). For rollouts whose numerics
+        differ from the trainer's (FP8 generators, stale weights). None keeps every token."""
+
+        def __post_init__(self) -> None:
+            if self.mismatch_mask_ratio is not None and self.mismatch_mask_ratio <= 1.0:
+                raise ValueError(
+                    f"mismatch_mask_ratio must be > 1, got {self.mismatch_mask_ratio}"
+                )
+
     def __init__(self, config: Config) -> None:
         self.ratio_clip_low = config.ratio_clip_low
         self.ratio_clip_high = config.ratio_clip_high
         self.global_vocab_size = config.global_vocab_size
+        self.mismatch_mask_ratio = config.mismatch_mask_ratio
 
     def __call__(
         self,
@@ -122,7 +135,14 @@ class DAPOLoss(Loss[torch.Tensor]):
         )
         token_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
 
-        masked_loss = token_loss * effective_loss_mask
+        gradient_mask = effective_loss_mask
+        if self.mismatch_mask_ratio is not None:
+            detached_ratio = ratio.detach()
+            gradient_mask = effective_loss_mask & (
+                (detached_ratio >= 1.0 / self.mismatch_mask_ratio)
+                & (detached_ratio <= self.mismatch_mask_ratio)
+            )
+        masked_loss = token_loss * gradient_mask
         loss = _normalize(masked_loss.sum(), global_loss_token_counts)
 
         with torch.no_grad():
@@ -156,6 +176,10 @@ class DAPOLoss(Loss[torch.Tensor]):
                     global_loss_token_counts,
                 ),
                 "bit_wise/logprob_diff/max": diff_for_metrics.abs().max(),
+                "loss/mismatch_masked_frac": _normalize(
+                    (effective_loss_mask & ~gradient_mask).float().sum(),
+                    global_loss_token_counts,
+                ),
                 # Mean entropy of softmax(logits / temperature) over tokens used by the loss.
                 "trainer/entropy/mean": _normalize(
                     (token_entropy * effective_loss_mask).sum(),

@@ -96,7 +96,9 @@ def test_judge_gets_token_ids_from_its_own_chat_template(tmp_path):
 
     async def call_one(token_ids, *, sampling_config, **kwargs):
         sent.append((token_ids, sampling_config))
-        return SimpleNamespace(token_ids=tokenizer.encode("Rating: [[9]]"))
+        return SimpleNamespace(
+            token_ids=tokenizer.encode("Rating: [[9]]"), finish_reason="stop"
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(str(tmp_path))
     controller = object.__new__(Controller)
@@ -126,3 +128,6 @@ def test_judge_gets_token_ids_from_its_own_chat_template(tmp_path):
     assert reply == tokenizer.decode(
         tokenizer.encode("Rating: [[9]]"), skip_special_tokens=True
     )
+    # with the completion's finish reason and token count (a reply cut at max_tokens shows)
+    assert reply.finish_reason == "stop"
+    assert reply.num_tokens == len(tokenizer.encode("Rating: [[9]]"))

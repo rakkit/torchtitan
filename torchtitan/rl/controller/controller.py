@@ -132,6 +132,7 @@ from torchtitan.rl.rollout.types import (
     Completion,
     GenerateFn,
     JudgeFn,
+    JudgeReply,
     ReleaseSessionFn,
     ScoreFn,
     TeacherScores,
@@ -823,7 +824,11 @@ class Controller(Configurable):
             )
             if completion is None:
                 return None
-            return tokenizer.decode(completion.token_ids, skip_special_tokens=True)
+            return JudgeReply(
+                tokenizer.decode(completion.token_ids, skip_special_tokens=True),
+                finish_reason=completion.finish_reason,
+                num_tokens=len(completion.token_ids),
+            )
 
         return judge_fn
 

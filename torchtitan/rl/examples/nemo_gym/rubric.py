@@ -465,6 +465,28 @@ def _escape_tags(text: str) -> str:
     )
 
 
+def _judged(rollout: Rollout, reply: str | None, verdict: object) -> None:
+    """Count an unparsed judge reply and keep the reply's end with the rollout
+    (``Rollout.logs["judge"]``, saved with the rollout samples): why a verdict did not parse
+    (format, a reply cut at the judge's ``max_tokens``) is read there."""
+    rollout.turns[-1].metrics.append(
+        m.Metric("nemo_gym/judge_unparsed", m.Mean(float(verdict is None)))
+    )
+    text = reply or ""
+    rollout.logs.setdefault("judge", []).append(
+        {
+            "parsed": verdict is not None,
+            "finish_reason": getattr(reply, "finish_reason", None),
+            "num_tokens": getattr(reply, "num_tokens", None),
+            "chars": len(text),
+            "tail": text[-_JUDGE_TAIL_CHARS:],
+        }
+    )
+
+
+_JUDGE_TAIL_CHARS = 300
+
+
 def parse_judge_rating(reply: str) -> float | None:
     """The judge's rating (1-10) scaled to [0, 1], read only from a last non-empty line
     ``Rating: [[X]]`` after any ``<think>`` part; None otherwise (a quoted ``[[10]]`` elsewhere
@@ -996,9 +1018,7 @@ class RewardNemoGym(JudgeRewardFn):
                 verdict = parse_label_verdict(
                     reply or "", spec["labels"]["positive"], spec["labels"]["negative"]
                 )
-                rollout.turns[-1].metrics.append(
-                    m.Metric("nemo_gym/judge_unparsed", m.Mean(float(verdict is None)))
-                )
+                _judged(rollout, reply, verdict)
                 key = (
                     "unclear"
                     if verdict is None
@@ -1047,10 +1067,8 @@ class RewardNemoGym(JudgeRewardFn):
                 )
             )
             verdicts = [parse_pass_fail_verdict(reply or "") for reply in replies]
-            for verdict in verdicts:
-                rollout.turns[-1].metrics.append(
-                    m.Metric("nemo_gym/judge_unparsed", m.Mean(float(verdict is None)))
-                )
+            for reply, verdict in zip(replies, verdicts, strict=True):
+                _judged(rollout, reply, verdict)
             # the mean over the rubric (NeMo Gym's default aggregation); no verdict = FAIL
             reward = sum(bool(v) for v in verdicts) / len(verdicts) if verdicts else 0.0
         elif env_input.agent == CALENDAR:
@@ -1074,9 +1092,7 @@ class RewardNemoGym(JudgeRewardFn):
                 group_id=rollout.group_id,
             )
             rating = parse_judge_rating(reply or "")
-            rollout.turns[-1].metrics.append(
-                m.Metric("nemo_gym/judge_unparsed", m.Mean(float(rating is None)))
-            )
+            _judged(rollout, reply, rating)
             reward = rating or 0.0
         elif env_input.agent == OPEN_QA:
             if judge_fn is None:
@@ -1100,9 +1116,7 @@ class RewardNemoGym(JudgeRewardFn):
                 group_id=rollout.group_id,
             )
             verdict = parse_equivalence_verdict(reply or "")
-            rollout.turns[-1].metrics.append(
-                m.Metric("nemo_gym/judge_unparsed", m.Mean(float(verdict is None)))
-            )
+            _judged(rollout, reply, verdict)
             reward = float(bool(verdict))
         elif env_input.agent == MULTICHALLENGE:
             if judge_fn is None:
@@ -1135,9 +1149,7 @@ class RewardNemoGym(JudgeRewardFn):
             passed = []
             for item, reply in zip(items, replies, strict=True):
                 verdict = parse_yes_no_verdict(reply or "")
-                rollout.turns[-1].metrics.append(
-                    m.Metric("nemo_gym/judge_unparsed", m.Mean(float(verdict is None)))
-                )
+                _judged(rollout, reply, verdict)
                 want_no = str(item.get("pass_criteria", "YES")).strip().upper() == "NO"
                 passed.append(verdict is not None and verdict != want_no)
             reward = sum(passed) / len(passed) if passed else 0.0
@@ -1161,9 +1173,7 @@ class RewardNemoGym(JudgeRewardFn):
                 group_id=rollout.group_id,
             )
             complied = parse_compliance_verdict(reply or "")
-            rollout.turns[-1].metrics.append(
-                m.Metric("nemo_gym/judge_unparsed", m.Mean(float(complied is None)))
-            )
+            _judged(rollout, reply, complied)
             reward = float(bool(complied))
         else:
             raise ValueError(f"no grader for NeMo Gym environment {env_input.agent!r}")
@@ -1228,14 +1238,12 @@ class NemoGymRubric(Rubric):
             )
         )
         verdicts = [parse_judge_comparison(reply or "") for reply in replies]
-        for (i, _), verdict in zip(pairs, verdicts, strict=True):
+        for (i, _), reply, verdict in zip(pairs, replies, verdicts, strict=True):
             # each comparison is counted once, on the rollout shown first
             if not rollouts[live[i]].turns:
                 continue
+            _judged(rollouts[live[i]], reply, verdict)
             metrics = rollouts[live[i]].turns[-1].metrics
-            metrics.append(
-                m.Metric("nemo_gym/judge_unparsed", m.Mean(float(verdict is None)))
-            )
             if verdict is not None:
                 metrics.append(
                     m.Metric(

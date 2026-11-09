@@ -155,6 +155,23 @@ class ScoreFn(Protocol):
         name, or ``None`` if the teacher produced none."""
 
 
+class JudgeReply(str):
+    """The judge's reply text, carrying its completion's finish reason ("stop" | "length" |
+    "abort") and generated token count: a reply cut at the judge's ``max_tokens`` holds no
+    verdict, and only these say so."""
+
+    finish_reason: str | None
+    num_tokens: int
+
+    def __new__(
+        cls, text: str, *, finish_reason: str | None = None, num_tokens: int = 0
+    ) -> "JudgeReply":
+        reply = super().__new__(cls, text)
+        reply.finish_reason = finish_reason
+        reply.num_tokens = num_tokens
+        return reply
+
+
 class JudgeFn(Protocol):
     """Ask a fixed judge model for a reply (LLM-judge / generative reward model rewards).
 
@@ -166,7 +183,8 @@ class JudgeFn(Protocol):
     async def __call__(
         self, messages: list[Message], *, request_id: str, group_id: int
     ) -> str | None:
-        """Return the judge's reply text, or ``None`` if the judge produced none."""
+        """Return the judge's reply text (a ``JudgeReply`` from the controller), or ``None``
+        if the judge produced none."""
 
 
 class ReleaseSessionFn(Protocol):

@@ -136,6 +136,55 @@ def test_chat_rows_are_rated_by_the_judge():
         asyncio.run(rubric.score_group([rollout], sample))
 
 
+def test_judge_replies_are_kept_with_the_rollout():
+    """judge_unparsed alone cannot say why a verdict failed: the reply's end, its finish
+    reason and token count are kept in Rollout.logs["judge"] (saved with the samples)."""
+    from torchtitan.rl.rollout.types import JudgeReply
+
+    sample = NemoGymSample(
+        agent="genrm_simple_agent",
+        source="hs3",
+        messages=[{"role": "user", "content": "hi"}],
+        fields={},
+    )
+    replies = iter(
+        [
+            JudgeReply(
+                "x" * 500 + " so the rating is", finish_reason="length", num_tokens=1024
+            ),
+            JudgeReply("Fine.\nRating: [[8]]", finish_reason="stop", num_tokens=6),
+        ]
+    )
+
+    async def judge_fn(messages, *, request_id, group_id):
+        return next(replies)
+
+    class _Turn:
+        completion_message = {"role": "assistant", "content": "hello"}
+        metrics = []
+
+    rubric = Rubric.Config(reward_fns=[RewardNemoGym.Config()]).build()
+    records = []
+    for k in range(2):
+        rollout = Rollout(group_id=3, rollout_id=k, status=RolloutStatus.COMPLETED)
+        rollout.turns = [_Turn()]
+        asyncio.run(rubric.score_group([rollout], sample, judge_fn=judge_fn))
+        records += rollout.logs["judge"]
+    cut, fine = records
+    assert (cut["parsed"], cut["finish_reason"], cut["num_tokens"]) == (
+        False,
+        "length",
+        1024,
+    )
+    assert (
+        cut["chars"] == 517
+        and cut["tail"].endswith("so the rating is")
+        and len(cut["tail"]) == 300
+    )
+    assert (fine["parsed"], fine["finish_reason"]) == (True, "stop")
+    assert isinstance(JudgeReply("a"), str) and JudgeReply("a") == "a"
+
+
 def test_mcqa_letter_must_end_and_be_an_option():
     # case-insensitive regexes would read the first letter of the next word ("definitely" -> D)
     answer_is = r"ANSWER IS\s*([A-Za-z0-9])\s*"

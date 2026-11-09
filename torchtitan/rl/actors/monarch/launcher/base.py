@@ -159,11 +159,11 @@ class MonarchLauncher(Configurable, abc.ABC):
             compute_generator_world_size(config.generator.parallelism),
             config.num_generators,
             teacher_world_size=(
-                compute_generator_world_size(config.teacher.parallelism)
-                if config.teacher is not None
+                compute_generator_world_size(config.teachers[0].generator.parallelism)
+                if config.teachers
                 else 0
             ),
-            num_teachers=config.num_teachers if config.teacher is not None else 0,
+            num_teachers=sum(teacher.num_replicas for teacher in config.teachers),
         )
         return LaunchPlan(
             job_name=f"{self.config.job_name}-{uuid.uuid4().hex[:6]}",

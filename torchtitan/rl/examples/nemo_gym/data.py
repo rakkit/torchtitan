@@ -42,6 +42,11 @@ class NemoGymSample:
     fields: dict[str, Any] = field(default_factory=dict)
     """The row's other fields (expected answer, schema, constraints, ...)."""
 
+    @property
+    def domain(self) -> str:
+        """The environment: picks the teacher under multi-teacher distillation."""
+        return self.agent
+
 
 def read_nemo_gym_rows(
     paths: list[str], agents: list[str]

@@ -286,7 +286,8 @@ class Rollouter(Configurable):
 
 @dataclass(kw_only=True, slots=True)
 class OnPolicyDistillationConfig:
-    """On-policy distillation: a fixed teacher scores the tokens the student sampled.
+    """On-policy distillation: a fixed teacher scores the tokens the student sampled
+    (several teachers: the teacher of each sample's domain, see the controller's ``teachers``).
 
     Each completion token's advantage is ``kl_coef * (teacher logprob - student logprob)``
     (a one-sample estimate of minus the per-token reverse KL to the teacher), plus
@@ -469,11 +470,16 @@ class RolloutWorker(Configurable):
                     f"distillation needs the student's own log-probs: sampling temperature "
                     f"must be 1.0, got {sampling.temperature}"
                 )
-            await self._distill_group(group, score_fn)
+            await self._distill_group(
+                group, score_fn, domain=getattr(sample, "domain", None)
+            )
         return group
 
-    async def _distill_group(self, group: RolloutGroup, score_fn: ScoreFn) -> None:
-        """Set each turn's per-token advantages from the teacher's log-probs of its tokens."""
+    async def _distill_group(
+        self, group: RolloutGroup, score_fn: ScoreFn, *, domain: str | None
+    ) -> None:
+        """Set each turn's per-token advantages from the log-probs of its tokens under the
+        teacher of ``domain``."""
         distillation = self._distillation
         assert distillation is not None
         turns: list[tuple[Rollout, RolloutTurn, int, list[int]]] = []
@@ -497,6 +503,7 @@ class RolloutWorker(Configurable):
                         f"/turn={turn.rollout_id.turn_id}"
                     ),
                     group_id=group.group_id,
+                    domain=domain,
                 )
                 for rollout, turn, _, tokens in turns
             )
@@ -515,15 +522,19 @@ class RolloutWorker(Configurable):
                 distillation.kl_coef * gap
                 + distillation.reward_advantage_weight * (rollout.advantage or 0.0)
             ).astype(np.float32)
-            turn.metrics.append(
-                m.Metric("distillation/reverse_kl", m.Mean(float(-gap.mean())))
-            )
-            turn.metrics.append(
-                m.Metric(
-                    "distillation/teacher_logprob",
-                    m.Mean(float(teacher_logprobs.mean())),
+            # overall, and per domain when the samples have one (multi-teacher distillation)
+            for prefix in ["distillation"] + (
+                [f"distillation/{domain}"] if domain else []
+            ):
+                turn.metrics.append(
+                    m.Metric(f"{prefix}/reverse_kl", m.Mean(float(-gap.mean())))
                 )
-            )
+                turn.metrics.append(
+                    m.Metric(
+                        f"{prefix}/teacher_logprob",
+                        m.Mean(float(teacher_logprobs.mean())),
+                    )
+                )
 
     async def _run_single_rollout(
         self,

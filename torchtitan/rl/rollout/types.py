@@ -128,11 +128,17 @@ class ScoreFn(Protocol):
 
     The Rollouter calls this once per rollout turn with the turn's full prompt + completion and
     reads the teacher's log-prob of each token. It can be a teacher generator router, an http
-    endpoint, etc.
+    endpoint, etc. ``domain`` (the dataset sample's ``domain`` attribute, None if it has none)
+    picks the teacher when there are several (multi-teacher distillation).
     """
 
     async def __call__(
-        self, token_ids: list[int], *, request_id: str, group_id: int
+        self,
+        token_ids: list[int],
+        *,
+        request_id: str,
+        group_id: int,
+        domain: str | None,
     ) -> list[float] | None:
         """Return the teacher's log-prob of every token of ``token_ids`` (``[len(token_ids)]``,
         position 0 NaN), or ``None`` if the teacher produced none."""

@@ -55,8 +55,7 @@ def _rl_config(*, trainer_dp=4, generator_tp=2, num_generators=1, **kwargs):
             parallelism=InferenceParallelismConfig(tensor_parallel_degree=generator_tp)
         ),
         num_generators=num_generators,
-        teacher=None,
-        num_teachers=1,
+        teachers=[],
         resolve_overrides=lambda: None,
         **kwargs,
     )

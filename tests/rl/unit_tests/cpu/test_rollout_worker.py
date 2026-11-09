@@ -328,8 +328,8 @@ def test_distillation_sets_per_token_advantages_from_the_teacher() -> None:
         )
         scored = []
 
-        async def score_fn(token_ids, *, request_id, group_id):
-            scored.append((token_ids, request_id, group_id))
+        async def score_fn(token_ids, *, request_id, group_id, domain):
+            scored.append((token_ids, request_id, group_id, domain))
             return [float("nan"), -1.0, -0.2]
 
         async def release_session_fn(**kwargs) -> None:
@@ -347,8 +347,9 @@ def test_distillation_sets_per_token_advantages_from_the_teacher() -> None:
             sampling=SamplingConfig(temperature=1.0, seed=1),
             score_fn=score_fn,
         )
-        assert [t for t, _, _ in scored] == [[1, 2, 4], [1, 2, 4]]
-        assert {g for _, _, g in scored} == {5}
+        assert [t for t, _, _, _ in scored] == [[1, 2, 4], [1, 2, 4]]
+        assert {g for _, _, g, _ in scored} == {5}
+        assert {d for _, _, _, d in scored} == {None}  # the sample has no domain
         got = [rollout.turns[0].token_advantages.tolist() for rollout in group.rollouts]
         assert [round(x[0], 5) for x in got] == [5.6, 10.6]
         teacher = [r.turns[0].teacher_logprobs.tolist() for r in group.rollouts]

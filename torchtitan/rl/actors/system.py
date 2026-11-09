@@ -116,11 +116,14 @@ class ActorSystem(Configurable, abc.ABC):
         self,
         config: InterGeneratorRouter.Config,
         *,
+        name: str,
+        num_replicas: int,
         teacher_config: Generator.Config,
         **teacher_kwargs: Any,
     ) -> Any:
-        """Spawn the provisioned teacher generators (fixed weights loaded by
-        ``teacher_config.checkpointer``) and their router; returns the router handle."""
+        """Spawn ``num_replicas`` of the provisioned teacher generators as teacher ``name``
+        (fixed weights loaded by ``teacher_config.checkpointer``) and its router; returns the
+        router handle. Each call takes the next unused teacher meshes."""
         raise NotImplementedError(f"{type(self).__name__} has no teacher generators")
 
     @abc.abstractmethod

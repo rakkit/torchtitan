@@ -28,7 +28,6 @@ from torchtitan.rl.actors.monarch.provisioning import (
     shutdown,
     spawn_cpu_procs,
     spawn_proc_mesh,
-    teacher_role_names,
 )
 from torchtitan.rl.actors.monarch.rollout_worker import RolloutWorkerActor
 from torchtitan.rl.actors.monarch.router import InterGeneratorRouterActor
@@ -187,29 +186,41 @@ class MonarchActorSystem(ActorSystem):
         self,
         config: InterGeneratorRouter.Config,
         *,
+        name: str,
+        num_replicas: int,
         teacher_config: Generator.Config,
         **teacher_kwargs: Any,
     ) -> Any:
         assert (
             self._teacher_router_mesh is not None
         ), "provision teachers before spawning"
-        for i, teacher_mesh in enumerate(self._teacher_meshes):
+        start = len(self._teachers)
+        if start + num_replicas > len(self._teacher_meshes):
+            raise ValueError(
+                f"teacher {name!r} needs {num_replicas} teacher meshes, "
+                f"{len(self._teacher_meshes) - start} are left"
+            )
+        replicas = []
+        for i, teacher_mesh in enumerate(
+            self._teacher_meshes[start : start + num_replicas]
+        ):
             teacher = teacher_mesh.spawn(
-                teacher_role_names(len(self._teacher_meshes))[i],
+                f"teacher_{name}_{i}",
                 GeneratorActor,
                 teacher_config,
                 **teacher_kwargs,
             )
-            self._teachers.append(
+            replicas.append(
                 ServiceHandle(
                     all_ranks=teacher, rank0=teacher.flatten("rank").slice(rank=0)
                 )
             )
+        self._teachers.extend(replicas)
         return self._teacher_router_mesh.spawn(
-            "teacher_router",
+            f"teacher_router_{name}",
             InterGeneratorRouterActor,
             config,
-            generators=self._teachers,
+            generators=replicas,
         )
 
     async def spawn_batcher(self, config: Batcher.Config, **kwargs: Any) -> Any:

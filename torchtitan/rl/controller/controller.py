@@ -157,6 +157,35 @@ class ValidationConfig:
 
 
 @dataclass(kw_only=True, slots=True)
+class TeacherConfig:
+    """One on-policy distillation teacher: generator replicas with fixed weights
+    (``generator.checkpointer`` loads them from ``hf_assets_path``) behind their own router.
+    The teacher must share the student's tokenizer. Several teachers = multi-teacher
+    distillation (MOPD): each scores the samples of its ``domains``.
+    """
+
+    name: str
+    """Names the teacher's actors, metrics and dump folder."""
+
+    generator: Generator.Config
+
+    hf_assets_path: str
+    """The teacher's HF assets (config, tokenizer)."""
+
+    domains: list[str] = field(default_factory=list)
+    """Sample domains (the dataset sample's ``domain`` attribute) this teacher scores;
+    empty: every sample no other teacher claims (at most one teacher has no domains)."""
+
+    num_replicas: int = 1
+    """Generator replicas of this teacher."""
+
+    router: InterGeneratorRouter.Config = field(
+        default_factory=InterGeneratorRouter.Config
+    )
+    """Routing across this teacher's replicas."""
+
+
+@dataclass(kw_only=True, slots=True)
 class AsyncLoopConfig(Configurable.Config):
     num_training_steps: int = 10
     """Optimizer steps to run."""
@@ -329,19 +358,10 @@ class Controller(Configurable):
             default_factory=InterGeneratorRouter.Config
         )
         """Generator routing strategy configuration."""
-        teacher: Generator.Config | None = None
-        """On-policy distillation teacher: generators with fixed weights (``checkpointer`` loads
-        them from ``teacher_hf_assets_path``) that score the student's rollouts; the rollout
-        worker's ``distillation`` config turns the scores into per-token advantages. The
-        teacher must share the student's tokenizer. None: off."""
-        teacher_hf_assets_path: str | None = None
-        """The teacher's HF assets (config, tokenizer); required with ``teacher``."""
-        num_teachers: int = 1
-        """Teacher generator replicas (with ``teacher``)."""
-        teacher_router: InterGeneratorRouter.Config = field(
-            default_factory=InterGeneratorRouter.Config
-        )
-        """Routing across the teacher replicas."""
+        teachers: list[TeacherConfig] = field(default_factory=list)
+        """On-policy distillation teachers that score the student's rollouts; the rollout
+        worker's ``distillation`` config turns the scores into per-token advantages. Empty:
+        off."""
 
         actor_system: ActorSystem.Config = field(
             default_factory=_default_actor_system_config
@@ -386,27 +406,56 @@ class Controller(Configurable):
                     json.dump(config_dict, file, indent=2)
                 logger.info(f"Saved job configs to {config_file}")
 
-        def __post_init__(self):
-            if self.teacher is not None:
+        def _validate_teachers(self) -> None:
+            names = [teacher.name for teacher in self.teachers]
+            if len(set(names)) != len(names) or not all(names):
+                raise ValueError(
+                    f"teacher names must be unique and non-empty, got {names}"
+                )
+            claimed: dict[str, str] = {}
+            for teacher in self.teachers:
+                if teacher.generator.checkpointer is None:
+                    raise ValueError(
+                        f"teacher {teacher.name!r} needs generator.checkpointer (its HF weights)"
+                    )
+                if teacher.num_replicas < 1:
+                    raise ValueError(
+                        f"teacher {teacher.name!r}: num_replicas must be >= 1, "
+                        f"got {teacher.num_replicas}"
+                    )
                 if (
-                    self.teacher.checkpointer is None
-                    or self.teacher_hf_assets_path is None
+                    teacher.generator.parallelism
+                    != self.teachers[0].generator.parallelism
                 ):
                     raise ValueError(
-                        "teacher needs checkpointer (its HF weights) and teacher_hf_assets_path"
+                        "all teachers must use the same generator parallelism (one teacher "
+                        f"mesh size); {teacher.name!r} differs from {self.teachers[0].name!r}"
                     )
-                if self.num_teachers < 1:
-                    raise ValueError(
-                        f"num_teachers must be >= 1, got {self.num_teachers}"
-                    )
+                for domain in teacher.domains:
+                    if domain in claimed:
+                        raise ValueError(
+                            f"domain {domain!r} is claimed by teachers {claimed[domain]!r} "
+                            f"and {teacher.name!r}"
+                        )
+                    claimed[domain] = teacher.name
+            defaults = [
+                teacher.name for teacher in self.teachers if not teacher.domains
+            ]
+            if len(defaults) > 1:
+                raise ValueError(
+                    f"at most one teacher may have no domains (the default), got {defaults}"
+                )
+
+        def __post_init__(self):
+            self._validate_teachers()
             worker = self.rollouter.worker
             distillation = worker.distillation if worker is not None else None
-            if (self.teacher is not None) != (distillation is not None):
+            if bool(self.teachers) != (distillation is not None):
                 raise ValueError(
-                    "teacher and rollouter.worker.distillation go together (both set or both None)"
+                    "teachers and rollouter.worker.distillation go together (both set or both off)"
                 )
             if (
-                self.teacher is not None
+                self.teachers
                 and self.async_loop.batcher.training_sample_builder.drop_zero_std_reward_groups
             ):
                 raise ValueError(
@@ -524,8 +573,8 @@ class Controller(Configurable):
         self.actor_system: ActorSystem | None = None
         self.trainer: TrainerHandle | None = None
         self.generator_router: InterGeneratorRouter | None = None
-        # On-policy distillation teachers' router (setup_async spawns it when `teacher` is set).
-        self.teacher_router: InterGeneratorRouter | None = None
+        # On-policy distillation: each teacher's router, by teacher name (setup_async spawns them).
+        self.teacher_routers: dict[str, InterGeneratorRouter] = {}
         # The batcher's single-actor handle.
         self.batcher: Any | None = None
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
@@ -638,10 +687,20 @@ class Controller(Configurable):
         return generate
 
     def _make_score_fn(self) -> ScoreFn:
-        """Build the rollout workers' `ScoreFn`: the teacher's log-prob of every token of a
-        sequence (prompt log-probs of a one-token request at temperature 1.0)."""
-        teacher_router = self.teacher_router
-        assert teacher_router is not None, "no teacher generators"
+        """Build the rollout workers' `ScoreFn`: the log-prob of every token of a sequence
+        under the teacher of the sample's domain (prompt log-probs of a one-token request at
+        temperature 1.0)."""
+        assert self.teacher_routers, "no teacher generators"
+        teacher_by_domain = {
+            domain: teacher.name
+            for teacher in self.config.teachers
+            for domain in teacher.domains
+        }
+        default_teacher = next(
+            (teacher.name for teacher in self.config.teachers if not teacher.domains),
+            None,
+        )
+        teacher_routers = self.teacher_routers
         sampling = SamplingConfig(
             temperature=1.0,
             max_tokens=1,
@@ -651,15 +710,25 @@ class Controller(Configurable):
 
         @sl.log_trace_span("teacher_score")
         async def score(
-            token_ids: list[int], *, request_id: str, group_id: int
+            token_ids: list[int], *, request_id: str, group_id: int, domain: str | None
         ) -> list[float] | None:
-            completion = await teacher_router.generate.call_one(
+            name = (
+                teacher_by_domain.get(domain, default_teacher)
+                if domain
+                else default_teacher
+            )
+            if name is None:
+                raise ValueError(
+                    f"no teacher scores domain {domain!r}: list it in a teacher's domains "
+                    "or add a teacher without domains"
+                )
+            completion = await teacher_routers[name].generate.call_one(
                 token_ids,
                 request_id=request_id,
                 group_id=group_id,
                 routing_session_id=None,
                 sampling_config=sampling,
-                metrics_prefix="teacher",
+                metrics_prefix=f"teacher/{name}",
             )
             return None if completion is None else completion.prompt_token_logprobs
 
@@ -737,9 +806,11 @@ class Controller(Configurable):
                 generator_parallelism=config.generator.parallelism,
                 num_generators=config.num_generators,
                 teacher_parallelism=(
-                    config.teacher.parallelism if config.teacher is not None else None
+                    config.teachers[0].generator.parallelism
+                    if config.teachers
+                    else None
                 ),
-                num_teachers=config.num_teachers if config.teacher is not None else 0,
+                num_teachers=sum(teacher.num_replicas for teacher in config.teachers),
             )
             self.trainer = await actor_system.spawn_trainer(
                 config.trainer,
@@ -759,14 +830,18 @@ class Controller(Configurable):
                 output_dir=config.dump_folder,
             )
             # On-policy distillation: teachers load their own HF weights and never sync.
-            if config.teacher is not None:
-                self.teacher_router = await actor_system.spawn_teacher_router(
-                    config.teacher_router,
-                    teacher_config=config.teacher,
+            for teacher in config.teachers:
+                self.teacher_routers[
+                    teacher.name
+                ] = await actor_system.spawn_teacher_router(
+                    teacher.router,
+                    name=teacher.name,
+                    num_replicas=teacher.num_replicas,
+                    teacher_config=teacher.generator,
                     precision=config.precision,
-                    model_path=config.teacher_hf_assets_path,
+                    model_path=teacher.hf_assets_path,
                     max_num_seqs=max_num_seqs,
-                    output_dir=f"{config.dump_folder}/teacher",
+                    output_dir=f"{config.dump_folder}/teacher/{teacher.name}",
                 )
             self.batcher = await actor_system.spawn_batcher(
                 async_loop.batcher,
@@ -823,8 +898,8 @@ class Controller(Configurable):
         # loop, so every rank must be running it first).
         with sl.log_trace_span("generator_start_engine_loop"):
             await self.generator_router.start_engine_loop.call_one()
-            if self.teacher_router is not None:
-                await self.teacher_router.start_engine_loop.call_one()
+            for teacher_router in self.teacher_routers.values():
+                await teacher_router.start_engine_loop.call_one()
 
         # Initial push and pull: only the trainer loads weights; generators pull them at start_step.
         with sl.log_trace_span("trainer_push_model_state_dict"):
@@ -974,7 +1049,7 @@ class Controller(Configurable):
         # rollout_loop
         generate_fn = self._make_generate_fn(metrics_prefix="generator")
         release_session_fn = self._make_release_session_fn()
-        score_fn = self._make_score_fn() if self.teacher_router is not None else None
+        score_fn = self._make_score_fn() if self.teacher_routers else None
 
         # One rollout worker per active buffer slot: lets generation fill every active slot,
         # including the cold start (step 0 fills every active slot, not just num_prompts_per_train_step per wave).

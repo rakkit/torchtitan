@@ -251,6 +251,28 @@ def test_row_tools_reach_the_env_in_the_chat_format(tmp_path):
         read_nemo_gym_rows([str(path)], ["structured_outputs_simple_agent"])
 
 
+def test_format_verification_rules():
+    from torchtitan.rl.examples.nemo_gym.rubric import grade_format_verification
+
+    cite = {"type": "regex", "verify_regex": [r"\[\d+\]$"], "verify_min_matches": 2}
+    assert grade_format_verification("a fact [1]\nanother [2]\nplain", cite) == 1.0
+    assert (
+        grade_format_verification("a fact [1] [2]\nplain", cite) == 0.0
+    )  # lines count once
+    markers = {
+        "type": "string_match",
+        "expected_markers": ["[1]", "[2]"],
+        "patterns": [r"\[\d+\]"],
+    }
+    assert grade_format_verification("x [1] y [2]", markers) == 1.0
+    assert grade_format_verification("x [1]", markers) == 0.0  # missing marker
+    assert (
+        grade_format_verification("x [1] y [2] z [7]", markers) == 0.0
+    )  # spurious marker
+    with pytest.raises(ValueError, match="unknown format verifier"):
+        grade_format_verification("x", {"type": "other"})
+
+
 def test_structured_output_broken_schema_scores_zero():
     # one bad row must not raise and drop the whole group
     assert grade_structured_output('{"x": 3}', '{"$ref": "#/missing"}') == 0.0

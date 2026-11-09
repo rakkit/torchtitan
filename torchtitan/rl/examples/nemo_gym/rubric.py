@@ -45,6 +45,11 @@ from torchtitan.rl.rollout.types import JudgeFn
 MATH = "math_with_judge_simple_agent"
 MCQA = "mcqa_simple_agent"
 STRUCTURED_OUTPUTS = "structured_outputs_simple_agent"
+# NeMo Gym format_verification: one rule grader, two datasets kept apart for per-source metrics
+FORMAT_VERIFICATION = (
+    "citation_format_simple_agent",
+    "freeform_formatting_simple_agent",
+)
 INSTRUCTION_FOLLOWING = "instruction_following_simple_agent"
 CHAT = "genrm_simple_agent"
 OPEN_QA = "equivalence_llm_judge_simple_agent"
@@ -638,6 +643,30 @@ def grade_structured_output(
     return 1.0
 
 
+def grade_format_verification(response: str, verifier: dict) -> float:
+    """NeMo Gym's format_verification server. ``regex`` / ``inline_prose``: 1.0 when at least
+    ``verify_min_matches`` lines (each counted once) match any of ``verify_regex``.
+    ``string_match``: 1.0 when every ``expected_markers`` string is in the response and no match
+    of ``patterns`` is outside them. An unknown verifier type raises (data error, not 0)."""
+    kind = verifier.get("type", "")
+    if kind in ("regex", "inline_prose"):
+        patterns = [re.compile(p) for p in verifier.get("verify_regex", [])]
+        lines = sum(
+            any(p.search(line) for p in patterns) for line in response.split("\n")
+        )
+        return float(lines >= verifier.get("verify_min_matches", 1))
+    if kind == "string_match":
+        expected = verifier.get("expected_markers", [])
+        if any(marker not in response for marker in expected):
+            return 0.0
+        allowed = set(expected)
+        for pattern in verifier.get("patterns", []):
+            if any(m.group(0) not in allowed for m in re.finditer(pattern, response)):
+                return 0.0
+        return 1.0
+    raise ValueError(f"unknown format verifier type {kind!r}")
+
+
 def grade_structured_tool_call(
     tool_calls: list[dict] | None,
     schema_str: str,
@@ -810,6 +839,8 @@ class RewardNemoGym(JudgeRewardFn):
                 reward = grade_structured_output(
                     response, fields["schema_str"], fields.get("schema_type") or "json"
                 )
+        elif env_input.agent in FORMAT_VERIFICATION:
+            reward = grade_format_verification(response, fields["verifier"])
         elif env_input.agent == INSTRUCTION_FOLLOWING:
             reward = grade_instruction_following(
                 response, fields["instruction_id_list"], fields["kwargs"]

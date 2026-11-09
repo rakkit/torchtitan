@@ -29,9 +29,12 @@ class NemoGymEnv(MessageEnv):
 
     def __init__(self, config: Config, *, env_input: NemoGymSample) -> None:
         self._messages = env_input.messages
+        self._tools = env_input.tools
 
     async def init(self) -> MessageEnvInitOutput:
-        return MessageEnvInitOutput(init_prompt_messages=list(self._messages))
+        return MessageEnvInitOutput(
+            init_prompt_messages=list(self._messages), tools=list(self._tools)
+        )
 
     async def step(self, completion_message: Message) -> MessageEnvStepOutput:
         return MessageEnvStepOutput(done=True)

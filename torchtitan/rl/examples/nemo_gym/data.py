@@ -39,6 +39,11 @@ class NemoGymSample:
     messages: list[Message]
     """Opening messages (``responses_create_params.input``)."""
 
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    """Tools the prompt offers (``responses_create_params.tools``), in the chat format
+    ``{"type": "function", "function": {"name", "description", "parameters"}}`` with
+    ``parameters`` a mapping, as vLLM passes them to the chat template; empty for most rows."""
+
     fields: dict[str, Any] = field(default_factory=dict)
     """The row's other fields (expected answer, schema, constraints, ...)."""
 
@@ -81,6 +86,16 @@ def read_nemo_gym_rows(
                     continue
                 params = row.pop("responses_create_params")
                 row.pop("agent_ref")
+                tools = list(params.get("tools") or [])
+                for tool in tools:
+                    function = tool.get("function") if isinstance(tool, dict) else None
+                    if not isinstance(function, dict) or not isinstance(
+                        function.get("parameters"), dict
+                    ):
+                        raise ValueError(
+                            f"{path}: a tool is not in the chat format with a parameters mapping "
+                            f"({str(tool)[:120]}); convert it in data preparation"
+                        )
                 samples.append(
                     NemoGymSample(
                         agent=agent,
@@ -89,6 +104,7 @@ def read_nemo_gym_rows(
                             {"role": m["role"], "content": m["content"]}
                             for m in params["input"]
                         ],
+                        tools=tools,
                         fields=row,
                     )
                 )

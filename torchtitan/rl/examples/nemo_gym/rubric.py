@@ -22,14 +22,18 @@ functions (no TitanRL imports) so an eval harness can use the same graders.
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import itertools
 import json
 import re
+import tomllib
 import unicodedata
 from dataclasses import dataclass
 from typing import Literal
 
 import jsonschema
+import yaml
 
 from torchtitan.rl.examples.dapo_math.math_verify_pool import MathVerifyPool
 from torchtitan.rl.examples.nemo_gym.data import NemoGymSample
@@ -609,17 +613,138 @@ def aggregate_comparisons(
     return [t / c if c else _NEUTRAL_VERDICT[0] for t, c in zip(total, count)]
 
 
-def grade_structured_output(response: str, schema_str: str) -> float:
-    """1.0 when the whole response is JSON valid against the schema made strict
-    (every property required, no others), as NeMo Gym's structured_outputs server.
-    Any failure scores 0, a broken schema included (it must not drop the group)."""
+def grade_structured_output(
+    response: str, schema_str: str, schema_type: str = "json"
+) -> float:
+    """1.0 when the whole response, parsed as ``schema_type`` (json / yaml / xml / toml / csv),
+    is valid against the schema made strict (every property required, no others), as NeMo Gym's
+    structured_outputs server: XML and CSV values (all strings) are first coerced to the
+    schema's types. Any failure scores 0, a broken schema included (it must not drop the group)."""
+    if schema_type == "xml":
+        import xmltodict  # noqa: F401  (XML rows need it: fail the run, not every answer)
+    if not response.strip():
+        return 0.0
     try:
         schema = json.loads(schema_str)
         _make_strict(schema)
-        jsonschema.validate(json.loads(response.strip()), schema)
+        value = _parse_structured(schema_type, response.strip())
+        if schema_type == "xml":
+            value = _coerce_xml(value, schema)
+        elif schema_type == "csv":
+            value = _coerce_csv(value, schema)
+        jsonschema.validate(value, schema)
     except Exception:
         return 0.0
     return 1.0
+
+
+def grade_structured_tool_call(
+    tool_calls: list[dict] | None,
+    schema_str: str,
+    *,
+    tool_name: str | None,
+    payload_key: str | None,
+) -> float:
+    """1.0 when the answer is exactly one tool call (to ``tool_name`` when set) whose arguments
+    (or their ``payload_key`` entry) are valid against the strict schema, as NeMo Gym's
+    structured_outputs ``response_mode="tool_call"``; else 0."""
+    if not tool_calls or len(tool_calls) != 1:
+        return 0.0
+    call = tool_calls[0].get("function") or tool_calls[0]
+    if tool_name and call.get("name") != tool_name:
+        return 0.0
+    try:
+        arguments = call.get("arguments")
+        if isinstance(arguments, str):
+            arguments = json.loads(arguments)
+        if not isinstance(arguments, dict):
+            return 0.0
+        if payload_key:
+            if payload_key not in arguments:
+                return 0.0
+            arguments = arguments[payload_key]
+        schema = json.loads(schema_str)
+        _make_strict(schema)
+        jsonschema.validate(arguments, schema)
+    except Exception:
+        return 0.0
+    return 1.0
+
+
+def _parse_structured(schema_type: str, text: str) -> object:
+    if schema_type == "json":
+        return json.loads(text)
+    if schema_type == "yaml":
+        return yaml.safe_load(text)
+    if schema_type == "toml":
+        return tomllib.loads(text)
+    if schema_type == "csv":
+        return list(csv.DictReader(io.StringIO(text)))
+    if schema_type == "xml":
+        import xmltodict
+
+        return xmltodict.parse(text)
+    raise ValueError(f"unknown schema_type {schema_type!r}")
+
+
+def _coerce_xml(data: object, schema: object) -> object:
+    """NeMo Gym's coerce_xml_types: xmltodict gives every leaf as a string."""
+    if not isinstance(schema, dict) or "type" not in schema:
+        return data
+    kind = schema["type"]
+    if kind == "object" and isinstance(data, dict):
+        properties = schema.get("properties", {})
+        return {
+            k: _coerce_xml(v, properties[k]) if k in properties else v
+            for k, v in data.items()
+        }
+    if kind == "array":
+        # xmltodict wraps repeated children as {"tag": [..]} and a single one as {"tag": value}
+        if isinstance(data, dict) and len(data) == 1:
+            data = next(iter(data.values()))
+        if not isinstance(data, list):
+            data = [data] if data is not None else []
+        return [_coerce_xml(item, schema.get("items", {})) for item in data]
+    if data is None and kind == "string":
+        return ""
+    return _coerce_scalar(data, kind) if isinstance(data, str) else data
+
+
+def _coerce_csv(rows: list[dict], schema: dict) -> list[dict]:
+    """NeMo Gym's coerce_csv_types: each value to its column's schema type."""
+    properties = schema.get("items", schema).get("properties", {})
+    return [
+        {
+            k: _coerce_scalar(v, properties.get(k, {}).get("type", "string"))
+            for k, v in row.items()
+        }
+        for row in rows
+    ]
+
+
+def _coerce_scalar(value: object, kind: object) -> object:
+    if isinstance(kind, list):  # e.g. ["integer", "null"]
+        if value in (None, "") and "null" in kind:
+            return None
+        for one in kind:
+            if one == "null":
+                continue
+            result = _coerce_scalar(value, one)
+            if not isinstance(result, str) or one == "string":
+                return result
+        return value
+    if not isinstance(value, str) or value == "":
+        return value
+    try:
+        if kind == "integer":
+            return int(value)
+        if kind == "number":
+            return float(value)
+        if kind == "boolean" and value.lower() in ("true", "1", "false", "0"):
+            return value.lower() in ("true", "1")
+    except ValueError:
+        pass
+    return value
 
 
 def _make_strict(schema: object) -> None:
@@ -674,7 +799,17 @@ class RewardNemoGym(JudgeRewardFn):
                 fields.get("options"),
             )
         elif env_input.agent == STRUCTURED_OUTPUTS:
-            reward = grade_structured_output(response, fields["schema_str"])
+            if fields.get("response_mode") == "tool_call":
+                reward = grade_structured_tool_call(
+                    message.get("tool_calls") if message else None,
+                    fields["schema_str"],
+                    tool_name=fields.get("tool_name"),
+                    payload_key=fields.get("tool_payload_key"),
+                )
+            else:
+                reward = grade_structured_output(
+                    response, fields["schema_str"], fields.get("schema_type") or "json"
+                )
         elif env_input.agent == INSTRUCTION_FOLLOWING:
             reward = grade_instruction_following(
                 response, fields["instruction_id_list"], fields["kwargs"]

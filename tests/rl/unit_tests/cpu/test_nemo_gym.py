@@ -148,6 +148,109 @@ def test_mcqa_letter_must_end_and_be_an_option():
     assert grade_mcqa("[[K]]", "K", double_brackets, options) == 0.0
 
 
+def test_structured_output_other_formats_and_tool_calls():
+    from torchtitan.rl.examples.nemo_gym.rubric import grade_structured_tool_call
+
+    obj = json.dumps(
+        {
+            "type": "object",
+            "properties": {"n": {"type": "integer"}, "ok": {"type": "boolean"}},
+        }
+    )
+    assert grade_structured_output("n: 3\nok: true", obj, "yaml") == 1.0
+    assert grade_structured_output("n: three\nok: true", obj, "yaml") == 0.0
+    assert grade_structured_output("n = 3\nok = true", obj, "toml") == 1.0
+    assert (
+        grade_structured_output("n = 3", obj, "toml") == 0.0
+    )  # strict: ok is required
+    rows = json.dumps({"type": "array", "items": json.loads(obj)})
+    # CSV values are strings until coerced to the column types (NeMo Gym's coerce_csv_types)
+    assert grade_structured_output("n,ok\n3,true\n4,0", rows, "csv") == 1.0
+    assert grade_structured_output("n,ok\nthree,true", rows, "csv") == 0.0
+    assert grade_structured_output("  ", obj, "yaml") == 0.0
+
+    def call(name, arguments):
+        return {"type": "function", "function": {"name": name, "arguments": arguments}}
+
+    grade = lambda calls, **kw: grade_structured_tool_call(  # noqa: E731
+        calls,
+        obj,
+        tool_name=kw.get("tool_name", "emit"),
+        payload_key=kw.get("payload_key", "data"),
+    )
+    good = call("emit", {"data": {"n": 1, "ok": False}})
+    assert grade([good]) == 1.0
+    assert grade([call("emit", json.dumps({"data": {"n": 1, "ok": False}}))]) == 1.0
+    assert grade([good, good]) == 0.0  # exactly one call
+    assert grade([call("other", {"data": {"n": 1, "ok": False}})]) == 0.0
+    assert grade([call("emit", {"n": 1, "ok": False})]) == 0.0  # payload key missing
+    assert grade([call("emit", "{broken")]) == 0.0
+    assert grade(None) == 0.0 and grade([]) == 0.0
+
+
+def test_structured_output_xml_is_coerced():
+    pytest.importorskip("xmltodict")
+    obj = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "root": {
+                    "type": "object",
+                    "properties": {
+                        "n": {"type": "integer"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                    },
+                }
+            },
+        }
+    )
+    assert (
+        grade_structured_output(
+            "<root><n>3</n><tags><t>a</t><t>b</t></tags></root>", obj, "xml"
+        )
+        == 1.0
+    )
+    assert (
+        grade_structured_output(
+            "<root><n>x</n><tags><t>a</t></tags></root>", obj, "xml"
+        )
+        == 0.0
+    )
+
+
+def test_row_tools_reach_the_env_in_the_chat_format(tmp_path):
+    from torchtitan.rl.examples.nemo_gym.env import NemoGymEnv
+
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "emit",
+            "description": "d",
+            "parameters": {"type": "object"},
+        },
+    }
+    row = {
+        "responses_create_params": {
+            "input": [{"role": "user", "content": "hi"}],
+            "tools": [tool],
+        },
+        "agent_ref": {"name": "structured_outputs_simple_agent"},
+        "schema_str": "{}",
+    }
+    path = tmp_path / "rows.jsonl"
+    path.write_text(json.dumps(row) + "\n")
+    (sample,), _ = read_nemo_gym_rows([str(path)], ["structured_outputs_simple_agent"])
+    init = asyncio.run(NemoGymEnv(NemoGymEnv.Config(), env_input=sample).init())
+    assert init.tools == [tool]
+    # the Responses-API flat form (parameters as a JSON string) is converted in data preparation, not guessed here
+    row["responses_create_params"]["tools"] = [
+        {"type": "function", "name": "emit", "parameters": "{}"}
+    ]
+    path.write_text(json.dumps(row) + "\n")
+    with pytest.raises(ValueError, match="chat format"):
+        read_nemo_gym_rows([str(path)], ["structured_outputs_simple_agent"])
+
+
 def test_structured_output_broken_schema_scores_zero():
     # one bad row must not raise and drop the whole group
     assert grade_structured_output('{"x": 3}', '{"$ref": "#/missing"}') == 0.0

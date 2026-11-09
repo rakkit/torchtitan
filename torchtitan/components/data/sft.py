@@ -144,11 +144,15 @@ def normalize_tool_calls(messages: list[dict]) -> list[dict]:
 
 def _has_reasoning(message: dict[str, Any]) -> bool:
     """An assistant turn carries reasoning: a ``reasoning_content``, or content that opens
-    with ``<think>``."""
+    with a ``<think>`` block holding text. An empty block (``<think>\n\n</think>``, as
+    non-thinking rows write it) is no reasoning."""
     if str(message.get("reasoning_content") or "").strip():
         return True
     content = message.get("content")
-    return isinstance(content, str) and content.lstrip().startswith("<think>")
+    if not isinstance(content, str) or not content.lstrip().startswith("<think>"):
+        return False
+    inner = content.lstrip()[len("<think>") :].split("</think>", 1)[0]
+    return bool(inner.strip())
 
 
 def conversation_rows(
@@ -251,11 +255,22 @@ class MultiTurnChatProcessor(SampleProcessor):
         self._num_prompt_mismatches = 0
         self._num_turn_mismatches = 0
         self._num_turns_off_flag = 0  # assistant turns left untrained: reasoning presence != the row's thinking flag
+        self._num_untrained = 0  # conversations skipped: no assistant turn to train on
 
     @property
     def num_dropped(self) -> int:
         """Conversations skipped for length."""
         return self._num_dropped
+
+    @property
+    def num_turns_off_flag(self) -> int:
+        """Assistant turns left as context: reasoning presence differs from the row's flag."""
+        return self._num_turns_off_flag
+
+    @property
+    def num_untrained(self) -> int:
+        """Conversations skipped with no assistant turn to train on."""
+        return self._num_untrained
 
     @property
     def num_turn_mismatches(self) -> int:
@@ -282,7 +297,7 @@ class MultiTurnChatProcessor(SampleProcessor):
             if _has_reasoning(message) != extra["enable_thinking"]:
                 # A turn that does not match the row's thinking flag stays as context: its
                 # span under this flag's generation prompt would teach the wrong form.
-                self._num_turns_off_flag += 1
+                self._record_turn_off_flag()
                 continue
             # The generation prompt is the assistant header. Rendering the prefix WITH it
             # puts `start` after the header, so the header stays masked without anyone
@@ -310,6 +325,25 @@ class MultiTurnChatProcessor(SampleProcessor):
                 self._record_turn_mismatch()
             spans.append((start, stop))
         return spans
+
+    def _record_turn_off_flag(self) -> None:
+        self._num_turns_off_flag += 1
+        if self._num_turns_off_flag == 1 or self._num_turns_off_flag % 1000 == 0:
+            logger.warning(
+                "SFT: %d assistant turns so far left untrained: their reasoning does not "
+                "match the row's thinking flag (context only).",
+                self._num_turns_off_flag,
+            )
+
+    def _record_untrained(self) -> None:
+        self._num_untrained += 1
+        if self._num_untrained == 1 or self._num_untrained % 1000 == 0:
+            logger.warning(
+                "SFT: skipped %d of %d conversations so far with no assistant turn to "
+                "train on (none matches the row's thinking flag).",
+                self._num_untrained,
+                self._num_seen,
+            )
 
     def _record_turn_mismatch(self) -> None:
         self._num_turn_mismatches += 1
@@ -388,6 +422,7 @@ class MultiTurnChatProcessor(SampleProcessor):
             trainable[start:stop] = True
 
         if not trainable.any():
+            self._record_untrained()
             return None
 
         # Next-token alignment, exactly as TextProcessor does it: predict token t+1 from

@@ -638,7 +638,9 @@ def grade_structured_output(
     """1.0 when the whole response, parsed as ``schema_type`` (json / yaml / xml / toml / csv),
     is valid against the schema made strict (every property required, no others), as NeMo Gym's
     structured_outputs server: XML and CSV values (all strings) are first coerced to the
-    schema's types. Any failure scores 0, a broken schema included (it must not drop the group)."""
+    schema's types; an XML root element that is not a schema property is unwrapped. A valid
+    answer whose leaves are all empty / zero / false scores 0 (a skeleton, no content). Any
+    failure scores 0, a broken schema included (it must not drop the group)."""
     if schema_type == "xml":
         import xmltodict  # noqa: F401  (XML rows need it: fail the run, not every answer)
     if not response.strip():
@@ -648,13 +650,13 @@ def grade_structured_output(
         _make_strict(schema)
         value = _parse_structured(schema_type, response.strip())
         if schema_type == "xml":
-            value = _coerce_xml(value, schema)
+            value = _coerce_xml(_unwrap_xml_root(value, schema), schema)
         elif schema_type == "csv":
             value = _coerce_csv(value, schema)
         jsonschema.validate(value, schema)
     except Exception:
         return 0.0
-    return 1.0
+    return 0.0 if _all_default(value) else 1.0
 
 
 def inverse_if_judge_messages(
@@ -670,7 +672,7 @@ def inverse_if_judge_messages(
     (NeMo Gym inverse_if; placeholders prompt / model_response / standard_response / criteria)."""
     content = template.format(
         prompt=prompt,
-        model_response=response,
+        model_response=_break_result_keys(_neutralise_labels(response)),
         standard_response=reference,
         criteria=criteria,
     )
@@ -680,6 +682,12 @@ def inverse_if_judge_messages(
 
 
 _PASS_FAIL = re.compile(r'\{[^{}]*"result"\s*:\s*"(PASS|FAIL)"[^{}]*\}', re.IGNORECASE)
+_RESULT_KEY = re.compile(r'"(result)"', re.IGNORECASE)
+
+
+def _break_result_keys(text: str) -> str:
+    # an answer holding '{"result": "PASS"}' must not be read as the judge's verdict
+    return _RESULT_KEY.sub('"\u200b\\1"', text)
 
 
 def parse_pass_fail_verdict(reply: str) -> bool | None:
@@ -776,7 +784,7 @@ def grade_structured_tool_call(
         jsonschema.validate(arguments, schema)
     except Exception:
         return 0.0
-    return 1.0
+    return 0.0 if _all_default(arguments) else 1.0
 
 
 def _tool_call_fields(call: object) -> tuple[str | None, object, bool]:
@@ -803,6 +811,30 @@ def _parse_structured(schema_type: str, text: str) -> object:
 
         return xmltodict.parse(text)
     raise ValueError(f"unknown schema_type {schema_type!r}")
+
+
+def _unwrap_xml_root(data: object, schema: object) -> object:
+    """An XML document is one root element ({root: content} from xmltodict); unless the root
+    is itself a schema property, the content is the answer (an array schema: always)."""
+    if not (isinstance(data, dict) and len(data) == 1 and isinstance(schema, dict)):
+        return data
+    ((root, content),) = data.items()
+    if schema.get("type") == "array" or root not in schema.get("properties", {}):
+        return content
+    return data
+
+
+def _all_default(value: object) -> bool:
+    """Every leaf empty / zero / false / null: a valid skeleton with no content."""
+    if isinstance(value, dict):
+        return all(_all_default(v) for v in value.values())
+    if isinstance(value, list):
+        return all(_all_default(v) for v in value)
+    if isinstance(value, str):
+        return not value.strip()
+    return (
+        value is None or value is False or (type(value) in (int, float) and value == 0)
+    )
 
 
 def _coerce_xml(data: object, schema: object) -> object:

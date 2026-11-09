@@ -337,6 +337,42 @@ def test_turns_that_do_not_match_the_thinking_flag_are_not_trained():
     assert _processor()(row_off, np.random.default_rng(0)) is None
 
 
+def test_an_empty_think_block_is_no_reasoning():
+    """Non-thinking rows written as "<think>\\n\\n</think>\\n\\nA" (Qwen style) render with
+    thinking off; under the thinking prompt they would train an empty think block."""
+    from torchtitan.components.data.sft import _has_reasoning
+
+    assert not _has_reasoning({"content": "<think>\n\n</think>\n\nA"})
+    assert not _has_reasoning({"content": "  <think></think>A"})
+    assert _has_reasoning({"content": "<think>plan</think>A"})
+    assert _has_reasoning({"content": "<think>cut off inside the thinking"})
+    assert not _has_reasoning({"content": "A <think>x</think>"})
+    processor = _processor()
+    row = {
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "<think>\n\n</think>\n\nANSWER"},
+        ]
+    }
+    # thinking off (no reasoning): the turn trains
+    assert "ANSWER" in _supervised_text(processor(row, np.random.default_rng(0)))
+    assert processor.num_turns_off_flag == 0
+
+
+def test_untrained_turns_and_rows_are_counted():
+    processor = _processor()
+    row = {
+        "enable_thinking": "on",
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "NO REASONING"},
+        ],
+    }
+    assert processor(row, np.random.default_rng(0)) is None
+    assert processor.num_turns_off_flag == 1
+    assert processor.num_untrained == 1
+
+
 def test_template_kwargs_are_applied_to_every_render():
     """`truncate_history_thinking=False` must reach the PREFIX renders too.
 

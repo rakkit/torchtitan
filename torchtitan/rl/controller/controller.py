@@ -405,6 +405,15 @@ class Controller(Configurable):
                 raise ValueError(
                     "teacher and rollouter.worker.distillation go together (both set or both None)"
                 )
+            if (
+                self.teacher is not None
+                and self.async_loop.batcher.training_sample_builder.drop_zero_std_reward_groups
+            ):
+                raise ValueError(
+                    "on-policy distillation gives every token a teacher signal: set "
+                    "async_loop.batcher.training_sample_builder.drop_zero_std_reward_groups=False "
+                    "(equal-reward groups would be dropped)"
+                )
             trainer_model_cls = type(self.trainer.model)
             generator_model_cls = type(self.generator.model)
             if trainer_model_cls is not generator_model_cls:

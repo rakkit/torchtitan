@@ -220,6 +220,10 @@ class RolloutTurn:
     """Per-token advantages (on-policy distillation fills them); None: the rollout's scalar
     ``advantage`` applies to every completion token."""
 
+    teacher_logprobs: np.ndarray | None = None  # [num_completion_tokens] float32
+    """The teacher's log-probs of this turn's completion tokens (on-policy distillation
+    fills them; the recorder saves them for offline distillation); None: no teacher."""
+
     routed_experts: np.ndarray | None = None
     """Routing replay: the generator's experts of this turn's request, ``[prompt +
     completion - 1, num_layers, top_k]`` (whole prompt, as a branch needs it); None: off."""

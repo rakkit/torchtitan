@@ -351,6 +351,8 @@ def test_distillation_sets_per_token_advantages_from_the_teacher() -> None:
         assert {g for _, _, g in scored} == {5}
         got = [rollout.turns[0].token_advantages.tolist() for rollout in group.rollouts]
         assert [round(x[0], 5) for x in got] == [5.6, 10.6]
+        teacher = [r.turns[0].teacher_logprobs.tolist() for r in group.rollouts]
+        assert [[round(x, 5) for x in t] for t in teacher] == [[-0.2], [-0.2]]
         names = {metric.key for metric in group.rollouts[0].turns[0].metrics}
         assert {"distillation/reverse_kl", "distillation/teacher_logprob"} <= names
         sample = (

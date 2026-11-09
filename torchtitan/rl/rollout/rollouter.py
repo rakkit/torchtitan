@@ -509,6 +509,7 @@ class RolloutWorker(Configurable):
                     f"the teacher returned no log-probs for group {group.group_id}"
                 )
             teacher_logprobs = np.asarray(teacher[num_prompt:], dtype=np.float32)
+            turn.teacher_logprobs = teacher_logprobs
             gap = teacher_logprobs - turn.completion_logprobs
             turn.token_advantages = (
                 distillation.kl_coef * gap

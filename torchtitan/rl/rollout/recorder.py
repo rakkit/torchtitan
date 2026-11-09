@@ -91,6 +91,21 @@ class KeepExtremeRewardsFilter(Configurable):
         return picked
 
 
+class KeepAllRolloutsFilter(Configurable):
+    """Keep every rollout of every group, e.g. to reuse a run's rollouts as SFT or
+    distillation data (text only, about 4 bytes per token; arrays are opt-in)."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        pass
+
+    def __init__(self, config: Config) -> None:
+        pass
+
+    def __call__(self, groups: list[RolloutGroup]) -> list[Rollout]:
+        return [rollout for group in groups for rollout in group.rollouts]
+
+
 class RolloutSampleRecorder(Configurable):
     """Append rollouts to a JSONL file for debugging and inspection.
 
@@ -107,7 +122,7 @@ class RolloutSampleRecorder(Configurable):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        filter: KeepExtremeRewardsFilter.Config = field(
+        filter: KeepExtremeRewardsFilter.Config | KeepAllRolloutsFilter.Config = field(
             default_factory=KeepExtremeRewardsFilter.Config
         )
         """Selects which rollouts to record each step."""
@@ -117,7 +132,8 @@ class RolloutSampleRecorder(Configurable):
         """Also record each turn's `prompt_prefix_len`, `prompt_delta_token_ids` and `completion_token_ids`;
         `RolloutTurn` shows how to rebuild the full prompt."""
         log_logprobs: bool = False
-        """Also record the raw per-token completion logprob arrays per turn."""
+        """Also record the per-token arrays of each turn: completion logprobs, and under
+        on-policy distillation the per-token advantages and the teacher's logprobs."""
 
     def __init__(self, config: Config, *, dump_dir: str) -> None:
         self._filter = config.filter.build()
@@ -196,4 +212,7 @@ class RolloutSampleRecorder(Configurable):
             encoded["completion_token_ids"] = turn.completion_token_ids.tolist()
         if self._log_logprobs:
             encoded["completion_logprobs"] = turn.completion_logprobs.tolist()
+            for name in ("token_advantages", "teacher_logprobs"):
+                values = getattr(turn, name)
+                encoded[name] = None if values is None else values.tolist()
         return encoded

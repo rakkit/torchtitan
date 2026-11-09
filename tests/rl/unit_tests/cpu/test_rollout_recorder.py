@@ -18,6 +18,7 @@ import pytest
 from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
 
 from torchtitan.rl.rollout.recorder import (
+    KeepAllRolloutsFilter,
     KeepExtremeRewardsFilter,
     RolloutSampleRecorder,
 )
@@ -155,6 +156,30 @@ def test_log_tensors_and_logprobs_opt_in(tmp_path) -> None:
     assert turn["completion_logprobs"] == [-0.5, -1.5]
 
 
+def test_keep_all_records_every_rollout_with_the_teachers_logprobs(tmp_path) -> None:
+    # reusing a run's rollouts (SFT, offline distillation) needs all of them
+    recorder = _recorder(
+        tmp_path, filter=KeepAllRolloutsFilter.Config(), log_logprobs=True
+    )
+    groups = [_group(0, rewards=[1.0, 0.5, 0.5, None]), _group(1, rewards=[0.0] * 3)]
+    groups[1].rollouts[0].turns[0].teacher_logprobs = np.array(
+        [-0.25, -1.5], np.float32
+    )
+    recorder.record(is_validation=False, rollout_groups=groups)
+    lines = _close_and_read_lines(recorder, tmp_path)
+    assert [(r["group_id"], r["rollout_id"]) for r in lines] == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+    ]
+    teacher = [r["turns"][0]["teacher_logprobs"] for r in lines if r["group_id"] == 1]
+    assert teacher == [[-0.25, -1.5], None, None]
+
+
 def test_appends_across_calls(tmp_path) -> None:
     recorder = _recorder(tmp_path)
     recorder.record(is_validation=True, rollout_groups=[_group(0, rewards=[1.0])])
@@ -255,8 +280,9 @@ def test_encode_turn_covers_all_rollout_turn_fields(tmp_path) -> None:
     recorder = _recorder(tmp_path, log_tensors=True, log_logprobs=True)
     encoded = recorder._encode_turn(_turn(completion_logprobs=[-0.5, -1.5]))
 
-    # rollout_id is flattened to turn_id; metrics is not JSON-serializable.
-    dropped_or_flattened = {"metrics", "rollout_id"}
+    # rollout_id is flattened to turn_id; metrics is not JSON-serializable; the routing
+    # replay arrays ([tokens, layers, top_k] per turn) are too large to log.
+    dropped_or_flattened = {"metrics", "rollout_id", "routed_experts"}
     for field in dataclasses.fields(RolloutTurn):
         if field.name in dropped_or_flattened:
             continue

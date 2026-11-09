@@ -91,8 +91,15 @@ def _torchtitan_model(**overrides):
         _SINKS,
         {"gated_attention_type": None},
         {"rope_of_swa": {"dim": 64, "theta": 10000.0}},
+        {"gated_attention_type": None, "conv_kernel_size": 0},
     ],
-    ids=["every-feature-gate", "sinks", "neither", "partial-rope-on-swa"],
+    ids=[
+        "every-feature-gate",
+        "sinks",
+        "neither",
+        "partial-rope-on-swa",
+        "neither-no-conv",
+    ],
 )
 def test_hf_forward_is_torchtitan_forward_bitwise(dtype, variant):
     # Both models' FlexAttention compile from the same state: what compiled

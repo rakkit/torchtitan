@@ -732,7 +732,9 @@ def grade_format_verification(response: str, verifier: dict) -> float:
     """NeMo Gym's format_verification server. ``regex`` / ``inline_prose``: 1.0 when at least
     ``verify_min_matches`` lines (each counted once) match any of ``verify_regex``.
     ``string_match``: 1.0 when every ``expected_markers`` string is in the response and no match
-    of ``patterns`` is outside them. An unknown verifier type raises (data error, not 0)."""
+    of ``patterns`` is outside them, and (``min_text_chars``, set at data preparation) the answer
+    keeps that many non-space characters once the pattern matches are removed: a reply of
+    markers alone is no answer. An unknown verifier type raises (data error, not 0)."""
     kind = verifier.get("type", "")
     if kind in ("regex", "inline_prose"):
         patterns = [re.compile(p) for p in verifier.get("verify_regex", [])]
@@ -745,10 +747,12 @@ def grade_format_verification(response: str, verifier: dict) -> float:
         if any(marker not in response for marker in expected):
             return 0.0
         allowed = set(expected)
+        text = response
         for pattern in verifier.get("patterns", []):
             if any(m.group(0) not in allowed for m in re.finditer(pattern, response)):
                 return 0.0
-        return 1.0
+            text = re.sub(pattern, "", text)
+        return float(len("".join(text.split())) >= verifier.get("min_text_chars", 0))
     raise ValueError(f"unknown format verifier type {kind!r}")
 
 

@@ -295,6 +295,23 @@ def test_structured_output_skeleton_answers_score_zero():
     )
 
 
+def test_citation_answer_needs_text_beyond_its_markers():
+    from torchtitan.rl.examples.nemo_gym.rubric import grade_format_verification
+
+    v = {
+        "type": "string_match",
+        "expected_markers": ["[ref:7]"],
+        "patterns": [r"\[ref:\d+\]"],
+    }
+    assert grade_format_verification("[ref:7]", v) == 1.0  # NeMo Gym: no minimum
+    assert (
+        grade_format_verification("Paris [ref:7] [ref:3]", v) == 0.0
+    )  # another part cited
+    v["min_text_chars"] = 3
+    assert grade_format_verification(" [ref:7] ", v) == 0.0
+    assert grade_format_verification("Paris [ref:7]", v) == 1.0
+
+
 def test_inverse_if_answer_cannot_carry_the_verdict():
     from torchtitan.rl.examples.nemo_gym.rubric import (
         inverse_if_judge_messages,

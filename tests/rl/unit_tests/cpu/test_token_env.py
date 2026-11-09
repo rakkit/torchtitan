@@ -37,8 +37,12 @@ class _RecordingRenderer:
         self.calls["render_ids"] = {"tools": tools}
         return [1, 2, 3]
 
-    def parse_response(self, token_ids, *, tools=None):
-        self.calls["parse_response"] = {"token_ids": token_ids, "tools": tools}
+    def parse_response(self, token_ids, *, tools=None, prompt_ids=None):
+        self.calls["parse_response"] = {
+            "token_ids": token_ids,
+            "tools": tools,
+            "prompt_ids": prompt_ids,
+        }
         return ParsedResponse(content="answer", reasoning_content=None, tool_calls=[])
 
     def bridge_to_next_turn(
@@ -89,7 +93,13 @@ def test_env_passes_tools_to_render_parse_and_bridge() -> None:
     env_output = asyncio.run(run())
     assert env_output.status == RolloutStatus.ONGOING
     assert renderer.calls["render_ids"]["tools"] == _TOOLS
-    assert renderer.calls["parse_response"] == {"token_ids": [7, 8], "tools": _TOOLS}
+    # the exact sampling prompt reaches the parser: a generation prompt that opens the
+    # think block (Qwen3.5+ style) would otherwise leave the reasoning in the content
+    assert renderer.calls["parse_response"] == {
+        "token_ids": [7, 8],
+        "tools": _TOOLS,
+        "prompt_ids": [1, 2, 3],
+    }
     assert renderer.calls["bridge_to_next_turn"]["tools"] == _TOOLS
 
 

@@ -186,6 +186,20 @@ def test_structured_output_other_formats_and_tool_calls():
     assert grade([call("emit", {"n": 1, "ok": False})]) == 0.0  # payload key missing
     assert grade([call("emit", "{broken")]) == 0.0
     assert grade(None) == 0.0 and grade([]) == 0.0
+    # what rollouts carry: the renderer's ParsedToolCall records (review TASK 10 H-2)
+    from renderers.base import ParsedToolCall, ToolCallParseStatus
+
+    parsed = ParsedToolCall(
+        raw="<tool_call>...", name="emit", arguments={"data": {"n": 1, "ok": False}}
+    )
+    assert grade([parsed]) == 1.0
+    broken = ParsedToolCall(
+        raw="<tool_call>...",
+        name="emit",
+        arguments=None,
+        status=ToolCallParseStatus.INVALID_JSON,
+    )
+    assert grade([broken]) == 0.0 and grade([parsed, broken]) == 0.0
 
 
 def test_structured_output_xml_is_coerced():

@@ -211,7 +211,7 @@ class _RewritingRenderer:
             return SimpleNamespace(token_ids=list(next_prompt))
         return None
 
-    def parse_response(self, token_ids, *, tools=None):
+    def parse_response(self, token_ids, *, tools=None, prompt_ids=None):
         return ParsedResponse(
             content=str(token_ids), reasoning_content=None, tool_calls=[]
         )

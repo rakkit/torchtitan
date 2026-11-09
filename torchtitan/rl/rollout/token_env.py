@@ -172,6 +172,9 @@ class TokenEnv(Configurable):
                 self._renderer.parse_response,
                 token_ids=completion.token_ids,
                 tools=self._tools,
+                # the exact sampling prompt: a generation prompt that opens the think block
+                # (Qwen3.5+ style) otherwise leaves the reasoning inside the content
+                prompt_ids=self._last_prompt_token_ids,
             )
         except Exception:
             logger.exception(

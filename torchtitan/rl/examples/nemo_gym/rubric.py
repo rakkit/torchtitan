@@ -745,22 +745,24 @@ def grade_format_verification(response: str, verifier: dict) -> float:
 
 
 def grade_structured_tool_call(
-    tool_calls: list[dict] | None,
+    tool_calls: list | None,
     schema_str: str,
     *,
     tool_name: str | None,
     payload_key: str | None,
 ) -> float:
-    """1.0 when the answer is exactly one tool call (to ``tool_name`` when set) whose arguments
-    (or their ``payload_key`` entry) are valid against the strict schema, as NeMo Gym's
-    structured_outputs ``response_mode="tool_call"``; else 0."""
-    if not tool_calls or len(tool_calls) != 1:
+    """1.0 when the answer is exactly one tool call (to ``tool_name`` when set), parsed cleanly,
+    whose arguments (or their ``payload_key`` entry) are valid against the strict schema, as NeMo
+    Gym's structured_outputs ``response_mode="tool_call"``; else 0. ``tool_calls`` are what the
+    rollout carries: the renderer's ParsedToolCall records (one per attempt, malformed ones
+    included) or OpenAI-style dicts."""
+    calls = [_tool_call_fields(c) for c in tool_calls or []]
+    if len(calls) != 1:
         return 0.0
-    call = tool_calls[0].get("function") or tool_calls[0]
-    if tool_name and call.get("name") != tool_name:
+    name, arguments, ok = calls[0]
+    if not ok or (tool_name and name != tool_name):
         return 0.0
     try:
-        arguments = call.get("arguments")
         if isinstance(arguments, str):
             arguments = json.loads(arguments)
         if not isinstance(arguments, dict):
@@ -775,6 +777,16 @@ def grade_structured_tool_call(
     except Exception:
         return 0.0
     return 1.0
+
+
+def _tool_call_fields(call: object) -> tuple[str | None, object, bool]:
+    """(name, arguments, parsed cleanly) of a renderers ParsedToolCall or an OpenAI-style dict."""
+    if isinstance(call, dict):
+        function = call.get("function") or call
+        return function.get("name"), function.get("arguments"), True
+    status = getattr(call, "status", None)
+    ok = status is None or getattr(status, "name", str(status)) == "OK"
+    return getattr(call, "name", None), getattr(call, "arguments", None), ok
 
 
 def _parse_structured(schema_type: str, text: str) -> object:

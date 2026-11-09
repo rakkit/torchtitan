@@ -111,6 +111,7 @@ def _sample(*, token_ids=(10, 11), finish_reason="stop"):
         token_ids=list(token_ids),
         logprobs=logprobs,
         finish_reason=finish_reason,
+        routed_experts=None,
     )
 
 
@@ -120,6 +121,7 @@ def _request_output(
     return SimpleNamespace(
         request_id=request_id,
         num_cached_tokens=0,
+        prompt_logprobs=None,
         metrics=SimpleNamespace(
             first_token_latency=0.012,
             queued_ts=1.0,
@@ -589,6 +591,7 @@ _PARALLELISM = InferenceParallelismConfig()
 _MODEL_CONFIG = SimpleNamespace(
     first_full_attention=SimpleNamespace(inner_attention=VarlenInnerAttention.Config()),
     max_context_length=1024,
+    traverse=lambda config_type: [],  # no routers: routing replay off
 )
 
 

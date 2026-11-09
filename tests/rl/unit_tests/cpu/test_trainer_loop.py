@@ -84,6 +84,8 @@ def _controller(events: list[str], *, on_push=None, on_pull=None) -> Controller:
             target_offpolicy_steps=1,
             max_offpolicy_steps=None,
             num_prompts_per_train_step=5,
+            stop_before_walltime_s=None,
+            stop_file=None,
         )
     )
     controller.start_step = 0

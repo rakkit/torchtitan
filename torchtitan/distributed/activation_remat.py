@@ -43,8 +43,8 @@ class ActivationRematConfig:
     recomputed.
 
     NB: Save-region names are relative to a transformer block, so the same
-    policy applies to every transformer block. Per-block remat policies are
-    not currently supported.
+    policy applies to every transformer block, except the blocks listed in
+    ``save_all_layers``.
     """
 
     recompute_regions: list[str] = field(default_factory=list)
@@ -54,6 +54,14 @@ class ActivationRematConfig:
     example, with ``save_regions=["*"]``, this lists the few regions to
     recompute, which suits starting from no remat and recomputing just enough
     to fit a memory budget.
+    """
+
+    save_all_layers: list[int] = field(default_factory=list)
+    """
+    Transformer block ids (the ``layers`` keys) that recompute nothing: every
+    region is saved in them. Spends memory left over by the policy on some
+    blocks' recompute (opt_moe L19 at 16 nodes: the routed experts saved in 4
+    of 19 blocks instead of recomputed, +1.45% throughput, +3.2 GiB per block).
     """
 
     preserve_rng_state: bool = False
@@ -83,6 +91,10 @@ class ActivationRematConfig:
             raise ValueError(
                 "torch_remat activation checkpointing does not support the debug "
                 "option."
+            )
+        if any(layer_id < 0 for layer_id in self.save_all_layers):
+            raise ValueError(
+                f"save_all_layers holds block ids >= 0, got {self.save_all_layers}"
             )
 
     def _check_fixed_regions(
@@ -139,9 +151,12 @@ class ActivationRematConfig:
         # regions across all pipeline stages instead of only this model part.
         for layer_id, transformer_block in transformer_blocks:
             assert isinstance(transformer_block, Module)
-            transformer_block.configure_remat_regions(
-                self.save_regions, self.recompute_regions
-            )
+            if int(layer_id) in self.save_all_layers:
+                transformer_block.configure_remat_regions(["*"], [])
+            else:
+                transformer_block.configure_remat_regions(
+                    self.save_regions, self.recompute_regions
+                )
             base_fqn = f"layers.{layer_id}"
             transformer_block.forward = remat.checkpoint(
                 region_name=base_fqn,

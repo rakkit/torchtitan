@@ -605,6 +605,45 @@ class TestRematRegions(unittest.TestCase):
                     expected_counts,
                 )
 
+    def test_save_all_layers_skip_recompute_in_listed_blocks(self):
+        def block():
+            feed_forward = _feed_forward_config().build()
+            feed_forward.w13 = _CountingColumnParallelLinear(_feed_forward_config().w13)
+            feed_forward.w2 = _CountingRowParallelLinear(_feed_forward_config().w2)
+            return _FeedForwardBlock(feed_forward)
+
+        class _TwoFeedForwardBlocks(Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = ModuleDict({"0": block(), "1": block()})
+
+            def forward(self, x_TD: torch.Tensor) -> torch.Tensor:
+                return self.layers["0"](x_TD) + self.layers["1"](x_TD)
+
+        torch.manual_seed(42)
+        baseline = _TwoFeedForwardBlocks()
+        remat_model = deepcopy(baseline)
+        ActivationRematConfig(save_regions=[], save_all_layers=[1]).apply(remat_model)
+
+        x_TD = torch.randn(3, 4)
+        expected = _run_forward_backward(baseline, x_TD)
+        actual = _run_forward_backward(remat_model, x_TD)
+        torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+        for actual_grad, expected_grad in zip(actual[2], expected[2]):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+        counts = [
+            (b.feed_forward.w13.num_forwards, b.feed_forward.w2.num_forwards)
+            for b in (remat_model.layers["0"], remat_model.layers["1"])
+        ]
+        # block 0 recomputes both linears (full remat); block 1 saves everything
+        self.assertEqual(counts, [(2, 2), (1, 1)])
+
+    def test_save_all_layers_rejects_negative_ids(self):
+        with self.assertRaisesRegex(ValueError, "save_all_layers"):
+            ActivationRematConfig(save_regions=[], save_all_layers=[-1])
+
     def test_feed_forward_variants_use_expected_region_boundaries(self):
         feed_forward_config = _feed_forward_config()
 

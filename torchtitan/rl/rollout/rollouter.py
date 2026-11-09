@@ -322,7 +322,8 @@ class RolloutWorker(Configurable):
         set `AdvantageEstimator.Config(should_std_normalize=True)` for standard GRPO."""
         distillation: OnPolicyDistillationConfig | None = None
         """On-policy distillation: a teacher scores every completion token and sets per-token
-        advantages (`run_group` then needs a `score_fn`). None: off."""
+        advantages for the groups `run_group` gets a `score_fn` for (the controller passes it for
+        training groups, not for validation). None: off."""
 
     def __init__(self, config: Config) -> None:
         self.rubric: Rubric = config.rubric.build()
@@ -461,11 +462,8 @@ class RolloutWorker(Configurable):
         advantages = self.advantage_estimator(group)
         for rollout, advantage in zip(group.rollouts, advantages, strict=True):
             rollout.advantage = advantage
-        if self._distillation is not None:
-            if score_fn is None:
-                raise ValueError(
-                    "distillation is configured but run_group got no score_fn"
-                )
+        # Training groups get the teacher's score_fn; validation groups (reward only) get none.
+        if self._distillation is not None and score_fn is not None:
             if sampling.temperature != 1.0:
                 raise ValueError(
                     f"distillation needs the student's own log-probs: sampling temperature "

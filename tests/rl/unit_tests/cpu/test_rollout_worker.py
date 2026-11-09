@@ -360,14 +360,20 @@ def test_distillation_sets_per_token_advantages_from_the_teacher() -> None:
         )
         assert round(float(sample.advantage[-1]), 5) == 5.6
 
-        for bad in (
-            dict(sampling=SamplingConfig(temperature=1.0)),
-            dict(sampling=SamplingConfig(temperature=0.8), score_fn=score_fn),
-        ):
-            try:
-                await worker.run_group(**kwargs, **bad)
-            except ValueError:
-                continue
-            raise AssertionError(f"expected ValueError for {bad}")
+        # validation groups get no score_fn: rewards only, no per-token advantages
+        plain = await worker.run_group(
+            **kwargs, sampling=SamplingConfig(temperature=0.6)
+        )
+        assert all(r.turns[0].token_advantages is None for r in plain.rollouts)
+        try:
+            await worker.run_group(
+                **kwargs, sampling=SamplingConfig(temperature=0.8), score_fn=score_fn
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "expected ValueError: distillation needs temperature 1.0"
+            )
 
     asyncio.run(run())

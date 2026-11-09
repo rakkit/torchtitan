@@ -85,6 +85,10 @@ class Completion:
     """Routing replay: the experts of every forwarded token of this request,
     ``[prompt + completion - 1, num_layers, top_k]``; None: off."""
 
+    prompt_token_logprobs: list[float] | None = None
+    """``SamplingConfig.prompt_logprobs``: each prompt token's log-prob, ``[prompt_tokens]``
+    (position 0: NaN); None: not requested."""
+
 
 class GenerateFn(Protocol):
     """Generate one model completion for a prompt.

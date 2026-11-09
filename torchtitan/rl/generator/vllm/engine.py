@@ -474,6 +474,8 @@ def _build_sampling_params(sampling: SamplingConfig) -> SamplingParams:
         ignore_eos=True,
         seed=sampling.seed,
         logprobs=0,  # return only the sampled token's logprob (for the GRPO ratio)
+        # 0: each prompt position carries only the log-prob of the token actually there
+        prompt_logprobs=0 if sampling.prompt_logprobs else None,
         # Token ids in, token ids and logprob floats out: stops are token ids and nothing reads
         # text, so skip vLLM's per-token detokenization and per-token logprob dicts.
         detokenize=False,
@@ -506,7 +508,22 @@ def _finished_request(request_output: RequestOutput) -> FinishedRequest:
         finish_reason=completion_output.finish_reason,
         metrics_inputs=_extract_request_metrics_inputs(request_output),
         routed_experts=completion_output.routed_experts,
+        prompt_token_logprobs=_prompt_token_logprobs(request_output),
     )
+
+
+def _prompt_token_logprobs(request_output: RequestOutput) -> list[float] | None:
+    """Each prompt token's log-prob when the request asked for prompt log-probs (position 0
+    has none: NaN), else None. With ``prompt_logprobs=0`` a position holds only its own token;
+    flat log-probs give position 0 as an empty entry, not None."""
+    if request_output.prompt_logprobs is None:
+        return None
+    return [
+        float("nan") if not position else position[token_id].logprob
+        for position, token_id in zip(
+            request_output.prompt_logprobs, request_output.prompt_token_ids, strict=True
+        )
+    ]
 
 
 def _extract_request_metrics_inputs(

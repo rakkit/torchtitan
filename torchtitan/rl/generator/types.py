@@ -37,6 +37,11 @@ class SamplingConfig:
     generation time: these are the only ids that end a request (the engine's EOS stops
     are off)."""
 
+    prompt_logprobs: bool = False
+    """Also return the log-prob of every prompt token (``Completion.prompt_token_logprobs``):
+    scoring a given sequence, e.g. a teacher scoring a student's tokens for on-policy
+    distillation (with ``max_tokens=1`` and ``temperature=1.0``, the raw model's log-probs)."""
+
     def __post_init__(self) -> None:
         # TODO(mask-replay): to allow top_p < 1, turn on vLLM's `return_sampling_mask` (needs a vLLM
         # upgrade, the V2 model runner, top_k > 0 and processed logprobs), carry each token's kept
@@ -104,3 +109,6 @@ class FinishedRequest:
     routed_experts: np.ndarray | None = None
     """Routing replay: the experts of each forwarded token, ``[prompt + generated - 1,
     num_layers, top_k]`` (the last sampled token is never forwarded); None: off."""
+    prompt_token_logprobs: list[float] | None = None
+    """``SamplingConfig.prompt_logprobs``: each prompt token's log-prob, ``[prompt_tokens]``
+    (position 0 has none: NaN); None: not requested."""

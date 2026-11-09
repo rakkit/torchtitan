@@ -316,6 +316,35 @@ def test_build_sampling_params_seed_defaults_to_none():
     assert params.seed is None
 
 
+def test_prompt_logprobs_are_requested_only_when_asked():
+    off = _build_sampling_params(SamplingConfig(max_tokens=8, stop_token_ids=[99]))
+    on = _build_sampling_params(
+        SamplingConfig(max_tokens=1, stop_token_ids=[99], prompt_logprobs=True)
+    )
+    assert off.prompt_logprobs is None
+    assert on.prompt_logprobs == 0
+
+
+def test_prompt_token_logprobs_read_each_tokens_own_logprob():
+    from vllm.logprobs import FlatLogprobs, Logprob
+
+    # vLLM's flat layout gives position 0 as an empty entry (no logprob for the first token)
+    flat = FlatLogprobs()
+    flat.append({})
+    flat.append({7: Logprob(logprob=-1.5, rank=3)})
+    flat.append({5: Logprob(logprob=-0.25, rank=1)})
+    out = SimpleNamespace(prompt_logprobs=flat, prompt_token_ids=[11, 7, 5])
+    got = vllm_engine_module._prompt_token_logprobs(out)
+    assert torch.isnan(torch.tensor(got[0]))
+    assert got[1:] == [-1.5, -0.25]
+    assert (
+        vllm_engine_module._prompt_token_logprobs(
+            SimpleNamespace(prompt_logprobs=None, prompt_token_ids=[1])
+        )
+        is None
+    )
+
+
 def _engine_request(request_id: str, *, min_policy_version: int, group_id: int = 3):
     request = EngineRequest(
         request_id=request_id,

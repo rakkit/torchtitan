@@ -142,6 +142,15 @@ def normalize_tool_calls(messages: list[dict]) -> list[dict]:
     return messages
 
 
+def _has_reasoning(message: dict[str, Any]) -> bool:
+    """An assistant turn carries reasoning: a ``reasoning_content``, or content that opens
+    with ``<think>``."""
+    if str(message.get("reasoning_content") or "").strip():
+        return True
+    content = message.get("content")
+    return isinstance(content, str) and content.lstrip().startswith("<think>")
+
+
 def conversation_rows(
     messages_key: str = "messages",
     tools_key: str | None = "tools",
@@ -241,6 +250,7 @@ class MultiTurnChatProcessor(SampleProcessor):
         self._num_seen = 0
         self._num_prompt_mismatches = 0
         self._num_turn_mismatches = 0
+        self._num_turns_off_flag = 0  # assistant turns left untrained: reasoning presence != the row's thinking flag
 
     @property
     def num_dropped(self) -> int:
@@ -268,6 +278,11 @@ class MultiTurnChatProcessor(SampleProcessor):
         spans: list[tuple[int, int]] = []
         for index, message in enumerate(messages):
             if message.get("role") != "assistant":
+                continue
+            if _has_reasoning(message) != extra["enable_thinking"]:
+                # A turn that does not match the row's thinking flag stays as context: its
+                # span under this flag's generation prompt would teach the wrong form.
+                self._num_turns_off_flag += 1
                 continue
             # The generation prompt is the assistant header. Rendering the prefix WITH it
             # puts `start` after the header, so the header stays masked without anyone
@@ -341,11 +356,16 @@ class MultiTurnChatProcessor(SampleProcessor):
         if not messages:
             return None
 
+        if enable_thinking is None:
+            # A row without reasoning renders with thinking OFF: under the thinking prompt
+            # ("<think>\n") its answers would teach an empty think block whenever thinking is on.
+            enable_thinking = any(
+                _has_reasoning(m) for m in messages if m.get("role") == "assistant"
+            )
         extra: dict[str, Any] = {}
         if tools:
             extra["tools"] = tools
-        if enable_thinking is not None:
-            extra["enable_thinking"] = bool(enable_thinking)
+        extra["enable_thinking"] = bool(enable_thinking)
         if not any(m.get("role") == "assistant" for m in messages):
             # Nothing to learn from: every token would be masked, so the sample would
             # contribute a zero-token row and skew packing.

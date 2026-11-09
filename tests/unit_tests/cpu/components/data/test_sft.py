@@ -275,12 +275,66 @@ def test_empty_json_columns_are_tolerated():
 
     sample = {
         "messages": json.dumps(
-            [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+            [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a", "reasoning_content": "r"},
+            ]
         ),
         "tools": "[]",
         "enable_thinking": True,
     }
     assert _processor()(sample, np.random.default_rng(0)) is not None
+
+
+def test_a_row_without_reasoning_renders_with_thinking_off():
+    """Under the thinking prompt ("<think>\\n") an answer without reasoning would train an
+    empty think block, teaching the model to skip thinking while thinking is on."""
+    seen: list[dict] = []
+
+    class RecordingTokenizer(CharTokenizer):
+        def apply_chat_template(self, messages, add_generation_prompt=False, **kwargs):
+            seen.append(dict(kwargs))
+            return super().apply_chat_template(messages, add_generation_prompt)
+
+    processor = MultiTurnChatProcessor(
+        MultiTurnChatProcessor.Config(),
+        context=DatasetBuildContext(
+            tokenizer=RecordingTokenizer(),
+            max_context_length=256,
+            num_tokens_per_microbatch=256,
+            read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=1),
+        ),
+    )
+    assert processor(_conversation("q", "a"), np.random.default_rng(0)) is not None
+    assert seen and all(kw.get("enable_thinking") is False for kw in seen)
+    seen.clear()
+    with_reasoning = {
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a", "reasoning_content": "r"},
+        ]
+    }
+    processor(with_reasoning, np.random.default_rng(0))
+    assert seen and all(kw.get("enable_thinking") is True for kw in seen)
+
+
+def test_turns_that_do_not_match_the_thinking_flag_are_not_trained():
+    row = {
+        "messages": [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "FIRST", "reasoning_content": "r"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "SECOND"},
+        ]
+    }
+    supervised = _supervised_text(_processor()(row, np.random.default_rng(0)))
+    # the row has reasoning -> thinking on: the turn without reasoning stays context only
+    assert "FIRST" in supervised and "SECOND" not in supervised
+    # an explicit flag that no turn matches leaves nothing to train: the row is skipped
+    row_off = dict(
+        row, enable_thinking="on", messages=[row["messages"][0], row["messages"][3]]
+    )
+    assert _processor()(row_off, np.random.default_rng(0)) is None
 
 
 def test_template_kwargs_are_applied_to_every_render():

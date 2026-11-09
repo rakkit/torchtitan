@@ -127,6 +127,23 @@ class Rubric(Configurable):
                 f"rubric weights must sum to a positive value; got {self._weight_sum}"
             )
 
+    def _short_circuit(self, rollout: Rollout) -> RubricOutput | None:
+        """The configured `truncation_reward` / `error_reward` output when it is set and the
+        rollout truncated / errored, else None. The breakdown records the reason so it shows
+        up in metrics."""
+        cfg = self._config
+        if cfg.truncation_reward is not None and rollout.status.is_truncated():
+            return RubricOutput(
+                reward=cfg.truncation_reward,
+                reward_breakdown={"truncated": cfg.truncation_reward},
+            )
+        if cfg.error_reward is not None and rollout.status.is_error():
+            return RubricOutput(
+                reward=cfg.error_reward,
+                reward_breakdown={"errored": cfg.error_reward},
+            )
+        return None
+
     @sl.log_trace_span("score_single_rollout")
     async def _score_single_rollout(
         self, rollout: Rollout, env_input: object, judge_fn: JudgeFn | None
@@ -141,19 +158,8 @@ class Rubric(Configurable):
         Returns:
             Final weighted reward + per-fn raw breakdown.
         """
-        # Short-circuit on truncate / error and return the configured reward. The
-        # breakdown records the short-circuit reason so it shows up in metrics.
-        cfg = self._config
-        if cfg.truncation_reward is not None and rollout.status.is_truncated():
-            return RubricOutput(
-                reward=cfg.truncation_reward,
-                reward_breakdown={"truncated": cfg.truncation_reward},
-            )
-        if cfg.error_reward is not None and rollout.status.is_error():
-            return RubricOutput(
-                reward=cfg.error_reward,
-                reward_breakdown={"errored": cfg.error_reward},
-            )
+        if (fixed := self._short_circuit(rollout)) is not None:
+            return fixed
 
         # Run all reward fns and weight-sum (weights normalized to sum to 1.0).
         per_fn_rewards = await asyncio.gather(

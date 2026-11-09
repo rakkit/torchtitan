@@ -13,12 +13,14 @@ from torchtitan.rl.examples.nemo_gym.env import NemoGymEnv
 from torchtitan.rl.examples.nemo_gym.rubric import (
     grade_mcqa,
     grade_structured_output,
+    NemoGymRubric,
     RewardNemoGym,
 )
 
 __all__ = [
     "NemoGymDataset",
     "NemoGymEnv",
+    "NemoGymRubric",
     "NemoGymSample",
     "RewardNemoGym",
     "grade_mcqa",

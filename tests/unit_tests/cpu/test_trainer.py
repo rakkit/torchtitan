@@ -1041,18 +1041,24 @@ def test_trainer_accumulates_reused_accelerator_graph_losses(
             ntokens_seen=3,
         ),
     )
-    data_iterator = iter(
-        [_batch(loss_token_counts, routing_token_counts) for _ in range(3)]
-    )
+    batches = [_batch(loss_token_counts, routing_token_counts) for _ in range(3)]
+    # one microbatch of 4 tokens, 3 of them padding: 6 tokens in the step, 3 padding
+    batches[0].padding_mask = torch.tensor([False, True, True, True])
+    data_iterator = iter(batches)
 
     Trainer.train_step(_training_loop(trainer), data_iterator)
 
+    main_loss_tokens = float(loss_token_counts.reshape(-1)[0]) * 3
     metrics_processor.log.assert_called_once_with(
         1,
         6.0,
         6.0,
         4.0,
-        extra_metrics={"n_tokens_seen": 3},
+        extra_metrics={
+            "n_tokens_seen": 3,
+            "data/padding_fraction": 0.5,
+            "data/supervised_fraction": main_loss_tokens / 6,
+        },
         num_flops=600.0,
     )
     # The first step after loading starts a new metrics window.

@@ -547,6 +547,8 @@ class Trainer(Configurable):
         microbatch_groups: list[list[TrainingMicrobatch]] = []
         local_loss_token_counts: torch.Tensor | None = None
         local_routing_token_counts: torch.Tensor | None = None
+        # padding / all tokens of the step (packing loss: SFT's first-fit pads rows)
+        local_padding_tokens = local_tokens = 0
         for _ in range(self.gradient_accumulation_steps):
             microbatch_group = []
             for _ in range(self.num_pp_microbatches):
@@ -562,6 +564,10 @@ class Trainer(Configurable):
                 local_loss_token_counts.add_(microbatch.loss_token_counts)
                 assert local_routing_token_counts is not None
                 local_routing_token_counts.add_(microbatch.routing_token_counts)
+                padding_mask = getattr(microbatch, "padding_mask", None)
+                if padding_mask is not None:
+                    local_padding_tokens += int(padding_mask.sum())
+                    local_tokens += padding_mask.numel()
                 microbatch_group.append(microbatch)
             microbatch_groups.append(microbatch_group)
         assert local_loss_token_counts is not None
@@ -579,6 +585,10 @@ class Trainer(Configurable):
             (
                 local_loss_token_counts.reshape(-1),
                 local_routing_token_counts.reshape(-1),
+                torch.tensor(
+                    [local_padding_tokens, local_tokens],
+                    dtype=local_loss_token_counts.dtype,
+                ),
             )
         ).to(engine.device, non_blocking=True)
         if parallelism_context.dp_enabled:
@@ -588,9 +598,10 @@ class Trainer(Configurable):
         global_loss_token_counts = global_token_counts[:num_loss_objectives].reshape(
             local_loss_token_counts.shape
         )
-        global_routing_token_counts = global_token_counts[num_loss_objectives:].reshape(
-            local_routing_token_counts.shape
-        )
+        global_routing_token_counts = global_token_counts[
+            num_loss_objectives:-2
+        ].reshape(local_routing_token_counts.shape)
+        global_padding_tokens, global_tokens = global_token_counts[-2:]
         forward_backward_result = engine.forward_backward(
             microbatch_groups=microbatch_groups,
             global_loss_token_counts=global_loss_token_counts,
@@ -682,6 +693,13 @@ class Trainer(Configurable):
                 global_avg_loss = global_max_loss = float(accumulated_loss.item())
                 global_ntokens_seen = engine.ntokens_seen
 
+        if float(global_tokens) > 0:
+            loss_metrics["data/padding_fraction"] = float(
+                global_padding_tokens / global_tokens
+            )
+            loss_metrics["data/supervised_fraction"] = float(
+                global_main_loss_token_count / global_tokens
+            )
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,

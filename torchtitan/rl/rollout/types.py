@@ -123,6 +123,17 @@ class GenerateFn(Protocol):
         """
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class TeacherScores:
+    """A teacher's log-prob of every token of a scored sequence, and which teacher it was."""
+
+    token_logprobs: list[float]
+    """``[len(token_ids)]``, position 0 NaN."""
+
+    teacher: str
+    """The teacher's name (``TeacherConfig.name``): recorded per rollout to check the routing."""
+
+
 class ScoreFn(Protocol):
     """Score a token sequence with a fixed teacher model (on-policy distillation).
 
@@ -139,9 +150,9 @@ class ScoreFn(Protocol):
         request_id: str,
         group_id: int,
         domain: str | None,
-    ) -> list[float] | None:
-        """Return the teacher's log-prob of every token of ``token_ids`` (``[len(token_ids)]``,
-        position 0 NaN), or ``None`` if the teacher produced none."""
+    ) -> TeacherScores | None:
+        """Return the teacher's log-prob of every token of ``token_ids`` and the teacher's
+        name, or ``None`` if the teacher produced none."""
 
 
 class JudgeFn(Protocol):

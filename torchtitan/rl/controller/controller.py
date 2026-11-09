@@ -134,6 +134,7 @@ from torchtitan.rl.rollout.types import (
     JudgeFn,
     ReleaseSessionFn,
     ScoreFn,
+    TeacherScores,
 )
 from torchtitan.rl.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.trainer.batcher import Batcher, TrainerStepBatch
@@ -762,7 +763,7 @@ class Controller(Configurable):
         @sl.log_trace_span("teacher_score")
         async def score(
             token_ids: list[int], *, request_id: str, group_id: int, domain: str | None
-        ) -> list[float] | None:
+        ) -> TeacherScores | None:
             name = (
                 teacher_by_domain.get(domain, default_teacher)
                 if domain
@@ -781,7 +782,11 @@ class Controller(Configurable):
                 sampling_config=sampling,
                 metrics_prefix=f"teacher/{name}",
             )
-            return None if completion is None else completion.prompt_token_logprobs
+            if completion is None:
+                return None
+            return TeacherScores(
+                token_logprobs=completion.prompt_token_logprobs, teacher=name
+            )
 
         return score
 
@@ -804,8 +809,9 @@ class Controller(Configurable):
         async def judge_fn(
             messages: list[Message], *, request_id: str, group_id: int
         ) -> str | None:
+            # return_dict=False: transformers 5 returns a BatchEncoding by default
             token_ids = tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=True
+                messages, add_generation_prompt=True, tokenize=True, return_dict=False
             )
             completion = await judge_router.generate.call_one(
                 list(token_ids),

@@ -22,7 +22,7 @@ from torchtitan.rl.rollout.message_env import MessageEnvInitOutput, MessageEnvSt
 from torchtitan.rl.rollout.rollouter import OnPolicyDistillationConfig, RolloutWorker
 from torchtitan.rl.rollout.rubric import RubricOutput
 from torchtitan.rl.rollout.token_env import TokenEnv, TokenEnvOutput
-from torchtitan.rl.rollout.types import Completion
+from torchtitan.rl.rollout.types import Completion, TeacherScores
 from torchtitan.rl.trainer.training_sample_builder import TrainingSampleBuilder
 
 
@@ -317,7 +317,9 @@ def test_distillation_sets_per_token_advantages_from_the_teacher() -> None:
                 token_env=_TokenEnvConfig(),
                 advantage=_Config(_AdvantageEstimator()),
                 distillation=OnPolicyDistillationConfig(
-                    kl_coef=2.0, reward_advantage_weight=0.5
+                    kl_coef=2.0,
+                    reward_advantage_weight=0.5,
+                    max_abs_token_advantage=6.0,
                 ),
             )
         )
@@ -330,7 +332,7 @@ def test_distillation_sets_per_token_advantages_from_the_teacher() -> None:
 
         async def score_fn(token_ids, *, request_id, group_id, domain):
             scored.append((token_ids, request_id, group_id, domain))
-            return [float("nan"), -1.0, -0.2]
+            return TeacherScores(token_logprobs=[float("nan"), -1.0, -0.2], teacher="t")
 
         async def release_session_fn(**kwargs) -> None:
             pass
@@ -351,7 +353,10 @@ def test_distillation_sets_per_token_advantages_from_the_teacher() -> None:
         assert {g for _, _, g, _ in scored} == {5}
         assert {d for _, _, _, d in scored} == {None}  # the sample has no domain
         got = [rollout.turns[0].token_advantages.tolist() for rollout in group.rollouts]
-        assert [round(x[0], 5) for x in got] == [5.6, 10.6]
+        assert [round(x[0], 5) for x in got] == [5.6, 6.0]  # 10.6 clamped to 6
+        assert {r.logs["teacher"] for r in group.rollouts} == {"t"}
+        names = {metric.key for metric in group.rollouts[1].turns[0].metrics}
+        assert "distillation/clipped_token_fraction" in names
         teacher = [r.turns[0].teacher_logprobs.tolist() for r in group.rollouts]
         assert [[round(x, 5) for x in t] for t in teacher] == [[-0.2], [-0.2]]
         names = {metric.key for metric in group.rollouts[0].turns[0].metrics}

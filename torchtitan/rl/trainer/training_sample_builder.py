@@ -172,6 +172,10 @@ class TrainingSampleBuilder(Configurable):
                     "training_sample_builder/num_groups_dropped_untrainable", m.Sum(1.0)
                 )
             )
+            if domain_prefix:
+                metrics.append(
+                    m.Metric(f"{domain_prefix}/num_groups_dropped_untrainable", m.Sum(1.0))
+                )
             return TrainingSampleGroup(
                 group_id=rollout_group.group_id, training_samples=[], metrics=metrics
             )

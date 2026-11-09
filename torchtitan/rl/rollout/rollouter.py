@@ -304,6 +304,10 @@ class OnPolicyDistillationConfig:
     reward_advantage_weight: float = 0.0
     """Weight of the rollout's reward advantage added to every token; 0: pure distillation."""
 
+    max_abs_token_advantage: float | None = None
+    """Clamp of each per-token advantage to [-x, x] (one token far off the teacher, e.g. a
+    format token, otherwise dominates the update); None: no clamp."""
+
 
 class RolloutWorker(Configurable):
     """Builds, executes, scores, and advantages one rollout group."""
@@ -461,12 +465,15 @@ class RolloutWorker(Configurable):
         # score
         outputs = await self.score_group(rollouts, sample, judge_fn=judge_fn)
         domain = getattr(sample, "domain", None)
+        row_id = getattr(sample, "row_id", None)
         for rollout, output in zip(rollouts, outputs, strict=True):
             rollout.reward = output.reward
             rollout.reward_breakdown = output.reward_breakdown
+            # per-domain reward metrics; the recorded rollout keeps its task and dataset row
             if domain is not None:
-                # per-domain reward metrics; the recorded rollout keeps its task
                 rollout.logs["domain"] = domain
+            if row_id is not None:
+                rollout.logs["row_id"] = row_id
 
         # Post-scoring: turn group rewards into per-rollout advantages.
         group = RolloutGroup(group_id=group_id, rollouts=rollouts)
@@ -475,10 +482,10 @@ class RolloutWorker(Configurable):
             rollout.advantage = advantage
         # Training groups get the teacher's score_fn; validation groups (reward only) get none.
         if self._distillation is not None and score_fn is not None:
-            if sampling.temperature != 1.0:
+            if sampling.temperature != 1.0 or sampling.top_p != 1.0:
                 raise ValueError(
                     f"distillation needs the student's own log-probs: sampling temperature "
-                    f"must be 1.0, got {sampling.temperature}"
+                    f"and top_p must be 1.0, got {sampling.temperature} / {sampling.top_p}"
                 )
             await self._distill_group(
                 group, score_fn, domain=getattr(sample, "domain", None)
@@ -525,14 +532,28 @@ class RolloutWorker(Configurable):
                 raise RuntimeError(
                     f"the teacher returned no log-probs for group {group.group_id}"
                 )
-            teacher_logprobs = np.asarray(teacher[num_prompt:], dtype=np.float32)
+            teacher_logprobs = np.asarray(
+                teacher.token_logprobs[num_prompt:], dtype=np.float32
+            )
             turn.teacher_logprobs = teacher_logprobs
+            rollout.logs["teacher"] = teacher.teacher
             gap = teacher_logprobs - turn.completion_logprobs
-            turn.token_advantages = (
+            advantages = (
                 distillation.kl_coef * gap
                 + distillation.reward_advantage_weight * (rollout.advantage or 0.0)
-            ).astype(np.float32)
-            # overall, and per domain when the samples have one (multi-teacher distillation)
+            )
+            clipped = None
+            if distillation.max_abs_token_advantage is not None:
+                bound = distillation.max_abs_token_advantage
+                clipped = (
+                    float(np.mean(np.abs(advantages) > bound))
+                    if len(advantages)
+                    else 0.0
+                )
+                advantages = np.clip(advantages, -bound, bound)
+            turn.token_advantages = advantages.astype(np.float32)
+            # overall, and per domain when the samples have one (multi-teacher distillation);
+            # tokens per teacher: compare with the domains' token counts to check the routing
             for prefix in ["distillation"] + (
                 [f"distillation/{domain}"] if domain else []
             ):
@@ -545,6 +566,28 @@ class RolloutWorker(Configurable):
                         m.Mean(float(teacher_logprobs.mean())),
                     )
                 )
+                turn.metrics.append(
+                    m.Metric(f"{prefix}/num_tokens", m.Sum(float(len(gap))))
+                )
+                if clipped is not None:
+                    turn.metrics.append(
+                        m.Metric(f"{prefix}/clipped_token_fraction", m.Mean(clipped))
+                    )
+                # without the first completion token, which teachers often score far off
+                # (a different opening word; review 11-09: 0.1% of tokens, 7% of the KL)
+                if len(gap) > 1:
+                    turn.metrics.append(
+                        m.Metric(
+                            f"{prefix}/reverse_kl_after_first_token",
+                            m.Mean(float(-gap[1:].mean())),
+                        )
+                    )
+            turn.metrics.append(
+                m.Metric(
+                    f"distillation/teacher/{teacher.teacher}/num_tokens",
+                    m.Sum(float(len(gap))),
+                )
+            )
 
     async def _run_single_rollout(
         self,

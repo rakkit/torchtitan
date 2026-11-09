@@ -39,6 +39,7 @@ from torchtitan.rl.rollout.rollouter import Rollouter, RolloutWorker
 from torchtitan.rl.rollout.rubric import RewardFn, Rubric
 from torchtitan.rl.rollout.types import (
     GenerateFn,
+    JudgeFn,
     ReleaseSessionFn,
     Rollout,
     RolloutGroup,
@@ -249,11 +250,13 @@ class VerifiersRollouter(Rollouter):
         group_size: int,
         sampling: SamplingConfig,
         score_fn: ScoreFn | None = None,
+        judge_fn: JudgeFn | None = None,
     ) -> RolloutGroup:
         """Run sibling rollouts through Verifiers, then compute advantages."""
-        if score_fn is not None:
+        if score_fn is not None or judge_fn is not None:
             raise NotImplementedError(
-                "on-policy distillation is not wired into the Verifiers rollouter"
+                "on-policy distillation and judge models are not wired into the Verifiers "
+                "rollouter (Verifiers environments score their own rollouts)"
             )
         if self._generation_server is None:
             raise RuntimeError("Verifiers rollouter is not initialized")

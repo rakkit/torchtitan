@@ -100,6 +100,7 @@ from typing import Any
 # PYTORCH_CUDA_ALLOC_CONF is set in torchtitan/rl/__init__.py (before torch is imported)
 # and in train.py; see the note there.
 import torch  # noqa: F401
+from renderers import Message
 
 from torchtitan.components.renderer import RendererConfig
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
@@ -130,6 +131,7 @@ from torchtitan.rl.rollout.rollouter import Rollouter
 from torchtitan.rl.rollout.types import (
     Completion,
     GenerateFn,
+    JudgeFn,
     ReleaseSessionFn,
     ScoreFn,
 )
@@ -183,6 +185,34 @@ class TeacherConfig:
         default_factory=InterGeneratorRouter.Config
     )
     """Routing across this teacher's replicas."""
+
+
+@dataclass(kw_only=True, slots=True)
+class JudgeConfig:
+    """The judge model of judge reward fns (``JudgeRewardFn``: LLM judge, generative reward
+    model): generator replicas with fixed weights (``generator.checkpointer`` loads them from
+    ``hf_assets_path``) that write the judge's replies; prompts use the judge's own chat
+    template (``hf_assets_path``). Judge replicas share the teachers' generator parallelism.
+    """
+
+    generator: Generator.Config
+
+    hf_assets_path: str
+    """The judge's HF assets (config, tokenizer with its chat template, generation config)."""
+
+    temperature: float
+    """Sampling temperature of the judge's replies."""
+
+    max_tokens: int
+    """Longest judge reply (its reasoning included)."""
+
+    num_replicas: int = 1
+    """Generator replicas of the judge."""
+
+    router: InterGeneratorRouter.Config = field(
+        default_factory=InterGeneratorRouter.Config
+    )
+    """Routing across the judge's replicas."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -358,6 +388,9 @@ class Controller(Configurable):
             default_factory=InterGeneratorRouter.Config
         )
         """Generator routing strategy configuration."""
+        judge: JudgeConfig | None = None
+        """The judge model of the rubric's judge reward fns (``JudgeRewardFn``). None: no judge."""
+
         teachers: list[TeacherConfig] = field(default_factory=list)
         """On-policy distillation teachers that score the student's rollouts; the rollout
         worker's ``distillation`` config turns the scores into per-token advantages. Empty:
@@ -445,6 +478,21 @@ class Controller(Configurable):
                 raise ValueError(
                     f"at most one teacher may have no domains (the default), got {defaults}"
                 )
+            judge = self.judge
+            if judge is not None:
+                if judge.generator.checkpointer is None or judge.num_replicas < 1:
+                    raise ValueError(
+                        "judge needs generator.checkpointer (its HF weights) and num_replicas >= 1"
+                    )
+                if (
+                    self.teachers
+                    and judge.generator.parallelism
+                    != self.teachers[0].generator.parallelism
+                ):
+                    raise ValueError(
+                        "the judge and the teachers share the fixed-weight generator meshes: "
+                        "give them the same generator parallelism"
+                    )
 
         def __post_init__(self):
             self._validate_teachers()
@@ -575,6 +623,9 @@ class Controller(Configurable):
         self.generator_router: InterGeneratorRouter | None = None
         # On-policy distillation: each teacher's router, by teacher name (setup_async spawns them).
         self.teacher_routers: dict[str, InterGeneratorRouter] = {}
+        # The judge model's router and chat tokenizer (setup_async, when `judge` is set).
+        self.judge_router: InterGeneratorRouter | None = None
+        self._judge_tokenizer: Any | None = None
         # The batcher's single-actor handle.
         self.batcher: Any | None = None
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
@@ -734,6 +785,42 @@ class Controller(Configurable):
 
         return score
 
+    def _make_judge_fn(self) -> JudgeFn:
+        """Build the rubric's `JudgeFn`: render the messages with the judge's chat template
+        and return the judge's reply text."""
+        judge = self.config.judge
+        judge_router, tokenizer = self.judge_router, self._judge_tokenizer
+        assert judge is not None and judge_router is not None and tokenizer is not None
+        from transformers import GenerationConfig
+
+        eos = GenerationConfig.from_pretrained(judge.hf_assets_path).eos_token_id
+        sampling = SamplingConfig(
+            temperature=judge.temperature,
+            max_tokens=judge.max_tokens,
+            stop_token_ids=list(eos) if isinstance(eos, (list, tuple)) else [eos],
+        )
+
+        @sl.log_trace_span("judge")
+        async def judge_fn(
+            messages: list[Message], *, request_id: str, group_id: int
+        ) -> str | None:
+            token_ids = tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=True
+            )
+            completion = await judge_router.generate.call_one(
+                list(token_ids),
+                request_id=request_id,
+                group_id=group_id,
+                routing_session_id=None,
+                sampling_config=sampling,
+                metrics_prefix="judge",
+            )
+            if completion is None:
+                return None
+            return tokenizer.decode(completion.token_ids, skip_special_tokens=True)
+
+        return judge_fn
+
     def _make_release_session_fn(self) -> ReleaseSessionFn:
         """Build the rollouter's `ReleaseSessionFn`: tell the generator router a rollout ended."""
         generator_router = self.generator_router
@@ -805,12 +892,16 @@ class Controller(Configurable):
                 trainer_parallelism=config.trainer.parallelism,
                 generator_parallelism=config.generator.parallelism,
                 num_generators=config.num_generators,
+                # teachers and the judge: fixed-weight generator meshes of one size
                 teacher_parallelism=(
                     config.teachers[0].generator.parallelism
                     if config.teachers
+                    else config.judge.generator.parallelism
+                    if config.judge
                     else None
                 ),
-                num_teachers=sum(teacher.num_replicas for teacher in config.teachers),
+                num_teachers=sum(teacher.num_replicas for teacher in config.teachers)
+                + (config.judge.num_replicas if config.judge else 0),
             )
             self.trainer = await actor_system.spawn_trainer(
                 config.trainer,
@@ -842,6 +933,22 @@ class Controller(Configurable):
                     model_path=teacher.hf_assets_path,
                     max_num_seqs=max_num_seqs,
                     output_dir=f"{config.dump_folder}/teacher/{teacher.name}",
+                )
+            if config.judge is not None:
+                from transformers import AutoTokenizer
+
+                self._judge_tokenizer = AutoTokenizer.from_pretrained(
+                    config.judge.hf_assets_path
+                )
+                self.judge_router = await actor_system.spawn_teacher_router(
+                    config.judge.router,
+                    name="judge",
+                    num_replicas=config.judge.num_replicas,
+                    teacher_config=config.judge.generator,
+                    precision=config.precision,
+                    model_path=config.judge.hf_assets_path,
+                    max_num_seqs=max_num_seqs,
+                    output_dir=f"{config.dump_folder}/judge",
                 )
             self.batcher = await actor_system.spawn_batcher(
                 async_loop.batcher,
@@ -900,6 +1007,8 @@ class Controller(Configurable):
             await self.generator_router.start_engine_loop.call_one()
             for teacher_router in self.teacher_routers.values():
                 await teacher_router.start_engine_loop.call_one()
+            if self.judge_router is not None:
+                await self.judge_router.start_engine_loop.call_one()
 
         # Initial push and pull: only the trainer loads weights; generators pull them at start_step.
         with sl.log_trace_span("trainer_push_model_state_dict"):
@@ -916,6 +1025,7 @@ class Controller(Configurable):
         # TODO: group_size=1 (best-of-1) only. Support best-of-N.
         generate = self._make_generate_fn(metrics_prefix="validation_generator")
         release_session_fn = self._make_release_session_fn()
+        judge_fn = self._make_judge_fn() if self.judge_router is not None else None
         # TODO(naming): reserve "sample" for TrainingSample; rename the rollouter's raw-prompt "sample" -> "prompt"/"data_input".
         group_results = await asyncio.gather(
             *(
@@ -928,6 +1038,7 @@ class Controller(Configurable):
                     group_id=-(i + 1),
                     group_size=1,
                     sampling=sampling,
+                    judge_fn=judge_fn,
                 )
                 for i, sample in enumerate(samples)
             ),
@@ -1050,6 +1161,7 @@ class Controller(Configurable):
         generate_fn = self._make_generate_fn(metrics_prefix="generator")
         release_session_fn = self._make_release_session_fn()
         score_fn = self._make_score_fn() if self.teacher_routers else None
+        judge_fn = self._make_judge_fn() if self.judge_router is not None else None
 
         # One rollout worker per active buffer slot: lets generation fill every active slot,
         # including the cold start (step 0 fills every active slot, not just num_prompts_per_train_step per wave).
@@ -1061,6 +1173,7 @@ class Controller(Configurable):
                     generate_fn=generate_fn,
                     release_session_fn=release_session_fn,
                     score_fn=score_fn,
+                    judge_fn=judge_fn,
                 ),
                 name=f"rollout_worker_{group_worker_id}",
             )
@@ -1186,6 +1299,7 @@ class Controller(Configurable):
         generate_fn: GenerateFn,
         release_session_fn: ReleaseSessionFn,
         score_fn: ScoreFn | None = None,
+        judge_fn: JudgeFn | None = None,
     ) -> None:
         """Generate + score one group at a time; a failed group becomes an empty group + a failure metric.
 
@@ -1214,6 +1328,7 @@ class Controller(Configurable):
                         group_size=self.config.async_loop.num_samples_per_prompt,
                         sampling=self._sampling,
                         score_fn=score_fn,
+                        judge_fn=judge_fn,
                     )
                 group.metrics = compute_rollout_metrics(
                     prefix="rollout", rollouts=group.rollouts

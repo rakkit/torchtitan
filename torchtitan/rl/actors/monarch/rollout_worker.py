@@ -65,6 +65,7 @@ class RolloutWorkerActor(Actor):
         group_size: int,
         sampling: Any,
         score_fn: Any = None,
+        judge_fn: Any = None,
     ) -> RolloutGroup:
         return await self._worker.run_group(
             generate_fn=generate_fn,
@@ -74,6 +75,7 @@ class RolloutWorkerActor(Actor):
             group_size=group_size,
             sampling=sampling,
             score_fn=score_fn,
+            judge_fn=judge_fn,
         )
 
     @concurrent_endpoint

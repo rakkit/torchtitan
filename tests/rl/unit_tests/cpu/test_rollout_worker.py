@@ -74,7 +74,7 @@ class _TokenEnvConfig:
 
 
 class _Rubric:
-    async def score_group(self, rollouts, env_input):
+    async def score_group(self, rollouts, env_input, *, judge_fn=None):
         return [
             RubricOutput(reward=float(rollout.rollout_id + 1)) for rollout in rollouts
         ]
@@ -94,9 +94,9 @@ class _CustomWorker(RolloutWorker):
         self.make_env_group_called = True
         return super().make_env_group(**kwargs)
 
-    async def score_group(self, rollouts, env_input):
+    async def score_group(self, rollouts, env_input, *, judge_fn=None):
         self.score_group_called = True
-        return await super().score_group(rollouts, env_input)
+        return await super().score_group(rollouts, env_input, judge_fn=judge_fn)
 
 
 class _GenerateFn:

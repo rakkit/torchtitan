@@ -158,12 +158,16 @@ class MonarchLauncher(Configurable, abc.ABC):
             compute_trainer_world_size(config.trainer.parallelism),
             compute_generator_world_size(config.generator.parallelism),
             config.num_generators,
+            # teachers and the judge: fixed-weight generator meshes of one size
             teacher_world_size=(
                 compute_generator_world_size(config.teachers[0].generator.parallelism)
                 if config.teachers
+                else compute_generator_world_size(config.judge.generator.parallelism)
+                if config.judge is not None
                 else 0
             ),
-            num_teachers=sum(teacher.num_replicas for teacher in config.teachers),
+            num_teachers=sum(teacher.num_replicas for teacher in config.teachers)
+            + (config.judge.num_replicas if config.judge is not None else 0),
         )
         return LaunchPlan(
             job_name=f"{self.config.job_name}-{uuid.uuid4().hex[:6]}",

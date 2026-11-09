@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 from torchtitan.config import Configurable
 from torchtitan.observability import structured_logger as sl
-from torchtitan.rl.rollout.types import Rollout
+from torchtitan.rl.rollout.types import JudgeFn, Rollout
 
 
 class RewardFn(Configurable, abc.ABC):
@@ -48,6 +48,20 @@ class RewardFn(Configurable, abc.ABC):
             rollout: Rollout to score.
             env_input: Dataset payload used to build the env (target/metadata).
         """
+
+
+class JudgeRewardFn(RewardFn):
+    """A reward fn that may ask a judge model (LLM judge / generative reward model).
+
+    The rubric passes the controller's ``judge_fn`` (None without ``Controller.Config.judge``);
+    a fn that needs the judge for a rollout raises when it is None.
+    """
+
+    @abc.abstractmethod
+    async def __call__(
+        self, rollout: Rollout, env_input: object, *, judge_fn: JudgeFn | None
+    ) -> float:
+        """Return this fn's score for one rollout, asking the judge through ``judge_fn``."""
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -115,7 +129,7 @@ class Rubric(Configurable):
 
     @sl.log_trace_span("score_single_rollout")
     async def _score_single_rollout(
-        self, rollout: Rollout, env_input: object
+        self, rollout: Rollout, env_input: object, judge_fn: JudgeFn | None
     ) -> RubricOutput:
         """Score one rollout. Short-circuits to `truncation_reward` /
         `error_reward` when those are set and the rollout truncated / errored.
@@ -143,7 +157,12 @@ class Rubric(Configurable):
 
         # Run all reward fns and weight-sum (weights normalized to sum to 1.0).
         per_fn_rewards = await asyncio.gather(
-            *(fn(rollout, env_input) for fn in self._reward_fns)
+            *(
+                fn(rollout, env_input, judge_fn=judge_fn)
+                if isinstance(fn, JudgeRewardFn)
+                else fn(rollout, env_input)
+                for fn in self._reward_fns
+            )
         )
 
         reward_breakdown = {}
@@ -159,6 +178,8 @@ class Rubric(Configurable):
         self,
         rollouts: list[Rollout],
         env_input: object,
+        *,
+        judge_fn: JudgeFn | None = None,
     ) -> list[RubricOutput]:
         """Score every rollout in one prompt group.
 
@@ -168,10 +189,11 @@ class Rubric(Configurable):
         Args:
             rollouts: Sibling rollouts sampled from one prompt group.
             env_input: Dataset payload originally used to construct the rollout env.
+            judge_fn: The judge model, passed to each `JudgeRewardFn`.
 
         Returns:
             One `RubricOutput` per rollout, in input order.
         """
         return await asyncio.gather(
-            *(self._score_single_rollout(r, env_input) for r in rollouts)
+            *(self._score_single_rollout(r, env_input, judge_fn) for r in rollouts)
         )

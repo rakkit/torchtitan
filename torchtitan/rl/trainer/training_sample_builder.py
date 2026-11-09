@@ -155,6 +155,13 @@ class TrainingSampleBuilder(Configurable):
                 group_id=rollout_group.group_id, training_samples=[], metrics=metrics
             )
 
+        # Per-domain group counts (the sample's task, logged by the rollout worker): the mix
+        # actually trained = num_groups minus the dropped ones, per domain.
+        domain = rollout_group.rollouts[0].logs.get("domain")
+        domain_prefix = f"training_sample_builder/domain/{domain}" if domain else None
+        if domain_prefix:
+            metrics.append(m.Metric(f"{domain_prefix}/num_groups", m.Sum(1.0)))
+
         # Untrainable: any sibling with no completion tokens -> drop the whole group
         if any(
             not any(len(turn.completion_token_ids) > 0 for turn in rollout.turns)
@@ -184,6 +191,10 @@ class TrainingSampleBuilder(Configurable):
                     "training_sample_builder/num_groups_dropped_zero_std", m.Sum(1.0)
                 )
             )
+            if domain_prefix:
+                metrics.append(
+                    m.Metric(f"{domain_prefix}/num_groups_dropped_zero_std", m.Sum(1.0))
+                )
             return TrainingSampleGroup(
                 group_id=rollout_group.group_id, training_samples=[], metrics=metrics
             )

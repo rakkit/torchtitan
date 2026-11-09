@@ -27,6 +27,7 @@ from torchtitan.rl.rollout.rubric import Rubric, RubricOutput
 from torchtitan.rl.rollout.token_env import TokenEnv
 from torchtitan.rl.rollout.types import (
     GenerateFn,
+    JudgeFn,
     ReleaseSessionFn,
     Rollout,
     RolloutGroup,
@@ -229,6 +230,7 @@ class Rollouter(Configurable):
         group_size: int,
         sampling: SamplingConfig,
         score_fn: ScoreFn | None = None,
+        judge_fn: JudgeFn | None = None,
     ) -> RolloutGroup:
         """Roll out and score one prompt group.
 
@@ -262,6 +264,7 @@ class Rollouter(Configurable):
                 group_size=group_size,
                 sampling=sampling,
                 score_fn=score_fn,
+                judge_fn=judge_fn,
             )
         )
         self._inflight_run_group_calls.add(call)
@@ -372,6 +375,8 @@ class RolloutWorker(Configurable):
         self,
         rollouts: list[Rollout],
         env_input: object,
+        *,
+        judge_fn: JudgeFn | None = None,
     ) -> list[RubricOutput]:
         """Score one group's rollouts; `run_group` applies the rewards.
 
@@ -386,7 +391,7 @@ class RolloutWorker(Configurable):
         Returns:
             One `RubricOutput` per rollout, in input order.
         """
-        return await self.rubric.score_group(rollouts, env_input)
+        return await self.rubric.score_group(rollouts, env_input, judge_fn=judge_fn)
 
     async def run_group(
         self,
@@ -398,6 +403,7 @@ class RolloutWorker(Configurable):
         group_size: int,
         sampling: SamplingConfig,
         score_fn: ScoreFn | None = None,
+        judge_fn: JudgeFn | None = None,
     ) -> RolloutGroup:
         """Roll out and score one prompt group.
 
@@ -453,10 +459,14 @@ class RolloutWorker(Configurable):
             await asyncio.gather(*(env.close() for env in envs), return_exceptions=True)
 
         # score
-        outputs = await self.score_group(rollouts, sample)
+        outputs = await self.score_group(rollouts, sample, judge_fn=judge_fn)
+        domain = getattr(sample, "domain", None)
         for rollout, output in zip(rollouts, outputs, strict=True):
             rollout.reward = output.reward
             rollout.reward_breakdown = output.reward_breakdown
+            if domain is not None:
+                # per-domain reward metrics; the recorded rollout keeps its task
+                rollout.logs["domain"] = domain
 
         # Post-scoring: turn group rewards into per-rollout advantages.
         group = RolloutGroup(group_id=group_id, rollouts=rollouts)

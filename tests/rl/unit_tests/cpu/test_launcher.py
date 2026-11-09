@@ -56,6 +56,7 @@ def _rl_config(*, trainer_dp=4, generator_tp=2, num_generators=1, **kwargs):
         ),
         num_generators=num_generators,
         teachers=[],
+        judge=None,
         resolve_overrides=lambda: None,
         **kwargs,
     )

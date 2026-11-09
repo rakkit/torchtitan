@@ -144,6 +144,20 @@ class ScoreFn(Protocol):
         position 0 NaN), or ``None`` if the teacher produced none."""
 
 
+class JudgeFn(Protocol):
+    """Ask a fixed judge model for a reply (LLM-judge / generative reward model rewards).
+
+    A judge reward fn (``JudgeRewardFn``) calls this with the judge's chat messages and reads
+    the judge's text reply. The controller renders the messages with the judge's own chat
+    template and generates with the judge's sampling settings.
+    """
+
+    async def __call__(
+        self, messages: list[Message], *, request_id: str, group_id: int
+    ) -> str | None:
+        """Return the judge's reply text, or ``None`` if the judge produced none."""
+
+
 class ReleaseSessionFn(Protocol):
     """Tell the generator side that a routing session makes no more calls.
 

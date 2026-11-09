@@ -288,6 +288,15 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
         m.Metric(f"{prefix}_reward/component/{name}", m.Mean.from_list(values))
         for name, values in sorted(values_by_name.items())
     )
+    # Per domain (task / environment of the dataset sample; `RolloutWorker.run_group` logs it)
+    values_by_domain: dict[str, list[float]] = defaultdict(list)
+    for rollout in rollouts:
+        if rollout.reward is not None and "domain" in rollout.logs:
+            values_by_domain[rollout.logs["domain"]].append(rollout.reward)
+    out.extend(
+        m.Metric(f"{prefix}_reward/domain/{domain}", m.Mean.from_list(values))
+        for domain, values in sorted(values_by_domain.items())
+    )
 
     # Per-generation turn metrics (latencies, output tokens) measured by the generator.
     # They carry their own keys (e.g. "generator/..."), so they ride through unprefixed.

@@ -382,3 +382,24 @@ def test_group_filters_preserve_group_id_for_commit() -> None:
     filtered_groups = [failed, untrainable, zero_std, no_valid_tokens]
     assert [group.group_id for group in filtered_groups] == [7, 8, 9, 10]
     assert all(not group.training_samples for group in filtered_groups)
+
+
+def test_groups_are_counted_per_domain() -> None:
+    # the trained task mix = groups per domain minus the dropped ones
+    builder = TrainingSampleBuilder.Config().build()
+    first, second = (
+        _scored_rollout(
+            [_turn(prompt_token_ids=[1], completion_token_ids=[2], version=1)],
+            reward=1.0,
+            advantage=0.0,
+        )
+        for _ in range(2)
+    )
+    for rollout in (first, second):
+        rollout.logs["domain"] = "mcqa"
+    group = builder.build_from_group(
+        rollout_group=RolloutGroup(group_id=9, rollouts=[first, second])
+    )
+    keys = {metric.key for metric in group.metrics}
+    assert "training_sample_builder/domain/mcqa/num_groups" in keys
+    assert "training_sample_builder/domain/mcqa/num_groups_dropped_zero_std" in keys

@@ -24,7 +24,9 @@ def _teacher(name, domains=(), *, parallelism="tp1", checkpointer="hf"):
 
 
 def _validate(*teachers):
-    Controller.Config._validate_teachers(SimpleNamespace(teachers=list(teachers)))
+    Controller.Config._validate_teachers(
+        SimpleNamespace(teachers=list(teachers), judge=None)
+    )
 
 
 def test_teacher_rules():

@@ -819,6 +819,7 @@ def _run_with_generator_watcher(watcher) -> None:
     controller.tokenizer = SimpleNamespace(eos_id=0)
     controller._sampling = SimpleNamespace(temperature=1.0)
     controller.teacher_routers = {}
+    controller.judge_router = None
     controller.generator_router = SimpleNamespace(
         wait_engine_loop=SimpleNamespace(call_one=watcher)
     )

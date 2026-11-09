@@ -48,9 +48,10 @@ def read_nemo_gym_rows(
 ) -> tuple[list[NemoGymSample], dict[str, int]]:
     """Samples of the rows whose ``agent_ref.name`` is in ``agents``.
 
-    Rows still holding an ``_hf_placeholder`` (prompt text not filled in from
-    their source dataset) are skipped. Returns the samples and the number of
-    rows skipped per reason.
+    Rows still holding a placeholder (``_hf_placeholder``,
+    ``_hf_question_placeholder``: prompt text not filled in from their source
+    dataset) are skipped. Returns the samples and the number of rows skipped
+    per reason.
     """
     wanted = set(agents)
     samples: list[NemoGymSample] = []
@@ -63,7 +64,7 @@ def read_nemo_gym_rows(
                 if agent not in wanted:
                     skipped["other_agent"] += 1
                     continue
-                if "_hf_placeholder" in row:
+                if any(k.startswith("_hf_") and k.endswith("placeholder") for k in row):
                     skipped["placeholder"] += 1
                     continue
                 params = row.pop("responses_create_params")

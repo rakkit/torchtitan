@@ -15,21 +15,32 @@ from torchtitan.rl.examples.nemo_gym import (
 )
 
 
-def test_mcqa_reads_the_last_answer_line():
-    assert grade_mcqa("Reasoning...\nAnswer: F", "F") == 1.0
-    assert grade_mcqa("Answer: (b)", "B") == 1.0
-    assert grade_mcqa("Answer: A\n...\nAnswer: C", "A") == 0.0  # the last line counts
-    assert grade_mcqa("no final line", "A") == 0.0
+def test_mcqa_uses_the_rows_answer_format():
+    # rows carry their prompt template's regex (about 30 formats in the Nano blend)
+    boxed = r"\\boxed\{\s*([A-Za-z0-9])\s*\}"
+    double_brackets = r"\[\[\s*([A-Za-z0-9])\s*\]\]"
+    assert grade_mcqa("Reasoning...\nAnswer: \\boxed{D}", "D", boxed) == 1.0
+    assert grade_mcqa("The correct answer is: [[c]]", "C", double_brackets) == 1.0
+    assert grade_mcqa("[[A]] at first, then [[C]]", "A", double_brackets) == 0.0
+    assert grade_mcqa("Answer: C", "C", double_brackets) == 0.0
+    # no regex match: the letter of the last \boxed{...}
+    assert grade_mcqa("so \\boxed{\\text{E}}", "E", double_brackets) == 1.0
+    assert grade_mcqa("no answer", "A") == 0.0
 
 
-def test_structured_output_validates_against_the_schema():
+def test_structured_output_is_strict_json():
     schema = json.dumps(
-        {"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]}
+        {
+            "type": "object",
+            "properties": {"x": {"type": "integer"}, "y": {"type": "string"}},
+        }
     )
-    assert grade_structured_output('```json\n{"x": 3}\n```', schema) == 1.0
-    assert grade_structured_output('{"x": 3}', schema) == 1.0
-    assert grade_structured_output('{"x": "three"}', schema) == 0.0
-    assert grade_structured_output("not json", schema) == 0.0
+    assert grade_structured_output('{"x": 3, "y": "a"}', schema) == 1.0
+    # every property is required and no others are allowed, the whole answer must be JSON
+    assert grade_structured_output('{"x": 3}', schema) == 0.0
+    assert grade_structured_output('{"x": 3, "y": "a", "z": 1}', schema) == 0.0
+    assert grade_structured_output('```json\n{"x": 3, "y": "a"}\n```', schema) == 0.0
+    assert grade_structured_output('{"x": "three", "y": "a"}', schema) == 0.0
 
 
 def test_rows_are_filtered_by_environment_and_placeholders_skipped(tmp_path):
@@ -47,6 +58,9 @@ def test_rows_are_filtered_by_environment_and_placeholders_skipped(tmp_path):
             for r in (
                 row("mcqa_simple_agent", expected_answer="B", dataset="stem"),
                 row("math_with_judge_simple_agent", _hf_placeholder={"row": 3}),
+                row(
+                    "math_with_judge_simple_agent", _hf_question_placeholder={"row": 4}
+                ),
                 row("code_gen_simple_agent"),
             )
         )
@@ -58,4 +72,4 @@ def test_rows_are_filtered_by_environment_and_placeholders_skipped(tmp_path):
         ("mcqa_simple_agent", "stem", "B")
     ]
     assert samples[0].messages == [{"role": "user", "content": "q"}]
-    assert skipped == {"other_agent": 1, "placeholder": 1}
+    assert skipped == {"other_agent": 1, "placeholder": 2}

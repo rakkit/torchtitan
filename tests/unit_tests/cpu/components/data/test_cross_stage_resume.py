@@ -21,6 +21,7 @@ import grain.python as grain
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 
@@ -52,23 +53,37 @@ class FakeTokenizer:
         )
 
 
+PACKINGS = ["concat_then_split", "concat_then_split_per_dataset"]
+
+
 def _corpus(root: Path, tag: str, rows: int) -> str:
+    return _corpus_of(root, [f"{tag}-{i:04d}" for i in range(rows)])
+
+
+def _corpus_of(root: Path, texts: list[str]) -> str:
     root.mkdir(parents=True, exist_ok=True)
-    pq.write_table(
-        pa.table({"text": [f"{tag}-{i:04d}" for i in range(rows)]}),
-        root / "part-00000.parquet",
-    )
+    pq.write_table(pa.table({"text": texts}), root / "part-00000.parquet")
     write_manifest(build_manifest(root), root / MANIFEST_FILENAME)
     return str(root)
 
 
-def _loader(tmp_path: Path, ids: list[str], rows: int = 256):
+def _loader(
+    tmp_path: Path,
+    ids: list[str],
+    rows: int = 256,
+    packing: str = "concat_then_split",
+):
     specs = [DatasetSpec(alias=i, path=_corpus(tmp_path / i, i, rows)) for i in ids]
+    return _build(specs, packing)
+
+
+def _build(specs: list[DatasetSpec], packing: str):
     # Deliberately the REAL factory, so the graph carries a packer and the mix state is
     # nested exactly as it is in production. Hand-building a packer-less graph here is
     # what let a broken `state_dict()` pass this suite.
     config = make_pretrain_dataloader_config(
         specs,
+        packing=packing,
         shuffle=False,
         repeat=True,
         seed=0,
@@ -97,11 +112,12 @@ def _consume(loader, batches: int) -> int:
     return batches
 
 
-def test_stage_two_resumes_old_datasets_and_starts_new_ones_fresh(tmp_path):
+@pytest.mark.parametrize("packing", PACKINGS)
+def test_stage_two_resumes_old_datasets_and_starts_new_ones_fresh(tmp_path, packing):
     stage1_ids = ["A", "B", "C", "D", "E"]
     stage2_ids = [*stage1_ids, "F", "G", "H", "I"]
 
-    stage1 = _loader(tmp_path, stage1_ids)
+    stage1 = _loader(tmp_path, stage1_ids, packing=packing)
     _consume(stage1, batches=6)
     checkpoint = stage1.state_dict()
     stage1.close()
@@ -114,7 +130,7 @@ def test_stage_two_resumes_old_datasets_and_starts_new_ones_fresh(tmp_path):
         c > 0 for c in saved_cursors.values()
     ), "stage 1 must have read something"
 
-    stage2 = _loader(tmp_path, stage2_ids)
+    stage2 = _loader(tmp_path, stage2_ids, packing=packing)
     stage2.load_state_dict(checkpoint)
     resumed = stage2._iterator.get_state()
     stage2.close()
@@ -161,20 +177,57 @@ def test_reordering_between_stages_does_not_move_cursors(tmp_path):
     assert cursors == saved, "a cursor must follow its dataset, not its position"
 
 
-def test_same_config_resume_is_exact(tmp_path):
+@pytest.mark.parametrize("packing", PACKINGS)
+def test_same_config_resume_is_exact(tmp_path, packing):
     ids = ["A", "B"]
-    first = _loader(tmp_path, ids)
-    _consume(first, batches=4)
+    first = _loader(tmp_path, ids, packing=packing)
+    iterator = iter(first)
+    for _ in range(4):
+        next(iterator)
     checkpoint = first.state_dict()
     before = first._iterator.get_state()
+    expected = [next(iterator).input.clone() for _ in range(5)]
     first.close()
 
-    second = _loader(tmp_path, ids)
+    second = _loader(tmp_path, ids, packing=packing)
     second.load_state_dict(checkpoint)
     after = second._iterator.get_state()
+    iterator = iter(second)
+    resumed = [next(iterator).input.clone() for _ in range(5)]
     second.close()
 
     assert after == before, "an unchanged config must restore bit-identically"
+    assert all(
+        (a == b).all() for a, b in zip(resumed, expected, strict=True)
+    ), "the resumed loader must yield the batches the uninterrupted one did"
+
+
+def test_per_dataset_packing_makes_weights_count_tokens(tmp_path):
+    # equal weights, documents of 2 vs 40 characters: mixing documents gives the long
+    # corpus ~95% of the tokens, packing each corpus first gives each ~half
+    short_id, long_id = 10 + ord("s") % 250, 10 + ord("L") % 250
+    specs = [
+        DatasetSpec(alias="short", path=_corpus_of(tmp_path / "short", ["ss"] * 4000)),
+        DatasetSpec(alias="long", path=_corpus_of(tmp_path / "long", ["L" * 40] * 400)),
+    ]
+
+    def microbatches(packing: str) -> list[torch.Tensor]:
+        loader = _build(specs, packing)
+        iterator = iter(loader)
+        out = [next(iterator).input.flatten().clone() for _ in range(400)]
+        loader.close()
+        return out
+
+    # documents mixed: the short corpus's characters are a small minority
+    tokens = torch.cat(microbatches("concat_then_split"))
+    num_short = int((tokens == short_id).sum())
+    assert num_short / (num_short + int((tokens == long_id).sum())) < 0.15
+
+    # packed per corpus: every microbatch (16 tokens) is one corpus, half of them each
+    rows = microbatches("concat_then_split_per_dataset")
+    is_short = [bool((row == short_id).any()) for row in rows]
+    assert not any(s and bool((row == long_id).any()) for s, row in zip(is_short, rows))
+    assert 0.4 < sum(is_short) / len(rows) < 0.6
 
 
 def test_legacy_state_version_is_refused(tmp_path):

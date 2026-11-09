@@ -251,6 +251,12 @@ def make_pretrain_dataloader_config(
 ) -> KeyedMixDataLoader.Config:
     """Build a complete dataloader config from the dataset record list.
 
+    ``concat_then_split`` mixes documents and then packs them, so a weight selects
+    DOCUMENTS: a corpus of long documents takes more tokens than its weight.
+    ``concat_then_split_per_dataset`` packs each dataset into its own full microbatches
+    and mixes those, so a weight is that dataset's share of TOKENS (the data README's
+    "pack each child before mixing"); each microbatch then holds one dataset.
+
     ``packing`` defaults to ``concat_then_split`` deliberately. Measured on a real
     long-document corpus at num_tokens_per_batch=8192, ``first_fit`` silently DROPS every
     document longer than ``max_context_length`` -- 41% of documents and 60.7% of all
@@ -274,13 +280,24 @@ def make_pretrain_dataloader_config(
     mix = build_mix(datasets, read_in_order=read_in_order)
     if packing == "concat_then_split":
         packed: Any = ConcatThenSplitPackingConfig(dataset=mix)
+    elif packing == "concat_then_split_per_dataset":
+        packed = replace(
+            mix,
+            datasets=tuple(
+                replace(
+                    item, dataset=ConcatThenSplitPackingConfig(dataset=item.dataset)
+                )
+                for item in mix.datasets
+            ),
+        )
     elif packing == "first_fit":
         packed = FirstFitPackingConfig(dataset=mix, num_packing_bins=num_packing_bins)
     elif packing == "none":
         packed = mix
     else:
         raise ValueError(
-            f"unknown packing {packing!r}; expected concat_then_split, first_fit or none"
+            f"unknown packing {packing!r}; expected concat_then_split, "
+            "concat_then_split_per_dataset, first_fit or none"
         )
 
     return KeyedMixDataLoader.Config(

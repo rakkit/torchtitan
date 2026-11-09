@@ -354,6 +354,67 @@ def test_calendar_schedule_rules():
     )  # nothing expected
 
 
+def test_inverse_if_rubric_judged_per_criterion():
+    import types
+
+    from torchtitan.rl.examples.nemo_gym.rubric import (
+        inverse_if_judge_messages,
+        parse_pass_fail_verdict,
+    )
+
+    assert (
+        parse_pass_fail_verdict(
+            'ok\n```json\n{"result": "PASS", "explanation": "x"}\n```'
+        )
+        is True
+    )
+    assert (
+        parse_pass_fail_verdict('{"result": "PASS"} then {"result": "fail"}') is False
+    )  # the last one counts
+    assert parse_pass_fail_verdict("PASS") is None  # bare words are not a verdict here
+    assert parse_pass_fail_verdict('<think>{"result": "PASS"}</think> no json') is None
+    template = 'Q: {prompt}\nA: {model_response}\nRef: {standard_response}\nCheck: {criteria}\nReturn {{"result": ...}}'
+    msgs = inverse_if_judge_messages(
+        template, "sys", prompt="p", response="r {x}", reference="s", criteria="c"
+    )
+    assert (
+        msgs[0] == {"role": "system", "content": "sys"}
+        and "A: r {x}" in msgs[1]["content"]
+    )
+
+    sample = NemoGymSample(
+        agent="inverse_if_simple_agent",
+        source="adv",
+        messages=[{"role": "user", "content": "p"}],
+        fields={
+            "rubric": [{"id": 1, "criteria": "one"}, {"id": 2, "criteria": "two"}],
+            "judge_prompt_template": template,
+            "prompt": "p",
+            "reference_response": "s",
+        },
+    )
+    rollout = Rollout(group_id=3, rollout_id=0, status=RolloutStatus.COMPLETED)
+    rollout.turns = [
+        types.SimpleNamespace(
+            completion_message={"role": "assistant", "content": "answer"}, metrics=[]
+        )
+    ]
+
+    async def judge_fn(messages, *, request_id, group_id):
+        return (
+            '{"result": "PASS"}'
+            if "Check: one" in messages[-1]["content"]
+            else "unsure"
+        )
+
+    rubric = Rubric.Config(reward_fns=[RewardNemoGym.Config()]).build()
+    (out,) = asyncio.run(rubric.score_group([rollout], sample, judge_fn=judge_fn))
+    assert out.reward == 0.5  # criterion two has no verdict -> fails
+    rollout.turns[0].completion_message = {"role": "assistant", "content": "  "}
+    (out,) = asyncio.run(rubric.score_group([rollout], sample, judge_fn=judge_fn))
+    assert out.reward == 0.0
+
+
 def test_structured_output_broken_schema_scores_zero():
     # one bad row must not raise and drop the whole group
     assert grade_structured_output('{"x": 3}', '{"$ref": "#/missing"}') == 0.0

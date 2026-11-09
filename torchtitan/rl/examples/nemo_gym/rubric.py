@@ -47,6 +47,7 @@ MATH = "math_with_judge_simple_agent"
 MCQA = "mcqa_simple_agent"
 STRUCTURED_OUTPUTS = "structured_outputs_simple_agent"
 CALENDAR = "calendar_simple_agent"
+INVERSE_IF = "inverse_if_simple_agent"
 # NeMo Gym format_verification: one rule grader, two datasets kept apart for per-source metrics
 FORMAT_VERIFICATION = (
     "citation_format_simple_agent",
@@ -645,6 +646,39 @@ def grade_structured_output(
     return 1.0
 
 
+def inverse_if_judge_messages(
+    template: str,
+    system: str | None,
+    *,
+    prompt: str,
+    response: str,
+    reference: str,
+    criteria: str,
+) -> list[dict]:
+    """The judge's prompt for one rubric criterion of an Inverse-IF row: the row's own template
+    (NeMo Gym inverse_if; placeholders prompt / model_response / standard_response / criteria)."""
+    content = template.format(
+        prompt=prompt,
+        model_response=response,
+        standard_response=reference,
+        criteria=criteria,
+    )
+    return ([{"role": "system", "content": system}] if system else []) + [
+        {"role": "user", "content": content}
+    ]
+
+
+_PASS_FAIL = re.compile(r'\{[^{}]*"result"\s*:\s*"(PASS|FAIL)"[^{}]*\}', re.IGNORECASE)
+
+
+def parse_pass_fail_verdict(reply: str) -> bool | None:
+    """True / False from the LAST JSON object with a ``"result": "PASS" | "FAIL"`` field in the
+    judge's reply (after any ``<think>`` part); None otherwise. NeMo Gym also accepts the bare
+    words PASS / FAIL in the last lines; here only the JSON verdict counts."""
+    matches = _PASS_FAIL.findall(_THINK.sub("", reply))
+    return None if not matches else matches[-1].upper() == "PASS"
+
+
 def grade_format_verification(response: str, verifier: dict) -> float:
     """NeMo Gym's format_verification server. ``regex`` / ``inline_prose``: 1.0 when at least
     ``verify_min_matches`` lines (each counted once) match any of ``verify_regex``.
@@ -841,6 +875,45 @@ class RewardNemoGym(JudgeRewardFn):
                 reward = grade_structured_output(
                     response, fields["schema_str"], fields.get("schema_type") or "json"
                 )
+        elif env_input.agent == INVERSE_IF:
+            if judge_fn is None:
+                raise ValueError(
+                    f"{INVERSE_IF} rows are graded by a judge model: set Controller.Config.judge"
+                )
+            answer = _final_answer(rollout)
+            if not answer.strip():
+                return 0.0
+            items = fields["rubric"]
+            replies = await asyncio.gather(
+                *(
+                    judge_fn(
+                        inverse_if_judge_messages(
+                            fields["judge_prompt_template"],
+                            fields.get("judge_system_prompt"),
+                            prompt=str(
+                                fields.get("prompt")
+                                or env_input.messages[-1]["content"]
+                            ),
+                            response=answer,
+                            reference=str(fields.get("reference_response") or ""),
+                            criteria=str(item.get("criteria", "")),
+                        ),
+                        request_id=(
+                            f"judge/group={rollout.group_id}/rollout={rollout.rollout_id}"
+                            f"/item={i}"
+                        ),
+                        group_id=rollout.group_id,
+                    )
+                    for i, item in enumerate(items)
+                )
+            )
+            verdicts = [parse_pass_fail_verdict(reply or "") for reply in replies]
+            for verdict in verdicts:
+                rollout.turns[-1].metrics.append(
+                    m.Metric("nemo_gym/judge_unparsed", m.Mean(float(verdict is None)))
+                )
+            # the mean over the rubric (NeMo Gym's default aggregation); no verdict = FAIL
+            reward = sum(bool(v) for v in verdicts) / len(verdicts) if verdicts else 0.0
         elif env_input.agent == CALENDAR:
             reward = grade_calendar(response, fields["exp_cal_state"])
         elif env_input.agent in FORMAT_VERIFICATION:

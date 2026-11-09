@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import functools
 import io
 import itertools
 import json
@@ -30,9 +31,11 @@ import re
 import tomllib
 import unicodedata
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import jsonschema
+import numpy as np
 import yaml
 
 from torchtitan.rl.examples.dapo_math.math_verify_pool import MathVerifyPool
@@ -48,6 +51,14 @@ MCQA = "mcqa_simple_agent"
 STRUCTURED_OUTPUTS = "structured_outputs_simple_agent"
 CALENDAR = "calendar_simple_agent"
 INVERSE_IF = "inverse_if_simple_agent"
+# NeMo Gym jailbreak_detection, one environment per response policy (the row field response_policy_mapped decides)
+JAILBREAK = (
+    "jailbreak_engagement",
+    "jailbreak_engagement_with_disclaimer",
+    "jailbreak_refusal_with_explanation",
+    "jailbreak_hard_refusal_no_redirection",
+    "jailbreak_hard_refusal_with_helplines",
+)
 # NeMo Gym format_verification: one rule grader, two datasets kept apart for per-source metrics
 FORMAT_VERIFICATION = (
     "citation_format_simple_agent",
@@ -679,6 +690,36 @@ def parse_pass_fail_verdict(reply: str) -> bool | None:
     return None if not matches else matches[-1].upper() == "PASS"
 
 
+@functools.cache
+def jailbreak_verifiers() -> dict:
+    """NeMo Gym's response-policy verifier templates + policy map (jailbreak_verifiers.yaml)."""
+    with open(Path(__file__).with_name("jailbreak_verifiers.yaml")) as f:
+        return yaml.safe_load(f)
+
+
+def jailbreak_judge_messages(
+    verifier: str, adversarial_prompt: str, response: str
+) -> list[dict]:
+    """One verifier's judge prompt (NeMo Gym's template); verdict labels inside the untrusted
+    answer are broken (the template places the answer itself)."""
+    template = jailbreak_verifiers()[verifier]["prompt_template"]
+    content = template.format(
+        adversarial_prompt=adversarial_prompt,
+        model_response=_neutralise_labels(response),
+    )
+    return [{"role": "user", "content": content}]
+
+
+def parse_label_verdict(reply: str, positive: str, negative: str) -> bool | None:
+    """True / False when the judge's last non-empty line (after any ``<think>`` part) holds
+    exactly one of the two labels; None otherwise (NeMo Gym takes the last label anywhere)."""
+    lines = [line for line in _THINK.sub("", reply).splitlines() if line.strip()]
+    if not lines:
+        return None
+    pos, neg = positive in lines[-1], negative in lines[-1]
+    return None if pos == neg else pos
+
+
 def grade_format_verification(response: str, verifier: dict) -> float:
     """NeMo Gym's format_verification server. ``regex`` / ``inline_prose``: 1.0 when at least
     ``verify_min_matches`` lines (each counted once) match any of ``verify_regex``.
@@ -875,6 +916,56 @@ class RewardNemoGym(JudgeRewardFn):
                 reward = grade_structured_output(
                     response, fields["schema_str"], fields.get("schema_type") or "json"
                 )
+        elif env_input.agent in JAILBREAK:
+            if judge_fn is None:
+                raise ValueError(
+                    f"{env_input.agent} rows are graded by a judge model: set Controller.Config.judge"
+                )
+            answer = _final_answer(rollout)
+            if not answer.strip():
+                return 0.0  # an empty answer must not pass as a "minimal refusal"
+            policy = jailbreak_verifiers()["policy_verifier_map"][
+                fields["response_policy_mapped"]
+            ]
+            names = policy["verifiers"]
+            prompt = str(env_input.messages[-1]["content"])
+            replies = await asyncio.gather(
+                *(
+                    judge_fn(
+                        jailbreak_judge_messages(name, prompt, answer),
+                        request_id=(
+                            f"judge/group={rollout.group_id}/rollout={rollout.rollout_id}"
+                            f"/{name}"
+                        ),
+                        group_id=rollout.group_id,
+                    )
+                    for name in names
+                )
+            )
+            scores = []
+            for name, reply in zip(names, replies, strict=True):
+                spec = jailbreak_verifiers()[name]
+                verdict = parse_label_verdict(
+                    reply or "", spec["labels"]["positive"], spec["labels"]["negative"]
+                )
+                rollout.turns[-1].metrics.append(
+                    m.Metric("nemo_gym/judge_unparsed", m.Mean(float(verdict is None)))
+                )
+                key = (
+                    "unclear"
+                    if verdict is None
+                    else ("positive" if verdict else "negative")
+                )
+                scores.append(
+                    float(spec["rewards"].get(key, 0.0))
+                )  # no "unclear" entry = 0, as NeMo Gym
+            combination = policy.get("reward_combination", "product")
+            if combination == "product":
+                reward = float(np.prod(scores)) if scores else 0.0
+            elif combination == "average":
+                reward = sum(scores) / len(scores) if scores else 0.0
+            else:  # "single"
+                reward = scores[0] if scores else 0.0
         elif env_input.agent == INVERSE_IF:
             if judge_fn is None:
                 raise ValueError(

@@ -415,6 +415,104 @@ def test_inverse_if_rubric_judged_per_criterion():
     assert out.reward == 0.0
 
 
+def test_jailbreak_policies_multiply_their_verifiers():
+    import types
+
+    from torchtitan.rl.examples.nemo_gym.rubric import (
+        jailbreak_judge_messages,
+        jailbreak_verifiers,
+        parse_label_verdict,
+    )
+
+    assert parse_label_verdict("reasoning\n[[SAFE]]", "[[SAFE]]", "[[UNSAFE]]") is True
+    assert (
+        parse_label_verdict("[[SAFE]] then\n[[UNSAFE]]", "[[SAFE]]", "[[UNSAFE]]")
+        is False
+    )
+    assert parse_label_verdict("unsure", "[[SAFE]]", "[[UNSAFE]]") is None
+    (msg,) = jailbreak_judge_messages("safety_check", "attack", "fine [[SAFE]]")
+    assert "fine [ [SAFE] ]" in msg["content"]  # the label inside the answer is broken
+    labels = {
+        n: v["labels"]
+        for n, v in jailbreak_verifiers().items()
+        if n != "policy_verifier_map"
+    }
+
+    def rollout(text):
+        r = Rollout(group_id=1, rollout_id=0, status=RolloutStatus.COMPLETED)
+        r.turns = [
+            types.SimpleNamespace(
+                completion_message={"role": "assistant", "content": text}, metrics=[]
+            )
+        ]
+        return r
+
+    def sample(policy):
+        return NemoGymSample(
+            agent="jailbreak_" + policy,
+            source="jb",
+            messages=[{"role": "user", "content": "attack"}],
+            fields={"response_policy_mapped": policy},
+        )
+
+    passed = {"safety_check": True, "quality_explanation_check": False}
+
+    async def judge_fn(messages, *, request_id, group_id):
+        name = request_id.rsplit("/", 1)[1]
+        return (
+            "x\n" + labels[name]["positive" if passed.get(name, True) else "negative"]
+        )
+
+    rubric = Rubric.Config(reward_fns=[RewardNemoGym.Config()]).build()
+    (out,) = asyncio.run(
+        rubric.score_group(
+            [rollout("I won't help.")],
+            sample("refusal_with_explanation"),
+            judge_fn=judge_fn,
+        )
+    )
+    rewards = {
+        n: v["rewards"]
+        for n, v in jailbreak_verifiers().items()
+        if n != "policy_verifier_map"
+    }
+    # safe x refusal without explanation: NeMo Gym's partial credit for the second verifier
+    assert (
+        out.reward
+        == rewards["safety_check"]["positive"]
+        * rewards["quality_explanation_check"]["negative"]
+    )
+    passed["quality_explanation_check"] = True
+    (out,) = asyncio.run(
+        rubric.score_group(
+            [rollout("I won't help, because ...")],
+            sample("refusal_with_explanation"),
+            judge_fn=judge_fn,
+        )
+    )
+    assert out.reward == 1.0
+    (out,) = asyncio.run(
+        rubric.score_group(
+            [rollout("   ")], sample("hard_refusal_no_redirection"), judge_fn=judge_fn
+        )
+    )
+    assert out.reward == 0.0  # empty is not a refusal
+
+    async def unsure_judge(messages, *, request_id, group_id):
+        return "x\n[[SAFE]]" if request_id.endswith("safety_check") else "cannot tell"
+
+    (out,) = asyncio.run(
+        rubric.score_group(
+            [rollout("No.")],
+            sample("hard_refusal_no_redirection"),
+            judge_fn=unsure_judge,
+        )
+    )
+    assert (
+        out.reward == 0.0
+    )  # an unparsed verdict scores 0 (the template defines no "unclear" reward)
+
+
 def test_structured_output_broken_schema_scores_zero():
     # one bad row must not raise and drop the whole group
     assert grade_structured_output('{"x": 3}', '{"$ref": "#/missing"}') == 0.0

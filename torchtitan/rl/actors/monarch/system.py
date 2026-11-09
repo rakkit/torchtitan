@@ -28,6 +28,7 @@ from torchtitan.rl.actors.monarch.provisioning import (
     shutdown,
     spawn_cpu_procs,
     spawn_proc_mesh,
+    teacher_role_names,
 )
 from torchtitan.rl.actors.monarch.rollout_worker import RolloutWorkerActor
 from torchtitan.rl.actors.monarch.router import InterGeneratorRouterActor
@@ -79,6 +80,10 @@ class MonarchActorSystem(ActorSystem):
         self._rollout_worker_mesh: ProcMesh | None = None
         self._trainer: Any | None = None
         self._generators: list[ServiceHandle] = []
+        # On-policy distillation: teacher generators (fixed HF weights) and their router.
+        self._teacher_meshes: list[ProcMesh] = []
+        self._teacher_router_mesh: ProcMesh | None = None
+        self._teachers: list[ServiceHandle] = []
 
     async def provision(
         self,
@@ -86,13 +91,25 @@ class MonarchActorSystem(ActorSystem):
         trainer_parallelism: ParallelismConfig,
         generator_parallelism: InferenceParallelismConfig,
         num_generators: int,
+        teacher_parallelism: InferenceParallelismConfig | None = None,
+        num_teachers: int = 0,
     ) -> None:
-        self._trainer_mesh, self._generator_meshes = spawn_proc_mesh(
+        (
+            self._trainer_mesh,
+            self._generator_meshes,
+            self._teacher_meshes,
+        ) = spawn_proc_mesh(
             compute_trainer_world_size(trainer_parallelism),
             compute_generator_world_size(generator_parallelism),
             host_meshes=self._host_meshes,
             num_generators=num_generators,
+            per_teacher_world_size=(
+                compute_generator_world_size(teacher_parallelism) if num_teachers else 0
+            ),
+            num_teachers=num_teachers,
         )
+        if num_teachers:
+            self._teacher_router_mesh = spawn_cpu_procs(1)
         # One process, so the router is a singleton and every caller reaches
         # it with `call_one`. It gets its own mesh rather than sharing the
         # controller's process so routing does not contend with the training
@@ -103,7 +120,7 @@ class MonarchActorSystem(ActorSystem):
         self._batcher_mesh = spawn_cpu_procs(1)
 
         await setup_torch_elastic_env(self._trainer_mesh)
-        for generator_mesh in self._generator_meshes:
+        for generator_mesh in [*self._generator_meshes, *self._teacher_meshes]:
             await setup_torch_elastic_env(generator_mesh)
 
     async def spawn_trainer(
@@ -166,6 +183,35 @@ class MonarchActorSystem(ActorSystem):
             generators=self._generators,
         )
 
+    async def spawn_teacher_router(
+        self,
+        config: InterGeneratorRouter.Config,
+        *,
+        teacher_config: Generator.Config,
+        **teacher_kwargs: Any,
+    ) -> Any:
+        assert (
+            self._teacher_router_mesh is not None
+        ), "provision teachers before spawning"
+        for i, teacher_mesh in enumerate(self._teacher_meshes):
+            teacher = teacher_mesh.spawn(
+                teacher_role_names(len(self._teacher_meshes))[i],
+                GeneratorActor,
+                teacher_config,
+                **teacher_kwargs,
+            )
+            self._teachers.append(
+                ServiceHandle(
+                    all_ranks=teacher, rank0=teacher.flatten("rank").slice(rank=0)
+                )
+            )
+        return self._teacher_router_mesh.spawn(
+            "teacher_router",
+            InterGeneratorRouterActor,
+            config,
+            generators=self._teachers,
+        )
+
     async def spawn_batcher(self, config: Batcher.Config, **kwargs: Any) -> Any:
         assert self._batcher_mesh is not None, "provision before spawning"
         return self._batcher_mesh.spawn("batcher", BatcherActor, config, **kwargs)
@@ -215,15 +261,18 @@ class MonarchActorSystem(ActorSystem):
             mesh
             for mesh in (
                 self._router_mesh,
+                self._teacher_router_mesh,
                 self._batcher_mesh,
                 self._trainer_mesh,
                 *self._generator_meshes,
+                *self._teacher_meshes,
             )
             if mesh is not None
         ]
         self._router_mesh, self._batcher_mesh = None, None
         self._trainer_mesh, self._generator_meshes = None, []
         self._trainer, self._generators = None, []
+        self._teacher_router_mesh, self._teacher_meshes, self._teachers = None, [], []
         for i, mesh in enumerate(meshes):
             try:
                 await mesh.stop()

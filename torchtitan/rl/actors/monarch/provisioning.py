@@ -9,7 +9,7 @@ CPU meshes on the controller host, and the Monarch client's shutdown."""
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from monarch.actor import (
     default_bootstrap_cmd,
@@ -102,6 +102,8 @@ class HostMeshes:
     trainer: HostMesh
     generators: list[HostMesh]
     gpus_per_node: int
+    teachers: list[HostMesh] = field(default_factory=list)
+    """Teacher generators (on-policy distillation): fixed weights, score the rollouts."""
 
 
 def generator_role_names(num_generators: int) -> list[str]:
@@ -109,6 +111,11 @@ def generator_role_names(num_generators: int) -> list[str]:
     if num_generators == 1:
         return ["generator"]
     return [f"generator_{i}" for i in range(num_generators)]
+
+
+def teacher_role_names(num_teachers: int) -> list[str]:
+    """Teacher mesh and actor names (on-policy distillation): ``teacher_<i>``."""
+    return [f"teacher_{i}" for i in range(num_teachers)]
 
 
 def compute_trainer_world_size(p: ParallelismConfig) -> int:
@@ -151,7 +158,10 @@ def _spawn_proc_mesh(
 
 
 def _check_gpus_per_host(
-    host_meshes: HostMeshes, trainer_world_size: int, per_generator_world_size: int
+    host_meshes: HostMeshes,
+    trainer_world_size: int,
+    per_generator_world_size: int,
+    per_teacher_world_size: int = 0,
 ) -> None:
     """Fail before spawning anything if the requested GPUs don't fit on the hosts.
 
@@ -177,7 +187,11 @@ def _check_gpus_per_host(
         (f"generator{i}", host_mesh, per_generator_world_size)
         for i, host_mesh in enumerate(host_meshes.generators)
     ]
-    roles = trainer_roles + generator_roles
+    teacher_roles = [
+        (f"teacher{i}", host_mesh, per_teacher_world_size)
+        for i, host_mesh in enumerate(host_meshes.teachers)
+    ]
+    roles = trainer_roles + generator_roles + teacher_roles
     # For each mesh object (by id), the GPUs per host each of its roles needs.
     role_gpus_by_mesh: dict[int, dict[str, int]] = {}
     for role, host_mesh, role_world_size in roles:
@@ -205,8 +219,10 @@ def spawn_proc_mesh(
     host_meshes: HostMeshes | None = None,
     *,
     num_generators: int = 1,
-) -> tuple[ProcMesh, list[ProcMesh]]:
-    """Spawn the trainer and generator proc meshes.
+    per_teacher_world_size: int = 0,
+    num_teachers: int = 0,
+) -> tuple[ProcMesh, list[ProcMesh], list[ProcMesh]]:
+    """Spawn the trainer, generator and teacher proc meshes.
 
     Args:
         trainer_world_size: Number of GPU procs to spawn for the trainer.
@@ -217,12 +233,18 @@ def spawn_proc_mesh(
             both roles are spawned on ``this_host()`` by using non-overlapping
             GPU ranges.
         num_generators: Number of generator proc meshes to spawn.
+        per_teacher_world_size: Number of GPU procs to spawn for each teacher.
+        num_teachers: Number of teacher proc meshes (on-policy distillation; 0: none).
 
     Returns:
-        The ``(trainer_mesh, generator_meshes)`` proc meshes.
+        The ``(trainer_mesh, generator_meshes, teacher_meshes)`` proc meshes.
     """
     total_generator_gpus = num_generators * per_generator_world_size
-    total_gpus = trainer_world_size + total_generator_gpus
+    total_gpus = (
+        trainer_world_size
+        + total_generator_gpus
+        + num_teachers * per_teacher_world_size
+    )
     logger.info(
         f"{num_generators} generator(s) * {per_generator_world_size} GPUs + "
         f"{trainer_world_size} trainer GPUs = {total_gpus} total"
@@ -237,13 +259,25 @@ def spawn_proc_mesh(
             f"expected {num_generators} generator host mesh(es), "
             f"got {len(generator_host_meshes)}"
         )
+        assert (
+            len(host_meshes.teachers) == num_teachers
+        ), f"expected {num_teachers} teacher host mesh(es), got {len(host_meshes.teachers)}"
 
-        _check_gpus_per_host(host_meshes, trainer_world_size, per_generator_world_size)
+        _check_gpus_per_host(
+            host_meshes,
+            trainer_world_size,
+            per_generator_world_size,
+            per_teacher_world_size,
+        )
         # Roles on the same mesh share one provisioner, which hands out the next free GPUs:
         #   mesh A: trainer -> 0,1 | gen0 -> 2 | gen1 -> 3
         # Keyed by id(mesh) because a HostMesh can't be a dict key.
         provisioners: dict[int, PerHostProvisioner] = {}
-        for host_mesh in [trainer_host_mesh, *generator_host_meshes]:
+        for host_mesh in [
+            trainer_host_mesh,
+            *generator_host_meshes,
+            *host_meshes.teachers,
+        ]:
             provisioners.setdefault(
                 id(host_mesh), PerHostProvisioner(total_gpus=gpus_per_node)
             )
@@ -261,6 +295,15 @@ def spawn_proc_mesh(
                 bootstrap=_bootstrap_generator,
             )
             for gen_host_mesh in generator_host_meshes
+        ]
+        teacher_meshes = [
+            _spawn_proc_mesh(
+                teacher_host_mesh,
+                per_teacher_world_size,
+                provisioners[id(teacher_host_mesh)],
+                bootstrap=_bootstrap_generator,
+            )
+            for teacher_host_mesh in host_meshes.teachers
         ]
     else:
         # Single-node mode: partition GPUs on this_host() via
@@ -284,8 +327,18 @@ def spawn_proc_mesh(
             )
             for _ in range(num_generators)
         ]
+        teacher_meshes = [
+            host_mesh.spawn_procs(
+                per_host={"gpus": per_teacher_world_size},
+                bootstrap=_bootstrap_generator,
+                bootstrap_command=default_bootstrap_cmd().with_env(
+                    provisioner.allocate(per_teacher_world_size)
+                ),
+            )
+            for _ in range(num_teachers)
+        ]
 
-    return trainer_mesh, generator_meshes
+    return trainer_mesh, generator_meshes, teacher_meshes
 
 
 def spawn_cpu_procs(num_procs: int) -> ProcMesh:

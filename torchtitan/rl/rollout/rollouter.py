@@ -19,6 +19,7 @@ from torchtitan.components.renderer import RendererConfig
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.data import RLDataset, RolloutDataLoader
 from torchtitan.rl.rollout.message_env import MessageEnv
@@ -32,6 +33,7 @@ from torchtitan.rl.rollout.types import (
     RolloutStatus,
     RolloutTurn,
     RolloutTurnID,
+    ScoreFn,
 )
 
 if TYPE_CHECKING:
@@ -226,6 +228,7 @@ class Rollouter(Configurable):
         group_id: int,
         group_size: int,
         sampling: SamplingConfig,
+        score_fn: ScoreFn | None = None,
     ) -> RolloutGroup:
         """Roll out and score one prompt group.
 
@@ -258,6 +261,7 @@ class Rollouter(Configurable):
                 group_id=group_id,
                 group_size=group_size,
                 sampling=sampling,
+                score_fn=score_fn,
             )
         )
         self._inflight_run_group_calls.add(call)
@@ -280,6 +284,23 @@ class Rollouter(Configurable):
         self._training_dataloader.load_state_dict(state_dict)
 
 
+@dataclass(kw_only=True, slots=True)
+class OnPolicyDistillationConfig:
+    """On-policy distillation: a fixed teacher scores the tokens the student sampled.
+
+    Each completion token's advantage is ``kl_coef * (teacher logprob - student logprob)``
+    (a one-sample estimate of minus the per-token reverse KL to the teacher), plus
+    ``reward_advantage_weight`` times the rollout's reward advantage. Teacher and student
+    must share the tokenizer; the student samples at temperature 1.0.
+    """
+
+    kl_coef: float = 1.0
+    """Weight of the per-token teacher signal."""
+
+    reward_advantage_weight: float = 0.0
+    """Weight of the rollout's reward advantage added to every token; 0: pure distillation."""
+
+
 class RolloutWorker(Configurable):
     """Builds, executes, scores, and advantages one rollout group."""
 
@@ -299,12 +320,16 @@ class RolloutWorker(Configurable):
         )
         """Post-scoring advantage estimator. Default = Dr.GRPO (mean-baseline only);
         set `AdvantageEstimator.Config(should_std_normalize=True)` for standard GRPO."""
+        distillation: OnPolicyDistillationConfig | None = None
+        """On-policy distillation: a teacher scores every completion token and sets per-token
+        advantages (`run_group` then needs a `score_fn`). None: off."""
 
     def __init__(self, config: Config) -> None:
         self.rubric: Rubric = config.rubric.build()
         self._message_env_config = config.message_env
         self._token_env_config = config.token_env
         self.advantage_estimator: AdvantageEstimator = config.advantage.build()
+        self._distillation = config.distillation
         self._renderer: Renderer
 
     async def setup_async(
@@ -370,6 +395,7 @@ class RolloutWorker(Configurable):
         group_id: int,
         group_size: int,
         sampling: SamplingConfig,
+        score_fn: ScoreFn | None = None,
     ) -> RolloutGroup:
         """Roll out and score one prompt group.
 
@@ -435,7 +461,70 @@ class RolloutWorker(Configurable):
         advantages = self.advantage_estimator(group)
         for rollout, advantage in zip(group.rollouts, advantages, strict=True):
             rollout.advantage = advantage
+        if self._distillation is not None:
+            if score_fn is None:
+                raise ValueError(
+                    "distillation is configured but run_group got no score_fn"
+                )
+            if sampling.temperature != 1.0:
+                raise ValueError(
+                    f"distillation needs the student's own log-probs: sampling temperature "
+                    f"must be 1.0, got {sampling.temperature}"
+                )
+            await self._distill_group(group, score_fn)
         return group
+
+    async def _distill_group(self, group: RolloutGroup, score_fn: ScoreFn) -> None:
+        """Set each turn's per-token advantages from the teacher's log-probs of its tokens."""
+        distillation = self._distillation
+        assert distillation is not None
+        turns: list[tuple[Rollout, RolloutTurn, int, list[int]]] = []
+        for rollout in group.rollouts:
+            previous: list[int] = []  # the previous turn's prompt + completion
+            for turn in rollout.turns:
+                prompt = (
+                    previous[: turn.prompt_prefix_len]
+                    + turn.prompt_delta_token_ids.tolist()
+                )
+                tokens = prompt + turn.completion_token_ids.tolist()
+                previous = tokens
+                if len(turn.completion_token_ids):
+                    turns.append((rollout, turn, len(prompt), tokens))
+        teacher_scores = await asyncio.gather(
+            *(
+                score_fn(
+                    tokens,
+                    request_id=(
+                        f"teacher/group={group.group_id}/rollout={rollout.rollout_id}"
+                        f"/turn={turn.rollout_id.turn_id}"
+                    ),
+                    group_id=group.group_id,
+                )
+                for rollout, turn, _, tokens in turns
+            )
+        )
+        for (rollout, turn, num_prompt, _), teacher in zip(
+            turns, teacher_scores, strict=True
+        ):
+            if teacher is None:
+                raise RuntimeError(
+                    f"the teacher returned no log-probs for group {group.group_id}"
+                )
+            teacher_logprobs = np.asarray(teacher[num_prompt:], dtype=np.float32)
+            gap = teacher_logprobs - turn.completion_logprobs
+            turn.token_advantages = (
+                distillation.kl_coef * gap
+                + distillation.reward_advantage_weight * (rollout.advantage or 0.0)
+            ).astype(np.float32)
+            turn.metrics.append(
+                m.Metric("distillation/reverse_kl", m.Mean(float(-gap.mean())))
+            )
+            turn.metrics.append(
+                m.Metric(
+                    "distillation/teacher_logprob",
+                    m.Mean(float(teacher_logprobs.mean())),
+                )
+            )
 
     async def _run_single_rollout(
         self,

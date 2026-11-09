@@ -483,7 +483,7 @@ def test_monarch_actor_system_provisions_every_role_before_spawning(monkeypatch)
             f"{kwargs['num_generators']}x{per_generator_world_size} "
             f"on {kwargs['host_meshes']}"
         )
-        return "trainer_mesh", ["generator_mesh_0", "generator_mesh_1"]
+        return "trainer_mesh", ["generator_mesh_0", "generator_mesh_1"], []
 
     async def setup_torch_elastic_env(mesh):
         events.append(f"torch elastic {mesh}")

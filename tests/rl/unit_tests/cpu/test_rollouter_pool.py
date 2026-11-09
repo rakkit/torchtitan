@@ -221,6 +221,7 @@ def test_rollout_group_dispatch_uses_choose(monkeypatch) -> None:
                 "group_id": 1,
                 "group_size": 2,
                 "sampling": "sampling",
+                "score_fn": None,
             }
         ]
 

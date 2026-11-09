@@ -127,7 +127,12 @@ from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.recorder import RolloutSampleRecorder
 from torchtitan.rl.rollout.rollouter import Rollouter
-from torchtitan.rl.rollout.types import Completion, GenerateFn, ReleaseSessionFn
+from torchtitan.rl.rollout.types import (
+    Completion,
+    GenerateFn,
+    ReleaseSessionFn,
+    ScoreFn,
+)
 from torchtitan.rl.routing.inter_generator import InterGeneratorRouter
 from torchtitan.rl.trainer.batcher import Batcher, TrainerStepBatch
 from torchtitan.rl.trainer.trainer import Trainer
@@ -324,6 +329,19 @@ class Controller(Configurable):
             default_factory=InterGeneratorRouter.Config
         )
         """Generator routing strategy configuration."""
+        teacher: Generator.Config | None = None
+        """On-policy distillation teacher: generators with fixed weights (``checkpointer`` loads
+        them from ``teacher_hf_assets_path``) that score the student's rollouts; the rollout
+        worker's ``distillation`` config turns the scores into per-token advantages. The
+        teacher must share the student's tokenizer. None: off."""
+        teacher_hf_assets_path: str | None = None
+        """The teacher's HF assets (config, tokenizer); required with ``teacher``."""
+        num_teachers: int = 1
+        """Teacher generator replicas (with ``teacher``)."""
+        teacher_router: InterGeneratorRouter.Config = field(
+            default_factory=InterGeneratorRouter.Config
+        )
+        """Routing across the teacher replicas."""
 
         actor_system: ActorSystem.Config = field(
             default_factory=_default_actor_system_config
@@ -369,6 +387,24 @@ class Controller(Configurable):
                 logger.info(f"Saved job configs to {config_file}")
 
         def __post_init__(self):
+            if self.teacher is not None:
+                if (
+                    self.teacher.checkpointer is None
+                    or self.teacher_hf_assets_path is None
+                ):
+                    raise ValueError(
+                        "teacher needs checkpointer (its HF weights) and teacher_hf_assets_path"
+                    )
+                if self.num_teachers < 1:
+                    raise ValueError(
+                        f"num_teachers must be >= 1, got {self.num_teachers}"
+                    )
+            worker = self.rollouter.worker
+            distillation = worker.distillation if worker is not None else None
+            if (self.teacher is not None) != (distillation is not None):
+                raise ValueError(
+                    "teacher and rollouter.worker.distillation go together (both set or both None)"
+                )
             trainer_model_cls = type(self.trainer.model)
             generator_model_cls = type(self.generator.model)
             if trainer_model_cls is not generator_model_cls:
@@ -479,6 +515,8 @@ class Controller(Configurable):
         self.actor_system: ActorSystem | None = None
         self.trainer: TrainerHandle | None = None
         self.generator_router: InterGeneratorRouter | None = None
+        # On-policy distillation teachers' router (setup_async spawns it when `teacher` is set).
+        self.teacher_router: InterGeneratorRouter | None = None
         # The batcher's single-actor handle.
         self.batcher: Any | None = None
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
@@ -590,6 +628,34 @@ class Controller(Configurable):
 
         return generate
 
+    def _make_score_fn(self) -> ScoreFn:
+        """Build the rollout workers' `ScoreFn`: the teacher's log-prob of every token of a
+        sequence (prompt log-probs of a one-token request at temperature 1.0)."""
+        teacher_router = self.teacher_router
+        assert teacher_router is not None, "no teacher generators"
+        sampling = SamplingConfig(
+            temperature=1.0,
+            max_tokens=1,
+            prompt_logprobs=True,
+            stop_token_ids=self._sampling.stop_token_ids,
+        )
+
+        @sl.log_trace_span("teacher_score")
+        async def score(
+            token_ids: list[int], *, request_id: str, group_id: int
+        ) -> list[float] | None:
+            completion = await teacher_router.generate.call_one(
+                token_ids,
+                request_id=request_id,
+                group_id=group_id,
+                routing_session_id=None,
+                sampling_config=sampling,
+                metrics_prefix="teacher",
+            )
+            return None if completion is None else completion.prompt_token_logprobs
+
+        return score
+
     def _make_release_session_fn(self) -> ReleaseSessionFn:
         """Build the rollouter's `ReleaseSessionFn`: tell the generator router a rollout ended."""
         generator_router = self.generator_router
@@ -661,6 +727,10 @@ class Controller(Configurable):
                 trainer_parallelism=config.trainer.parallelism,
                 generator_parallelism=config.generator.parallelism,
                 num_generators=config.num_generators,
+                teacher_parallelism=(
+                    config.teacher.parallelism if config.teacher is not None else None
+                ),
+                num_teachers=config.num_teachers if config.teacher is not None else 0,
             )
             self.trainer = await actor_system.spawn_trainer(
                 config.trainer,
@@ -679,6 +749,16 @@ class Controller(Configurable):
                 max_num_seqs=max_num_seqs,
                 output_dir=config.dump_folder,
             )
+            # On-policy distillation: teachers load their own HF weights and never sync.
+            if config.teacher is not None:
+                self.teacher_router = await actor_system.spawn_teacher_router(
+                    config.teacher_router,
+                    teacher_config=config.teacher,
+                    precision=config.precision,
+                    model_path=config.teacher_hf_assets_path,
+                    max_num_seqs=max_num_seqs,
+                    output_dir=f"{config.dump_folder}/teacher",
+                )
             self.batcher = await actor_system.spawn_batcher(
                 async_loop.batcher,
                 num_tokens_per_microbatch_per_dp_rank=(
@@ -734,6 +814,8 @@ class Controller(Configurable):
         # loop, so every rank must be running it first).
         with sl.log_trace_span("generator_start_engine_loop"):
             await self.generator_router.start_engine_loop.call_one()
+            if self.teacher_router is not None:
+                await self.teacher_router.start_engine_loop.call_one()
 
         # Initial push and pull: only the trainer loads weights; generators pull them at start_step.
         with sl.log_trace_span("trainer_push_model_state_dict"):
@@ -883,6 +965,7 @@ class Controller(Configurable):
         # rollout_loop
         generate_fn = self._make_generate_fn(metrics_prefix="generator")
         release_session_fn = self._make_release_session_fn()
+        score_fn = self._make_score_fn() if self.teacher_router is not None else None
 
         # One rollout worker per active buffer slot: lets generation fill every active slot,
         # including the cold start (step 0 fills every active slot, not just num_prompts_per_train_step per wave).
@@ -893,6 +976,7 @@ class Controller(Configurable):
                     group_buffer=self._group_buffer,
                     generate_fn=generate_fn,
                     release_session_fn=release_session_fn,
+                    score_fn=score_fn,
                 ),
                 name=f"rollout_worker_{group_worker_id}",
             )
@@ -1017,6 +1101,7 @@ class Controller(Configurable):
         group_buffer: RolloutGroupWorkBuffer,
         generate_fn: GenerateFn,
         release_session_fn: ReleaseSessionFn,
+        score_fn: ScoreFn | None = None,
     ) -> None:
         """Generate + score one group at a time; a failed group becomes an empty group + a failure metric.
 
@@ -1044,6 +1129,7 @@ class Controller(Configurable):
                         group_id=work.group_id,
                         group_size=self.config.async_loop.num_samples_per_prompt,
                         sampling=self._sampling,
+                        score_fn=score_fn,
                     )
                 group.metrics = compute_rollout_metrics(
                     prefix="rollout", rollouts=group.rollouts

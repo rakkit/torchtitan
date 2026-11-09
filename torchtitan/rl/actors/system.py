@@ -86,9 +86,12 @@ class ActorSystem(Configurable, abc.ABC):
         trainer_parallelism: ParallelismConfig,
         generator_parallelism: InferenceParallelismConfig,
         num_generators: int,
+        teacher_parallelism: InferenceParallelismConfig | None = None,
+        num_teachers: int = 0,
     ) -> None:
         """Reserve the processes for the trainer, ``num_generators`` generators, the
-        generator router and the batcher, before any of them is spawned."""
+        generator router and the batcher, and ``num_teachers`` teacher generators with
+        their router (on-policy distillation), before any of them is spawned."""
 
     @abc.abstractmethod
     async def spawn_trainer(
@@ -108,6 +111,17 @@ class ActorSystem(Configurable, abc.ABC):
         """Spawn the provisioned generators and the singleton router over them;
         returns the router's single-actor handle, the only way to reach the
         generators. ``generator_kwargs`` go to ``Generator``'s constructor."""
+
+    async def spawn_teacher_router(
+        self,
+        config: InterGeneratorRouter.Config,
+        *,
+        teacher_config: Generator.Config,
+        **teacher_kwargs: Any,
+    ) -> Any:
+        """Spawn the provisioned teacher generators (fixed weights loaded by
+        ``teacher_config.checkpointer``) and their router; returns the router handle."""
+        raise NotImplementedError(f"{type(self).__name__} has no teacher generators")
 
     @abc.abstractmethod
     async def spawn_batcher(self, config: Batcher.Config, **kwargs: Any) -> Any:

@@ -25,6 +25,7 @@ from torchtitan.rl.actors.monarch.provisioning import (
     compute_trainer_world_size,
     generator_role_names,
     HostMeshes,
+    teacher_role_names,
 )
 from torchtitan.rl.actors.monarch.system import MonarchActorSystem
 from torchtitan.rl.controller.controller import Controller
@@ -82,7 +83,8 @@ class Layout:
                 gpus_per_node=8,
             )
         """
-        num_generators = len(self.role_mesh) - 1
+        num_generators = sum(role.startswith("generator") for role in self.role_mesh)
+        num_teachers = sum(role.startswith("teacher_") for role in self.role_mesh)
         return HostMeshes(
             trainer=meshes[self.role_mesh["trainer"]],
             generators=[
@@ -90,6 +92,10 @@ class Layout:
                 for role in generator_role_names(num_generators)
             ],
             gpus_per_node=self.gpus_per_node,
+            teachers=[
+                meshes[self.role_mesh[role]]
+                for role in teacher_role_names(num_teachers)
+            ],
         )
 
     def to_json(self) -> str:
@@ -152,6 +158,12 @@ class MonarchLauncher(Configurable, abc.ABC):
             compute_trainer_world_size(config.trainer.parallelism),
             compute_generator_world_size(config.generator.parallelism),
             config.num_generators,
+            teacher_world_size=(
+                compute_generator_world_size(config.teacher.parallelism)
+                if config.teacher is not None
+                else 0
+            ),
+            num_teachers=config.num_teachers if config.teacher is not None else 0,
         )
         return LaunchPlan(
             job_name=f"{self.config.job_name}-{uuid.uuid4().hex[:6]}",
@@ -162,9 +174,16 @@ class MonarchLauncher(Configurable, abc.ABC):
         )
 
     def _layout(
-        self, trainer_world_size: int, generator_world_size: int, num_generators: int
+        self,
+        trainer_world_size: int,
+        generator_world_size: int,
+        num_generators: int,
+        *,
+        teacher_world_size: int = 0,
+        num_teachers: int = 0,
     ) -> Layout:
-        """Place the trainer, then each generator, filling one node before the next.
+        """Place the trainer, then each generator, then each teacher (on-policy distillation),
+        filling one node before the next.
 
         Rules and examples: the "Layout" section of
         ``torchtitan/rl/actors/monarch/README.md``. A role using whole nodes gets a
@@ -175,6 +194,7 @@ class MonarchLauncher(Configurable, abc.ABC):
         role_world_sizes = {
             "trainer": trainer_world_size,
             **dict.fromkeys(generator_role_names(num_generators), generator_world_size),
+            **dict.fromkeys(teacher_role_names(num_teachers), teacher_world_size),
         }
         mesh_nodes: dict[str, int] = {}
         role_mesh: dict[str, str] = {}

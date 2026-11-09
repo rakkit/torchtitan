@@ -19,7 +19,7 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.rollout import RolloutStatus
 from torchtitan.rl.rollout.message_env import MessageEnvInitOutput, MessageEnvStepOutput
-from torchtitan.rl.rollout.rollouter import RolloutWorker
+from torchtitan.rl.rollout.rollouter import OnPolicyDistillationConfig, RolloutWorker
 from torchtitan.rl.rollout.rubric import RubricOutput
 from torchtitan.rl.rollout.token_env import TokenEnv, TokenEnvOutput
 from torchtitan.rl.rollout.types import Completion
@@ -127,6 +127,7 @@ def test_worker_executes_group_without_actor_mesh() -> None:
             message_env=_MessageEnvConfig(),
             token_env=token_env_config,
             advantage=_Config(_AdvantageEstimator()),
+            distillation=None,
         )
         worker = _CustomWorker(worker_config)
         released = []
@@ -249,6 +250,7 @@ def test_delta_prompts_rebuild_the_full_prompt_samples() -> None:
             message_env=None,
             token_env=None,
             advantage=_Config(None),
+            distillation=None,
         )
     )
     builder = TrainingSampleBuilder.Config().build()
@@ -300,5 +302,72 @@ def test_delta_prompts_rebuild_the_full_prompt_samples() -> None:
             assert [
                 (s.rollout_id.turn_id, s.token_ids.tolist()) for s in samples
             ] == expected
+
+    asyncio.run(run())
+
+
+def test_distillation_sets_per_token_advantages_from_the_teacher() -> None:
+    # Prompt [1, 2], the student samples token 4 at log-prob -0.5; the teacher scores [1, 2, 4] as
+    # [NaN, -1.0, -0.2]: per-token advantage = 2.0 * (-0.2 - -0.5) + 0.5 * reward advantage (10 / 20).
+    async def run() -> None:
+        worker = RolloutWorker(
+            SimpleNamespace(
+                rubric=_Config(_Rubric()),
+                message_env=_MessageEnvConfig(),
+                token_env=_TokenEnvConfig(),
+                advantage=_Config(_AdvantageEstimator()),
+                distillation=OnPolicyDistillationConfig(
+                    kl_coef=2.0, reward_advantage_weight=0.5
+                ),
+            )
+        )
+        await worker.setup_async(
+            tokenizer_config=HuggingFaceTokenizer.Config(),
+            renderer_config=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
+            hf_assets_path="tests/assets/tokenizer",
+        )
+        scored = []
+
+        async def score_fn(token_ids, *, request_id, group_id):
+            scored.append((token_ids, request_id, group_id))
+            return [float("nan"), -1.0, -0.2]
+
+        async def release_session_fn(**kwargs) -> None:
+            pass
+
+        kwargs = dict(
+            generate_fn=_GenerateFn(),
+            release_session_fn=release_session_fn,
+            sample="sample",
+            group_id=5,
+            group_size=2,
+        )
+        group = await worker.run_group(
+            **kwargs,
+            sampling=SamplingConfig(temperature=1.0, seed=1),
+            score_fn=score_fn,
+        )
+        assert [t for t, _, _ in scored] == [[1, 2, 4], [1, 2, 4]]
+        assert {g for _, _, g in scored} == {5}
+        got = [rollout.turns[0].token_advantages.tolist() for rollout in group.rollouts]
+        assert [round(x[0], 5) for x in got] == [5.6, 10.6]
+        names = {metric.key for metric in group.rollouts[0].turns[0].metrics}
+        assert {"distillation/reverse_kl", "distillation/teacher_logprob"} <= names
+        sample = (
+            TrainingSampleBuilder.Config()
+            .build()
+            .rollout_to_training_samples(group.rollouts[0])[0]
+        )
+        assert round(float(sample.advantage[-1]), 5) == 5.6
+
+        for bad in (
+            dict(sampling=SamplingConfig(temperature=1.0)),
+            dict(sampling=SamplingConfig(temperature=0.8), score_fn=score_fn),
+        ):
+            try:
+                await worker.run_group(**kwargs, **bad)
+            except ValueError:
+                continue
+            raise AssertionError(f"expected ValueError for {bad}")
 
     asyncio.run(run())

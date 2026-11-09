@@ -45,6 +45,7 @@ from torchtitan.rl.rollout.types import (
     RolloutStatus,
     RolloutTurn,
     RolloutTurnID,
+    ScoreFn,
     split_prompt,
 )
 
@@ -247,8 +248,13 @@ class VerifiersRollouter(Rollouter):
         group_id: int,
         group_size: int,
         sampling: SamplingConfig,
+        score_fn: ScoreFn | None = None,
     ) -> RolloutGroup:
         """Run sibling rollouts through Verifiers, then compute advantages."""
+        if score_fn is not None:
+            raise NotImplementedError(
+                "on-policy distillation is not wired into the Verifiers rollouter"
+            )
         if self._generation_server is None:
             raise RuntimeError("Verifiers rollouter is not initialized")
         self._generation_server.set_generate_fn(generate_fn)

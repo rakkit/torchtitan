@@ -55,6 +55,8 @@ def _rl_config(*, trainer_dp=4, generator_tp=2, num_generators=1, **kwargs):
             parallelism=InferenceParallelismConfig(tensor_parallel_degree=generator_tp)
         ),
         num_generators=num_generators,
+        teacher=None,
+        num_teachers=1,
         resolve_overrides=lambda: None,
         **kwargs,
     )
@@ -305,7 +307,7 @@ def spawned(monkeypatch):
 
     def spawn_proc_mesh(trainer_ws, generator_ws, **kwargs):
         spawned["host_meshes"] = kwargs["host_meshes"]
-        return SimpleNamespace(stop=_stop_ok), []
+        return SimpleNamespace(stop=_stop_ok), [], []
 
     async def setup_torch_elastic_env(mesh):
         pass

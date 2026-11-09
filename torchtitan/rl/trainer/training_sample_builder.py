@@ -422,7 +422,9 @@ class TrainingSampleBuilder(Configurable):
             ]
             sample_in_progress.advantage += [
                 np.zeros(num_delta, dtype=np.float32),
-                np.full(num_completion, rollout_advantage, dtype=np.float32),
+                np.full(num_completion, rollout_advantage, dtype=np.float32)
+                if rollout_turn.token_advantages is None
+                else rollout_turn.token_advantages.astype(np.float32, copy=False),
             ]
             # Widen the segment's version span to include this turn (the min stays the opening turn's).
             sample_in_progress.max_policy_version = max(

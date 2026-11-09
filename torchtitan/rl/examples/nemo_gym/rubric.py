@@ -36,6 +36,7 @@ import jsonschema
 import yaml
 
 from torchtitan.rl.examples.dapo_math.math_verify_pool import MathVerifyPool
+from torchtitan.rl.examples.nemo_gym.calendar import grade_calendar
 from torchtitan.rl.examples.nemo_gym.data import NemoGymSample
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout
@@ -45,6 +46,7 @@ from torchtitan.rl.rollout.types import JudgeFn
 MATH = "math_with_judge_simple_agent"
 MCQA = "mcqa_simple_agent"
 STRUCTURED_OUTPUTS = "structured_outputs_simple_agent"
+CALENDAR = "calendar_simple_agent"
 # NeMo Gym format_verification: one rule grader, two datasets kept apart for per-source metrics
 FORMAT_VERIFICATION = (
     "citation_format_simple_agent",
@@ -839,6 +841,8 @@ class RewardNemoGym(JudgeRewardFn):
                 reward = grade_structured_output(
                     response, fields["schema_str"], fields.get("schema_type") or "json"
                 )
+        elif env_input.agent == CALENDAR:
+            reward = grade_calendar(response, fields["exp_cal_state"])
         elif env_input.agent in FORMAT_VERIFICATION:
             reward = grade_format_verification(response, fields["verifier"])
         elif env_input.agent == INSTRUCTION_FOLLOWING:

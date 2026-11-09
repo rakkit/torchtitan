@@ -273,6 +273,87 @@ def test_format_verification_rules():
         grade_format_verification("x", {"type": "other"})
 
 
+def test_calendar_schedule_rules():
+    from torchtitan.rl.examples.nemo_gym.calendar import grade_calendar
+
+    want = {
+        "0": {
+            "event_id": 0,
+            "duration": 60,
+            "constraint": "after 10am",
+            "min_time": "10:00",
+            "max_time": "16:00",
+        },
+        "1": {
+            "event_id": 1,
+            "duration": 30,
+            "constraint": "between 1pm and 2:30pm",
+            "min_time": "10:00",
+            "max_time": "16:00",
+        },
+        "2": {
+            "event_id": 2,
+            "duration": 45,
+            "constraint": "at 3:15pm",
+            "min_time": "10:00",
+            "max_time": "16:00",
+        },
+    }
+
+    def cal(*events):
+        rows = [
+            {"event_id": i, "event_name": "e", "start_time": t, "duration": d}
+            for i, t, d in events
+        ]
+        return "Here you go:\n" + json.dumps(rows)
+
+    assert (
+        grade_calendar(
+            cal((0, "10:00", 60), (1, "1:30pm", 30), (2, "3:15pm", 45)), want
+        )
+        == 1.0
+    )
+    assert (
+        grade_calendar(cal((0, "9:30", 60), (1, "1:30pm", 30), (2, "3:15pm", 45)), want)
+        == 0.0
+    )  # outside window
+    assert (
+        grade_calendar(
+            cal((0, "10:00", 60), (1, "2:15pm", 30), (2, "3:15pm", 45)), want
+        )
+        == 0.0
+    )  # ends 2:45pm
+    assert (
+        grade_calendar(cal((0, "10:00", 60), (1, "1pm", 30), (2, "3pm", 45)), want)
+        == 0.0
+    )  # not at 3:15pm
+    assert (
+        grade_calendar(cal((0, "1pm", 60), (1, "1:30pm", 30), (2, "3:15pm", 45)), want)
+        == 0.0
+    )  # overlap
+    assert (
+        grade_calendar(
+            cal((0, "10:00", 60), (0, "1:30pm", 30), (2, "3:15pm", 45)), want
+        )
+        == 0.0
+    )  # duplicate id
+    assert (
+        grade_calendar(cal((0, "10:00", 60), (1, "1:30pm", 30)), want) == 0.0
+    )  # an event missing
+    assert grade_calendar("I scheduled everything.", want) == 0.0  # no JSON list
+    assert (
+        grade_calendar(
+            "<think>x</think>"
+            + cal((0, "10:00", 60), (1, "1:30pm", 30), (2, "3:15pm", 45)),
+            want,
+        )
+        == 0.0
+    )
+    assert (
+        grade_calendar("", {}) == 0.0 and grade_calendar("Done.", {}) == 1.0
+    )  # nothing expected
+
+
 def test_structured_output_broken_schema_scores_zero():
     # one bad row must not raise and drop the whole group
     assert grade_structured_output('{"x": 3}', '{"$ref": "#/missing"}') == 0.0

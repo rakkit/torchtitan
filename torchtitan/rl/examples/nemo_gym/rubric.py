@@ -986,6 +986,16 @@ class RewardNemoGym(JudgeRewardFn):
                 reward = grade_structured_output(
                     response, fields["schema_str"], fields.get("schema_type") or "json"
                 )
+            # one environment holds text (5 formats) and tool-call rows: a pass rate per kind
+            kind = (
+                "tool_call"
+                if fields.get("response_mode") == "tool_call"
+                else fields.get("schema_type") or "json"
+            )
+            if rollout.turns:
+                rollout.turns[-1].metrics.append(
+                    m.Metric(f"nemo_gym/structured_{kind}_pass", m.Mean(reward))
+                )
         elif env_input.agent in JAILBREAK:
             if judge_fn is None:
                 raise ValueError(

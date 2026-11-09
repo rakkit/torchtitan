@@ -412,6 +412,34 @@ def test_row_tools_reach_the_env_in_the_chat_format(tmp_path):
         read_nemo_gym_rows([str(path)], ["structured_outputs_simple_agent"])
 
 
+def test_structured_output_pass_rate_per_format():
+    """One environment holds five formats and tool calls: each gets its own pass metric."""
+    schema = json.dumps({"type": "object", "properties": {"n": {"type": "integer"}}})
+    rubric = Rubric.Config(reward_fns=[RewardNemoGym.Config()]).build()
+    got = {}
+    for fmt, answer in (("json", '{"n": 2}'), ("yaml", "n: x")):
+        sample = NemoGymSample(
+            agent="structured_outputs_simple_agent",
+            source="so",
+            messages=[{"role": "user", "content": "q"}],
+            fields={"schema_str": schema, "schema_type": fmt},
+        )
+
+        class _Turn:
+            completion_message = {"role": "assistant", "content": answer}
+            metrics = []
+
+        rollout = Rollout(group_id=0, rollout_id=0, status=RolloutStatus.COMPLETED)
+        rollout.turns = [_Turn()]
+        asyncio.run(rubric.score_group([rollout], sample))
+        for metric in rollout.turns[-1].metrics:
+            got[metric.key] = metric
+    assert set(got) >= {
+        "nemo_gym/structured_json_pass",
+        "nemo_gym/structured_yaml_pass",
+    }
+
+
 def test_format_verification_rules():
     from torchtitan.rl.examples.nemo_gym.rubric import grade_format_verification
 

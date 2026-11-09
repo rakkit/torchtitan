@@ -14,7 +14,7 @@ from torch.distributed.tensor.placement_types import (
     Shard,
 )
 
-from torchtitan.models.base.state_dict_adapter import StateDictAdapter
+from torchtitan.models.base.state_dict_adapter import stack_views, StateDictAdapter
 
 from torchtitan.models.common.decoder import Decoder
 
@@ -318,10 +318,12 @@ class MoEStateDictAdapter(StateDictAdapter):
         sorted_expert_ids = sorted(experts.keys())
         sorted_experts = [experts[i] for i in sorted_expert_ids]
 
-        # Stack experts - result may be DTensor or plain tensor depending on sub_mesh
-        local_tensor = torch.stack(sorted_experts, dim=0)
-        if isinstance(local_tensor, DTensor):
-            local_tensor = local_tensor._local_tensor
+        # Stack the experts' local tensors (DTensors when sub_mesh is set); a
+        # view when an in-place load filled to_hf()'s slices (no copy).
+        local_tensor = stack_views(
+            [e._local_tensor if isinstance(e, DTensor) else e for e in sorted_experts],
+            dim=0,
+        )
 
         assert (
             abstract_key in self.grouped_expert_weight_placements

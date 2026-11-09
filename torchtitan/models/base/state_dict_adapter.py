@@ -18,12 +18,71 @@ import torch
 from torch.distributed.checkpoint import HuggingFaceStorageReader
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.distributed.tensor.placement_types import Placement
+from torch.distributed.tensor.placement_types import _StridedShard, Placement
 
 from .model import BaseModel
 
 
 logger = logging.getLogger(__name__)
+
+
+def stack_views(parts: list[torch.Tensor], dim: int) -> torch.Tensor:
+    """``torch.stack(parts, dim)``, as a view when the parts are equally spaced
+    views of one buffer.
+
+    ``to_hf`` hands out slices of the model's own parameters (one tensor per
+    expert, gate / up halves of a fused weight) and an in-place HF load
+    (``dcp.load``) fills them: stacking them back in ``from_hf`` would copy
+    every such weight once more (Qwen3-30B-A3B on one 95 GB GPU: the experts'
+    ~57 GB twice, out of memory). The view holds exactly the elements
+    ``torch.stack`` would copy, so the values are the same either way.
+    """
+    if isinstance(parts[0], DTensor):
+        first = parts[0]
+        placements = []
+        for p in first.placements:
+            if isinstance(p, Replicate):
+                placements.append(p)
+            elif isinstance(p, _StridedShard):
+                d = p.dim + 1 if p.dim >= dim else p.dim
+                placements.append(_StridedShard(d, split_factor=p.split_factor))
+            elif isinstance(p, Shard):
+                placements.append(Shard(p.dim + 1 if p.dim >= dim else p.dim))
+            else:
+                return torch.stack(parts, dim=dim)
+        if any(
+            not isinstance(q, DTensor)
+            or q.device_mesh != first.device_mesh
+            or q.placements != first.placements
+            or q.shape != first.shape
+            for q in parts
+        ):
+            return torch.stack(parts, dim=dim)
+        shape = list(first.shape)
+        shape.insert(dim, len(parts))
+        return DTensor.from_local(
+            stack_views([q._local_tensor for q in parts], dim),
+            first.device_mesh,
+            placements,
+            run_check=False,
+            shape=torch.Size(shape),
+            stride=torch.empty(shape, device="meta").stride(),
+        )
+    first = parts[0]
+    if len(parts) > 1:
+        step = parts[1].storage_offset() - first.storage_offset()
+        if step > 0 and all(
+            p.shape == first.shape
+            and p.stride() == first.stride()
+            and p.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+            and p.storage_offset() == first.storage_offset() + i * step
+            for i, p in enumerate(parts)
+        ):
+            shape, stride = list(first.shape), list(first.stride())
+            shape.insert(dim, len(parts))
+            stride.insert(dim, step)
+            return first.as_strided(shape, stride, first.storage_offset())
+    return torch.stack(parts, dim=dim)
 
 
 def dtensor_safe(fn):
@@ -251,7 +310,7 @@ class StateDictAdapter(BaseStateDictAdapter):
         """Stack logical projection parameters into one native parameter."""
         if not all(key in state_dict for key in logical_keys):
             return
-        state_dict[fused_key] = torch.stack(
+        state_dict[fused_key] = stack_views(
             [state_dict.pop(key) for key in logical_keys], dim=dim
         )
 

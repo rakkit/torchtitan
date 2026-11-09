@@ -287,6 +287,88 @@ class Qwen3StateDictAdapterTest(unittest.TestCase):
         model.load_state_dict(restored, strict=True)
 
 
+class MoEOnlineExpertLoadTest(unittest.TestCase):
+    """An online HF load (dcp.load into to_hf's slices of the parameters) must
+    not make from_hf copy every expert weight again (stack per expert, then
+    gate / up fused into w13)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._temporary_directory = tempfile.TemporaryDirectory()
+        cls._owns_process_group = not dist.is_initialized()
+        if cls._owns_process_group:
+            dist.init_process_group(
+                backend="gloo",
+                init_method=f"file://{cls._temporary_directory.name}/rendezvous",
+                rank=0,
+                world_size=1,
+            )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._owns_process_group:
+            dist.destroy_process_group()
+        cls._temporary_directory.cleanup()
+
+    def _experts_and_hf(self):
+        build_config, max_context_length = QWEN3_MODEL_FLAVORS["debugmodel_moe"]
+        config = build_config(
+            attn_backend="flex",
+            seq_len=max_context_length,
+            parallelism=ParallelismConfig(),
+        )
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("ep",))
+        experts = {
+            k: distribute_tensor(v, mesh, [Shard(0)])
+            for k, v in Qwen3Model(config).state_dict().items()
+            if ".routed_experts." in k
+        }
+        adapter = Qwen3StateDictAdapter(config, hf_assets_path=None)
+        return experts, adapter, adapter.to_hf(experts)
+
+    def test_in_place_loaded_experts_are_not_copied(self) -> None:
+        experts, adapter, hf = self._experts_and_hf()
+        torch.manual_seed(0)
+        for value in hf.values():  # what dcp.load does: fill the slices in place
+            value.copy_(torch.randn(value.shape))
+        restored = adapter.from_hf(hf)
+        self.assertEqual(restored.keys(), experts.keys())
+        for key, param in experts.items():
+            got = restored[key]
+            self.assertEqual(
+                got._local_tensor.data_ptr(), param._local_tensor.data_ptr()
+            )
+            self.assertEqual(got.shape, param.shape)
+            self.assertTrue(torch.equal(got.full_tensor(), param.full_tensor()))
+
+    def test_separately_loaded_experts_are_stacked(self) -> None:
+        experts, adapter, hf = self._experts_and_hf()
+        torch.manual_seed(0)
+        fresh = {k: torch.randn(v.shape) for k, v in hf.items()}
+        restored = adapter.from_hf(fresh)
+        for key, param in experts.items():
+            layer, num_experts = key.split(".")[1], param.shape[0]
+
+            def stacked(name):
+                return torch.stack(
+                    [
+                        fresh[f"model.layers.{layer}.mlp.experts.{e}.{name}.weight"]
+                        for e in range(num_experts)
+                    ]
+                )
+
+            want = (
+                torch.stack([stacked("gate_proj"), stacked("up_proj")], dim=1)
+                if key.endswith("w13.weight")
+                else stacked("down_proj")
+            )
+            got = restored[key]
+            self.assertNotEqual(
+                got._local_tensor.data_ptr(), param._local_tensor.data_ptr()
+            )
+            self.assertTrue(torch.equal(got.full_tensor(), want))
+
+
 class UnsupportedQuantizedKeysTest(unittest.TestCase):
     def test_adapters_without_quantized_loads_reject_quantized_layout(self) -> None:
         adapters = [

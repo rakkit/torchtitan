@@ -451,6 +451,23 @@ class TestBaseTokenizerChatTemplate(unittest.TestCase):
         )
         self.assertEqual(result, expected)
 
+    def test_generation_markers_render_their_body(self):
+        """Templates with Hugging Face's assistant-mask markers (Qwen3.8's) must load and render
+        as if the markers were absent; without the extension Jinja raises on the unknown tag."""
+        marked = (
+            "{% for msg in messages %}<|im_start|>{{ msg.role }}\n"
+            "{% if msg.role == 'assistant' %}{% generation %}{{ msg.content }}<|im_end|>{% endgeneration %}"
+            "{% else %}{{ msg.content }}<|im_end|>{% endif %}{{ '\\n' }}{% endfor %}"
+        )
+        tok = DummyTokenizer()
+        tok.set_chat_template(marked)
+        plain = DummyTokenizer()
+        plain.set_chat_template(CHATML_TEMPLATE)
+        self.assertEqual(
+            tok.apply_chat_template(SAMPLE_MESSAGES),
+            plain.apply_chat_template(SAMPLE_MESSAGES),
+        )
+
     def test_apply_chat_template_raises_when_no_template(self):
         tok = DummyTokenizer()
         with self.assertRaises(ValueError):

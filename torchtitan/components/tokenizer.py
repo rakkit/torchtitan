@@ -50,6 +50,7 @@ class BaseTokenizer(ABC, Configurable):
 
         import jinja2
         import jinja2.ext
+        import jinja2.nodes
         import jinja2.sandbox
 
         def raise_exception(msg):
@@ -71,10 +72,28 @@ class BaseTokenizer(ABC, Configurable):
 
             return datetime.now().strftime(fmt)
 
+        class GenerationBlock(jinja2.ext.Extension):
+            """Hugging Face's ``{% generation %}...{% endgeneration %}`` (the assistant-mask
+            markers of e.g. Qwen3.8's template), rendered as its body."""
+
+            tags = {"generation"}
+
+            def parse(self, parser):
+                lineno = next(parser.stream).lineno
+                body = parser.parse_statements(
+                    ("name:endgeneration",), drop_needle=True
+                )
+                return jinja2.nodes.CallBlock(
+                    self.call_method("_render"), [], [], body
+                ).set_lineno(lineno)
+
+            def _render(self, caller):
+                return caller()
+
         env = jinja2.sandbox.ImmutableSandboxedEnvironment(
             trim_blocks=True,
             lstrip_blocks=True,
-            extensions=[jinja2.ext.loopcontrols],
+            extensions=[jinja2.ext.loopcontrols, GenerationBlock],
         )
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = strftime_now

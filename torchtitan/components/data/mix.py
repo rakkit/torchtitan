@@ -28,6 +28,7 @@ from torchtitan.components.data.dataset import (
     SampleProcessor,
     SingleDatasetConfig,
     TextSequence,
+    TokenWeightedMixConfig,
     WeightedDataset,
 )
 from torchtitan.components.data.keyed_loader import KeyedMixDataLoader
@@ -108,10 +109,13 @@ class KeyedDatasetMixConfig(DatasetMixConfig):
     """A mix whose children are seeded by alias instead of by list position.
 
     Everything else -- weighting, the map/iter dispatch, the exhaustion rules -- is
-    upstream's. Only the seed derivation is replaced; see `alias_seed`.
+    upstream's (``by_tokens=False``: grain's mix, a weight selects ELEMENTS) or
+    `TokenWeightedMixConfig`'s (``by_tokens=True``: a weight is a share of TOKENS).
+    Only the seed derivation is replaced; see `alias_seed`.
     """
 
     aliases: tuple[str, ...]
+    by_tokens: bool
 
     def build(
         self,
@@ -136,7 +140,8 @@ class KeyedDatasetMixConfig(DatasetMixConfig):
         ]
         # Delegate to upstream with children that pin their own seed, so upstream's
         # `seed + index` lands on a value the child then ignores.
-        return DatasetMixConfig(datasets=tuple(children)).build(
+        mix = TokenWeightedMixConfig if self.by_tokens else DatasetMixConfig
+        return mix(datasets=tuple(children)).build(
             context=context,
             dataset_iteration_policy=dataset_iteration_policy,
         )
@@ -173,6 +178,7 @@ def _text_reader(column: str):
 def build_mix(
     datasets: list[DatasetSpec],
     *,
+    by_tokens: bool,
     processor_for: Any = None,
     read_in_order: bool = False,
 ) -> KeyedDatasetMixConfig:
@@ -239,6 +245,7 @@ def build_mix(
     return KeyedDatasetMixConfig(
         datasets=tuple(children),
         aliases=tuple(dataset.alias for dataset in datasets),
+        by_tokens=by_tokens,
     )
 
 
@@ -255,8 +262,11 @@ def make_pretrain_dataloader_config(
 ) -> KeyedMixDataLoader.Config:
     """Build a complete dataloader config from the dataset record list.
 
-    ``concat_then_split`` mixes documents and then packs them, so a weight selects
-    DOCUMENTS: a corpus of long documents takes more tokens than its weight.
+    ``concat_then_split`` mixes documents by TOKEN weight (`TokenWeightedMixConfig`:
+    the next document comes from the dataset furthest below its share) and packs them
+    into microbatch-long rows; a document is cut only every ``max_context_length`` of
+    its own tokens and at the row end, and each rank's microbatch follows the weights
+    to within one document per dataset. ``first_fit`` uses the same mix.
     ``concat_then_split_per_dataset`` packs each dataset into its own rows of
     ``max_context_length`` tokens and mixes those rows, so a weight is that dataset's
     share of TOKENS (the data README's "pack each child before mixing"); a microbatch
@@ -283,7 +293,13 @@ def make_pretrain_dataloader_config(
     an A/B whose two arms had differently-configured validators reported a spurious
     +0.027 that vanished once both scored the same tokens.
     """
-    mix = build_mix(datasets, read_in_order=read_in_order)
+    mix = build_mix(
+        datasets,
+        # per-dataset rows all hold max_context_length tokens, so grain's element
+        # weights are token weights there
+        by_tokens=packing != "concat_then_split_per_dataset",
+        read_in_order=read_in_order,
+    )
     if packing == "concat_then_split":
         packed: Any = ConcatThenSplitPackingConfig(dataset=mix)
     elif packing == "concat_then_split_per_dataset":

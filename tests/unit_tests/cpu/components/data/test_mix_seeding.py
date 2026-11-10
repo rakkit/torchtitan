@@ -82,6 +82,7 @@ def _mix(aliases: tuple[str, ...], seen: dict[str, list]) -> KeyedDatasetMixConf
             for a in aliases
         ),
         aliases=aliases,
+        by_tokens=False,
     )
 
 
@@ -134,7 +135,7 @@ def test_build_mix_carries_the_aliases(tmp_path: Path):
         write_manifest(build_manifest(root), root / MANIFEST_FILENAME)
         specs.append(DatasetSpec(alias=name, path=str(root)))
 
-    mix = build_mix(specs)
+    mix = build_mix(specs, by_tokens=True)
 
     assert mix.aliases == ("a", "b")
 

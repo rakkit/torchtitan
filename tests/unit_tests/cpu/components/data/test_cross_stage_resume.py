@@ -208,9 +208,9 @@ def test_same_config_resume_is_exact(tmp_path, packing):
     ), "the resumed loader must yield the batches the uninterrupted one did"
 
 
-def test_per_dataset_packing_makes_weights_count_tokens(tmp_path):
-    # equal weights, documents of 2 vs 40 characters: mixing documents gives the long
-    # corpus ~95% of the tokens, packing each corpus first gives each ~half
+def test_both_packings_make_weights_count_tokens(tmp_path):
+    # equal weights, documents of 2 vs 40 characters: a document-count mix would give the
+    # long corpus ~95% of the tokens; both packings give each corpus ~half
     short_id, long_id = 10 + ord("s") % 250, 10 + ord("L") % 250
     specs = [
         DatasetSpec(alias="short", path=_corpus_of(tmp_path / "short", ["ss"] * 4000)),
@@ -224,10 +224,11 @@ def test_per_dataset_packing_makes_weights_count_tokens(tmp_path):
         loader.close()
         return out
 
-    # documents mixed: the short corpus's characters are a small minority
+    # documents mixed by token weight: half of ALL tokens each (each document's BOS
+    # included), so the letters split (2/3) / (2/3 + 40/41) = 0.406 : 0.594
     tokens = torch.cat(microbatches("concat_then_split"))
     num_short = int((tokens == short_id).sum())
-    assert num_short / (num_short + int((tokens == long_id).sum())) < 0.15
+    assert 0.39 < num_short / (num_short + int((tokens == long_id).sum())) < 0.42
 
     # packed per corpus: every row (max_context_length 8) is one corpus, half of the
     # rows each, and a microbatch (16 tokens = 2 rows) can hold both corpora
@@ -256,7 +257,7 @@ def test_dataset_ids_are_required(tmp_path):
     """Without ids the checkpoint cannot name its cursors; fail loudly at build."""
     specs = [DatasetSpec(alias="A", path=_corpus(tmp_path / "A", "A", 32))]
     config = KeyedMixDataLoader.Config(
-        dataset=build_mix(specs),
+        dataset=build_mix(specs, by_tokens=True),
         collator=TextCollator.Config(),
         dataset_ids=(),
         shuffle=False,
@@ -429,15 +430,13 @@ def _rank_state_of(checkpoint: dict, rank: int) -> dict:
     return pickle.loads(checkpoint[f"dp_rank_{rank}"])
 
 
-@pytest.mark.parametrize("packing", PACKINGS)
+@pytest.mark.parametrize("packing", ["concat_then_split_per_dataset"])
 def test_rank_start_survives_stage_switch_and_dp_change(tmp_path, packing):
     # Each DP rank starts its walk through the mix at dp_rank * stride (stride = rows per
     # microbatch for per-dataset rows), so the ranks of a step draw different datasets. A
     # restore that resets the mix index to 0 puts every rank on the same dataset again: the
     # stage switch (changed dataset list) and the DP change must keep each rank's own start.
-    stride = (
-        2 if packing == "concat_then_split_per_dataset" else 1
-    )  # 16 tokens / 8 per row
+    stride = 2  # 16 tokens / 8 per row
     specs = [DatasetSpec(alias=i, path=_corpus(tmp_path / i, i, 256)) for i in "ABC"]
     checkpoint = {}
     for rank in range(4):
@@ -463,3 +462,32 @@ def test_rank_start_survives_stage_switch_and_dp_change(tmp_path, packing):
     assert index_after_load(staged, 4, 3, checkpoint) == 3 * stride
     # DP change 4 -> 2: the same, at the new rank's start
     assert index_after_load(specs, 2, 1, checkpoint) == 1 * stride
+
+
+def test_token_counts_resume_exactly_and_restart_on_a_stage_switch(tmp_path):
+    # The token-weighted mix keeps one token count per dataset next to the cursors. An
+    # exact resume restores them; a stage switch (changed dataset list) or a DP change
+    # starts this rank's counts at 0 for the new mix while the cursors carry over.
+    specs = [DatasetSpec(alias=i, path=_corpus(tmp_path / i, i, 256)) for i in "ABC"]
+    checkpoint = {}
+    for rank in range(2):
+        loader = _build(specs, "concat_then_split", dp_world_size=2, dp_rank=rank)
+        _consume(loader, batches=5)
+        checkpoint.update(loader.state_dict())
+        loader.close()
+    saved = find_mix_node(_rank_state_of(checkpoint, 1)["iterator"])["tokens"]
+    assert all(t > 0 for t in saved)
+
+    def tokens_after_load(new_specs, world, rank):
+        loader = _build(
+            new_specs, "concat_then_split", dp_world_size=world, dp_rank=rank
+        )
+        loader.load_state_dict(checkpoint)
+        tokens = find_mix_node(loader._iterator.get_state())["tokens"]
+        loader.close()
+        return tokens
+
+    assert tokens_after_load(specs, 2, 1) == saved
+    staged = [*specs, DatasetSpec(alias="D", path=_corpus(tmp_path / "D", "D", 256))]
+    assert tokens_after_load(staged, 2, 1) == [0, 0, 0, 0]
+    assert tokens_after_load(specs, 1, 0) == [0, 0, 0]

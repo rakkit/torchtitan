@@ -472,6 +472,8 @@ def make_sft_dataloader_config(
     ]
     mix = build_mix(
         datasets,
+        # SFT: a weight selects conversations (first_fit keeps each one whole)
+        by_tokens=False,
         # Per-dataset, so a mixture can span corpus layouts. `row_adapter` is the only
         # thing that varies; everything downstream is shared.
         processor_for=lambda dataset: MultiTurnChatProcessor.Config(

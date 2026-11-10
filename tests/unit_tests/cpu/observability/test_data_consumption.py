@@ -151,5 +151,6 @@ def test_aliases_that_collide_after_metric_normalization_are_refused(tmp_path: P
             [
                 DatasetSpec(alias="PDF-HQ/law", path="/nonexistent", weight=3.0),
                 DatasetSpec(alias="PDF-HQ_law", path="/nonexistent", weight=1.0),
-            ]
+            ],
+            by_tokens=True,
         )

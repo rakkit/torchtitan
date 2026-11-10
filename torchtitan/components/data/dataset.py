@@ -299,6 +299,113 @@ class _RankOffsetMixIterDataset(grain.IterDataset):
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
+class TokenWeightedMixConfig:
+    """Interleave weighted children of DOCUMENTS so that each child's share of the
+    emitted TOKENS follows its weight.
+
+    Each next document comes from the child whose emitted tokens divided by its
+    weight is smallest (ties: the first child). The shares track the weights to
+    within one document per child at any point, whatever the document lengths, so
+    no per-corpus length statistics are needed; the state is the children's
+    cursors plus one token count per child. Pack the output with a packer, e.g.
+    ConcatThenSplit: every row then holds documents of several children (unlike
+    per-child packing, where one row is one child).
+
+    Example, weights 1 : 1, child A's documents 2 tokens, child B's 6::
+
+        A B A A A B A A A B ...   (A gets three documents per B document)
+
+    The choice depends only on the token counts, so DP ranks start alike; each
+    rank reads its own shard of every child, and the ranks drift apart as their
+    documents' lengths differ. With `repeat=False` the mix stops at the first
+    exhausted child.
+    """
+
+    datasets: tuple[WeightedDataset, ...]
+
+    def build(
+        self,
+        *,
+        context: DatasetBuildContext,
+        dataset_iteration_policy: DatasetIterationPolicy,
+    ) -> GrainDataset:
+        if not self.datasets or any(
+            not math.isfinite(item.weight) or item.weight <= 0 for item in self.datasets
+        ):
+            raise ValueError(
+                "TokenWeightedMixConfig requires finite, positive-weight datasets"
+            )
+        children = [
+            item.dataset.build(
+                context=context,
+                dataset_iteration_policy=replace(
+                    dataset_iteration_policy,
+                    seed=dataset_iteration_policy.seed + index,
+                ),
+            )
+            for index, item in enumerate(self.datasets)
+        ]
+        children = [
+            child.to_iter_dataset(read_options=context.read_options)
+            if isinstance(child, grain.MapDataset)
+            else child
+            for child in children
+        ]
+        return _TokenWeightedMixIterDataset(
+            children, weights=[item.weight for item in self.datasets]
+        )
+
+
+class _TokenWeightedMixIterDataset(grain.IterDataset):
+    def __init__(self, parents: list[grain.IterDataset], *, weights: list[float]):
+        super().__init__(parents)
+        self._weights = weights
+
+    def __iter__(self):
+        return _TokenWeightedMixIterator(
+            [parent.__iter__() for parent in self._parents], self._weights
+        )
+
+
+class _TokenWeightedMixIterator(grain.DatasetIterator):
+    # The state keeps grain's mix layout ("parents" = the children's cursors), so
+    # keyed_mix_state finds and re-keys the cursors as for grain's own mix.
+    def __init__(self, parents: list[grain.DatasetIterator], weights: list[float]):
+        super().__init__(parents)
+        self._weights = weights
+        self._tokens = [0] * len(parents)
+        self._stop = False
+
+    def __next__(self) -> TextSequence:
+        if self._stop:
+            raise StopIteration
+        index = min(
+            range(len(self._parents)),
+            key=lambda i: self._tokens[i] / self._weights[i],
+        )
+        try:
+            document = next(self._parents[index])
+        except StopIteration:
+            self._stop = True
+            raise
+        self._tokens[index] += len(document.input_ids)
+        return document
+
+    def get_state(self) -> dict[str, Any]:
+        return {
+            "parents": [parent.get_state() for parent in self._parents],
+            "tokens": list(self._tokens),
+            "stop": self._stop,
+        }
+
+    def set_state(self, state: dict[str, Any]) -> None:
+        for parent, parent_state in zip(self._parents, state["parents"], strict=True):
+            parent.set_state(parent_state)
+        self._tokens = list(state["tokens"])
+        self._stop = state["stop"]
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
 class DatasetConcatConfig:
     """Concatenates finite children before global shuffle and DP sharding."""
 

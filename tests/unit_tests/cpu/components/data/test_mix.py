@@ -17,7 +17,7 @@ Two things are load-bearing and therefore tested against behaviour, not shape:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 import grain.python as grain
@@ -89,7 +89,8 @@ def test_mix_draws_from_every_dataset(tmp_path):
         [
             DatasetSpec(alias="a", path=str(a), weight=1.0),
             DatasetSpec(alias="b", path=str(b), weight=1.0),
-        ]
+        ],
+        by_tokens=True,
     )
     dataset = mix.build(context=CONTEXT, dataset_iteration_policy=_policy())
     tags = [_decode(s) for s in list(dataset)[:40] if s is not None]
@@ -105,7 +106,8 @@ def test_mix_respects_relative_weights(tmp_path):
         [
             DatasetSpec(alias="a", path=str(a), weight=3.0),
             DatasetSpec(alias="b", path=str(b), weight=1.0),
-        ]
+        ],
+        by_tokens=True,
     )
     dataset = mix.build(context=CONTEXT, dataset_iteration_policy=_policy())
     tags = [_decode(s) for s in list(dataset)[:200] if s is not None]
@@ -123,7 +125,8 @@ def test_each_dataset_can_use_a_different_column(tmp_path):
         [
             DatasetSpec(alias="a", path=str(a), text_key="text"),
             DatasetSpec(alias="b", path=str(b), text_key="content"),
-        ]
+        ],
+        by_tokens=True,
     )
     dataset = mix.build(context=CONTEXT, dataset_iteration_policy=_policy())
     tags = [_decode(s) for s in list(dataset)[:40] if s is not None]
@@ -132,7 +135,9 @@ def test_each_dataset_can_use_a_different_column(tmp_path):
 
 def test_a_wrong_column_fails_at_startup(tmp_path):
     a = _corpus(tmp_path / "a", "a", rows=8, column="text")
-    mix = build_mix([DatasetSpec(alias="a", path=str(a), text_key="content")])
+    mix = build_mix(
+        [DatasetSpec(alias="a", path=str(a), text_key="content")], by_tokens=True
+    )
     with pytest.raises(ValueError, match="not found"):
         mix.build(context=CONTEXT, dataset_iteration_policy=_policy())
 
@@ -148,7 +153,7 @@ def test_ranks_partition_the_mix_without_overlap(tmp_path):
 
     lengths = []
     for rank in range(world):
-        mix = build_mix(specs)
+        mix = build_mix(specs, by_tokens=True)
         dataset = mix.build(
             context=CONTEXT,
             dataset_iteration_policy=_policy(dp_rank=rank, dp_world_size=world),

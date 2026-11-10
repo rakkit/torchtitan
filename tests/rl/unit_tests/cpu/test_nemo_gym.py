@@ -463,6 +463,9 @@ def test_reasoning_gym_rows_use_their_task_scorer():
     assert grade_reasoning_gym(f"\\boxed{{{gold}}}", q, gold, meta) == 1.0
     assert grade_reasoning_gym("<answer>-123456789</answer>", q, gold, meta) < 1.0
     assert grade_reasoning_gym("", q, gold, meta) == 0.0
+    # a wrong answer that contains the gold gets no partial credit
+    assert grade_reasoning_gym(f"<answer>{gold}, 7</answer>", q, gold, meta) == 0.0
+    assert grade_reasoning_gym(f"<answer>1{gold}</answer>", q, gold, meta) == 0.0
     # the last answer tag counts
     assert (
         extract_reasoning_gym_answer("<answer>1</answer> then <answer>2</answer>")

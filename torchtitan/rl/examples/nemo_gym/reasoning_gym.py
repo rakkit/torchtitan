@@ -7,7 +7,10 @@
 """reasoning_gym grader: a port of NeMo Gym's resources_servers/reasoning_gym (Apache-2.0).
 Each row is one procedurally generated task (``metadata["source_dataset"]``, e.g.
 ``zebra_puzzles``); the reasoning_gym package's own scorer for that task grades the answer:
-the last ``<answer>...</answer>``, else the first ``\\boxed{...}``, else the whole reply."""
+the last ``<answer>...</answer>``, else the first ``\\boxed{...}``, else the whole reply.
+Reward 1 only when that score is 1, else 0: reasoning_gym's default scorer gives len(gold) /
+len(answer) when the gold is a substring of a WRONG answer ("112" for 12, "12, 7"), >= 0.5 on
+about half of the rows (review TASK 16); NeMo Gym passes the partial score through."""
 
 from __future__ import annotations
 
@@ -45,8 +48,9 @@ def grade_reasoning_gym(
     entry = {"question": question, "answer": answer, "metadata": metadata}
     try:
         score_fn = reasoning_gym.get_score_answer_fn(task)
-        return float(
+        score = float(
             score_fn(answer=extract_reasoning_gym_answer(response), entry=entry)
         )
     except Exception:  # NeMo Gym: an answer the task's scorer cannot read scores 0
         return 0.0
+    return 1.0 if score >= 1.0 else 0.0

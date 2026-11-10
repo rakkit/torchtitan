@@ -475,6 +475,39 @@ def test_reasoning_gym_rows_use_their_task_scorer():
         grade_reasoning_gym("<answer>1</answer>", q, gold, {})
 
 
+def test_rule_graders_read_the_answer_after_thinking():
+    # a \boxed{} in the thinking must not win when the final answer says otherwise
+    import types
+
+    def rollout(text):
+        r = Rollout(group_id=1, rollout_id=0, status=RolloutStatus.COMPLETED)
+        r.turns = [
+            types.SimpleNamespace(
+                completion_message={"role": "assistant", "content": text}, metrics=[]
+            )
+        ]
+        return r
+
+    sample = NemoGymSample(
+        agent="math_with_judge_simple_agent",
+        source="math",
+        messages=[{"role": "user", "content": "q"}],
+        fields={"expected_answer": "190"},
+    )
+    rubric = Rubric.Config(reward_fns=[RewardNemoGym.Config()]).build()
+    thought, answered = asyncio.run(
+        rubric.score_group(
+            [
+                rollout("<think>maybe \\boxed{190}</think>So the answer is 191."),
+                rollout("<think>x</think>\\boxed{190}"),
+            ],
+            sample,
+            judge_fn=None,
+        )
+    )
+    assert (thought.reward, answered.reward) == (0.0, 1.0)
+
+
 def test_format_verification_rules():
     from torchtitan.rl.examples.nemo_gym.rubric import grade_format_verification
 

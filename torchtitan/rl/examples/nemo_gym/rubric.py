@@ -1007,7 +1007,9 @@ class RewardNemoGym(JudgeRewardFn):
         if not rollout.turns:
             return 0.0
         message = rollout.turns[-1].completion_message
-        response = (message.get("content") or "") if message else ""
+        # Rule graders read the answer after the last </think> only: a \boxed{} in the thinking
+        # must not win when the final answer says otherwise.
+        response = _THINK.sub("", (message.get("content") or "") if message else "")
         fields = env_input.fields
         if env_input.agent == MATH:
             result = await self._math.score(

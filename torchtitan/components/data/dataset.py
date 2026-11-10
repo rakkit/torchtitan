@@ -210,6 +210,8 @@ class WeightedDataset:
 
     dataset: DatasetConfig
     weight: float = 1.0
+    tokens_per_document: float | None = None
+    """Mean tokens per document; only `TokenWeightedMixConfig` reads it (start phase)."""
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -323,12 +325,14 @@ class TokenWeightedMixConfig:
     The choice depends only on the token counts. Every rank emits the same tokens
     per step, so ranks starting alike would reach a small child's turn at the same
     step (all ranks on it in one step, none in the next ones). So DP rank r starts
-    with a PHASE: the counts the same choice reaches after r microbatches of
-    max_context_length pieces (`_rank_phase`), added to its own counts when it
-    chooses. The ranks of one step then sit at consecutive microbatches of one
-    schedule, which follow the weights (as `_RankOffsetMixIterDataset` does for the
-    per-dataset packing). Each rank still reads its own shard of every child from
-    its start. With `repeat=False` the mix stops at the first exhausted child.
+    with a PHASE: the counts the same choice reaches after r microbatches' tokens
+    (`_rank_phase`), each child's pieces sized min(max_context_length, its
+    `tokens_per_document`) so that its start is off by at most one of its own pieces;
+    the phase is added to the rank's own counts when it chooses. The ranks of one
+    step then sit at consecutive microbatches of one schedule, which follow the
+    weights (as `_RankOffsetMixIterDataset` does for the per-dataset packing). Each
+    rank still reads its own shard of every child from its start. With
+    `repeat=False` the mix stops at the first exhausted child.
     """
 
     datasets: tuple[WeightedDataset, ...]
@@ -368,22 +372,36 @@ class TokenWeightedMixConfig:
             max_context_length=context.max_context_length,
             phase=_rank_phase(
                 weights,
-                pieces=dataset_iteration_policy.dp_rank
-                * (context.num_tokens_per_microbatch // context.max_context_length),
-                piece_tokens=context.max_context_length,
+                tokens=dataset_iteration_policy.dp_rank
+                * context.num_tokens_per_microbatch,
+                piece_tokens=[
+                    max(
+                        1,
+                        round(
+                            min(context.max_context_length, item.tokens_per_document)
+                        ),
+                    )
+                    if item.tokens_per_document
+                    else context.max_context_length
+                    for item in self.datasets
+                ],
             ),
         )
 
 
-def _rank_phase(weights: list[float], *, pieces: int, piece_tokens: int) -> list[int]:
-    """Per child, the tokens the token-weighted choice gives it in its first
-    `pieces` pieces of `piece_tokens` tokens: a DP rank's start in the common
-    schedule (`TokenWeightedMixConfig`)."""
+def _rank_phase(
+    weights: list[float], *, tokens: int, piece_tokens: list[int]
+) -> list[int]:
+    """Per child, the tokens the token-weighted choice gives it until `tokens` tokens
+    are emitted, child i's pieces `piece_tokens[i]` long: a DP rank's start in the
+    common schedule (`TokenWeightedMixConfig`)."""
     counts = [0] * len(weights)
     heap = [(0.0, index) for index in range(len(weights))]  # (count / weight, index)
-    for _ in range(pieces):
+    emitted = 0
+    while emitted < tokens:
         _, index = heapq.heappop(heap)
-        counts[index] += piece_tokens
+        counts[index] += piece_tokens[index]
+        emitted += piece_tokens[index]
         heapq.heappush(heap, (counts[index] / weights[index], index))
     return counts
 

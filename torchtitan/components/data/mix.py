@@ -55,6 +55,10 @@ class DatasetSpec:
     weight: float = 1.0
     """Relative selection weight. Normalized against the other datasets, so only ratios
     matter. Selects documents."""
+    tokens_per_document: float | None = None
+    """Mean tokens per document (measured, e.g. data_tokens / data_docs of a run). The
+    token-weighted mix sizes this dataset's start phase in pieces of
+    min(max_context_length, this) (`TokenWeightedMixConfig`); None: max_context_length."""
     text_key: str = "text"
     """Column to read. Validated against the manifest at startup."""
     manifest_path: str | None = None
@@ -135,6 +139,7 @@ class KeyedDatasetMixConfig(DatasetMixConfig):
                     seed=alias_seed(base_seed, alias),
                 ),
                 weight=item.weight,
+                tokens_per_document=item.tokens_per_document,
             )
             for item, alias in zip(self.datasets, self.aliases)
         ]
@@ -240,6 +245,7 @@ def build_mix(
                     processor=processor,
                 ),
                 weight=dataset.weight,
+                tokens_per_document=dataset.tokens_per_document,
             )
         )
     return KeyedDatasetMixConfig(

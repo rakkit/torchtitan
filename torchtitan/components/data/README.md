@@ -349,7 +349,27 @@ between the two loaders:
 | `packing=` | name | how it mixes | per step, off the weights (4.19M tokens / step, 46 datasets) |
 | --- | --- | --- | --- |
 | `"concat_then_split_per_dataset"` | per-dataset rows | each dataset packed into its own rows of `max_context_length`; grain's mix picks rows; DP rank r starts at r x rows per microbatch | 3.2% median, 6.5% max (100 steps: 0.6%) |
-| `"concat_then_split"` | pool | `TokenWeightedMixConfig`: documents cut into pieces of at most `max_context_length`; the next piece comes from the dataset furthest below its token share; pieces packed into microbatch-long rows | every rank within one piece per dataset |
+| `"concat_then_split"` | pool | `TokenWeightedMixConfig`: documents cut into pieces of at most `max_context_length`; the next piece comes from the dataset furthest below its token share (DP rank r starts at its phase in the schedule); pieces packed into microbatch-long rows | every rank within one piece per dataset; per step ~5.4% median, 7.7% max (simulation, 64 GPUs) |
+
+Per step, the two loaders do not shrink their error alike with the number of GPUs (test fixture, 15 datasets, 4
+nominal pieces per GPU per step, per-step distance to the weights, median / max):
+
+| GPUs | pool | per-dataset rows |
+| --- | --- | --- |
+| 4 | 20.4% / 33.4% | 13.2% / 22.5% |
+| 16 | 9.8% / 17.8% | 4.4% / 6.1% |
+| 64 | 5.0% / 7.1% | 1.2% / 1.6% |
+
+Per-dataset rows are equal units on one shared sequence, and the GPUs of a step take neighbouring places in it, so the
+error falls like 1 / GPUs. Pool pieces have each document's own length and every GPU balances only its own stream, so
+the GPUs' errors add like a random walk: 1 / sqrt(GPUs). Both converge to the weights over steps. The pool's start
+phase (rank r starts with the counts the schedule reaches after r microbatches of full pieces) keeps the GPUs from
+taking a rare dataset in the same step (without it, all 4 GPUs of a 1-node smoke took the same < 1% dataset in one step
+142 times in 60 steps, 5 if independent). The phase sizes each dataset's pieces as
+min(`max_context_length`, `DatasetSpec.tokens_per_document`): give the measured mean (e.g. `data_tokens` / `data_docs`
+of a run). Without it a dataset counts in full pieces, and a short-document dataset then starts up to one full piece
+off and catches up over the first steps after a start, a stage switch or a DP change (fixture, 16 GPUs: steps 0-4
+22.5, 10.1, 8.0, 6.1, 6.7% off the weights without, 3.2, 3.1, 2.8, 5.0, 2.4% with).
 
 Example, `max_context_length` 16k, 64k tokens per GPU, web documents A (5k), B (3k), C (40k):
 
@@ -372,9 +392,9 @@ segment. The pool keeps more segments at full length (test fixture, 13-token doc
 State and metrics:
 - per-dataset rows: the children's cursors and grain's mix index (each rank's start position, kept across a stage
   switch and a DP change).
-- pool: the children's cursors (at the start of a partly emitted document), the next piece per child (`pieces`), and the
-  tokens drawn per child (`tokens`). An exact resume re-reads at most one document per child. A stage switch or a DP
-  change starts the counts and pieces at 0.
+- pool: the children's cursors (at the start of a partly emitted document), the next piece per child (`pieces`), the
+  tokens drawn per child (`tokens`) and this rank's start `phase`. An exact resume re-reads at most one document per
+  child. A stage switch or a DP change starts the counts and pieces at 0 and takes the rank's fresh phase.
 - both log `data_docs/{alias}` (documents read, per rank); the pool also logs `data_tokens/{alias}` (tokens drawn, per
   rank, cumulative): the per-step share of a dataset is the difference between two logged steps summed over ranks.
 

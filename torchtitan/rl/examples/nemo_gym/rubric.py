@@ -1021,6 +1021,25 @@ class RewardNemoGym(JudgeRewardFn):
                 ground_truth=str(fields["expected_answer"]),
             )
             reward = result.score
+            if env_input.agent == NS_TOOLS:
+                # the latest tool counters the env reported (env.py _tool_counts)
+                counts = next(
+                    (
+                        t.env_rewards
+                        for t in reversed(rollout.turns)
+                        if any(k.startswith("tool/") for k in t.env_rewards)
+                    ),
+                    {},
+                )
+                rollout.turns[-1].metrics.extend(
+                    [m.Metric(f"nemo_gym/{k}", m.Mean(v)) for k, v in counts.items()]
+                    + [
+                        m.Metric(
+                            "nemo_gym/tool/used",
+                            m.Mean(float(counts.get("tool/tool_calls", 0.0) > 0)),
+                        )
+                    ]
+                )
         elif env_input.agent == MCQA:
             template = fields.get("template_metadata") or {}
             reward = grade_mcqa(

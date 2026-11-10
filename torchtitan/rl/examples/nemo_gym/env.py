@@ -86,9 +86,51 @@ class NemoGymEnv(MessageEnv):
     async def step(self, completion_message: Message) -> MessageEnvStepOutput:
         if self._tool_env is None:
             return MessageEnvStepOutput(done=True)
-        env_messages, done = await self._tool_env.step(completion_message)
-        return MessageEnvStepOutput(env_messages=env_messages, done=done)
+        message = dict(completion_message)
+        if message.get("tool_calls"):
+            message["tool_calls"] = [
+                _openai_tool_call(call, i)
+                for i, call in enumerate(message["tool_calls"])
+            ]
+        env_messages, done = await self._tool_env.step(message)
+        # tool counters so far, read by the rubric as nemo_gym/tool/* metrics
+        return MessageEnvStepOutput(
+            env_messages=env_messages,
+            done=done,
+            env_rewards=_tool_counts(self._tool_env),
+        )
 
     async def close(self) -> None:
         if self._tool_env is not None:
             await self._tool_env.close()
+
+
+def _openai_tool_call(call: object, index: int) -> dict:
+    """A renderers ParsedToolCall (how `TokenEnv` parses a reply) as the OpenAI-style dict
+    the framework-free tool env reads. A call that did not parse keeps its raw text as the
+    arguments, so the env answers with a tool error instead of the rollout failing."""
+    if isinstance(call, dict):
+        return call
+    status = getattr(call, "status", None)
+    ok = status is None or getattr(status, "name", str(status)) == "OK"
+    return {
+        "id": getattr(call, "id", None) or f"call_{index}",
+        "type": "function",
+        "function": {
+            "name": getattr(call, "name", None),
+            "arguments": getattr(call, "arguments", None) if ok else call.raw,
+        },
+    }
+
+
+def _tool_counts(tool_env) -> dict[str, float]:
+    """The rollout's tool counters (calls, bad / capped calls, seconds, and the sandbox
+    session's timeouts, memory stops, dead sessions, refused forks, cut outputs)."""
+    counts = {
+        k: v
+        for k, v in tool_env.info.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+    if tool_env.session is not None:
+        counts.update({f"session_{k}": v for k, v in tool_env.session.stats.items()})
+    return {f"tool/{k}": float(v) for k, v in counts.items()}

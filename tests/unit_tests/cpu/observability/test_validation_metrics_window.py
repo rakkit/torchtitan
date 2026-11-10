@@ -47,3 +47,45 @@ def test_validation_is_measured_on_its_own_window(monkeypatch) -> None:
     assert processor.data_loading_times == []
     assert processor.device_memory_monitor.resets == 1
     assert processor.step_last_log == 10
+
+
+def _processor(logged: dict, *, logs_global: bool) -> MetricsProcessor:
+    processor = object.__new__(MetricsProcessor)
+    processor.parallelism_context = SimpleNamespace(non_data_parallel_size=1)
+    processor.color = NoColor()
+    processor.loggers = [SimpleNamespace(log=lambda m, step: logged.update(m))]
+    processor.device_memory_monitor = _FakeMemoryMonitor()
+    processor.gpu_peak_flops = 1e15
+    processor.has_quantization = False
+    processor.ntokens_since_last_log = 5000
+    processor.data_loading_times = [0.5]
+    processor.time_last_log = 50.0
+    processor.step_last_log = 8
+    processor._logs_global_metrics = logs_global
+    return processor
+
+
+def test_global_metrics_only_from_the_metrics_rank(monkeypatch) -> None:
+    # every rank has a logger (save_for_all_ranks): the loss is the same on all of them, so
+    # only the metrics rank logs it; per-GPU and rank-local values come from every rank
+    monkeypatch.setattr(metrics.time, "perf_counter", lambda: 60.0)
+    for logs_global in (True, False):
+        logged: dict = {}
+        _processor(logged, logs_global=logs_global).log(
+            10,
+            2.5,
+            3.0,
+            0.7,
+            {"lr": 1e-3},
+            num_flops=1e12,
+            local_metrics={"data_docs/a": 4},
+        )
+        assert ("loss_metrics/global_avg_loss" in logged) is logs_global
+        assert ("grad_norm" in logged) is logs_global and (
+            "lr" in logged
+        ) is logs_global
+        assert "throughput(tps)" in logged and logged["data_docs/a"] == 4
+        logged.clear()
+        _processor(logged, logs_global=logs_global).log_validation(loss=1.0, step=10)
+        assert ("validation_metrics/loss" in logged) is logs_global
+        assert "validation_metrics/throughput(tps)" in logged

@@ -712,9 +712,10 @@ class Trainer(Configurable):
             engine.num_completed_steps
         )
         extra_metrics.update(data_mix)
-        extra_metrics.update({k: int(v) for k, v in data_docs.items()})
+        # this rank's data cursors and its shard's optimizer statistics: every rank logs its own
+        local_metrics = {k: int(v) for k, v in data_docs.items()}
         if disco is not None:
-            extra_metrics.update(disco.collect_metrics(engine.num_completed_steps))
+            local_metrics.update(disco.collect_metrics(engine.num_completed_steps))
         self.metrics_processor.log(
             engine.num_completed_steps,
             global_avg_loss,
@@ -722,6 +723,7 @@ class Trainer(Configurable):
             float(grad_norm.item()),
             extra_metrics=extra_metrics,
             num_flops=mean_num_flops,
+            local_metrics=local_metrics,
         )
 
     @record

@@ -459,7 +459,15 @@ class MetricsProcessor(Configurable):
         ft_replica_id (int): Fault tolerance replica ID.
         config_dict (dict | None): Full job config dict for logging.
         tag (str | None): Prefix for metric names. Defaults to None.
+
+    With a logger on every rank (`save_for_all_ranks`), only the metrics rank logs
+    the step's GLOBAL values (loss, grad norm, the trainer's reduced extras,
+    validation loss); every rank logs its own per-GPU values (throughput, timing,
+    memory) and its `local_metrics`, so a run group holds one copy of each global
+    curve and one per-GPU curve per rank.
     """
+
+    _logs_global_metrics: bool = True
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
@@ -548,6 +556,7 @@ class MetricsProcessor(Configurable):
             metrics_rank = _get_metrics_rank(
                 parallelism_context=parallelism_context, pp_schedule=pp_schedule
             )
+            self._logs_global_metrics = rank == metrics_rank
             log_dir = os.path.join(
                 dump_folder,
                 config.save_tb_folder,
@@ -612,6 +621,7 @@ class MetricsProcessor(Configurable):
         extra_metrics: dict[str, Any] | None = None,
         *,
         num_flops: float,
+        local_metrics: dict[str, Any] | None = None,
     ):
         """
         Log training metrics including loss, throughput, and memory statistics.
@@ -623,8 +633,10 @@ class MetricsProcessor(Configurable):
             global_max_loss: Maximum local loss across all ranks
                 Defined as max(local_loss_sum / local_valid_tokens)
             grad_norm: Gradient norm after clipping
-            extra_metrics: Optional additional metrics to log
+            extra_metrics: Optional additional GLOBAL metrics (the same on every rank)
             num_flops: Mean model-wide logical FLOPs per DP replica in this interval
+            local_metrics: Optional metrics of this rank only (e.g. its data cursors,
+                its shard's optimizer statistics), logged by every rank
 
         """
 
@@ -650,9 +662,6 @@ class MetricsProcessor(Configurable):
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
         metrics = {
-            "loss_metrics/global_avg_loss": global_avg_loss,
-            "loss_metrics/global_max_loss": global_max_loss,
-            "grad_norm": grad_norm,
             "throughput(tps)": tps,
             "tflops": tflops,
             "time_metrics/end_to_end(s)": time_end_to_end,
@@ -667,9 +676,17 @@ class MetricsProcessor(Configurable):
         }
         if mfu is not None:
             metrics["mfu(%)"] = mfu
-
-        if extra_metrics:
-            metrics.update(extra_metrics)
+        if self._logs_global_metrics:
+            metrics.update(
+                {
+                    "loss_metrics/global_avg_loss": global_avg_loss,
+                    "loss_metrics/global_max_loss": global_max_loss,
+                    "grad_norm": grad_norm,
+                    **(extra_metrics or {}),
+                }
+            )
+        if local_metrics:
+            metrics.update(local_metrics)
 
         for metric_logger in self.loggers:
             metric_logger.log(metrics, step)
@@ -709,7 +726,7 @@ class MetricsProcessor(Configurable):
         tag: str | None = None,
     ):
         if tag is not None:  # another weight set scored at this step: its loss only
-            for metric_logger in self.loggers:
+            for metric_logger in self.loggers if self._logs_global_metrics else ():
                 metric_logger.log({f"validation_metrics/{tag}/loss": loss}, step)
             logger.info(
                 f"{self.color.yellow}validate step: {step:2}  [{tag}]  {self.color.green}loss: {loss:7.4f}{self.color.reset}"
@@ -727,7 +744,6 @@ class MetricsProcessor(Configurable):
         )
 
         metrics = {
-            "validation_metrics/loss": loss,
             "validation_metrics/throughput(tps)": tps,
             "validation_metrics/memory/max_active(GiB)": device_mem_stats.max_active_gib,
             "validation_metrics/memory/max_active(%)": device_mem_stats.max_active_pct,
@@ -735,8 +751,8 @@ class MetricsProcessor(Configurable):
             "validation_metrics/memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
         }
 
-        if extra_metrics:
-            metrics.update(extra_metrics)
+        if self._logs_global_metrics:
+            metrics.update({"validation_metrics/loss": loss, **(extra_metrics or {})})
 
         for metric_logger in self.loggers:
             metric_logger.log(metrics, step)

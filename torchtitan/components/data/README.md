@@ -340,6 +340,47 @@ token_ratio_mix_ds = DatasetMixConfig(
 
 Automatic adjustment from observed document or supervised-token counts is not implemented. A custom mix can maintain per-dataset moving averages and rebalance its weights.
 
+### Weights as token shares per step: the two pretraining loaders
+
+`make_pretrain_dataloader_config(datasets, packing=...)` (`mix.py`) builds the pretraining and midtraining loader from
+`DatasetSpec` records. Each weight is that dataset's share of the TOKENS of every optimizer step. One word switches
+between the two loaders:
+
+| `packing=` | name | how it mixes | per step, off the weights (4.19M tokens / step, 46 datasets) |
+| --- | --- | --- | --- |
+| `"concat_then_split_per_dataset"` | per-dataset rows | each dataset packed into its own rows of `max_context_length`; grain's mix picks rows; DP rank r starts at r x rows per microbatch | 3.2% median, 6.5% max (100 steps: 0.6%) |
+| `"concat_then_split"` | pool | `TokenWeightedMixConfig`: documents cut into pieces of at most `max_context_length`; the next piece comes from the dataset furthest below its token share; pieces packed into microbatch-long rows | every rank within one piece per dataset |
+
+Example, `max_context_length` 16k, 64k tokens per GPU, web documents A (5k), B (3k), C (40k):
+
+```
+per-dataset rows: web's stream cut every 16k, a row = one dataset
+  web rows: [A 5k | B 3k | C 0-8k] [C 8-24k] [C 24-40k ...]
+  GPU 0:    [web row][code row][math row][web row]
+  C's segments: 8k, 8k, 8k, 8k, 8k   (cut at C's own 16k marks AND at every row end)
+
+pool: pieces cut at each document's own 16k marks, mixed by token share, then packed
+  web pieces: A 5k, B 3k, C 0-16k, C 16-32k, C 32-40k
+  GPU 0:    [A][code][C 0-16k][math][B][qa][C 16-32k ...]   (cut once more at the 64k end)
+  C's segments: 16k, 16k, 8k
+```
+
+Attention never crosses a position reset (document start, piece start, row start), so a token's context is its
+segment. The pool keeps more segments at full length (test fixture, 13-token documents, `max_context_length` 8:
+70 full segments of 331 vs 16 of 414 for per-dataset rows), at the price of more global-attention work per token.
+
+State and metrics:
+- per-dataset rows: the children's cursors and grain's mix index (each rank's start position, kept across a stage
+  switch and a DP change).
+- pool: the children's cursors (at the start of a partly emitted document), the next piece per child (`pieces`), and the
+  tokens drawn per child (`tokens`). An exact resume re-reads at most one document per child. A stage switch or a DP
+  change starts the counts and pieces at 0.
+- both log `data_docs/{alias}` (documents read, per rank); the pool also logs `data_tokens/{alias}` (tokens drawn, per
+  rank, cumulative): the per-step share of a dataset is the difference between two logged steps summed over ranks.
+
+Cost of the pool: one comparison over the datasets per piece and one partly emitted document per dataset in memory.
+`first_fit` uses the same token-weighted mix. SFT (`sft.py`) keeps grain's mix: there a weight selects conversations.
+
 ### Concatenate datasets
 
 Use concatenation to treat finite datasets as one corpus. Every row appears once; dataset sizes determine their proportions. Use mixing instead for explicit weights or streaming datasets.

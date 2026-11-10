@@ -262,11 +262,12 @@ def make_pretrain_dataloader_config(
 ) -> KeyedMixDataLoader.Config:
     """Build a complete dataloader config from the dataset record list.
 
-    ``concat_then_split`` mixes documents by TOKEN weight (`TokenWeightedMixConfig`:
-    the next document comes from the dataset furthest below its share) and packs them
-    into microbatch-long rows; a document is cut only every ``max_context_length`` of
-    its own tokens and at the row end, and each rank's microbatch follows the weights
-    to within one document per dataset. ``first_fit`` uses the same mix.
+    ``concat_then_split`` (the pool) mixes by TOKEN weight (`TokenWeightedMixConfig`:
+    documents cut into pieces of at most ``max_context_length``, the next piece from the
+    dataset furthest below its share) and packs the pieces into microbatch-long rows, so
+    every rank follows the weights to within one piece per dataset. ``first_fit`` uses
+    the same mix. The data README ("the two pretraining loaders") compares it with
+    ``concat_then_split_per_dataset``.
     ``concat_then_split_per_dataset`` packs each dataset into its own rows of
     ``max_context_length`` tokens and mixes those rows, so a weight is that dataset's
     share of TOKENS (the data README's "pack each child before mixing"); a microbatch

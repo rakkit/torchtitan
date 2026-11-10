@@ -348,8 +348,22 @@ between the two loaders:
 
 | `packing=` | name | how it mixes | per step, off the weights (4.19M tokens / step, 46 datasets) |
 | --- | --- | --- | --- |
-| `"concat_then_split_per_dataset"` | per-dataset rows | each dataset packed into its own rows of `max_context_length`; grain's mix picks rows; DP rank r starts at r x rows per microbatch | 3.2% median, 6.5% max (100 steps: 0.6%) |
+| `"concat_then_split_per_dataset"` | per-dataset rows | each dataset packed into its own rows of `max_context_length`; grain's mix picks rows; the GPUs' n-th microbatches take block n of the one sequence (`_StridedMixIterDataset`) | 3.2% median, 6.5% max (100 steps: 0.6%) |
 | `"concat_then_split"` | pool | `TokenWeightedMixConfig`: documents cut into pieces of at most `max_context_length`; the next piece comes from the dataset furthest below its token share (DP rank r starts at its phase in the schedule); pieces packed into microbatch-long rows | every rank within one piece per dataset; per step ~5.4% median, 7.7% max (simulation, 64 GPUs) |
+
+Per dataset, tokens received / tokens due (1.00 = exact; fixture, 64 GPUs, 15 datasets with short and long
+documents, 60 steps). Per-step distance alone hides the small datasets: 1 point off is nothing for a 20% dataset and
+doubles a 1% one.
+
+| weight class | pool, one step (10th-90th pct) | pool, 10-step averages | per-dataset rows, one step | per-dataset rows, 10-step averages |
+| --- | --- | --- | --- | --- |
+| >= 10% | 0.90-1.13 | 0.99-1.01 | 0.98-1.02 | 1.00 |
+| 2-8% | 0.83-1.20 | 0.99-1.02 | 0.91-1.17 | 0.99-1.02 |
+| 0.5-1.5% | 0.56-1.39 | 0.89-1.08 (a long-document 0.7% set: 0.73-1.12) | 0.49-1.56 | 0.94-1.06 |
+
+One step cannot be exact for a small dataset with either loader (a 0.5% dataset due 1.3 pieces per step gets 1 or 2).
+Before the strided blocks (83446e6bc), the ranks of a step shared a window that moved 4 positions per step, and a 0.5%
+dataset got 76% of its due over 50 steps and 8% over one 10-step stretch.
 
 Per step, the two loaders do not shrink their error alike with the number of GPUs (test fixture, 15 datasets, 4
 nominal pieces per GPU per step, per-step distance to the weights, median / max):
@@ -390,8 +404,8 @@ segment. The pool keeps more segments at full length (test fixture, 13-token doc
 70 full segments of 331 vs 16 of 414 for per-dataset rows), at the price of more global-attention work per token.
 
 State and metrics:
-- per-dataset rows: the children's cursors and grain's mix index (each rank's start position, kept across a stage
-  switch and a DP change).
+- per-dataset rows: the children's cursors and the mix index (this rank's rows; a stage switch or a DP change starts it
+  at 0, which is the rank's own block).
 - pool: the children's cursors (at the start of a partly emitted document), the next piece per child (`pieces`), the
   tokens drawn per child (`tokens`) and this rank's start `phase`. An exact resume re-reads at most one document per
   child. A stage switch or a DP change starts the counts and pieces at 0 and takes the rank's fresh phase.

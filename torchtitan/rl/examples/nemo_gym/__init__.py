@@ -9,7 +9,7 @@ from torchtitan.rl.examples.nemo_gym.data import (
     NemoGymSample,
     read_nemo_gym_rows,
 )
-from torchtitan.rl.examples.nemo_gym.env import NemoGymEnv
+from torchtitan.rl.examples.nemo_gym.env import NemoGymEnv, PythonToolConfig
 from torchtitan.rl.examples.nemo_gym.rubric import (
     grade_mcqa,
     grade_structured_output,
@@ -20,6 +20,7 @@ from torchtitan.rl.examples.nemo_gym.rubric import (
 __all__ = [
     "NemoGymDataset",
     "NemoGymEnv",
+    "PythonToolConfig",
     "NemoGymRubric",
     "NemoGymSample",
     "RewardNemoGym",

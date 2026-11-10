@@ -41,6 +41,7 @@ import yaml
 from torchtitan.rl.examples.dapo_math.math_verify_pool import MathVerifyPool
 from torchtitan.rl.examples.nemo_gym.calendar import grade_calendar
 from torchtitan.rl.examples.nemo_gym.data import NemoGymSample
+from torchtitan.rl.examples.nemo_gym.env import NS_TOOLS
 from torchtitan.rl.examples.nemo_gym.reasoning_gym import grade_reasoning_gym
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout
@@ -1011,7 +1012,10 @@ class RewardNemoGym(JudgeRewardFn):
         # must not win when the final answer says otherwise.
         response = _THINK.sub("", (message.get("content") or "") if message else "")
         fields = env_input.fields
-        if env_input.agent == MATH:
+        if env_input.agent in (
+            MATH,
+            NS_TOOLS,
+        ):  # ns_tools: math solved with a Python tool
             result = await self._math.score(
                 response=response,
                 ground_truth=str(fields["expected_answer"]),

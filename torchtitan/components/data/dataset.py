@@ -300,25 +300,28 @@ class _RankOffsetMixIterDataset(grain.IterDataset):
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class TokenWeightedMixConfig:
-    """Interleave weighted children of DOCUMENTS so that each child's share of the
-    emitted TOKENS follows its weight.
+    """Interleave weighted children so that each child's share of the emitted TOKENS
+    follows its weight, one PIECE at a time.
 
-    Each next document comes from the child whose emitted tokens divided by its
-    weight is smallest (ties: the first child). The shares track the weights to
-    within one document per child at any point, whatever the document lengths, so
-    no per-corpus length statistics are needed; the state is the children's
-    cursors plus one token count per child. Pack the output with a packer, e.g.
-    ConcatThenSplit: every row then holds documents of several children (unlike
-    per-child packing, where one row is one child).
+    Each child's documents are cut where the packer cuts them anyway (at every
+    document start and every ``max_context_length`` tokens after it, as
+    `_text_sequence_to_packing_input` assigns positions), and the next piece comes
+    from the child whose emitted tokens divided by its weight is smallest (ties: the
+    first child). Every rank's shares then track the weights to within one piece per
+    child, whatever the document lengths: a 500k-token document is spread over many
+    microbatches instead of filling one rank's microbatches back to back. A packer
+    sees exactly the pieces whole documents would have given it. The state is the
+    children's cursors (at the start of a partly emitted document), the offset into
+    that document, and one token count per child.
 
-    Example, weights 1 : 1, child A's documents 2 tokens, child B's 6::
+    Example, weights 1 : 1, max_context_length 4, child A's documents 2 tokens,
+    child B's 10 (pieces 4, 4, 2)::
 
-        A B A A A B A A A B ...   (A gets three documents per B document)
+        A B A A B A B ...   (A2 B4 A2 A2 B4 A2 B2: equal tokens)
 
-    The choice depends only on the token counts, so DP ranks start alike; each
-    rank reads its own shard of every child, and the ranks drift apart as their
-    documents' lengths differ. With `repeat=False` the mix stops at the first
-    exhausted child.
+    The choice depends only on the token counts, so DP ranks start alike; each rank
+    reads its own shard of every child. With `repeat=False` the mix stops at the
+    first exhausted child.
     """
 
     datasets: tuple[WeightedDataset, ...]
@@ -352,29 +355,86 @@ class TokenWeightedMixConfig:
             for child in children
         ]
         return _TokenWeightedMixIterDataset(
-            children, weights=[item.weight for item in self.datasets]
+            children,
+            weights=[item.weight for item in self.datasets],
+            max_context_length=context.max_context_length,
         )
 
 
+def _piece_starts(document: TextSequence, max_context_length: int) -> np.ndarray:
+    """Where the packer restarts positions: every document start and every
+    max_context_length tokens after it (`_text_sequence_to_packing_input`)."""
+    token_indices = np.arange(len(document.input_ids), dtype=np.int64)
+    document_starts = 0
+    if document.positions is not None:
+        document_starts = np.maximum.accumulate(
+            np.where(np.asarray(document.positions) == 0, token_indices, 0)
+        )
+    return np.flatnonzero((token_indices - document_starts) % max_context_length == 0)
+
+
+def _slice(document: TextSequence, start: int, end: int) -> TextSequence:
+    def cut(field: np.ndarray | None) -> np.ndarray | None:
+        return None if field is None else np.asarray(field)[start:end]
+
+    return TextSequence(
+        input_ids=cut(document.input_ids),
+        labels=cut(document.labels),
+        positions=cut(document.positions),
+        padding_mask=cut(document.padding_mask),
+    )
+
+
 class _TokenWeightedMixIterDataset(grain.IterDataset):
-    def __init__(self, parents: list[grain.IterDataset], *, weights: list[float]):
+    def __init__(
+        self,
+        parents: list[grain.IterDataset],
+        *,
+        weights: list[float],
+        max_context_length: int,
+    ):
         super().__init__(parents)
         self._weights = weights
+        self._max_context_length = max_context_length
 
     def __iter__(self):
         return _TokenWeightedMixIterator(
-            [parent.__iter__() for parent in self._parents], self._weights
+            [parent.__iter__() for parent in self._parents],
+            self._weights,
+            self._max_context_length,
         )
 
 
 class _TokenWeightedMixIterator(grain.DatasetIterator):
     # The state keeps grain's mix layout ("parents" = the children's cursors), so
     # keyed_mix_state finds and re-keys the cursors as for grain's own mix.
-    def __init__(self, parents: list[grain.DatasetIterator], weights: list[float]):
+    def __init__(
+        self,
+        parents: list[grain.DatasetIterator],
+        weights: list[float],
+        max_context_length: int,
+    ):
         super().__init__(parents)
         self._weights = weights
+        self._max_context_length = max_context_length
         self._tokens = [0] * len(parents)
+        # per child: its partly emitted document, the cursor before it, the next
+        # piece's index into that document's piece starts
+        self._document: list[TextSequence | None] = [None] * len(parents)
+        self._starts: list[np.ndarray | None] = [None] * len(parents)
+        self._cursor: list[Any] = [None] * len(parents)
+        self._piece = [0] * len(parents)
         self._stop = False
+
+    def _fetch(self, index: int) -> None:
+        cursor = self._parents[index].get_state()
+        document = next(self._parents[index])
+        while len(document.input_ids) == 0:
+            cursor = self._parents[index].get_state()
+            document = next(self._parents[index])
+        self._document[index], self._cursor[index] = document, cursor
+        self._starts[index] = _piece_starts(document, self._max_context_length)
+        self._piece[index] = 0
 
     def __next__(self) -> TextSequence:
         if self._stop:
@@ -383,24 +443,53 @@ class _TokenWeightedMixIterator(grain.DatasetIterator):
             range(len(self._parents)),
             key=lambda i: self._tokens[i] / self._weights[i],
         )
-        try:
-            document = next(self._parents[index])
-        except StopIteration:
-            self._stop = True
-            raise
-        self._tokens[index] += len(document.input_ids)
-        return document
+        if self._document[index] is None:
+            try:
+                self._fetch(index)
+            except StopIteration:
+                self._stop = True
+                raise
+        document, starts, piece = (
+            self._document[index],
+            self._starts[index],
+            self._piece[index],
+        )
+        start = int(starts[piece])
+        end = (
+            int(starts[piece + 1])
+            if piece + 1 < len(starts)
+            else len(document.input_ids)
+        )
+        if piece + 1 < len(starts):
+            self._piece[index] = piece + 1
+        else:
+            self._document[index] = self._starts[index] = self._cursor[index] = None
+        self._tokens[index] += end - start
+        return _slice(document, start, end)
 
     def get_state(self) -> dict[str, Any]:
         return {
-            "parents": [parent.get_state() for parent in self._parents],
+            "parents": [
+                parent.get_state() if self._document[i] is None else self._cursor[i]
+                for i, parent in enumerate(self._parents)
+            ],
+            "pieces": [
+                0 if self._document[i] is None else self._piece[i]
+                for i in range(len(self._parents))
+            ],
             "tokens": list(self._tokens),
             "stop": self._stop,
         }
 
     def set_state(self, state: dict[str, Any]) -> None:
-        for parent, parent_state in zip(self._parents, state["parents"], strict=True):
+        for index, (parent, parent_state) in enumerate(
+            zip(self._parents, state["parents"], strict=True)
+        ):
             parent.set_state(parent_state)
+            self._document[index] = self._starts[index] = self._cursor[index] = None
+            if state["pieces"][index]:  # re-read the partly emitted document
+                self._fetch(index)
+                self._piece[index] = state["pieces"][index]
         self._tokens = list(state["tokens"])
         self._stop = state["stop"]
 

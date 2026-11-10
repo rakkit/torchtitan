@@ -494,3 +494,46 @@ def test_token_counts_resume_exactly_and_restart_on_a_stage_switch(tmp_path):
     staged = [*specs, DatasetSpec(alias="D", path=_corpus(tmp_path / "D", "D", 256))]
     assert tokens_after_load(staged, 2, 1) == [0, 0, 0, 0]
     assert tokens_after_load(specs, 1, 0) == [0, 0, 0]
+
+
+def _long_and_short_specs(tmp_path: Path) -> list[DatasetSpec]:
+    return [
+        DatasetSpec(alias="short", path=_corpus_of(tmp_path / "short", ["ss"] * 4000)),
+        DatasetSpec(alias="long", path=_corpus_of(tmp_path / "long", ["L" * 200] * 40)),
+    ]
+
+
+def test_long_documents_are_mixed_piece_by_piece(tmp_path):
+    # The mix picks max_context_length pieces, not whole documents: a 201-token
+    # document (8-token pieces) is spread over many microbatches instead of filling
+    # ~12 microbatches of this rank back to back, so every microbatch keeps both corpora.
+    short_id, long_id = 10 + ord("s") % 250, 10 + ord("L") % 250
+    loader = _build(_long_and_short_specs(tmp_path), "concat_then_split")
+    iterator = iter(loader)
+    batches = [next(iterator).input.flatten().clone() for _ in range(200)]
+    loader.close()
+    for mb in batches[2:]:
+        assert bool((mb == short_id).any()) and bool((mb == long_id).any())
+    # and the packer still sees the documents' own pieces: no segment longer than 8
+    for mb in batches:
+        assert int((mb == long_id).sum()) <= 16
+
+
+def test_resume_in_the_middle_of_a_cut_document_is_exact(tmp_path):
+    specs = _long_and_short_specs(tmp_path)
+    first = _build(specs, "concat_then_split")
+    iterator = iter(first)
+    for _ in range(7):
+        next(iterator)
+    checkpoint = first.state_dict()
+    pieces = find_mix_node(_rank_state(checkpoint)["iterator"])["pieces"]
+    expected = [next(iterator).input.clone() for _ in range(30)]
+    first.close()
+    assert pieces[1] > 0, "the checkpoint must fall inside a long document"
+
+    second = _build(specs, "concat_then_split")
+    second.load_state_dict(checkpoint)
+    iterator = iter(second)
+    resumed = [next(iterator).input.clone() for _ in range(30)]
+    second.close()
+    assert all((a == b).all() for a, b in zip(resumed, expected, strict=True))

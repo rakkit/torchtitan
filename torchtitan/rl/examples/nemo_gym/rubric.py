@@ -72,7 +72,11 @@ OPEN_QA = "equivalence_llm_judge_simple_agent"
 MULTICHALLENGE = "multichallenge_simple_agent"
 OVER_REFUSAL = "over_refusal_detection_simple_agent"
 
-_RATING_LINE = re.compile(r"^\W*Rating\W*\[\[\s*(10|[1-9])\s*\]\]\W*$", re.IGNORECASE)
+# the prompt asks for "Rating: [[X]]"; Qwen3-30B-A3B-Instruct ends 66% of its replies with "Rating: X"
+# (judge-smoke4: 604 of 609 unparsed replies), so the last line may carry X with or without [[ ]]
+_RATING_LINE = re.compile(
+    r"^\W*Rating\W*(?:\[\[\s*(10|[1-9])\s*\]\]|(10|[1-9]))\W*$", re.IGNORECASE
+)
 _TAG = re.compile(
     r"<\s*/?\s*(?:answer(?:_[12])?|conversation|candidate|response)\s*>", re.IGNORECASE
 )
@@ -490,12 +494,12 @@ _JUDGE_TAIL_CHARS = 300
 
 
 def parse_judge_rating(reply: str) -> float | None:
-    """The judge's rating (1-10) scaled to [0, 1], read only from a last non-empty line
-    ``Rating: [[X]]`` after any ``<think>`` part; None otherwise (a quoted ``[[10]]`` elsewhere
-    does not count)."""
+    """The judge's rating (1-10, a whole number) scaled to [0, 1], read only from a last
+    non-empty line ``Rating: [[X]]`` or ``Rating: X`` after any ``<think>`` part; None otherwise
+    (a quoted ``[[10]]`` elsewhere does not count)."""
     lines = [line for line in _THINK.sub("", reply).splitlines() if line.strip()]
     found = _RATING_LINE.match(lines[-1]) if lines else None
-    return (int(found.group(1)) - 1) / 9 if found else None
+    return (int(found.group(1) or found.group(2)) - 1) / 9 if found else None
 
 
 def parse_judge_comparison(reply: str) -> tuple[float, float, float] | None:

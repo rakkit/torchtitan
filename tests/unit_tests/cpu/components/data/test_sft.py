@@ -569,3 +569,64 @@ def test_row_adapters_cover_the_layouts_the_old_loader_had_builders_for():
             [{"role": "assistant", "tool_calls": [{"function": {"arguments": raw}}]}]
         )
         assert out[0]["tool_calls"][0]["function"]["arguments"] == want, raw
+
+
+def test_sft_weights_are_token_shares_of_whole_conversations(tmp_path):
+    """A weight is a dataset's share of the TOKENS the model trains on (user 11-10 14:5x),
+    and SFT keeps every conversation whole (user 11-10 17:5x: "SFT we want smth close to
+    pool loader because SFT we cannot trunc"). Two datasets at 1 : 1, one of short and one
+    of 6x longer conversations: by conversation count the long one would get ~6x the
+    tokens; by tokens both get about half, and the short one supplies ~6x the conversations.
+    """
+    import json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from torchtitan.components.data.keyed_loader import KeyedMixDataLoader
+    from torchtitan.components.data.mix import DatasetSpec
+    from torchtitan.components.data.parquet_manifest import (
+        build_manifest,
+        MANIFEST_FILENAME,
+        write_manifest,
+    )
+    from torchtitan.components.data.sft import make_sft_dataloader_config
+
+    specs = []
+    for alias, answer in (("short", "a"), ("long", "b" * 45)):
+        root = tmp_path / alias
+        root.mkdir()
+        row = json.dumps(
+            [{"role": "user", "content": "q"}, {"role": "assistant", "content": answer}]
+        )
+        pq.write_table(pa.table({"messages": [row] * 400}), root / "p.parquet")
+        write_manifest(build_manifest(root), root / MANIFEST_FILENAME)
+        specs.append(DatasetSpec(alias=alias, path=str(root), weight=1.0))
+    config = make_sft_dataloader_config(
+        specs,
+        max_context_length=64,
+        num_packing_bins=4,
+        read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=1),
+        num_prefetch_microbatches=1,
+        repeat=True,
+    )
+    loader = KeyedMixDataLoader(
+        config,
+        dp_world_size=1,
+        dp_rank=0,
+        tokenizer=CharTokenizer(),
+        max_context_length=64,
+        num_tokens_per_microbatch=256,
+    )
+    try:
+        iterator = iter(loader)
+        for _ in range(40):
+            next(iterator)
+        metrics = loader.consumption_metrics()
+    finally:
+        loader.close()
+    tokens = {a: metrics[f"data_tokens/{a}"] for a in ("short", "long")}
+    docs = {a: metrics[f"data_docs/{a}"] for a in ("short", "long")}
+    share = tokens["short"] / (tokens["short"] + tokens["long"])
+    assert abs(share - 0.5) < 0.05, (tokens, docs)
+    assert docs["short"] > 4 * docs["long"], docs

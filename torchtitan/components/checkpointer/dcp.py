@@ -17,6 +17,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, cast, Literal, TYPE_CHECKING
 
+import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import HuggingFaceStorageWriter, Metadata
@@ -580,8 +581,6 @@ class CheckpointManager(BaseCheckpointManager):
                     )
                 )
                 # its worker thread would start on GPU 0 (see _set_thread_device_initializer)
-                import torch
-
                 if (
                     torch.cuda.is_available()
                     and self.stager._staging_executor is not None
@@ -595,6 +594,12 @@ class CheckpointManager(BaseCheckpointManager):
                             torch.cuda.current_device()
                         ),
                     )
+            # DefaultStager copies on its own stream, which does not wait for the
+            # current stream. Without this wait, it can copy weights and optimizer
+            # state before the optimizer step finishes writing them.
+            staging_stream = self.stager._staging_stream
+            assert staging_stream is not None
+            staging_stream.wait_stream(torch.accelerator.current_stream())
 
             async_save_started_at = time.monotonic()
             result = self.dcp_save(

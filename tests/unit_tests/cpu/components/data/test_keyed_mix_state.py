@@ -144,15 +144,18 @@ def test_alias_is_independent_of_path():
     assert plan.restored == ("High-Quality", "v1-Code")
 
 
-def test_mix_index_is_reset_when_the_child_set_changes():
-    """`index` drives the interleave and is only valid for the set that produced it."""
+def test_mix_index_restarts_at_the_fresh_start_when_the_child_set_changes():
+    """`index` drives the interleave and is only valid for the set that produced it. A
+    changed set restarts at the live fresh state's index, which is this DP rank's start
+    position (dp_rank * mix_rank_stride), not at 0: 0 on every rank puts all ranks on
+    the same child at the same step."""
     keyed = to_keyed(_loader_state([5, 5], index=10), ["a", "b"])
 
     unchanged, _ = from_keyed(keyed, ["a", "b"])
     assert _mix_index(unchanged) == 10, "unchanged set keeps its phase"
 
-    changed, _ = from_keyed(keyed, ["a", "b", "c"], _loader_state([0, 0, 0], index=99))
-    assert _mix_index(changed) == 0, "changed set must not resume out of phase"
+    changed, _ = from_keyed(keyed, ["a", "b", "c"], _loader_state([0, 0, 0], index=6))
+    assert _mix_index(changed) == 6, "changed set restarts at this rank's fresh start"
 
 
 def test_a_changed_dataset_list_needs_the_live_fresh_state():

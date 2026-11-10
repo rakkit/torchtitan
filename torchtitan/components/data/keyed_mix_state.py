@@ -167,7 +167,9 @@ def from_keyed(
     # `index` counts emitted samples and drives which child the mix draws from next. It
     # is only meaningful for the child set and weights that produced it, so a changed
     # dataset list must not inherit it -- otherwise the interleave resumes out of phase.
-    node["index"] = 0
+    # The fresh state's own index is kept: it is this rank's start position (dp_rank *
+    # mix_rank_stride), and resetting it to 0 put every DP rank on the same dataset at
+    # the same step again.
     return fresh_state, plan
 
 

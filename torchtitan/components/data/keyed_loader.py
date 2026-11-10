@@ -174,7 +174,7 @@ class KeyedMixDataLoader(GrainDataLoader):
         dataset, the rows every old rank had not read in its current pass are
         re-dealt over the new ranks (`redealt_state`). The packer's partial
         document and the mix's draw counter of the old ranks are dropped: the mix
-        and its weights restart from this rank's fresh state."""
+        and its weights restart from this rank's fresh state (its own start position)."""
         old_world = int(state_dict["dp_world_size"])
         old = []
         for rank in range(old_world):
@@ -209,7 +209,8 @@ class KeyedMixDataLoader(GrainDataLoader):
             target.clear()
             target.update(redealt)
             restored.append(alias)
-        node["index"] = 0
+        # the mix restarts at this rank's fresh index (its start position, dp_rank *
+        # mix_rank_stride), never at 0 on every rank
         saved = {alias for cursors in old for alias in cursors}
         plan = RestorePlan(
             restored=tuple(restored),
@@ -238,7 +239,12 @@ def _parquet_sources(dataset_config: Any) -> dict[str, ParquetStreamSource.Confi
             )
     sources = {}
     for alias, item in zip(node.aliases, node.datasets):
-        source = getattr(item.dataset, "source", None)
+        child = (
+            item.dataset
+        )  # per-dataset packing wraps each child in its packer config
+        while not hasattr(child, "source") and hasattr(child, "dataset"):
+            child = child.dataset
+        source = getattr(child, "source", None)
         if not isinstance(source, ParquetStreamSource.Config):
             raise ValueError(
                 f"dataset {alias!r}: re-dealing after a data-parallel degree change "

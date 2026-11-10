@@ -77,7 +77,13 @@ def _loader(
     return _build(specs, packing)
 
 
-def _build(specs: list[DatasetSpec], packing: str):
+def _build(
+    specs: list[DatasetSpec],
+    packing: str,
+    *,
+    dp_world_size: int = 1,
+    dp_rank: int = 0,
+):
     # Deliberately the REAL factory, so the graph carries a packer and the mix state is
     # nested exactly as it is in production. Hand-building a packer-less graph here is
     # what let a broken `state_dict()` pass this suite.
@@ -92,8 +98,8 @@ def _build(specs: list[DatasetSpec], packing: str):
     )
     return KeyedMixDataLoader(
         config,
-        dp_world_size=1,
-        dp_rank=0,
+        dp_world_size=dp_world_size,
+        dp_rank=dp_rank,
         tokenizer=FakeTokenizer(),
         max_context_length=8,
         num_tokens_per_microbatch=16,
@@ -421,3 +427,39 @@ def test_a_dp_degree_change_redeals_every_old_rank_through_the_checkpointer(tmp_
 
 def _rank_state_of(checkpoint: dict, rank: int) -> dict:
     return pickle.loads(checkpoint[f"dp_rank_{rank}"])
+
+
+@pytest.mark.parametrize("packing", PACKINGS)
+def test_rank_start_survives_stage_switch_and_dp_change(tmp_path, packing):
+    # Each DP rank starts its walk through the mix at dp_rank * stride (stride = rows per
+    # microbatch for per-dataset rows), so the ranks of a step draw different datasets. A
+    # restore that resets the mix index to 0 puts every rank on the same dataset again: the
+    # stage switch (changed dataset list) and the DP change must keep each rank's own start.
+    stride = (
+        2 if packing == "concat_then_split_per_dataset" else 1
+    )  # 16 tokens / 8 per row
+    specs = [DatasetSpec(alias=i, path=_corpus(tmp_path / i, i, 256)) for i in "ABC"]
+    checkpoint = {}
+    for rank in range(4):
+        loader = _build(specs, packing, dp_world_size=4, dp_rank=rank)
+        assert find_mix_node(loader._iterator.get_state())["index"] == rank * stride
+        _consume(loader, batches=3)
+        checkpoint.update(loader.state_dict())
+        loader.close()
+
+    def index_after_load(new_specs, world, rank, state):
+        loader = _build(new_specs, packing, dp_world_size=world, dp_rank=rank)
+        loader.load_state_dict(state)
+        index = find_mix_node(loader._iterator.get_state())["index"]
+        loader.close()
+        return index
+
+    # same datasets, same DP degree: the exact resume continues from the saved index
+    saved = find_mix_node(_rank_state_of(checkpoint, 3)["iterator"])["index"]
+    assert saved > 3 * stride
+    assert index_after_load(specs, 4, 3, checkpoint) == saved
+    # stage switch (a dataset added): the mix restarts at this rank's own start
+    staged = [*specs, DatasetSpec(alias="D", path=_corpus(tmp_path / "D", "D", 256))]
+    assert index_after_load(staged, 4, 3, checkpoint) == 3 * stride
+    # DP change 4 -> 2: the same, at the new rank's start
+    assert index_after_load(specs, 2, 1, checkpoint) == 1 * stride

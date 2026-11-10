@@ -15,6 +15,7 @@ from typing import Any, cast, Protocol, TypeAlias
 
 import grain.python as grain
 import numpy as np
+from grain._src.python.dataset.transformations import mix as _grain_mix
 
 from torchtitan.components.data.sources import (
     RandomAccessDataSource,
@@ -267,38 +268,100 @@ class DatasetMixConfig:
             else child
             for child in children
         ]
-        mixed = grain.IterDataset.mix(children, weights=weights)
-        if len(children) > 1 and dataset_iteration_policy.dp_rank > 0:
-            mixed = _RankOffsetMixIterDataset(
-                mixed,
-                offset=dataset_iteration_policy.dp_rank * context.mix_rank_stride,
-            )
-        return mixed
+        if len(children) == 1:
+            return grain.IterDataset.mix(children, weights=weights)
+        return _StridedMixIterDataset(
+            children,
+            weights=weights,
+            block=context.mix_rank_stride,
+            ranks=dataset_iteration_policy.dp_world_size,
+            rank=dataset_iteration_policy.dp_rank,
+        )
 
 
-class _RankOffsetMixIterDataset(grain.IterDataset):
-    """Starts this DP rank's walk through the mix's child sequence at its rank.
+class _StridedMixIterDataset(grain.IterDataset):
+    """grain's weighted interleave (`IterDataset.mix`), each DP rank at its own
+    positions of the one sequence.
 
-    grain's IterDataset.mix picks the child of the k-th element from k and the
-    weights only, so without this every DP rank draws the same child at the same
-    position: with one packed element per rank per step (per-dataset packing), a
-    whole global batch came from ONE child. Offset by the rank (times the elements a
-    rank takes per microbatch), the ranks of a step cover consecutive positions of
-    the sequence, which follow the weights. Only
-    the starting position changes; each rank still reads its own shard of every
-    child, and the offset lives in the mix's checkpointed index.
+    grain picks the child of the k-th element from k and the weights only. This
+    rank's i-th element takes position (i // block) * block * ranks + rank * block
+    + i % block (block = elements a rank takes per microbatch), so the ranks' n-th
+    microbatches together take block n of block * ranks consecutive positions, and
+    every round of microbatches follows the weights to within one element per
+    child. (A rank walking consecutive positions from rank * block made the ranks
+    of a step share a window that moved only `block` positions per step: a child due
+    1.3 elements per step got 1 for ~`ranks` steps in a row.) One rank = grain's
+    mix. Only the choice of child changes: each rank reads its own shard of every
+    child, in order. The state keeps grain's layout; "index" counts this rank's
+    elements.
     """
 
-    def __init__(self, parent: grain.IterDataset, *, offset: int):
-        super().__init__(parent)
-        self._offset = offset
+    def __init__(
+        self,
+        parents: list[grain.IterDataset],
+        *,
+        weights: list[float],
+        block: int,
+        ranks: int,
+        rank: int,
+    ):
+        super().__init__(parents)
+        self._proportions = tuple(_grain_mix._float_to_int_proportions(weights))
+        self._block, self._ranks, self._rank = block, ranks, rank
 
     def __iter__(self):
-        iterator = self._parent.__iter__()
-        state = iterator.get_state()
-        state["index"] += self._offset
-        iterator.set_state(state)
-        return iterator
+        return _StridedMixIterator(
+            [parent.__iter__() for parent in self._parents],
+            self._proportions,
+            block=self._block,
+            ranks=self._ranks,
+            rank=self._rank,
+        )
+
+
+class _StridedMixIterator(grain.DatasetIterator):
+    def __init__(
+        self,
+        parents: list[grain.DatasetIterator],
+        proportions: tuple[int, ...],
+        *,
+        block: int,
+        ranks: int,
+        rank: int,
+    ):
+        super().__init__(parents)
+        self._proportions = proportions
+        self._block, self._ranks, self._rank = block, ranks, rank
+        self._index = 0
+        self._stop = False
+
+    def __next__(self):
+        if self._stop:
+            raise StopIteration
+        group, offset = divmod(self._index, self._block)
+        position = (group * self._ranks + self._rank) * self._block + offset
+        child, _ = _grain_mix._dataset_and_key_of_next_element(
+            position, self._proportions
+        )
+        self._index += 1
+        try:
+            return next(self._parents[child])
+        except Exception:
+            self._stop = True  # as grain's mix: stop at the first exhausted child
+            raise
+
+    def get_state(self) -> dict[str, Any]:
+        return {
+            "parents": [parent.get_state() for parent in self._parents],
+            "index": self._index,
+            "stop": self._stop,
+        }
+
+    def set_state(self, state: dict[str, Any]) -> None:
+        for parent, parent_state in zip(self._parents, state["parents"], strict=True):
+            parent.set_state(parent_state)
+        self._index = state["index"]
+        self._stop = state["stop"]
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -330,7 +393,7 @@ class TokenWeightedMixConfig:
     `tokens_per_document`) so that its start is off by at most one of its own pieces;
     the phase is added to the rank's own counts when it chooses. The ranks of one
     step then sit at consecutive microbatches of one schedule, which follow the
-    weights (as `_RankOffsetMixIterDataset` does for the per-dataset packing). Each
+    weights (as `_StridedMixIterDataset` does for the per-dataset packing). Each
     rank still reads its own shard of every child from its start. With
     `repeat=False` the mix stops at the first exhausted child.
     """

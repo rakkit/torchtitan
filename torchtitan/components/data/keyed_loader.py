@@ -219,8 +219,7 @@ class KeyedMixDataLoader(GrainDataLoader):
             target.clear()
             target.update(redealt)
             restored.append(alias)
-        # the mix restarts at this rank's fresh index (its start position, dp_rank *
-        # mix_rank_stride), never at 0 on every rank
+        # the mix restarts from this rank's fresh state (its own place in the sequence)
         saved = {alias for cursors in old for alias in cursors}
         plan = RestorePlan(
             restored=tuple(restored),

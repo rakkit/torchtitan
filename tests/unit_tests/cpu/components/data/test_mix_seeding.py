@@ -23,6 +23,7 @@ from typing import Any
 import grain.python as grain
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from torchtitan.components.data.dataset import WeightedDataset
 from torchtitan.components.data.mix import (
@@ -158,7 +159,9 @@ class _ConstantChild:
         )
 
 
-def _rank_iterator(weights: list[float], dp_rank: int, dp_world_size: int):
+def _rank_iterator(
+    weights: list[float], dp_rank: int, dp_world_size: int, stride: int = 1
+):
     from types import SimpleNamespace
 
     from torchtitan.components.data.dataset import DatasetMixConfig
@@ -177,7 +180,7 @@ def _rank_iterator(weights: list[float], dp_rank: int, dp_world_size: int):
         dp_world_size=dp_world_size,
         streaming_shuffle_buffer_size=1,
     )
-    context = SimpleNamespace(read_options=grain.ReadOptions(), mix_rank_stride=1)
+    context = SimpleNamespace(read_options=grain.ReadOptions(), mix_rank_stride=stride)
     return iter(mix.build(context=context, dataset_iteration_policy=policy))
 
 
@@ -201,3 +204,28 @@ def test_rank_offset_survives_resume():
     resumed = _rank_iterator(weights, dp_rank=5, dp_world_size=8)
     resumed.set_state(state)
     assert [next(resumed) for _ in range(11)] == expected
+
+
+@pytest.mark.parametrize("stride", [1, 4])
+def test_small_children_follow_their_weight_over_ten_steps(stride):
+    # 64 ranks x `stride` elements per microbatch (4 = per-dataset rows of 16k in a 64k
+    # microbatch). The ranks' n-th microbatches take block n of the one sequence, so a
+    # child due 1.3 elements per step gets 1 or 2 as due, and any 10 steps are within
+    # ~1 element of 10 x its due. (Ranks walking consecutive positions from
+    # rank * stride shared a window moving `stride` positions per step: 10-step totals
+    # off by up to 12.8 elements for the 0.5% children.)
+    weights = [30, 20, 12, 10, 8, 6, 4, 3, 2, 1.5, 1, 0.8, 0.7, 0.5, 0.5]
+    world = 64
+    due = [w / sum(weights) * world * stride for w in weights]
+    iterators = [_rank_iterator(weights, r, world, stride) for r in range(world)]
+    steps = []
+    for _ in range(60):
+        step = [next(it) for it in iterators for _ in range(stride)]
+        steps.append([step.count(child) for child in range(len(weights))])
+    for counts in steps:
+        for child, count in enumerate(counts):
+            assert abs(count - due[child]) < 1.5, (child, count, due[child])
+    for start in range(0, 51, 10):
+        for child in range(len(weights)):
+            total = sum(counts[child] for counts in steps[start : start + 10])
+            assert abs(total - 10 * due[child]) < 2, (start, child, total)

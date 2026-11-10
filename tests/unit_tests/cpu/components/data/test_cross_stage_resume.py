@@ -434,18 +434,31 @@ def _rank_state_of(checkpoint: dict, rank: int) -> dict:
 
 
 @pytest.mark.parametrize("packing", ["concat_then_split_per_dataset"])
-def test_rank_start_survives_stage_switch_and_dp_change(tmp_path, packing):
-    # Each DP rank starts its walk through the mix at dp_rank * stride (stride = rows per
-    # microbatch for per-dataset rows), so the ranks of a step draw different datasets. A
-    # restore that resets the mix index to 0 puts every rank on the same dataset again: the
-    # stage switch (changed dataset list) and the DP change must keep each rank's own start.
-    stride = 2  # 16 tokens / 8 per row
-    specs = [DatasetSpec(alias=i, path=_corpus(tmp_path / i, i, 256)) for i in "ABC"]
+def test_ranks_take_strided_blocks_and_restart_fresh(tmp_path, packing):
+    # grain picks the dataset of the k-th row from k and the weights. DP rank r's n-th
+    # microbatch takes positions (n * world + r) * stride ... + stride - 1, so the ranks'
+    # n-th microbatches take block n of the one sequence: rank r's n-th microbatch
+    # holds the datasets a 1-rank loader draws as its (n * world + r)-th. (A walk of
+    # consecutive positions from r * stride made the ranks of a step share a window that
+    # moved `stride` positions per step.) "index" counts this rank's rows: an exact
+    # resume restores it; a stage switch or a DP change starts at 0 (= the rank's own
+    # block).
+    world = 4
+    specs = [
+        DatasetSpec(alias=c, path=_corpus_of(tmp_path / c, [c * 200] * 40), weight=w)
+        for c, w in (("A", 3.0), ("B", 2.0), ("C", 1.0), ("D", 0.5))
+    ]
+    one = _build(specs, packing)
+    iterator = iter(one)
+    single = [_datasets_in(next(iterator)) for _ in range(3 * world)]
+    one.close()
     checkpoint = {}
-    for rank in range(4):
-        loader = _build(specs, packing, dp_world_size=4, dp_rank=rank)
-        assert find_mix_node(loader._iterator.get_state())["index"] == rank * stride
-        _consume(loader, batches=3)
+    for rank in range(world):
+        loader = _build(specs, packing, dp_world_size=world, dp_rank=rank)
+        assert find_mix_node(loader._iterator.get_state())["index"] == 0
+        iterator = iter(loader)
+        for n in range(3):
+            assert _datasets_in(next(iterator)) == single[n * world + rank], (rank, n)
         checkpoint.update(loader.state_dict())
         loader.close()
 
@@ -456,15 +469,12 @@ def test_rank_start_survives_stage_switch_and_dp_change(tmp_path, packing):
         loader.close()
         return index
 
-    # same datasets, same DP degree: the exact resume continues from the saved index
     saved = find_mix_node(_rank_state_of(checkpoint, 3)["iterator"])["index"]
-    assert saved > 3 * stride
-    assert index_after_load(specs, 4, 3, checkpoint) == saved
-    # stage switch (a dataset added): the mix restarts at this rank's own start
-    staged = [*specs, DatasetSpec(alias="D", path=_corpus(tmp_path / "D", "D", 256))]
-    assert index_after_load(staged, 4, 3, checkpoint) == 3 * stride
-    # DP change 4 -> 2: the same, at the new rank's start
-    assert index_after_load(specs, 2, 1, checkpoint) == 1 * stride
+    assert saved > 0
+    assert index_after_load(specs, world, 3, checkpoint) == saved
+    staged = [*specs, DatasetSpec(alias="E", path=_corpus(tmp_path / "E", "E", 256))]
+    assert index_after_load(staged, world, 3, checkpoint) == 0
+    assert index_after_load(specs, 2, 1, checkpoint) == 0
 
 
 def test_token_counts_resume_exactly_and_restart_on_a_stage_switch(tmp_path):

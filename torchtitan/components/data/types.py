@@ -95,6 +95,10 @@ class DatasetBuildContext:
     read_options: grain.ReadOptions
     max_num_documents: int | None = None
     num_mtp_layers: int = 0
+    mix_rank_stride: int = 1
+    """Mix elements one DP rank takes per microbatch: a rank's walk through a mix's
+    child sequence starts at dp_rank * mix_rank_stride, so the ranks of one step
+    cover consecutive positions of the sequence (see `_RankOffsetMixIterDataset`)."""
     vision_processor: VisionProcessor | None = None
     """The model's image and video preprocessing. None: no image or video
     inputs."""

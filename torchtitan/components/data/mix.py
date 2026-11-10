@@ -19,11 +19,15 @@ import hashlib
 from dataclasses import dataclass, replace
 from typing import Any
 
+import numpy as np
+
 from torchtitan.components.data.collators import TextCollator
+
 from torchtitan.components.data.dataset import (
     DatasetMixConfig,
     SampleProcessor,
     SingleDatasetConfig,
+    TextSequence,
     WeightedDataset,
 )
 from torchtitan.components.data.keyed_loader import KeyedMixDataLoader
@@ -253,9 +257,11 @@ def make_pretrain_dataloader_config(
 
     ``concat_then_split`` mixes documents and then packs them, so a weight selects
     DOCUMENTS: a corpus of long documents takes more tokens than its weight.
-    ``concat_then_split_per_dataset`` packs each dataset into its own full microbatches
-    and mixes those, so a weight is that dataset's share of TOKENS (the data README's
-    "pack each child before mixing"); each microbatch then holds one dataset.
+    ``concat_then_split_per_dataset`` packs each dataset into its own rows of
+    ``max_context_length`` tokens and mixes those rows, so a weight is that dataset's
+    share of TOKENS (the data README's "pack each child before mixing"); a microbatch
+    joins consecutive mixed rows, and the DP ranks of a step take consecutive rows of
+    the mix (`PerDatasetRowsMixConfig`), so every step follows the weights.
 
     ``packing`` defaults to ``concat_then_split`` deliberately. Measured on a real
     long-document corpus at num_tokens_per_batch=8192, ``first_fit`` silently DROPS every
@@ -281,14 +287,16 @@ def make_pretrain_dataloader_config(
     if packing == "concat_then_split":
         packed: Any = ConcatThenSplitPackingConfig(dataset=mix)
     elif packing == "concat_then_split_per_dataset":
-        packed = replace(
-            mix,
-            datasets=tuple(
-                replace(
-                    item, dataset=ConcatThenSplitPackingConfig(dataset=item.dataset)
-                )
-                for item in mix.datasets
-            ),
+        packed = PerDatasetRowsMixConfig(
+            dataset=replace(
+                mix,
+                datasets=tuple(
+                    replace(
+                        item, dataset=ConcatThenSplitPackingConfig(dataset=item.dataset)
+                    )
+                    for item in mix.datasets
+                ),
+            )
         )
     elif packing == "first_fit":
         packed = FirstFitPackingConfig(dataset=mix, num_packing_bins=num_packing_bins)
@@ -309,6 +317,69 @@ def make_pretrain_dataloader_config(
         repeat=repeat,
         seed=seed,
         **loader_kwargs,
+    )
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class PerDatasetRowsMixConfig:
+    """Mix rows packed per dataset, then join each rank's rows into microbatches.
+
+    The children of ``dataset`` pack their own documents into rows of
+    ``max_context_length`` tokens; the mix interleaves those rows by weight, and every
+    ``num_tokens_per_microbatch / max_context_length`` consecutive rows become one
+    microbatch. Mixing whole microbatches instead put one dataset in each microbatch,
+    and with grain's index-only selection every DP rank drew the same dataset at the
+    same step: a whole global batch from one dataset, and a train loss that jumped
+    between the datasets' loss levels (8B study, 11-10). Each row starts its own
+    document segment (positions restart at 0), as rows do in any packed microbatch.
+
+    Example, 4 rows per microbatch, 2 DP ranks, mix sequence A A B C A D B A ...::
+
+        step 1: rank 0 rows A A B C   rank 1 rows A D B A
+    """
+
+    dataset: DatasetMixConfig
+
+    def build(
+        self,
+        *,
+        context: DatasetBuildContext,
+        dataset_iteration_policy: DatasetIterationPolicy,
+    ) -> Any:
+        rows_per_microbatch, rest = divmod(
+            context.num_tokens_per_microbatch, context.max_context_length
+        )
+        if context.max_num_documents is not None:
+            raise ValueError(
+                "per-dataset rows do not support max_num_documents (a per-microbatch "
+                "cap; each row would need its share of it)"
+            )
+        if rest or rows_per_microbatch < 1:
+            raise ValueError(
+                f"num_tokens_per_microbatch {context.num_tokens_per_microbatch} must be a "
+                f"multiple of max_context_length {context.max_context_length}"
+            )
+        rows = self.dataset.build(
+            context=replace(
+                context,
+                num_tokens_per_microbatch=context.max_context_length,
+                mix_rank_stride=rows_per_microbatch,
+            ),
+            dataset_iteration_policy=dataset_iteration_policy,
+        )
+        return rows.batch(rows_per_microbatch, drop_remainder=True, batch_fn=_join_rows)
+
+
+def _join_rows(rows: list[TextSequence]) -> TextSequence:
+    def join(field: str) -> np.ndarray | None:
+        parts = [getattr(row, field) for row in rows]
+        return None if parts[0] is None else np.concatenate(parts)
+
+    return TextSequence(
+        input_ids=join("input_ids"),
+        labels=join("labels"),
+        positions=join("positions"),
+        padding_mask=join("padding_mask"),
     )
 
 

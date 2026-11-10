@@ -223,8 +223,13 @@ def test_per_dataset_packing_makes_weights_count_tokens(tmp_path):
     num_short = int((tokens == short_id).sum())
     assert num_short / (num_short + int((tokens == long_id).sum())) < 0.15
 
-    # packed per corpus: every microbatch (16 tokens) is one corpus, half of them each
-    rows = microbatches("concat_then_split_per_dataset")
+    # packed per corpus: every row (max_context_length 8) is one corpus, half of the
+    # rows each, and a microbatch (16 tokens = 2 rows) can hold both corpora
+    rows = [
+        row
+        for mb in microbatches("concat_then_split_per_dataset")
+        for row in mb.split(8)
+    ]
     is_short = [bool((row == short_id).any()) for row in rows]
     assert not any(s and bool((row == long_id).any()) for s, row in zip(is_short, rows))
     assert 0.4 < sum(is_short) / len(rows) < 0.6

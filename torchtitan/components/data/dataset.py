@@ -264,7 +264,38 @@ class DatasetMixConfig:
             else child
             for child in children
         ]
-        return grain.IterDataset.mix(children, weights=weights)
+        mixed = grain.IterDataset.mix(children, weights=weights)
+        if len(children) > 1 and dataset_iteration_policy.dp_rank > 0:
+            mixed = _RankOffsetMixIterDataset(
+                mixed,
+                offset=dataset_iteration_policy.dp_rank * context.mix_rank_stride,
+            )
+        return mixed
+
+
+class _RankOffsetMixIterDataset(grain.IterDataset):
+    """Starts this DP rank's walk through the mix's child sequence at its rank.
+
+    grain's IterDataset.mix picks the child of the k-th element from k and the
+    weights only, so without this every DP rank draws the same child at the same
+    position: with one packed element per rank per step (per-dataset packing), a
+    whole global batch came from ONE child. Offset by the rank (times the elements a
+    rank takes per microbatch), the ranks of a step cover consecutive positions of
+    the sequence, which follow the weights. Only
+    the starting position changes; each rank still reads its own shard of every
+    child, and the offset lives in the mix's checkpointed index.
+    """
+
+    def __init__(self, parent: grain.IterDataset, *, offset: int):
+        super().__init__(parent)
+        self._offset = offset
+
+    def __iter__(self):
+        iterator = self._parent.__iter__()
+        state = iterator.get_state()
+        state["index"] += self._offset
+        iterator.set_state(state)
+        return iterator
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)

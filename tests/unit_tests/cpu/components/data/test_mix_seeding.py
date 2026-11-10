@@ -137,3 +137,66 @@ def test_build_mix_carries_the_aliases(tmp_path: Path):
     mix = build_mix(specs)
 
     assert mix.aliases == ("a", "b")
+
+
+# grain's IterDataset.mix picks the child of the k-th element from k and the weights only. Without a per-rank start,
+# every DP rank draws the same child at every step: with one packed microbatch per step and per-dataset packing, a
+# whole global batch came from ONE dataset (the 8B study's train loss jumped between dataset loss levels, 11-10).
+
+
+@dataclass(frozen=True)
+class _ConstantChild:
+    child_id: int
+
+    def build(self, *, context, dataset_iteration_policy):
+        no_threads = grain.ReadOptions(num_threads=0, prefetch_buffer_size=0)
+        return (
+            grain.MapDataset.range(10**9)
+            .map(lambda _: self.child_id)
+            .to_iter_dataset(read_options=no_threads)
+        )
+
+
+def _rank_iterator(weights: list[float], dp_rank: int, dp_world_size: int):
+    from types import SimpleNamespace
+
+    from torchtitan.components.data.dataset import DatasetMixConfig
+
+    mix = DatasetMixConfig(
+        datasets=tuple(
+            WeightedDataset(dataset=_ConstantChild(i), weight=w)
+            for i, w in enumerate(weights)
+        )
+    )
+    policy = DatasetIterationPolicy(
+        seed=0,
+        shuffle=False,
+        repeat=True,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        streaming_shuffle_buffer_size=1,
+    )
+    context = SimpleNamespace(read_options=grain.ReadOptions(), mix_rank_stride=1)
+    return iter(mix.build(context=context, dataset_iteration_policy=policy))
+
+
+def test_each_step_mixes_children_across_dp_ranks():
+    weights = [0.4, 0.3, 0.2, 0.1]
+    world = 64
+    iterators = [_rank_iterator(weights, r, world) for r in range(world)]
+    for _ in range(20):  # 20 steps, one element per rank per step
+        step = [next(it) for it in iterators]
+        for child, w in enumerate(weights):
+            assert abs(step.count(child) - w * world) <= 2, (child, step.count(child))
+
+
+def test_rank_offset_survives_resume():
+    weights = [0.5, 0.3, 0.2]
+    it = _rank_iterator(weights, dp_rank=5, dp_world_size=8)
+    for _ in range(7):
+        next(it)
+    state = it.get_state()
+    expected = [next(it) for _ in range(11)]
+    resumed = _rank_iterator(weights, dp_rank=5, dp_world_size=8)
+    resumed.set_state(state)
+    assert [next(resumed) for _ in range(11)] == expected

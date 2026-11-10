@@ -6,6 +6,7 @@
 
 """Composable dataset recipes backed by Grain."""
 
+import heapq
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -312,16 +313,22 @@ class TokenWeightedMixConfig:
     microbatches instead of filling one rank's microbatches back to back. A packer
     sees exactly the pieces whole documents would have given it. The state is the
     children's cursors (at the start of a partly emitted document), the offset into
-    that document, and one token count per child.
+    that document, one token count per child and this rank's phase.
 
     Example, weights 1 : 1, max_context_length 4, child A's documents 2 tokens,
     child B's 10 (pieces 4, 4, 2)::
 
         A B A A B A B ...   (A2 B4 A2 A2 B4 A2 B2: equal tokens)
 
-    The choice depends only on the token counts, so DP ranks start alike; each rank
-    reads its own shard of every child. With `repeat=False` the mix stops at the
-    first exhausted child.
+    The choice depends only on the token counts. Every rank emits the same tokens
+    per step, so ranks starting alike would reach a small child's turn at the same
+    step (all ranks on it in one step, none in the next ones). So DP rank r starts
+    with a PHASE: the counts the same choice reaches after r microbatches of
+    max_context_length pieces (`_rank_phase`), added to its own counts when it
+    chooses. The ranks of one step then sit at consecutive microbatches of one
+    schedule, which follow the weights (as `_RankOffsetMixIterDataset` does for the
+    per-dataset packing). Each rank still reads its own shard of every child from
+    its start. With `repeat=False` the mix stops at the first exhausted child.
     """
 
     datasets: tuple[WeightedDataset, ...]
@@ -354,11 +361,31 @@ class TokenWeightedMixConfig:
             else child
             for child in children
         ]
+        weights = [item.weight for item in self.datasets]
         return _TokenWeightedMixIterDataset(
             children,
-            weights=[item.weight for item in self.datasets],
+            weights=weights,
             max_context_length=context.max_context_length,
+            phase=_rank_phase(
+                weights,
+                pieces=dataset_iteration_policy.dp_rank
+                * (context.num_tokens_per_microbatch // context.max_context_length),
+                piece_tokens=context.max_context_length,
+            ),
         )
+
+
+def _rank_phase(weights: list[float], *, pieces: int, piece_tokens: int) -> list[int]:
+    """Per child, the tokens the token-weighted choice gives it in its first
+    `pieces` pieces of `piece_tokens` tokens: a DP rank's start in the common
+    schedule (`TokenWeightedMixConfig`)."""
+    counts = [0] * len(weights)
+    heap = [(0.0, index) for index in range(len(weights))]  # (count / weight, index)
+    for _ in range(pieces):
+        _, index = heapq.heappop(heap)
+        counts[index] += piece_tokens
+        heapq.heappush(heap, (counts[index] / weights[index], index))
+    return counts
 
 
 def _piece_starts(document: TextSequence, max_context_length: int) -> np.ndarray:
@@ -392,16 +419,19 @@ class _TokenWeightedMixIterDataset(grain.IterDataset):
         *,
         weights: list[float],
         max_context_length: int,
+        phase: list[int],
     ):
         super().__init__(parents)
         self._weights = weights
         self._max_context_length = max_context_length
+        self._phase = phase
 
     def __iter__(self):
         return _TokenWeightedMixIterator(
             [parent.__iter__() for parent in self._parents],
             self._weights,
             self._max_context_length,
+            self._phase,
         )
 
 
@@ -413,11 +443,13 @@ class _TokenWeightedMixIterator(grain.DatasetIterator):
         parents: list[grain.DatasetIterator],
         weights: list[float],
         max_context_length: int,
+        phase: list[int],
     ):
         super().__init__(parents)
         self._weights = weights
         self._max_context_length = max_context_length
-        self._tokens = [0] * len(parents)
+        self._tokens = [0] * len(parents)  # emitted by this rank (data_tokens/*)
+        self._phase = list(phase)  # this rank's start in the schedule
         # per child: its partly emitted document, the cursor before it, the next
         # piece's index into that document's piece starts
         self._document: list[TextSequence | None] = [None] * len(parents)
@@ -441,7 +473,7 @@ class _TokenWeightedMixIterator(grain.DatasetIterator):
             raise StopIteration
         index = min(
             range(len(self._parents)),
-            key=lambda i: self._tokens[i] / self._weights[i],
+            key=lambda i: (self._tokens[i] + self._phase[i]) / self._weights[i],
         )
         if self._document[index] is None:
             try:
@@ -478,6 +510,7 @@ class _TokenWeightedMixIterator(grain.DatasetIterator):
                 for i in range(len(self._parents))
             ],
             "tokens": list(self._tokens),
+            "phase": list(self._phase),
             "stop": self._stop,
         }
 
@@ -491,6 +524,7 @@ class _TokenWeightedMixIterator(grain.DatasetIterator):
                 self._fetch(index)
                 self._piece[index] = state["pieces"][index]
         self._tokens = list(state["tokens"])
+        self._phase = list(state["phase"])
         self._stop = state["stop"]
 
 

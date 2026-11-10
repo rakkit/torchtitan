@@ -297,6 +297,9 @@ def test_per_dataset_document_counts_come_from_the_cursors(tmp_path):
     # Aliases label the series; "/" is a wandb namespace separator and must be scrubbed.
     assert "data_docs/A" in metrics and "data_docs/B" in metrics
     assert metrics["data_docs/A"] == counts["A"]
+    # the token-weighted mix (concat_then_split) reports its token counts too
+    tokens = find_mix_node(keyed["iterator"])["tokens"]
+    assert [metrics["data_tokens/A"], metrics["data_tokens/B"]] == tokens
 
 
 def test_consumption_counts_survive_a_resume(tmp_path):

@@ -115,16 +115,26 @@ class KeyedMixDataLoader(GrainDataLoader):
     def consumption_metrics(self) -> dict[str, int]:
         """Per-dataset documents consumed, ready for the metrics logger.
 
-        Reported as `data_docs/{alias}`; the alias is the key.
+        Reported as `data_docs/{alias}`; the alias is the key. A token-weighted mix
+        also reports its own count of tokens drawn per dataset as
+        `data_tokens/{alias}` (this rank, cumulative since the mix started).
         """
-        counts = documents_consumed(
-            to_keyed(self._iterator.get_state(), self._dataset_ids)
-        )
-        return {
-            # "/" is a namespace separator in wandb, so it must not appear in a label.
+        state = self._iterator.get_state()
+        counts = documents_consumed(to_keyed(state, self._dataset_ids))
+        # "/" is a namespace separator in wandb, so it must not appear in a label.
+        metrics = {
             f"data_docs/{alias.replace('/', '_')}": value
             for alias, value in counts.items()
         }
+        tokens = find_mix_node(state).get("tokens")
+        if tokens is not None:
+            metrics.update(
+                {
+                    f"data_tokens/{alias.replace('/', '_')}": int(value)
+                    for alias, value in zip(self._dataset_ids, tokens, strict=True)
+                }
+            )
+        return metrics
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self._saved_rank_ids = ()  # requested for this load only

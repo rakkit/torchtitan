@@ -110,10 +110,14 @@ def test_documents_consumed_is_reported_per_dataset(tmp_path: Path):
     finally:
         loader.close()
 
-    assert set(data_docs) == {"data_docs/High-Quality", "data_docs/v1-Code"}
-    assert sum(int(v) for v in data_docs.values()) > 0
-    # Token counts are deliberately not tracked anywhere in this design, so
-    # there is no third return value to assert on -- the tuple is (mix, docs).
+    # the token-weighted mix (concat_then_split) adds its own token counts per dataset
+    assert set(data_docs) == {
+        "data_docs/High-Quality",
+        "data_docs/v1-Code",
+        "data_tokens/High-Quality",
+        "data_tokens/v1-Code",
+    }
+    assert sum(int(v) for k, v in data_docs.items() if k.startswith("data_docs/")) > 0
     assert len(metrics.get_log_dict_at_step(4)) == 2
 
 

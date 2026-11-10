@@ -6,9 +6,8 @@
 
 """Per-dataset data metrics of the keyed-mix loader (no upstream equivalent):
 ``data_docs/{alias}``, the documents consumed per dataset, read straight from
-the checkpointed cursors, and the constant ``data_mixing/{alias}`` weights. Token
-counts are not tracked (a ``token_count`` column is neither guaranteed present
-nor accurate)."""
+the checkpointed cursors, ``data_tokens/{alias}`` from a token-weighted mix's own
+counts, and the constant ``data_mixing/{alias}`` weights."""
 
 import torch
 

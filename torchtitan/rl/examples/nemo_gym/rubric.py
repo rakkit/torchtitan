@@ -665,10 +665,21 @@ def grade_structured_output(
     schema's types; an XML root element that is not a schema property is unwrapped. A valid
     answer whose leaves are all empty / zero / false scores 0 (a skeleton, no content). Any
     failure scores 0, a broken schema included (it must not drop the group)."""
+    value = _validated_structured_value(response, schema_str, schema_type)
+    return 0.0 if value is _INVALID or _all_default(value) else 1.0
+
+
+_INVALID = object()  # a validation failure (a valid answer can be None / null)
+
+
+def _validated_structured_value(
+    response: str, schema_str: str, schema_type: str
+) -> object:
+    """The response parsed, coerced and valid against the strict schema, else ``_INVALID``."""
     if schema_type == "xml":
         import xmltodict  # noqa: F401  (XML rows need it: fail the run, not every answer)
     if not response.strip():
-        return 0.0
+        return _INVALID
     try:
         schema = json.loads(schema_str)
         _make_strict(schema)
@@ -679,8 +690,8 @@ def grade_structured_output(
             value = _coerce_csv(value, schema)
         jsonschema.validate(value, schema)
     except Exception:
-        return 0.0
-    return 0.0 if _all_default(value) else 1.0
+        return _INVALID
+    return value
 
 
 def inverse_if_judge_messages(
@@ -792,27 +803,42 @@ def grade_structured_tool_call(
     Gym's structured_outputs ``response_mode="tool_call"``; else 0. ``tool_calls`` are what the
     rollout carries: the renderer's ParsedToolCall records (one per attempt, malformed ones
     included) or OpenAI-style dicts."""
+    arguments = _validated_tool_arguments(
+        tool_calls, schema_str, tool_name=tool_name, payload_key=payload_key
+    )
+    return 0.0 if arguments is _INVALID or _all_default(arguments) else 1.0
+
+
+def _validated_tool_arguments(
+    tool_calls: list | None,
+    schema_str: str,
+    *,
+    tool_name: str | None,
+    payload_key: str | None,
+) -> object:
+    """The one tool call's arguments (or their ``payload_key`` entry), valid against the strict
+    schema, else ``_INVALID``."""
     calls = [_tool_call_fields(c) for c in tool_calls or []]
     if len(calls) != 1:
-        return 0.0
+        return _INVALID
     name, arguments, ok = calls[0]
     if not ok or (tool_name and name != tool_name):
-        return 0.0
+        return _INVALID
     try:
         if isinstance(arguments, str):
             arguments = json.loads(arguments)
         if not isinstance(arguments, dict):
-            return 0.0
+            return _INVALID
         if payload_key:
             if payload_key not in arguments:
-                return 0.0
+                return _INVALID
             arguments = arguments[payload_key]
         schema = json.loads(schema_str)
         _make_strict(schema)
         jsonschema.validate(arguments, schema)
     except Exception:
-        return 0.0
-    return 0.0 if _all_default(arguments) else 1.0
+        return _INVALID
+    return arguments
 
 
 def _tool_call_fields(call: object) -> tuple[str | None, object, bool]:
@@ -850,6 +876,23 @@ def _unwrap_xml_root(data: object, schema: object) -> object:
     if schema.get("type") == "array" or root not in schema.get("properties", {}):
         return content
     return data
+
+
+def _mostly_default(value: object) -> bool:
+    """At least half of the leaves (scalars, empty containers) empty / zero / false / null."""
+    leaves = list(_leaves(value))
+    return 2 * sum(_all_default(leaf) for leaf in leaves) >= len(leaves)
+
+
+def _leaves(value: object):
+    if isinstance(value, (dict, list)):
+        children = list(value.values()) if isinstance(value, dict) else value
+        if not children:
+            yield value
+        for child in children:
+            yield from _leaves(child)
+    else:
+        yield value
 
 
 def _all_default(value: object) -> bool:
@@ -978,15 +1021,25 @@ class RewardNemoGym(JudgeRewardFn):
             )
         elif env_input.agent == STRUCTURED_OUTPUTS:
             if fields.get("response_mode") == "tool_call":
-                reward = grade_structured_tool_call(
+                value = _validated_tool_arguments(
                     message.get("tool_calls") if message else None,
                     fields["schema_str"],
                     tool_name=fields.get("tool_name"),
                     payload_key=fields.get("tool_payload_key"),
                 )
             else:
-                reward = grade_structured_output(
+                value = _validated_structured_value(
                     response, fields["schema_str"], fields.get("schema_type") or "json"
+                )
+            reward = 0.0 if value is _INVALID or _all_default(value) else 1.0
+            # passing answers that are mostly empty: the grader checks the format, not the
+            # content (review TASK 14: add a judge only if this share grows)
+            if reward and rollout.turns:
+                rollout.turns[-1].metrics.append(
+                    m.Metric(
+                        "nemo_gym/structured_pass_mostly_empty",
+                        m.Mean(float(_mostly_default(value))),
+                    )
                 )
             # one environment holds text (5 formats) and tool-call rows: a pass rate per kind
             kind = (

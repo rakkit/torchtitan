@@ -438,6 +438,12 @@ def test_structured_output_pass_rate_per_format():
         "nemo_gym/structured_json_pass",
         "nemo_gym/structured_yaml_pass",
     }
+    # passing answers also report whether they are mostly empty (the yaml answer failed: none)
+    assert "nemo_gym/structured_pass_mostly_empty" in got
+    from torchtitan.rl.examples.nemo_gym.rubric import _mostly_default
+
+    assert _mostly_default({"a": "x", "b": "", "c": []})
+    assert not _mostly_default({"a": "x", "b": "y", "c": [1, 0]})
 
 
 def test_reasoning_gym_rows_use_their_task_scorer():

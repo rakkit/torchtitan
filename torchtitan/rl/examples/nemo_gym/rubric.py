@@ -41,6 +41,7 @@ import yaml
 from torchtitan.rl.examples.dapo_math.math_verify_pool import MathVerifyPool
 from torchtitan.rl.examples.nemo_gym.calendar import grade_calendar
 from torchtitan.rl.examples.nemo_gym.data import NemoGymSample
+from torchtitan.rl.examples.nemo_gym.reasoning_gym import grade_reasoning_gym
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout
 from torchtitan.rl.rollout.rubric import JudgeRewardFn, Rubric, RubricOutput
@@ -50,6 +51,7 @@ MATH = "math_with_judge_simple_agent"
 MCQA = "mcqa_simple_agent"
 STRUCTURED_OUTPUTS = "structured_outputs_simple_agent"
 CALENDAR = "calendar_simple_agent"
+REASONING_GYM = "reasoning_gym_simple_agent"
 INVERSE_IF = "inverse_if_simple_agent"
 # NeMo Gym jailbreak_detection, one environment per response policy (the row field response_policy_mapped decides)
 JAILBREAK = (
@@ -1083,6 +1085,10 @@ class RewardNemoGym(JudgeRewardFn):
             reward = sum(bool(v) for v in verdicts) / len(verdicts) if verdicts else 0.0
         elif env_input.agent == CALENDAR:
             reward = grade_calendar(response, fields["exp_cal_state"])
+        elif env_input.agent == REASONING_GYM:
+            reward = grade_reasoning_gym(
+                response, fields["question"], fields.get("answer"), fields["metadata"]
+            )
         elif env_input.agent in FORMAT_VERIFICATION:
             reward = grade_format_verification(response, fields["verifier"])
         elif env_input.agent == INSTRUCTION_FOLLOWING:

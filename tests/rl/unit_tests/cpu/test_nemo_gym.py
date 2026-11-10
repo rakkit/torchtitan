@@ -440,6 +440,29 @@ def test_structured_output_pass_rate_per_format():
     }
 
 
+def test_reasoning_gym_rows_use_their_task_scorer():
+    rg = pytest.importorskip("reasoning_gym")
+    from torchtitan.rl.examples.nemo_gym.reasoning_gym import (
+        extract_reasoning_gym_answer,
+        grade_reasoning_gym,
+    )
+
+    entry = rg.create_dataset("basic_arithmetic", size=1, seed=0)[0]
+    q, gold, meta = entry["question"], entry["answer"], entry["metadata"]
+    meta = dict(meta, source_dataset="basic_arithmetic")
+    assert grade_reasoning_gym(f"work\n<answer>{gold}</answer>", q, gold, meta) == 1.0
+    assert grade_reasoning_gym(f"\\boxed{{{gold}}}", q, gold, meta) == 1.0
+    assert grade_reasoning_gym("<answer>-123456789</answer>", q, gold, meta) < 1.0
+    assert grade_reasoning_gym("", q, gold, meta) == 0.0
+    # the last answer tag counts
+    assert (
+        extract_reasoning_gym_answer("<answer>1</answer> then <answer>2</answer>")
+        == "2"
+    )
+    with pytest.raises(ValueError, match="source_dataset"):
+        grade_reasoning_gym("<answer>1</answer>", q, gold, {})
+
+
 def test_format_verification_rules():
     from torchtitan.rl.examples.nemo_gym.rubric import grade_format_verification
 

@@ -180,6 +180,62 @@ def test_worker_executes_group_without_actor_mesh() -> None:
     asyncio.run(run())
 
 
+def test_each_rollout_closes_its_env_when_it_ends() -> None:
+    # A finished rollout must free its env (e.g. a sandbox slot) before its slowest sibling
+    # ends: rollout 1 waits for rollout 0's env to close; a group-level close deadlocks here.
+    async def run() -> None:
+        freed = asyncio.Event()
+
+        class _FirstEnv(_TokenEnv):
+            async def close(self) -> None:
+                self.closed = True
+                freed.set()
+
+        class _WaitingEnv(_TokenEnv):
+            async def step(self, completion: Completion) -> TokenEnvOutput:
+                await freed.wait()
+                return await super().step(completion)
+
+        class _Envs(_TokenEnvConfig):
+            def build(self, *, message_env, renderer) -> _TokenEnv:
+                env = (_FirstEnv if not self.envs else _WaitingEnv)()
+                self.envs.append(env)
+                return env
+
+        worker = RolloutWorker(
+            SimpleNamespace(
+                rubric=_Config(_Rubric()),
+                message_env=_MessageEnvConfig(),
+                token_env=_Envs(),
+                advantage=_Config(_AdvantageEstimator()),
+                distillation=None,
+            )
+        )
+
+        async def release_session_fn(**kwargs) -> None:
+            pass
+
+        await worker.setup_async(
+            tokenizer_config=HuggingFaceTokenizer.Config(),
+            renderer_config=from_renderers(Qwen3RendererConfig(enable_thinking=False)),
+            hf_assets_path="tests/assets/tokenizer",
+        )
+        group = await asyncio.wait_for(
+            worker.run_group(
+                generate_fn=_GenerateFn(),
+                release_session_fn=release_session_fn,
+                sample="sample",
+                group_id=1,
+                group_size=2,
+                sampling=SamplingConfig(seed=0),
+            ),
+            timeout=5,
+        )
+        assert [r.status for r in group.rollouts] == [RolloutStatus.COMPLETED] * 2
+
+    asyncio.run(run())
+
+
 class _RewritingRenderer:
     """Bridges each turn, or rewrites the history and makes TokenEnv re-render it, at random."""
 

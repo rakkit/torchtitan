@@ -93,7 +93,8 @@ class NemoGymEnv(MessageEnv):
                 for i, call in enumerate(message["tool_calls"])
             ]
         env_messages, done = await self._tool_env.step(message)
-        # tool counters so far, read by the rubric as nemo_gym/tool/* metrics
+        # tool counters so far: the "tool/" keys are COUNTERS, never rewards; only the
+        # rubric reads them, as nemo_gym/tool/* metrics
         return MessageEnvStepOutput(
             env_messages=env_messages,
             done=done,

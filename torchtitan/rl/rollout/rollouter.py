@@ -609,7 +609,8 @@ class RolloutWorker(Configurable):
                 decoupled from the generator actor.
             release_session_fn: Async callable this rollout calls once after its last turn,
                 with its `routing_session_id`.
-            env: The env for this rollout; `run_group` closes it.
+            env: The env for this rollout; closed when the rollout ends (`run_group` closes
+                it again, idempotently, should the rollout not get that far).
             sampling: Sampling config for every generate call.
             group_id: The GRPO group id.
             rollout_id: Sibling index within the group; combined with the turn index into the
@@ -688,6 +689,14 @@ class RolloutWorker(Configurable):
         except Exception:
             # Not fatal: `max_sessions` evicts an unreleased session.
             logger.exception("releasing routing session %s failed", routing_session_id)
+        try:
+            # Free the env's resources (e.g. a sandbox) when THIS rollout ends, not when its slowest
+            # sibling does: finished rollouts holding capped resources could starve waiting ones.
+            await env.close()
+        except Exception:
+            logger.exception(
+                "closing the env of rollout %s/rollout=%d failed", group_id, rollout_id
+            )
         return Rollout(
             group_id=group_id,
             rollout_id=rollout_id,

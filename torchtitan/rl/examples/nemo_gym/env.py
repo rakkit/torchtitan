@@ -31,8 +31,9 @@ NS_TOOLS = "ns_tools_simple_agent"
 class PythonToolConfig:
     """The sandboxed stateful Python tool of ``ns_tools_simple_agent`` rows."""
 
-    envs_dir: str
-    """titan_eval's ``envs`` folder; ``python_tool`` (framework-free) is imported from it."""
+    titan_eval_lib: str
+    """titan_eval's ``lib`` folder; the framework-free tool is imported from it as
+    ``titan_eval_envs.python_tool``."""
 
     image: str
     """The tool's Apptainer image (python-sci ``image.sif``)."""
@@ -56,9 +57,9 @@ class NemoGymEnv(MessageEnv):
         if env_input.agent == NS_TOOLS:
             if config.python_tool is None:
                 raise ValueError(f"{NS_TOOLS} rows need NemoGymEnv.Config.python_tool")
-            if config.python_tool.envs_dir not in sys.path:
-                sys.path.insert(0, config.python_tool.envs_dir)
-            from python_tool.env import PythonToolEnv
+            if config.python_tool.titan_eval_lib not in sys.path:
+                sys.path.insert(0, config.python_tool.titan_eval_lib)
+            from titan_eval_envs.python_tool.env import PythonToolEnv
 
             row = {
                 "responses_create_params": {

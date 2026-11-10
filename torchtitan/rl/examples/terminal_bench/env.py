@@ -124,17 +124,17 @@ class TerminalTaskEnv(MessageEnv):
 
     @dataclass(kw_only=True, slots=True)
     class Config(MessageEnv.Config):
-        envs_dir: str
-        """titan_eval's ``envs`` folder; ``terminal`` (framework-free) is imported from it."""
+        titan_eval_lib: str
+        """titan_eval's ``lib`` folder; the framework-free env is imported from it as
+        ``titan_eval_envs.terminal``."""
 
         log_dir: str
         """Grading logs per rollout: <log_dir>/<task>/<sandbox name>/."""
 
     def __init__(self, config: Config, *, env_input: TerminalTaskSample) -> None:
-        terminal_dir = str(Path(config.envs_dir) / "terminal")
-        if terminal_dir not in sys.path:
-            sys.path.insert(0, terminal_dir)
-        from env import TerminusEnv  # titan_eval envs/terminal/env.py
+        if config.titan_eval_lib not in sys.path:
+            sys.path.insert(0, config.titan_eval_lib)
+        from titan_eval_envs.terminal.env import TerminusEnv
 
         name = f"term-{uuid.uuid4().hex[:16]}"
         self._grade_image = env_input.grade_image

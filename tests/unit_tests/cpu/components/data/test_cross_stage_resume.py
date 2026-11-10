@@ -496,6 +496,91 @@ def test_token_counts_resume_exactly_and_restart_on_a_stage_switch(tmp_path):
     assert tokens_after_load(specs, 1, 0) == [0, 0, 0]
 
 
+def _datasets_in(microbatch) -> set[int]:
+    # a document's first piece also holds its BOS, so compare which datasets a
+    # microbatch holds, not the exact token counts
+    return {t for t in microbatch.input.flatten().tolist() if t > 2}
+
+
+def test_pool_ranks_of_a_step_take_consecutive_microbatches(tmp_path):
+    # Every rank emits the same tokens per step, so ranks starting the token-weighted
+    # choice alike reach a rare dataset's turn at the same step (smoke 2815079: all 4
+    # ranks on the same < 1% dataset 142 times in 60 steps). With the start phase, rank
+    # r's first microbatch is what rank 0 draws as its r-th: the ranks of a step cover
+    # consecutive microbatches of one schedule. Long documents: every piece is a full 8.
+    specs = [
+        DatasetSpec(alias=c, path=_corpus_of(tmp_path / c, [c * 200] * 40), weight=w)
+        for c, w in (("A", 1.0), ("B", 1.0), ("C", 2.0), ("D", 0.25))
+    ]
+    first = []
+    for rank in range(4):
+        loader = _build(specs, "concat_then_split", dp_world_size=4, dp_rank=rank)
+        iterator = iter(loader)
+        first.append([_datasets_in(next(iterator)) for _ in range(4)])
+        loader.close()
+    for rank in range(1, 4):
+        assert first[rank][0] == first[0][rank]
+    # and the rare dataset (1 in 17 pieces) is not on every rank in the same step
+    rare = 10 + ord("D") % 250
+    assert sum(rare in first[rank][0] for rank in range(4)) <= 1
+
+
+def _pool_phase(
+    tmp_path: Path, tokens_per_document, *, world=4, rank=1, state=None, extra=()
+):
+    specs = [
+        DatasetSpec(
+            alias="short",
+            path=_corpus_of(tmp_path / "short", ["ss"] * 400),
+            weight=1.0,
+            tokens_per_document=tokens_per_document,
+        ),
+        DatasetSpec(
+            alias="long",
+            path=_corpus_of(tmp_path / "long", ["L" * 200] * 40),
+            weight=3.0,
+        ),
+        *extra,
+    ]
+    loader = _build(specs, "concat_then_split", dp_world_size=world, dp_rank=rank)
+    if state is not None:
+        loader.load_state_dict(state)
+    phase = find_mix_node(loader._iterator.get_state())["phase"]
+    return loader, phase
+
+
+def test_pool_phase_takes_tokens_per_document_and_survives_a_resume(tmp_path):
+    # The phase counts the schedule's first dp_rank microbatches in pieces of
+    # min(max_context_length, tokens_per_document): rank 1 of weights 1 : 3 starts at
+    # [4, 16] with 4-token pieces for the short-document dataset, at [8, 8] with full
+    # 8-token pieces. Dropping the field anywhere between DatasetSpec and the mix makes
+    # both equal.
+    loader, with_tpd = _pool_phase(tmp_path, 4.0)
+    loader.close()
+    loader, without = _pool_phase(tmp_path, None)
+    loader.close()
+    assert with_tpd == [4, 16]
+    assert without == [8, 8]
+    # rank 0 starts at the schedule's start
+    loader, zero = _pool_phase(tmp_path, 4.0, rank=0)
+    loader.close()
+    assert zero == [0, 0]
+    # an exact resume restores the saved phase; a stage switch takes the fresh one
+    loader, phase = _pool_phase(tmp_path, 4.0)
+    _consume(loader, batches=3)
+    checkpoint = loader.state_dict()
+    loader.close()
+    loader, resumed = _pool_phase(tmp_path, 4.0, state=checkpoint)
+    loader.close()
+    assert resumed == phase
+    extra = (DatasetSpec(alias="new", path=_corpus_of(tmp_path / "new", ["nn"] * 50)),)
+    loader, switched = _pool_phase(tmp_path, 4.0, state=checkpoint, extra=extra)
+    loader.close()
+    fresh_loader, fresh = _pool_phase(tmp_path, 4.0, extra=extra)
+    fresh_loader.close()
+    assert switched == fresh
+
+
 def _long_and_short_specs(tmp_path: Path) -> list[DatasetSpec]:
     return [
         DatasetSpec(alias="short", path=_corpus_of(tmp_path / "short", ["ss"] * 4000)),

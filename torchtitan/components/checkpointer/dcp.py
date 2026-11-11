@@ -97,6 +97,52 @@ def _spawned_children_see_only_this_gpu():
             os.environ["CUDA_VISIBLE_DEVICES"] = visible
 
 
+def _wait_for_writer_process(ret, timeout_s: float = 1800.0) -> None:
+    """Return once torch's PROCESS async checkpointer has started its writer process.
+
+    ``dcp.async_save`` returns before the writer exists: torch creates it from a
+    background thread (``_ProcessBasedAsyncCheckpointExecutor._execute_save_impl``
+    -> ``_AsyncCheckpointProcess``). Leaving the ``CUDA_VISIBLE_DEVICES`` block
+    earlier lets that thread start the child with all GPUs visible, so its context
+    still lands on GPU 0 (smoke 2842821: 4 writer contexts of 558 MiB on GPU 0).
+    Only the first save waits; later saves reuse the process. Stops waiting when
+    the save future already finished (an error there is raised by the caller's
+    wait as before).
+
+    TODO: upstream -- reads torch's private ``_CHECKPOINT_PROCESS``; the child
+    should set its device from LOCAL_RANK in _async_process_executor.py.
+    """
+    from torch.distributed.checkpoint import _async_process_executor as ape
+
+    # the save's final future: AsyncSaveResponse.upload_completion, or ret itself
+    upload = getattr(ret, "upload_completion", ret)
+    deadline = time.monotonic() + timeout_s
+    while ape._CHECKPOINT_PROCESS is None:
+        if (
+            isinstance(upload, Future) and upload.done()
+        ) or time.monotonic() > deadline:
+            return
+        time.sleep(0.05)
+
+
+def _set_thread_device_initializer(device_index: int):
+    """ThreadPoolExecutor initializer: give a worker thread this rank's GPU.
+
+    A new thread starts on CUDA device 0. torch's DefaultStager copies the state
+    dict to pinned memory in its own worker thread, so its first CUDA call opened
+    a context on GPU 0 for every rank (smoke 2842821: ranks 1-3, 558 MiB each).
+
+    TODO: upstream -- replaces DefaultStager's private ``_staging_executor``; the
+    stager should create its worker on the device of its staging stream.
+    """
+    import torch
+
+    def init() -> None:
+        torch.cuda.set_device(device_index)
+
+    return init
+
+
 class AsyncMode(str, enum.Enum):
     DISABLED = "disabled"
     ASYNC = "async"
@@ -371,6 +417,7 @@ class CheckpointManager(BaseCheckpointManager):
                     async_checkpointer_type=AsyncCheckpointerType.PROCESS,
                     async_stager=self.stager,
                 )
+                _wait_for_writer_process(ret)
         else:
             ret = dcp.save(
                 state_dict,
@@ -527,6 +574,22 @@ class CheckpointManager(BaseCheckpointManager):
                         use_non_blocking_copy=True,
                     )
                 )
+                # its worker thread would start on GPU 0 (see _set_thread_device_initializer)
+                import torch
+
+                if (
+                    torch.cuda.is_available()
+                    and self.stager._staging_executor is not None
+                ):
+                    from concurrent.futures import ThreadPoolExecutor
+
+                    self.stager._staging_executor.shutdown(wait=False)
+                    self.stager._staging_executor = ThreadPoolExecutor(
+                        max_workers=1,
+                        initializer=_set_thread_device_initializer(
+                            torch.cuda.current_device()
+                        ),
+                    )
 
             async_save_started_at = time.monotonic()
             result = self.dcp_save(

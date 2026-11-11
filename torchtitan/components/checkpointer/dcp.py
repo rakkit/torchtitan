@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import logging
 import os
@@ -58,6 +59,42 @@ if TYPE_CHECKING:
         OptimizersContainer,
     )
     from torchtitan.models.base.state_dict_adapter import BaseStateDictAdapter
+
+
+@contextlib.contextmanager
+def _spawned_children_see_only_this_gpu():
+    """Make a process spawned inside this block see only this rank's GPU.
+
+    The PROCESS async checkpointer spawns its writer process on the first save.
+    The child inherits ``os.environ`` and never sets its device, so its first
+    CUDA call (``current_stream()`` in DCP's ``_OverlappingCpuLoader``) opens a
+    CUDA context (~560 MiB) on device 0. With 4 ranks per node, GPU 0 got 4
+    extra contexts; a 92%-full GPU 0 failed one with CUDA_ERROR_OUT_OF_MEMORY,
+    and the save of that rank's shard was lost. Restricting
+    ``CUDA_VISIBLE_DEVICES`` while the child is spawned puts its context on
+    this rank's own GPU. The parent's CUDA is already initialized, so the
+    parent does not read the changed variable.
+
+    TODO: upstream -- the child in
+    torch/distributed/checkpoint/_async_process_executor.py should set its
+    device from LOCAL_RANK.
+    """
+    import torch
+
+    # Cache the device count before the variable changes: an uncached
+    # device_count() in this window would read the single visible GPU.
+    torch.cuda.device_count()
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    device_index = torch.cuda.current_device()
+    physical = visible.split(",")[device_index] if visible else str(device_index)
+    os.environ["CUDA_VISIBLE_DEVICES"] = physical
+    try:
+        yield
+    finally:
+        if visible is None:
+            del os.environ["CUDA_VISIBLE_DEVICES"]
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = visible
 
 
 class AsyncMode(str, enum.Enum):
@@ -325,14 +362,15 @@ class CheckpointManager(BaseCheckpointManager):
                 process_group=self.pg,
             )
         elif async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
-            ret = dcp.async_save(
-                state_dict,
-                storage_writer=storage_writer,
-                checkpoint_id=checkpoint_save_id,
-                process_group=self.pg,
-                async_checkpointer_type=AsyncCheckpointerType.PROCESS,
-                async_stager=self.stager,
-            )
+            with _spawned_children_see_only_this_gpu():
+                ret = dcp.async_save(
+                    state_dict,
+                    storage_writer=storage_writer,
+                    checkpoint_id=checkpoint_save_id,
+                    process_group=self.pg,
+                    async_checkpointer_type=AsyncCheckpointerType.PROCESS,
+                    async_stager=self.stager,
+                )
         else:
             ret = dcp.save(
                 state_dict,

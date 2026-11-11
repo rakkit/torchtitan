@@ -312,6 +312,124 @@ class WandBLogger(BaseLogger):
             self.wandb.finish()
 
 
+class MetricsRankWandBLogger(WandBLogger):
+    """`WandBLogger` on the metrics rank only, also under `save_for_all_ranks`: one W&B
+    run per job with the global metrics; the per-rank values go to `RankFileLogger`."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(WandBLogger.Config):
+        metrics_rank_only: ClassVar[bool] = True
+
+
+def _host_values(metrics: dict[str, Any]) -> dict[str, Any]:
+    """`metrics` with every scalar tensor as a Python number: one device->host copy per
+    device for all of them (what `wandb.log` did value by value). Non-scalar tensors are
+    left out (they are not scalar metrics)."""
+    out: dict[str, Any] = {}
+    by_device: dict[Any, list[tuple[str, torch.Tensor]]] = {}
+    for k, v in metrics.items():
+        if isinstance(v, torch.Tensor):
+            if v.numel() == 1:
+                by_device.setdefault(v.device, []).append((k, v))
+        elif isinstance(v, (int, float, str, bool)) or v is None:
+            out[k] = v
+    for items in by_device.values():
+        vals = torch.stack([t.detach().reshape(()).double() for _, t in items]).cpu()
+        out.update(zip((k for k, _ in items), vals.tolist()))
+    return out
+
+
+class RankFileLogger(BaseLogger):
+    """Every logging rank appends its metrics to `<log_dir>/metrics.jsonl`, one JSON line
+    per `log` call: {"trainer/step": step, "time": unix seconds, <metric>: <number>, ...}.
+
+    No collective: each rank writes its own values (with `save_for_all_ranks`, `log_dir`
+    is per rank). `log` converts the values to Python numbers (one host copy) and hands the
+    dict to a background thread of this rank's process, which serializes, writes and
+    flushes it; the training thread never waits on the file system. The queue is bounded
+    (`max_queued` lines): if the file system stalls, the oldest queued lines are dropped,
+    never the training step, and the next written line records how many
+    ("_dropped_lines"); RAM stays bounded. Every line is flushed; os.fsync runs at most
+    every `fsync_interval_s` and at `close`, so a killed job loses at most that window.
+    The offline merger (launch_scripts/wandb_merge_ranks.py) uploads these files as one
+    W&B run per experiment.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseLogger.Config):
+        max_queued: int = 256
+        """Lines waiting for the writer; one line per log call (log_freq steps)."""
+        fsync_interval_s: float = 30.0
+
+    def __init__(self, config: Config, *, log_dir: str, **_: Any):
+        import collections
+        import threading
+
+        os.makedirs(log_dir, exist_ok=True)
+        self.path = os.path.join(log_dir, "metrics.jsonl")
+        self._queue: collections.deque = collections.deque()
+        self._max = config.max_queued
+        self._fsync_s = config.fsync_interval_s
+        self._dropped = 0
+        self._cv = threading.Condition()
+        self._closed = False
+        self._file = open(self.path, "a", encoding="utf-8")
+        # one header line per process start: which job and rank wrote the lines below
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        self._queue.append(
+            {
+                "_meta": {
+                    "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+                    "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+                    "rank": rank,
+                    "start": time.time(),
+                }
+            }
+        )
+        self._thread = threading.Thread(
+            target=self._writer, name="rank-metrics-writer", daemon=True
+        )
+        self._thread.start()
+
+    def log(self, metrics: dict[str, Any], step: int) -> None:
+        row = {"trainer/step": step, "time": time.time(), **_host_values(metrics)}
+        with self._cv:
+            if len(self._queue) >= self._max:
+                self._queue.popleft()
+                self._dropped += 1
+            self._queue.append(row)
+            self._cv.notify()
+
+    def _writer(self) -> None:
+        import json
+
+        last_sync = time.monotonic()
+        while True:
+            with self._cv:
+                while not self._queue and not self._closed:
+                    self._cv.wait()
+                if not self._queue and self._closed:
+                    break
+                row = self._queue.popleft()
+                dropped, self._dropped = self._dropped, 0
+            if dropped:
+                row["_dropped_lines"] = dropped
+            self._file.write(json.dumps(row, allow_nan=True) + "\n")
+            self._file.flush()
+            if time.monotonic() - last_sync >= self._fsync_s:
+                os.fsync(self._file.fileno())
+                last_sync = time.monotonic()
+        self._file.flush()
+        os.fsync(self._file.fileno())
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify()
+        self._thread.join(timeout=60)
+        self._file.close()
+
+
 class MLFlowLogger(BaseLogger):
     """Logger implementation for MLflow."""
 
@@ -578,7 +696,11 @@ class MetricsProcessor(Configurable):
                 ):
                     continue
                 kw = dict(log_dir=log_dir, config_dict=config_dict, tag=tag)
-                if per_rank and isinstance(logger_config, WandBLogger.Config):
+                if (
+                    per_rank
+                    and isinstance(logger_config, WandBLogger.Config)
+                    and not logger_config.metrics_rank_only
+                ):
                     kw.update(
                         rank=rank,
                         default_group=os.path.basename(os.path.normpath(dump_folder)),

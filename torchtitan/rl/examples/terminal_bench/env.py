@@ -15,6 +15,9 @@ A task row (jsonl)::
 
     {"task": <name>, "task_dir": <instruction.md, task.toml, tests/>, "image": <image.sif>,
      "prep_dir": <tb_prepare output: task.env + template>, "grade_image": <optional>}
+
+A TMax row (titan_eval tasksets/tmax: the shared stack image + the task's template) adds
+``"layout": "tmax"`` with ``prep_dir`` = the template folder (``TerminusEnv.for_tmax``).
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from renderers import Message
 
@@ -50,7 +54,15 @@ class TerminalTaskSample:
     image: str
     prep_dir: str
     grade_image: str | None = None
+    layout: Literal["tb2", "tmax"] = "tb2"
+    """``tb2`` (task image + tb_prepare folders) or ``tmax`` (stack image + template)."""
     task_set: str = "terminal"
+
+    def __post_init__(self) -> None:
+        if self.layout not in ("tb2", "tmax"):
+            raise ValueError(
+                f"task {self.task}: layout {self.layout!r} is neither 'tb2' nor 'tmax'"
+            )
 
     @property
     def domain(self) -> str:
@@ -138,13 +150,19 @@ class TerminalTaskEnv(MessageEnv):
 
         name = f"term-{uuid.uuid4().hex[:16]}"
         self._grade_image = env_input.grade_image
-        self._env = TerminusEnv.for_task(
-            env_input.task_dir,
-            env_input.image,
-            env_input.prep_dir,
-            str(Path(config.log_dir) / env_input.task / name),
-            name=name,
-        )
+        log_dir = str(Path(config.log_dir) / env_input.task / name)
+        if env_input.layout == "tmax":
+            self._env = TerminusEnv.for_tmax(
+                env_input.task_dir, env_input.prep_dir, log_dir, name=name
+            )
+        else:
+            self._env = TerminusEnv.for_task(
+                env_input.task_dir,
+                env_input.image,
+                env_input.prep_dir,
+                log_dir,
+                name=name,
+            )
 
     async def init(self) -> MessageEnvInitOutput:
         return MessageEnvInitOutput(init_prompt_messages=await self._env.init())

@@ -154,9 +154,11 @@ class TerminalTaskEnv(MessageEnv):
 
         name = f"term-{uuid.uuid4().hex[:16]}"
         self._grade_image = env_input.grade_image
-        log_file = str(
-            Path(config.log_dir) / f"grades-{socket.gethostname()}-{os.getpid()}.jsonl"
-        )
+        actor = f"{socket.gethostname()}-{os.getpid()}"
+        log_file = str(Path(config.log_dir) / f"grades-{actor}.jsonl")
+        # ids in each grade record; MessageEnv has no group / policy-step ids yet: the trainer
+        # joins on rollout_id (the sandbox name) until the RL loop passes them in
+        meta = {"rollout_id": name, "actor": actor, "task_set": env_input.task_set}
         if env_input.layout == "tmax":
             self._env = TerminusEnv.for_tmax(
                 env_input.task_dir,
@@ -164,6 +166,7 @@ class TerminalTaskEnv(MessageEnv):
                 None,
                 name=name,
                 log_file=log_file,
+                meta=meta,
             )
         else:
             self._env = TerminusEnv.for_task(
@@ -173,6 +176,7 @@ class TerminalTaskEnv(MessageEnv):
                 None,
                 name=name,
                 log_file=log_file,
+                meta=meta,
             )
 
     async def init(self) -> MessageEnvInitOutput:

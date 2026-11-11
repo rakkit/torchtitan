@@ -23,7 +23,9 @@ A TMax row (titan_eval tasksets/tmax: the shared stack image + the task's templa
 from __future__ import annotations
 
 import json
+import os
 import random
+import socket
 import sys
 import uuid
 from collections.abc import Iterator
@@ -141,7 +143,9 @@ class TerminalTaskEnv(MessageEnv):
         ``titan_eval_envs.terminal``."""
 
         log_dir: str
-        """Grading logs per rollout: <log_dir>/<task>/<sandbox name>/."""
+        """Grading records: ONE JSONL file per actor process, <log_dir>/grades-<host>-<pid>.jsonl,
+        one line per rollout (task, reward, per-test outcomes, output tails). No folder per
+        rollout: at RL scale that is millions of files on the shared file system (11-11 limit)."""
 
     def __init__(self, config: Config, *, env_input: TerminalTaskSample) -> None:
         if config.titan_eval_lib not in sys.path:
@@ -150,18 +154,25 @@ class TerminalTaskEnv(MessageEnv):
 
         name = f"term-{uuid.uuid4().hex[:16]}"
         self._grade_image = env_input.grade_image
-        log_dir = str(Path(config.log_dir) / env_input.task / name)
+        log_file = str(
+            Path(config.log_dir) / f"grades-{socket.gethostname()}-{os.getpid()}.jsonl"
+        )
         if env_input.layout == "tmax":
             self._env = TerminusEnv.for_tmax(
-                env_input.task_dir, env_input.prep_dir, log_dir, name=name
+                env_input.task_dir,
+                env_input.prep_dir,
+                None,
+                name=name,
+                log_file=log_file,
             )
         else:
             self._env = TerminusEnv.for_task(
                 env_input.task_dir,
                 env_input.image,
                 env_input.prep_dir,
-                log_dir,
+                None,
                 name=name,
+                log_file=log_file,
             )
 
     async def init(self) -> MessageEnvInitOutput:

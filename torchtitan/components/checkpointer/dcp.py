@@ -121,6 +121,11 @@ def _wait_for_writer_process(ret, timeout_s: float = 1800.0) -> None:
         if (
             isinstance(upload, Future) and upload.done()
         ) or time.monotonic() > deadline:
+            logger.warning(
+                "Async checkpoint writer process did not start (save finished: %s); "
+                "a writer started later may open its CUDA context on GPU 0.",
+                isinstance(upload, Future) and upload.done(),
+            )
             return
         time.sleep(0.05)
 

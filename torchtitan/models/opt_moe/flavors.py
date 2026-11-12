@@ -111,6 +111,7 @@ from .sharding import (
     mtp_projection_sharding_config,
     opt_moe_sharding_config,
 )
+from .sonicmoe_experts import SonicMoERoutedExperts
 
 __all__ = ["MODEL_FLAVORS", "build_model_config", "build_opt_moe_layers"]
 
@@ -263,7 +264,9 @@ def build_opt_moe_layers(
     quantile_balance_bins: int | None = None,
     track_router_metrics: bool = True,
     token_dispatch: Literal["scatter_add", "gather"] = "gather",
-    expert_gemm: Literal["torch", "deepgemm"] = "torch",
+    expert_gemm: Literal["torch", "deepgemm", "sonicmoe"] = "torch",
+    sonic_state: Literal["recompute", "store"] = "recompute",
+    sonic_store_layers: int = 0,
     router_topk: Literal["torch", "triton"] = "triton",
     w1_init_fn_type: str = "scaled_orthogonal",
     w1_init_std: float = 1.0,
@@ -315,6 +318,13 @@ def build_opt_moe_layers(
     takes the depth divisor too with ``init_gate_as_residual``. The token
     dispatcher: all-to-all under EP, local dispatch without (DeepEP / HybridEP:
     upstream's ``TokenDispatcherTransform`` on the recipe).
+
+    ``expert_gemm``: "torch" (``torch._grouped_mm``), "deepgemm" or "sonicmoe"
+    (``sonicmoe_experts.py``: SonicMoE's kernels take the router's selection;
+    ``SONICMOE_SITE`` names its package). With "sonicmoe", ``sonic_state``
+    "recompute" runs the experts as a rematerialisation region (nothing held for
+    the backward; the first ``sonic_store_layers`` MoE layers store instead) and
+    "store" keeps SonicMoE's state (1 GiB per layer at 64k tokens) in every MoE layer.
     """
     if gated_attention_type not in (None, "element-wise"):
         raise ValueError(
@@ -333,6 +343,20 @@ def build_opt_moe_layers(
         raise ValueError(
             f"layers {n_dense_layers}..{n_layers - 1} are MoE layers: they need "
             "moe_hidden_dim, num_experts and top_k"
+        )
+    if expert_gemm != "sonicmoe" and (
+        sonic_state != "recompute" or sonic_store_layers != 0
+    ):
+        raise ValueError(
+            'sonic_state / sonic_store_layers need expert_gemm="sonicmoe" '
+            f"(got expert_gemm={expert_gemm!r}, sonic_state={sonic_state!r}, "
+            f"sonic_store_layers={sonic_store_layers})"
+        )
+    if sonic_store_layers < 0 or (sonic_state == "store" and sonic_store_layers):
+        raise ValueError(
+            "sonic_store_layers counts the MoE layers that store while the others "
+            'recompute: >= 0, and 0 with sonic_state="store" (all store), got '
+            f"{sonic_store_layers} with sonic_state={sonic_state!r}"
         )
     if prenorm_gain_init != 1.0 and norm_type != "rmsnorm":
         raise ValueError(
@@ -499,9 +523,27 @@ def build_opt_moe_layers(
                     'expert_gemm="deepgemm" needs dim and moe_hidden_dim multiples of '
                     f"64 (DeepGEMM's SM90 bf16 K granularity), got {dim} / {moe_hidden_dim}"
                 )
+            if expert_gemm == "sonicmoe" and (
+                token_dispatch != "gather" or enable_ep or enable_tp
+            ):
+                raise ValueError(
+                    'expert_gemm="sonicmoe" needs token_dispatch="gather", EP 1 and TP 1 '
+                    "(SonicMoE gathers each expert's tokens itself, on this rank's whole "
+                    "token set)"
+                )
             expert_linear = (
                 DeepGEMMGroupedLinear if expert_gemm == "deepgemm" else GroupedLinear
             )
+            # sonicmoe: the first sonic_store_layers MoE layers (counted from the
+            # first one after the dense layers) hold SonicMoE's backward state, the
+            # others recompute it
+            routed_experts_cls, routed_experts_extra = RoutedExperts, {}
+            if expert_gemm == "sonicmoe":
+                routed_experts_cls = SonicMoERoutedExperts
+                routed_experts_extra = dict(
+                    recompute=sonic_state == "recompute"
+                    and layer_id - n_dense_layers >= sonic_store_layers
+                )
             dispatcher = (
                 GatherTokenDispatcher.Config(
                     num_experts=num_experts,
@@ -530,7 +572,7 @@ def build_opt_moe_layers(
                     if quantile_balance_bins is not None
                     else plain_router.Config(**router_args)
                 ),
-                routed_experts=RoutedExperts.Config(
+                routed_experts=routed_experts_cls.Config(
                     w13=expert_linear.Config(
                         group_size=num_experts,
                         in_features=dim,
@@ -571,6 +613,7 @@ def build_opt_moe_layers(
                     # All-to-all under EP, local dispatch at EP 1 (no EP mesh).
                     token_dispatcher=dispatcher,
                     sharding_config=routed_experts_sharding_config(),
+                    **routed_experts_extra,
                 ),
                 shared_experts=(
                     _ffn(

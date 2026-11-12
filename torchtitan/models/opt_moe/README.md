@@ -144,6 +144,22 @@ each a dict of `CosSinRoPE.Config` fields (the cache is `seq_len` long, or
     to `torch._grouped_mm`); needs `token_dispatch="gather"`, EP 1 and `dim` /
     `moe_hidden_dim` multiples of 64. Set `DG_JIT_CACHE_DIR` (its kernels
     compile on first use; the default is under `$HOME`).
+  - `expert_gemm="sonicmoe"`: SonicMoE's kernels (`sonicmoe_experts.py`; the
+    PyPI wheel `sonic-moe`, not installed: `SONICMOE_SITE` names the folder
+    that holds the `sonicmoe` package, imported on first use) take the
+    router's selected experts and fp32 scores: one grouped GEMM with the SwiGLU
+    in its epilogue, one for the down projection, a gather-sum with the scores.
+    No dispatch rows, no padding, the same parameters as the other backends
+    (zero-copy views of `w13` / `w2`). Needs `token_dispatch="gather"`, EP 1,
+    TP 1 and `dim` / `moe_hidden_dim` multiples of 8. Its kernels sit behind
+    custom ops, so `compile_blocks` works (SonicMoE asserts against tracing).
+    `sonic_state="recompute"` (default): the experts are one remat region
+    (`<fqn>.sonicmoe`) that the backward reruns, nothing of them is held, and
+    the replay under `compile_blocks` skips the down projection;
+    `sonic_state="store"`: SonicMoE's pre-activation and routing metadata stay
+    on the GPU (1 GiB per layer at 64k tokens, top 8, `moe_hidden_dim` 512);
+    `sonic_store_layers=N` (with "recompute"): the first N MoE layers store.
+    The flag decides, not the `activation_remat` patterns.
   l44 q32 top 8 E256, 16k context, 64k tokens, 16 nodes, same nodes (steps 20 /
   30, tokens / s / GPU): upstream's 12,324 / 12,315; gather 12,479 / 12,464;
   + DeepGEMM 12,620 / 12,586; + Triton top-k 12,738 / 12,674 (+3.4% / +2.9%).

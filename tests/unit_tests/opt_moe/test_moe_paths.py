@@ -7,7 +7,9 @@
 """opt_moe's MoE paths (flavor arguments token_dispatch, expert_gemm,
 router_topk) train the same model: one step of a two-layer model, same init and
 tokens, loss and every gradient close to upstream's paths (scatter-add dispatch,
-torch._grouped_mm, torch.topk)."""
+torch._grouped_mm, torch.topk). expert_gemm="sonicmoe" needs SONICMOE_SITE."""
+
+import os
 
 import pytest
 import torch
@@ -53,11 +55,14 @@ def _step(**paths):
         dict(token_dispatch="gather"),
         dict(router_topk="triton"),
         dict(token_dispatch="gather", expert_gemm="deepgemm", router_topk="triton"),
+        dict(token_dispatch="gather", expert_gemm="sonicmoe", router_topk="triton"),
     ],
 )
 def test_alternative_moe_paths_train_the_same_model(paths):
     """Each combination vs the upstream paths: loss and every gradient."""
-    pytest.importorskip("deep_gemm") if paths.get("expert_gemm") else None
+    pytest.importorskip("deep_gemm") if paths.get("expert_gemm") == "deepgemm" else None
+    if paths.get("expert_gemm") == "sonicmoe" and not os.environ.get("SONICMOE_SITE"):
+        pytest.skip("needs SONICMOE_SITE (the folder that holds the sonicmoe package)")
     upstream = dict(
         token_dispatch="scatter_add", expert_gemm="torch", router_topk="torch"
     )

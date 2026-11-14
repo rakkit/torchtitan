@@ -54,6 +54,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated, Any
 
+import jinja2
 import numpy as np
 
 import tyro
@@ -252,6 +253,7 @@ class MultiTurnChatProcessor(SampleProcessor):
         self._drop_if_longer_than = config.drop_if_longer_than
         self._num_dropped = 0
         self._num_seen = 0
+        self._num_unrenderable = 0
         self._num_prompt_mismatches = 0
         self._num_turn_mismatches = 0
         self._num_turns_off_flag = 0  # assistant turns left untrained: reasoning presence != the row's thinking flag
@@ -405,7 +407,21 @@ class MultiTurnChatProcessor(SampleProcessor):
             # contribute a zero-token row and skew packing.
             return None
 
-        token_ids = self._tokenize(messages, extra)
+        try:
+            token_ids = self._tokenize(messages, extra)
+        except jinja2.TemplateError as e:
+            # A malformed row (e.g. an unknown role) must not stop the run: skip it, and log it.
+            self._num_unrenderable += 1
+            if self._num_unrenderable == 1 or self._num_unrenderable % 100 == 0:
+                logger.warning(
+                    "SFT: skipped %d of %d conversations so far that the chat template cannot "
+                    "render (latest: %s; roles %s).",
+                    self._num_unrenderable,
+                    self._num_seen,
+                    e,
+                    [m.get("role") for m in messages][:8],
+                )
+            return None
         if len(token_ids) < 2:
             return None
         # The training sequence is one token shorter than the render (next-token shift).

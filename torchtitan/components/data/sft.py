@@ -447,6 +447,50 @@ class MultiTurnChatProcessor(SampleProcessor):
         return TextSequence(input_ids=input_ids[:-1], labels=labels)
 
 
+class PretokenizedSFTProcessor(SampleProcessor):
+    """Rows that `MultiTurnChatProcessor` already processed offline: `input_ids` and
+    `labels` columns holding exactly the TextSequence it returns. Rendering on the fly
+    runs in one thread per rank and measured ~19k tokens/s per core, below the trainer's
+    ~25k tokens/s per GPU, so offline tokenization removes the loader stall."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(SampleProcessor.Config):
+        pass
+
+    def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
+        del context
+        self.config = config
+
+    def __call__(
+        self, sample: dict[str, Any], rng: np.random.Generator
+    ) -> TextSequence:
+        del rng
+        return TextSequence(
+            input_ids=np.asarray(sample["input_ids"], dtype=np.int64),
+            labels=np.asarray(sample["labels"], dtype=np.int64),
+        )
+
+
+def make_pretokenized_sft_dataloader_config(
+    datasets: list[DatasetSpec],
+    *,
+    num_packing_bins: int = 32,
+    **loader_kwargs: Any,
+) -> KeyedMixDataLoader.Config:
+    """`make_sft_dataloader_config` for corpora written by `MultiTurnChatProcessor`
+    offline (same packing; the length drop already happened offline)."""
+    datasets = [replace_columns(d, ("input_ids", "labels")) for d in datasets]
+    mix = build_mix(datasets, processor_for=lambda _: PretokenizedSFTProcessor.Config())
+    loader_kwargs.setdefault("shuffle", False)
+    return KeyedMixDataLoader.Config(
+        dataset=FirstFitPackingConfig(dataset=mix, num_packing_bins=num_packing_bins),
+        collator=TextCollator.Config(),
+        dataset_ids=tuple(dataset.alias for dataset in datasets),
+        dataset_weights=tuple(float(dataset.weight) for dataset in datasets),
+        **loader_kwargs,
+    )
+
+
 def make_sft_dataloader_config(
     datasets: list[DatasetSpec],
     *,

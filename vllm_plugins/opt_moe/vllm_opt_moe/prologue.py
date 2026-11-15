@@ -47,7 +47,6 @@ def _conv_slice(
     tokens,
     positions,
     requests,
-    slots,
     qstart,
     valid,
     row_mask,
@@ -61,23 +60,12 @@ def _conv_slice(
 ):
     """``x + conv(x)`` (fp32) of ``S`` channels of one head: the projection's
     columns ``col ..``, the state head ``cache_head``'s dims ``d0 ..`` (this
-    forward's raw ``x`` inserted first)."""
+    forward's raw ``x`` already in the state: ``_state_store_kernel``)."""
     dims = tl.arange(0, S)
     x = tl.load(
         qkv_ptr + tokens[:, None] * stride_qkv_t + col + dims[None, :],
         mask=row_mask[:, None],
         other=0.0,
-    )
-    safe_slot = tl.maximum(slots, 0)
-    tl.store(
-        cache_ptr
-        + (safe_slot // block_size)[:, None] * stride_c_blk
-        + cache_head * stride_c_h
-        + (safe_slot % block_size)[:, None] * stride_c_n
-        + d0
-        + dims[None, :],
-        x,
-        mask=valid[:, None],
     )
     acc = tl.zeros([BT, S], dtype=tl.float32)
     for tap in tl.static_range(W):
@@ -184,6 +172,47 @@ def _norm_rope_store(
         tl.store(base + 2 * R + rc[None, :], c.to(DTYPE), mask=row_mask[:, None])
 
 
+@triton.jit(do_not_specialize=["T", "block_size"])
+def _state_store_kernel(
+    qkv_ptr,
+    stride_qkv_t,
+    kv_col0,
+    cache_ptr,
+    stride_c_blk,
+    stride_c_h,
+    stride_c_n,
+    slot_ptr,
+    T,
+    block_size,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+):
+    """This forward's raw k / v into the conv state (head ``h`` of the state =
+    the projection's columns ``kv_col0 + h K``). A launch of its own, before
+    the conv reads the state: a request with a prefix-cache hit reads state
+    blocks that another request of the same forward writes."""
+    tokens = tl.program_id(0) * BT + tl.arange(0, BT)
+    head = tl.program_id(1)
+    dims = tl.arange(0, K)
+    slots = tl.load(slot_ptr + tokens, mask=tokens < T, other=-1)
+    valid = (tokens < T) & (slots >= 0)
+    x = tl.load(
+        qkv_ptr + tokens[:, None] * stride_qkv_t + kv_col0 + head * K + dims[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    )
+    safe_slot = tl.maximum(slots, 0)
+    tl.store(
+        cache_ptr
+        + (safe_slot // block_size)[:, None] * stride_c_blk
+        + head * stride_c_h
+        + (safe_slot % block_size)[:, None] * stride_c_n
+        + dims[None, :],
+        x,
+        mask=valid[:, None],
+    )
+
+
 @triton.jit(do_not_specialize=["T", "max_blocks", "block_size"])
 def _prologue_kernel(
     qkv_ptr,
@@ -283,7 +312,6 @@ def _prologue_kernel(
             tokens,
             positions,
             requests,
-            slots,
             qstart,
             valid,
             row_mask,
@@ -310,7 +338,6 @@ def _prologue_kernel(
             tokens,
             positions,
             requests,
-            slots,
             qstart,
             valid,
             row_mask,
@@ -339,7 +366,6 @@ def _prologue_kernel(
                 tokens,
                 positions,
                 requests,
-                slots,
                 qstart,
                 valid,
                 row_mask,
@@ -389,7 +415,6 @@ def _prologue_kernel(
             tokens,
             positions,
             requests,
-            slots,
             qstart,
             valid,
             row_mask,
@@ -445,6 +470,20 @@ def attention_prologue(
     assert R & (R - 1) == 0 and (C == 0 or C & (C - 1) == 0), (rope_dim, K)
     weight = q_norm_weight is not None
     BT = 4
+    _state_store_kernel[(triton.cdiv(T, BT), 2 * G)](
+        qkv_TC,
+        qkv_TC.stride(0),
+        qkv_TC.shape[1] - 2 * G * K,
+        conv_cache,
+        conv_cache.stride(0),
+        conv_cache.stride(1),
+        conv_cache.stride(2),
+        slot_mapping,
+        T,
+        conv_cache.shape[2],
+        K=K,
+        BT=BT,
+    )
     grid = (triton.cdiv(T, BT), H + G)
     _prologue_kernel[grid](
         qkv_TC,

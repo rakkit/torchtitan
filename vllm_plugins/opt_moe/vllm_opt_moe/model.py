@@ -145,6 +145,11 @@ def opt_moe_attention_prologue(
     owner = context.no_compile_layers[layer_name]
     T, dev = qkv_TC.shape[0], qkv_TC.device
     if metadata is None:  # vLLM's profiling / dummy runs: no state, no conv
+        if torch.cuda.is_current_stream_capturing():
+            # a graph captured here would replay without the conv (V1 runner)
+            raise RuntimeError(
+                "vLLM opt_moe: CUDA graph captured without attention metadata"
+            )
         none = torch.full((T,), -1, dtype=torch.int64, device=dev)
         zeros = torch.zeros((T,), dtype=torch.int32, device=dev)
         state = torch.empty(
@@ -246,7 +251,7 @@ class OptMoeAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
         self.conv_state = None
-        if config.conv_kernel_size:
+        if config.layer_types[layer_idx].startswith("hybrid"):  # the conv layers
             self.conv_state = OptMoeConvState(config, prefix=f"{prefix}.conv_state")
             # this rank's k conv rows, then its v conv rows (the HF k_conv /
             # v_conv weights): one parameter, no per-forward concatenation

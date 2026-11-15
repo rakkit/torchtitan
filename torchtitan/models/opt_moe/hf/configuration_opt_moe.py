@@ -31,7 +31,7 @@ class OptMoeConfig(PretrainedConfig):
     partial RoPE); ``attention_gate`` (None | ``element-wise``:
     ``sigmoid(gate_proj(x))`` on the output); ``attention_sinks`` (one logit
     per head in the softmax; not with the gate); ``conv_kernel_size`` (the
-    Canon short conv ``x + conv(x)`` on k and v, 0: none).
+    Canon short conv ``x + conv(x)`` on k and v of the hybrid layers, 0: none).
 
     Feed-forward: the first ``first_k_dense_replace`` layers a SwiGLU FFN of
     ``intermediate_size``, the rest MoE: ``n_routed_experts`` of
@@ -123,7 +123,8 @@ class OptMoeConfig(PretrainedConfig):
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.hidden_act = hidden_act
         self.use_cache = use_cache
-        allowed = _CONV_LAYER_TYPES if conv_kernel_size else _LAYER_TYPES
+        # with a conv: the conv layers are hybrid, the others may have none
+        allowed = _CONV_LAYER_TYPES | _LAYER_TYPES if conv_kernel_size else _LAYER_TYPES
         if not set(self.layer_types) <= allowed:
             raise ValueError(
                 f"layer_types {sorted(set(self.layer_types))}: with conv_kernel_size "

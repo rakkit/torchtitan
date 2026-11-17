@@ -904,6 +904,8 @@ class TestCheckpointManager(unittest.TestCase):
         manager1.close()
         manager2.close()
 
+    # the stubbed async_save starts no writer process to wait for
+    @mock.patch("torchtitan.components.checkpointer.dcp._wait_for_writer_process")
     @mock.patch("torchtitan.components.checkpointer.dcp.logger")
     @mock.patch("torch.distributed.get_rank", return_value=0)
     @mock.patch("torch.cuda.Stream")
@@ -922,6 +924,7 @@ class TestCheckpointManager(unittest.TestCase):
         mock_cuda_stream,
         mock_rank,
         mock_logger,
+        mock_wait_for_writer_process,
     ):
         """
         Test that AsyncMode.ASYNC_WITH_PINNED_MEM correctly assigns the staging future.

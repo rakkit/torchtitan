@@ -480,7 +480,11 @@ def make_pretokenized_sft_dataloader_config(
     """`make_sft_dataloader_config` for corpora written by `MultiTurnChatProcessor`
     offline (same packing; the length drop already happened offline)."""
     datasets = [replace_columns(d, ("input_ids", "labels")) for d in datasets]
-    mix = build_mix(datasets, processor_for=lambda _: PretokenizedSFTProcessor.Config())
+    mix = build_mix(
+        datasets,
+        by_tokens=True,  # as make_sft_dataloader_config: a weight is a share of the tokens
+        processor_for=lambda _: PretokenizedSFTProcessor.Config(),
+    )
     loader_kwargs.setdefault("shuffle", False)
     return KeyedMixDataLoader.Config(
         dataset=FirstFitPackingConfig(dataset=mix, num_packing_bins=num_packing_bins),

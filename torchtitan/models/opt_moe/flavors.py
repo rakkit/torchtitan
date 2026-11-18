@@ -824,6 +824,50 @@ def _mis_30b_a3b(**overrides: Any) -> OPTMoEModel.Config:
     )
 
 
+# 49 layers F + (5S + 1F) x 8: SWA 512 with RoPE, the full layers NoPE; attention
+# sinks (no gate), k / v conv; 256 experts x 512, top 8 + 1 shared, quantile
+# balancing (1000 bins); 40.62B parameters, 3.17B active (2.76B without the
+# embedding, 2.35B without embedding and head).
+def _mis_40b_a3b(**overrides: Any) -> OPTMoEModel.Config:
+    swa_pattern = "F" + "SSSSSF" * 8
+    return _opt_moe_config(
+        **dict(
+            _MIS,
+            dim=2048,
+            n_layers=49,
+            swa_pattern=swa_pattern,
+            rope_pattern="".join("N" if c == "F" else "R" for c in swa_pattern),
+            sliding_window_size=512,
+            attn_backend="flex_flash",
+            n_dense_layers=1,
+            dense_hidden_dim=6144,
+            moe_hidden_dim=512,
+            num_experts=256,
+            quantile_balance_bins=1000,
+            gated_attention_type=None,
+            attention_sinks=True,
+            sinks_init_fn_type="zeros",
+            conv_kernel_size=4,
+            conv_init_fn_type="delay",
+            conv_init_gain=4.0,
+            vocab_size=201088,
+            depth_init="identity",
+            init_gate_as_residual=False,
+            prenorm_gain_init=1.0,
+            embedding_init_fn_type="scion_normal_input",
+            embedding_init_std=0.02,
+            lm_head_init_fn_type="scion_normal_output",
+            lm_head_init_std=1,
+            **{
+                f"{w}_init_{k}": v
+                for w in ("wqkv", "wo", "w_gate", "w1", "w2", "w3", "router")
+                for k, v in (("fn_type", "scaled_orthogonal"), ("std", 4))
+            },
+        )
+        | overrides
+    )
+
+
 def _mis_100b_a5b(**overrides: Any) -> OPTMoEModel.Config:
     return _opt_moe_config(
         **dict(
@@ -916,6 +960,7 @@ MODEL_FLAVORS: dict[str, tuple[Callable[..., OPTMoEModel.Config], int]] = {
         4096,
     ),
     "mis-30b-a3b": (_mis_30b_a3b, 4096),
+    "mis-40b-a3b": (_mis_40b_a3b, 16384),
     "mis-100b-a5b": (_mis_100b_a5b, 4096),
     "gauge-d8-w256": (
         functools.partial(

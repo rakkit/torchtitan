@@ -49,11 +49,14 @@ context) with piecewise CUDA graphs for prefill and full ones for decoding.
 MoE kernel configs: vLLM ships tuned fused-MoE configs for many GPUs but none
 for GH200, so its Triton MoE runs a default config there. `register()` points
 `VLLM_TUNED_CONFIG_FOLDER` at `vllm_opt_moe/moe_configs/` (unless already set;
-vLLM reads it before its own folder). For now it holds H100's bf16 config for
-256 experts of width 512 and H100's block-FP8 config for 256 experts of width
-384 (`E=256,N=384,...,block_shape=[128,128]`), the H100 configs matching our
-shapes. TODO: tune block FP8 and bf16 on GH200 for the final expert shape
-(vLLM's benchmarks/kernels/benchmark_moe.py) once the architecture is final.
+vLLM reads it before its own folder). It holds configs tuned on GH200 for 256
+experts, hidden 2048, top 8: width 512 (TP 1) and 256 (TP 2 shards), bf16 and
+block FP8, at 1-16,384 tokens (each token count timed over a pruned config
+space under CUDA graphs; bf16 outputs bitwise equal to the default config's,
+FP8 within 1.5e-4). Per MoE layer vs the default config: TP 1 bf16 1.00-1.13x,
+FP8 1.00-1.18x; TP 2 bf16 1.01-1.15x, FP8 1.00-1.22x. vLLM looks the file up
+by the device name: JUPITER's compute nodes report `NVIDIA_GH200_120GB`, its
+login nodes `NVIDIA_GH200_480GB`, so each file is there under both names.
 vLLM's DeepGEMM block-FP8 MoE does not import in this environment (its bundled
 `deep_gemm` lacks `_C`), so the block-FP8 MoE runs vLLM's Triton kernel.
 

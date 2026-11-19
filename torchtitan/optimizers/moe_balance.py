@@ -23,7 +23,7 @@ import torch.nn as nn
 
 from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.utils import fsdp_shard_mesh
-from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.moe import estimate_expert_biases, MoE
 
 if TYPE_CHECKING:
     from torchtitan.components.optim import OptimizersContainer
@@ -229,11 +229,19 @@ def _quantile_update_expert_bias(
             )
         histograms = list(stacked_LEB.unbind())
 
-    for histogram_EB, balancer, expert_bias_E in zip(
-        histograms, balancers, bias_params, strict=True
-    ):
-        expert_bias_E.copy_(balancer.estimate_expert_bias(histogram_EB, expert_bias_E))
-        balancer.required_bias_histogram_EB.zero_()
+    if len({(b.num_experts, b.top_k, b.num_bins) for b in balancers}) != 1:
+        raise ValueError(
+            "Quantile balancing updates all MoE layers in one batch: every layer needs the same "
+            "(num_experts, top_k, num_bins)."
+        )
+    next_expert_bias_LE = estimate_expert_biases(
+        torch.stack(histograms),
+        torch.stack(bias_params),
+        top_k=balancers[0].top_k,
+        num_bins=balancers[0].num_bins,
+    )
+    torch._foreach_copy_(bias_params, list(next_expert_bias_LE.unbind(0)))
+    torch._foreach_zero_([b.required_bias_histogram_EB for b in balancers])
 
 
 def register_moe_load_balancing_hook(

@@ -251,7 +251,7 @@ class OptMoeAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
         self.conv_state = None
-        if config.layer_types[layer_idx].startswith("hybrid"):  # the conv layers
+        if config.conv_kernel_size:
             self.conv_state = OptMoeConvState(config, prefix=f"{prefix}.conv_state")
             # this rank's k conv rows, then its v conv rows (the HF k_conv /
             # v_conv weights): one parameter, no per-forward concatenation

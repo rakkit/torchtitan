@@ -237,7 +237,6 @@ def build_opt_moe_layers(
     swa_pattern: str | None = None,
     gated_attention_type: Literal["element-wise"] | None = None,
     conv_kernel_size: int = 0,
-    conv_on_full_attention: bool = True,
     attention_sinks: bool = False,
     wqkv_init_fn_type: str = "scaled_orthogonal",
     wqkv_init_std: float = 1.0,
@@ -300,8 +299,7 @@ def build_opt_moe_layers(
     ``gated_attention_type`` "element-wise": the output times
     ``sigmoid(gate_proj(x))``; ``conv_kernel_size`` > 0: the Canon short conv
     ``x + conv(x)`` on k and v, each channel initialized by ``conv_init_fn_type`` ("delay",
-    "random_opnorm", "torch_default") at ``conv_init_gain``; ``conv_on_full_attention``
-    False: the conv on the sliding-window layers only;
+    "random_opnorm", "torch_default") at ``conv_init_gain``;
     ``attention_sinks``: one learned logit per head in the softmax (the gate or
     sinks: one or neither).
 
@@ -465,7 +463,7 @@ def build_opt_moe_layers(
                 },
                 sharding_config=replicated_input_colwise_sharding_config(),
             )
-        if conv_kernel_size > 0 and (use_swa[mirror] or conv_on_full_attention):
+        if conv_kernel_size > 0:
             attention["k_conv"] = conv(n_kv_heads * head_dim)
             attention["v_conv"] = conv(n_kv_heads * head_dim)
         if attention_sinks:

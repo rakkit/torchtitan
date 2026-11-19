@@ -197,8 +197,7 @@ class OptMoeAttention(nn.Module):
             if config.attention_gate == "element-wise"
             else None
         )
-        hybrid = config.layer_types[layer_idx].startswith("hybrid")
-        w = config.conv_kernel_size if hybrid else 0  # the conv layers are hybrid
+        w = config.conv_kernel_size
 
         def conv(channels):
             return nn.Conv1d(channels, channels, w, groups=channels, bias=False)

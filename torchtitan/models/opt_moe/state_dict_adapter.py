@@ -127,8 +127,7 @@ def hf_config(model_config: Any) -> dict[str, Any]:
             raise NotImplementedError(f"hf_config: RoPE scaling {r.scaling!r}")
         return {"dim": r.dim, "theta": r.theta}
 
-    convs = [l.attention.k_conv for l in layers]
-    conv = next((c for c in convs if c is not None), None)
+    conv = attn.k_conv
     return {
         "architectures": ["OptMoeForCausalLM"],
         "model_type": "opt_moe",
@@ -148,12 +147,12 @@ def hf_config(model_config: Any) -> dict[str, Any]:
         "head_dim": qkv.head_dim,
         "qk_norm": attn.qk_norm is not None,
         # transformers' cache layer types: a conv layer is "hybrid" (K / V and
-        # conv states in one cache layer); the conv may be on some layers only
+        # conv states in one cache layer)
         "layer_types": [
-            ("hybrid" if c is not None else "full_attention")
+            ("hybrid" if conv is not None else "full_attention")
             if w is None
-            else ("hybrid_sliding" if c is not None else "sliding_attention")
-            for w, c in zip(windows, convs, strict=True)
+            else ("hybrid_sliding" if conv is not None else "sliding_attention")
+            for w in windows
         ],
         "sliding_window": next(iter(window), None),
         "rope_layers": [rope(l) for l in layers],

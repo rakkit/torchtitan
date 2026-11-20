@@ -37,12 +37,21 @@ Packed documents unbalance head-tail: the rank whose chunks hold a long
 document's late tokens does most of its attention (256k, CP 4, l44, one step:
 4.3 / 5.8 / 4.9 / 4.7 s of attention on one group's ranks). With varlen,
 `DocumentCPLoadBalancer` (`parallelism.context_parallel_load_balancer`) cuts
-the row's longest document head-tail and deals the rest in contiguous runs:
+every long document of the row (`min_document_length`, default 8,192 tokens)
+head-tail, longest first, and deals the rest in contiguous runs:
 
 ```text
 row:   [A: short docs][D: long doc, chunks d0..d7][B: short docs]     CP 4
 rank r holds d_r, d_(7-r) and a quarter of A + B (row order), T / 4 tokens
 ```
+
+A rank holds at most 16 token ranges (`MAX_CP_RANK_FRAGMENTS`): when cutting
+every long document would need more, the shortest of them stay whole.
+`max_split_documents` limits how many are cut (None: all that fit, the default;
+1: only the longest, the rule before 11-20; 0: none). Measured on the L49 40B
+shape, text 256k, CP 4, 32 nodes, old / new alternating in one job: 7,266 /
+7,260 tokens per second per GPU with 1, 7,658 / 7,678 with None (+5.4% / +5.8%,
+same memory).
 
 Each rank runs one varlen call over its document pieces; a piece's keys are
 gathered by index from the all-gathered K / V (sliding window: from its own rows

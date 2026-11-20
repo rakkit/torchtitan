@@ -159,12 +159,14 @@ def document_cp_fragments(
     *,
     cp_size: int,
     min_document_length: int,
+    max_split_documents: int | None = None,
 ) -> list[list[tuple[int, int]]]:
     """Each CP rank's global token ranges ``[start, stop)`` (ascending) under
     `DocumentCPLoadBalancer`'s layout of one row with document offsets
     ``cu_seqlens``: the documents of at least ``min_document_length`` tokens,
-    longest first and as many as keep every rank within
-    `MAX_CP_RANK_FRAGMENTS` ranges, are each cut into 2 x CP chunks (rank r:
+    longest first, at most ``max_split_documents`` of them (None: no limit) and
+    as many as keep every rank within `MAX_CP_RANK_FRAGMENTS` ranges, are each
+    cut into 2 x CP chunks (rank r:
     chunks r and 2 CP - 1 - r); the other tokens are dealt in row order,
     filling each rank to T / CP tokens. Chunk sizes differ by one token, so a
     rank over T / CP after the cut documents hands its last tokens to the
@@ -179,7 +181,7 @@ def document_cp_fragments(
     long_first = sorted(
         (i for i, (a, b) in enumerate(documents) if b - a >= min_document_length),
         key=lambda i: documents[i][0] - documents[i][1],
-    )
+    )[:max_split_documents]
     for num_split in range(len(long_first), 0, -1):
         fragments = _document_cp_layout(
             documents, set(long_first[:num_split]), num_tokens, cp_size
@@ -268,6 +270,13 @@ class DocumentCPLoadBalancer(ContextParallelLoadBalancer):
         """A row whose longest document is shorter stays contiguous: its
         attention work per token is about even."""
 
+        max_split_documents: int | None = None
+        """At most this many of a row's long documents are cut head-tail,
+        longest first. None cuts every long document that fits in
+        `MAX_CP_RANK_FRAGMENTS` ranges per rank (L49 40B shape, text 256k, CP 4,
+        32 nodes: +5.4% / +5.8% tokens per second over 1, two rounds in one job).
+        1 cuts only the longest; 0 cuts none (the row stays contiguous)."""
+
     def __init__(
         self,
         config: Config,
@@ -291,6 +300,7 @@ class DocumentCPLoadBalancer(ContextParallelLoadBalancer):
             attention_metadata.cu_seq_q.tolist(),
             cp_size=cp_group.size(),
             min_document_length=config.min_document_length,
+            max_split_documents=config.max_split_documents,
         )
         assert sum(b - a for f in self.fragments for a, b in f) == seq_len
         self.device = attention_metadata.cu_seq_q.device

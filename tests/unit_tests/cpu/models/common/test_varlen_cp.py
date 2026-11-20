@@ -164,6 +164,25 @@ class TestDocumentLayout(TestCase):
             document_cp_fragments([0, 40, 80, 96], cp_size=2, min_document_length=32),
             [[(0, 10), (30, 50), (70, 88)], [(10, 30), (50, 70), (88, 96)]],
         )
+        # max_split_documents 1: only the first of the two is cut; 0: none
+        self.assertEqual(
+            document_cp_fragments(
+                [0, 40, 80, 96],
+                cp_size=2,
+                min_document_length=32,
+                max_split_documents=1,
+            ),
+            [[(0, 10), (30, 68)], [(10, 30), (68, 96)]],
+        )
+        self.assertEqual(
+            document_cp_fragments(
+                [0, 40, 80, 96],
+                cp_size=2,
+                min_document_length=32,
+                max_split_documents=0,
+            ),
+            [[(0, 48)], [(48, 96)]],
+        )
         # chunk sizes differ by one: rank 0 gets 17 + 17 of two 33-token
         # documents and hands its last token to rank 1 (33 each)
         fragments = document_cp_fragments(

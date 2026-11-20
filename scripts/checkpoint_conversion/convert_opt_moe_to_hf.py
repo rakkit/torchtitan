@@ -169,15 +169,24 @@ def _write_hf_files(
         GenerationConfig(**token_ids).save_pretrained(output_dir)
 
 
-def load_run_model(job_config: Path):
+def load_run_model(job_config: Path, export_dtype: str):
     """The run (its training config) and its model, rebuilt from the run's
-    ``job_config.json`` without init: built on meta, materialized empty on CPU."""
+    ``job_config.json`` without init: built on meta, materialized empty on CPU,
+    the parameters in ``export_dtype``.
+
+    The checkpoint's fp32 values are cast while they are copied in (the rounding
+    of a cast after the load), so a 40B model needs ~81 GB of RAM in bf16, not
+    ~162 GB. The buffers (the router bias, kept in fp32 in the export) stay as
+    built."""
     run = load_training_config(job_config).config
     if run.model.name != "opt_moe":
         raise ValueError(f"{job_config} is not an opt_moe run: {run.model.name}")
     with torch.device("meta"):
         model = run.model.build()
     model.to_empty(device="cpu")
+    if export_dtype != "float32":
+        for param in model.parameters():
+            param.data = torch.empty_like(param, dtype=TORCH_DTYPE_MAP[export_dtype])
     return run, model
 
 
@@ -199,10 +208,17 @@ def _file_index_by_size(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, int
     return mapping
 
 
-def save_hf_folder(run, state_dict, output_dir: Path, export_dtype: str) -> None:
+def save_hf_folder(
+    run,
+    state_dict,
+    output_dir: Path,
+    export_dtype: str,
+    extra_hf_state: dict[str, torch.Tensor] | None = None,
+) -> None:
     """``state_dict`` (native names) as a complete HF folder: the weights in
     ``export_dtype`` (the adapter's fp32 tensors kept fp32), the config, the
-    modeling and tokenizer files, a generation config and a chat template."""
+    modeling and tokenizer files, a generation config and a chat template.
+    ``extra_hf_state``: tensors the adapter does not map (HF names), saved too."""
     if not (Path(run.hf_assets_path) / "tokenizer.json").is_file():
         # without it the folder has no tokenizer and no bos / eos ids: generation
         # would never stop
@@ -215,6 +231,7 @@ def save_hf_folder(run, state_dict, output_dir: Path, export_dtype: str) -> None
     # cast first would round them before the fp32 copy.
     adapter = OPTMoEStateDictAdapter(run.model, None)
     hf_state_dict = adapter.to_hf(state_dict)
+    hf_state_dict.update(extra_hf_state or {})
     dtype = TORCH_DTYPE_MAP[export_dtype]
     for key, value in hf_state_dict.items():
         if value.is_floating_point():
@@ -244,7 +261,7 @@ def convert_opt_moe_to_hf(
     *,
     read_threads: int = 16,
 ) -> None:
-    run, model = load_run_model(job_config)
+    run, model = load_run_model(job_config, export_dtype)
     state_dict = ModelWrapper(model)._get_state_dict()
     dcp.load(
         state_dict,

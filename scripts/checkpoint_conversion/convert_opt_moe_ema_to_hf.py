@@ -13,8 +13,8 @@ CheckpointManager keeps the EMA container under the ``ema`` key (DCP:
 fraction). The copy exported (``--ema_key``, or the checkpoint's only one) is read
 straight into the model's tensors under those keys, the tensors it does not
 cover (frozen parameters, buffers it does not average) from the trained weights:
-one fp32 copy of the model in memory (upstream's ``convert_ema_to_hf.py``
-rebuilds the container next to the model, about 2.5x that).
+one copy of the model in memory, in the export dtype (upstream's
+``convert_ema_to_hf.py`` rebuilds the container next to the model).
 
     python scripts/checkpoint_conversion/convert_opt_moe_ema_to_hf.py \\
         <dump>/checkpoint/step-N <dump>/job_config.json <out> --export_dtype bfloat16
@@ -80,7 +80,7 @@ def convert_opt_moe_ema_to_hf(
     read_threads: int = 16,
     ema_key: str | None = None,
 ) -> None:
-    run, model = load_run_model(job_config)
+    run, model = load_run_model(job_config, export_dtype)
     ema_key, ema_fqns = _ema_copy(checkpoint_dir, ema_key)
     state_dict = ModelWrapper(model)._get_state_dict()
     # An EMA tensor without its state-dict key would export the trained
@@ -90,7 +90,7 @@ def convert_opt_moe_ema_to_hf(
         raise ValueError(
             f"the EMA copy does not map onto the model's state dict: {missing[:5]}"
         )
-    # One fp32 copy of the model: the tensors the EMA copy covers are read from
+    # One copy of the model: the tensors the EMA copy covers are read from
     # their EMA entries into the model's own tensors, the rest (frozen
     # parameters, buffers the EMA does not average) from the trained weights.
     dcp.load(

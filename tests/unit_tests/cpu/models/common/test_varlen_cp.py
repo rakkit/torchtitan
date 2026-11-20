@@ -24,6 +24,7 @@ from torchtitan.distributed.accelerator_graph import AcceleratorGraphInputSpec
 from torchtitan.distributed.context_parallel import (
     document_cp_fragments,
     get_token_fragments,
+    MAX_CP_RANK_FRAGMENTS,
 )
 from torchtitan.distributed.spmd_types import set_current_spmd_mesh
 from torchtitan.models.common.attention import (
@@ -171,6 +172,14 @@ class TestDocumentLayout(TestCase):
         self.assertEqual([sum(b - a for a, b in f) for f in fragments], [33, 33])
         covered = sorted(g for f in fragments for a, b in f for g in range(a, b))
         self.assertEqual(covered, list(range(66)))
+        # 40 long documents cannot all be cut within MAX_CP_RANK_FRAGMENTS
+        # ranges per rank: the longest ones are, the rest dealt in row order
+        many = [64 * i for i in range(41)]
+        fragments = document_cp_fragments(many, cp_size=4, min_document_length=8)
+        self.assertLessEqual(max(len(f) for f in fragments), MAX_CP_RANK_FRAGMENTS)
+        covered = sorted(g for f in fragments for a, b in f for g in range(a, b))
+        self.assertEqual(covered, list(range(64 * 40)))
+        self.assertEqual([sum(b - a for a, b in f) for f in fragments], [640] * 4)
         # no document long enough: contiguous shards
         self.assertEqual(
             document_cp_fragments(offsets, cp_size=2, min_document_length=81),

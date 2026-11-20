@@ -147,9 +147,11 @@ class HeadTailCPLoadBalancer(ContextParallelLoadBalancer):
 
 
 # Most token ranges a CP rank holds under a load-balancing permutation
-# (head-tail: 2; DocumentCPLoadBalancer: 4). Rank-local tables are sized by it,
-# so every layout gives the compiled blocks the same shapes.
-MAX_CP_RANK_FRAGMENTS = 4
+# (head-tail: 2; DocumentCPLoadBalancer: up to this many). Rank-local tables are
+# sized by it, so every layout gives the compiled blocks the same shapes; a
+# sliding window gathers this many window-row tails per rank. 16 holds every
+# document of 32k+ tokens of the 256k midtrain rows split (at most 14 ranges).
+MAX_CP_RANK_FRAGMENTS = 16
 
 
 def document_cp_fragments(
@@ -160,22 +162,45 @@ def document_cp_fragments(
 ) -> list[list[tuple[int, int]]]:
     """Each CP rank's global token ranges ``[start, stop)`` (ascending) under
     `DocumentCPLoadBalancer`'s layout of one row with document offsets
-    ``cu_seqlens``: every document of at least ``min_document_length`` tokens
-    is cut into 2 x CP chunks (rank r: chunks r and 2 CP - 1 - r); the other
-    tokens are dealt in row order, filling each rank to T / CP tokens. Chunk
-    sizes differ by one token, so a rank over T / CP after the cut documents
-    hands its last tokens to the row-order deal."""
+    ``cu_seqlens``: the documents of at least ``min_document_length`` tokens,
+    longest first and as many as keep every rank within
+    `MAX_CP_RANK_FRAGMENTS` ranges, are each cut into 2 x CP chunks (rank r:
+    chunks r and 2 CP - 1 - r); the other tokens are dealt in row order,
+    filling each rank to T / CP tokens. Chunk sizes differ by one token, so a
+    rank over T / CP after the cut documents hands its last tokens to the
+    row-order deal."""
     num_tokens = cu_seqlens[-1]
     if num_tokens % cp_size:
         raise ValueError(
             f"The token count ({num_tokens}) must be divisible by the CP degree "
             f"({cp_size})."
         )
+    documents = list(zip(cu_seqlens[:-1], cu_seqlens[1:]))
+    long_first = sorted(
+        (i for i, (a, b) in enumerate(documents) if b - a >= min_document_length),
+        key=lambda i: documents[i][0] - documents[i][1],
+    )
+    for num_split in range(len(long_first), 0, -1):
+        fragments = _document_cp_layout(
+            documents, set(long_first[:num_split]), num_tokens, cp_size
+        )
+        if max(len(f) for f in fragments) <= MAX_CP_RANK_FRAGMENTS:
+            return fragments
+    return _document_cp_layout(documents, set(), num_tokens, cp_size)
+
+
+def _document_cp_layout(
+    documents: list[tuple[int, int]],
+    split: set[int],
+    num_tokens: int,
+    cp_size: int,
+) -> list[list[tuple[int, int]]]:
+    """`document_cp_fragments` with the documents ``split`` cut head-tail."""
     pieces: list[list[tuple[int, int]]] = [[] for _ in range(cp_size)]
     rest = []
     n = 2 * cp_size
-    for start, stop in zip(cu_seqlens[:-1], cu_seqlens[1:]):
-        if stop - start < min_document_length:
+    for i, (start, stop) in enumerate(documents):
+        if i not in split:
             rest.append((start, stop))
             continue
         bounds = [start + j * (stop - start) // n for j in range(n + 1)]

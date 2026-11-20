@@ -18,6 +18,7 @@ from typing import Any
 
 from torchtitan.components.data.mix import DatasetSpec
 
+from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.base.model import BaseModel
 from torchtitan.trainer import Trainer
@@ -189,14 +190,14 @@ def load_training_config(snapshot_path: str | Path) -> LoadedTrainingConfig:
         build_args=_optional_mapping(model_snapshot, "build_args") or {},
     )
 
+    # The run's training settings go in before Trainer.Config validates the
+    # model against them (e.g. disable_accelerator_graphs with varlen attention).
+    training = TrainingConfig()
+    _overlay_dataclass(training, _required_mapping(snapshot, "training"), "training")
     config = Trainer.Config(
         model=model_config,
         hf_assets_path=_required_string(snapshot, "hf_assets_path"),
-    )
-    _overlay_dataclass(
-        config.training,
-        _required_mapping(snapshot, "training"),
-        "training",
+        training=training,
     )
     _overlay_dataclass(
         config.parallelism,

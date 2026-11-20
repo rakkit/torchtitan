@@ -561,6 +561,7 @@ class OPTMoEModel(Decoder):
         padding_mask: torch.Tensor | None = None,
         aux_loss_denominators: torch.Tensor | None = None,
         routed_experts: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
     ):
         """Upstream's ``Decoder.forward`` plus the residual statistics and,
         with MTP, the MTP depths after the main stack.
@@ -576,6 +577,8 @@ class OPTMoEModel(Decoder):
                 the MoE leaves out of its balance statistics.
             routed_experts: Routing replay (RL) ``[T, num_layers, K]``, ``-1``
                 where the generator routed nothing; block ``i`` reads ``[:, i]``.
+            input_embeds: The first block's input when the caller embedded the
+                tokens itself (the vision model's image features are in it).
 
         Returns:
             The logits (hidden states with ``_skip_lm_head``); with MTP a tuple,
@@ -607,11 +610,12 @@ class OPTMoEModel(Decoder):
         else:
             mtp_embeds = []
             # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
-            h = (
-                self.tok_embeddings(tokens)
-                if self.tok_embeddings is not None
-                else tokens
-            )
+            if input_embeds is not None:
+                h = input_embeds
+            elif self.tok_embeddings is not None:
+                h = self.tok_embeddings(tokens)
+            else:
+                h = tokens
         # Upstream's aux-loss normaliser: the step-global routed-token count (one
         # per block; every block routes the same tokens), as Decoder.forward.
         with spmd.no_typecheck():

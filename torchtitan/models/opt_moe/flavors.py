@@ -997,6 +997,7 @@ def build_model_config(
     rope_length: int | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
     cp_attention: Literal["all_gather_kv", "ulysses"] = "all_gather_kv",
+    vision_encoder: Literal["siglip2-so400m-patch16-512"] | None = None,
     **overrides: Any,
 ) -> OPTMoEModel.Config:
     """The complete, sharded config of ``flavor`` for ``parallelism``, with the
@@ -1008,7 +1009,17 @@ def build_model_config(
     all-gathered K / V (``all_gather_kv``, with a load balancer for causal
     masks) or the whole sequence for ``heads / cp`` heads after an all-to-all
     (``ulysses``: needs the q and KV head counts divisible by CP, contiguous
-    shards)."""
+    shards). ``vision_encoder``: the vision model (``build_vl_model_config``)."""
+    if vision_encoder is not None:
+        return build_vl_model_config(
+            flavor,
+            parallelism=parallelism,
+            seq_len=seq_len,
+            rope_length=rope_length,
+            converters=converters,
+            cp_attention=cp_attention,
+            **overrides,
+        )
     if flavor not in MODEL_FLAVORS:
         raise ValueError(
             f"Unknown opt_moe flavor {flavor!r}; available: {', '.join(MODEL_FLAVORS)}"
@@ -1053,4 +1064,66 @@ def build_model_config(
             config = c.build().convert(config)
     config.flavor = flavor
     config.build_args = copy.deepcopy(overrides)
+    return config
+
+
+def build_vl_model_config(
+    flavor: str,
+    *,
+    parallelism: ParallelismConfig,
+    seq_len: int | None = None,
+    **overrides: Any,
+) -> OPTMoEModel.Config:
+    """``build_model_config``'s text model plus the SigLIP 2 So400m/16-512
+    encoder (Qwen3.5's ViT code: 1152 wide, 27 layers, 16 heads, MLP 4304,
+    patch 16, single-frame patches, its 32 x 32 learned position table, no RoPE,
+    its post_layernorm) and Qwen3.5's merger (LayerNorm, 2x2 concat, biased
+    2-layer MLP) projecting to the model dimension."""
+    # VL-only: imported here so that a text run does not load qwen3_5
+    from torchtitan.models.common.nn_modules import LayerNorm
+    from torchtitan.models.common.vision_encoder_sharding import (
+        invariant_norm_sharding_config,
+        vision_inner_attention_sharding_config,
+    )
+    from torchtitan.models.qwen3_5.flavors import _qwen35_vision_encoder_config
+    from torchtitan.models.qwen3_5.vision_encoder import (
+        FullSequenceVarlenInnerAttention,
+    )
+    from .vl_model import OPTMoEVLModel
+
+    text = build_model_config(
+        flavor, parallelism=parallelism, seq_len=seq_len, **overrides
+    )
+    encoder = _qwen35_vision_encoder_config(
+        dim=1152,
+        ffn_dim=4304,
+        num_layers=27,
+        num_heads=16,
+        patch_size=16,
+        temporal_patch_size=1,
+        spatial_merge_size=2,
+        out_hidden_size=text.dim,
+        num_position_embeddings=1024,
+    )
+    encoder.rotary_pos_emb = None
+    encoder.post_norm = LayerNorm.Config(
+        normalized_shape=1152,
+        eps=1e-6,
+        sharding_config=invariant_norm_sharding_config(),
+    )
+    # One varlen sequence per image frame on FA3 (cuDNN plans again for every new
+    # tile count; FA4's query gradient is wrong at head dim 72).
+    encoder.block.attn.inner_attention = FullSequenceVarlenInnerAttention.Config(
+        sdpa_backends=["FLASH_ATTENTION"],
+        sharding_config=vision_inner_attention_sharding_config(),
+    )
+    config = OPTMoEVLModel.Config(
+        **{f.name: getattr(text, f.name) for f in dataclasses.fields(text)},
+        vision_encoder=encoder,
+    )
+    # so build_model_config(flavor, **build_args) rebuilds the VL model
+    config.build_args = {
+        **text.build_args,
+        "vision_encoder": "siglip2-so400m-patch16-512",
+    }
     return config

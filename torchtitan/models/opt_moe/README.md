@@ -301,6 +301,32 @@ A run's checkpoint becomes an HF folder with
 chat template, a generation config, safetensors files of at most 5 GB). The run's EMA weights instead (an EMA copy, `--ema_key` when the
 run kept several): `convert_opt_moe_ema_to_hf.py`, same arguments.
 
+## Vision-language variant
+
+`vl_model.py`: `OPTMoEVLModel`, the text model plus a SigLIP 2 So400m/16-512
+encoder (Qwen3.5's ViT code with SigLIP's learned position table and
+post_layernorm, no RoPE, then Qwen3.5's merger to the model dimension), built by
+`build_vl_model_config` (`build_model_config(..., vision_encoder=...)` rebuilds
+it from a run's `build_args`). Images are InternVL tiles of 512 px
+(`components/data/multimodal/internvl_tiling.py`, 256 tokens per tile, DataComp-VLM
+shards in `dcvlm.py`); their features replace the image placeholder tokens'
+embeddings, a text-only microbatch runs the encoder on a dummy grid so every rank
+joins its FSDP collectives. The recipe weights the loss per token
+(`MMSamplePackingConfig(loss_weights=True)` with
+`ChunkedLossWrapper(loss_fn=WeightedCrossEntropyLoss.Config(...))`).
+
+Parallelism: FSDP only. CP, PP and MTP raise; TP, SP and EP are not verified.
+`OPTMoEVLModel` is not re-exported by `__init__.py` so that a text run does not
+import qwen3_5.
+
+HF: `scripts/checkpoint_conversion/convert_opt_moe_vl_to_hf.py` (the arguments of
+the text converter) writes a folder for `OptMoeForConditionalGeneration`
+(`hf/modeling_opt_moe_vl.py`: `OptMoeForCausalLM` plus transformers'
+`SiglipVisionModel` and the merger; `tile_images` is a copy of the training tiling,
+`tests/unit_tests/cpu/components/data/test_internvl_tiling.py`). The
+numerics check is the converted model's logits against the training forward on
+the same tiles; the converter raises when a vision tensor has no HF name.
+
 ## RL (TitanRL generator)
 
 The generator runs this model inside vLLM (`torchtitan/rl`). Decode speed at

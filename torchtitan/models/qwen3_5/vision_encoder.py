@@ -13,19 +13,26 @@ Shape suffixes:
 - K = merged feature dimension
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import spmd_types as spmd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import sdpa_kernel
 
 from torchtitan.models.base.model import FlopsEstimator
 from torchtitan.models.base.module import Module, ModuleDict
 from torchtitan.models.common import Linear
 
+from torchtitan.models.common.attention import (
+    VarlenAttentionMetadata,
+    VarlenInnerAttention,
+)
 from torchtitan.models.common.flops import active_parameter_flops_per_token
 from torchtitan.models.common.nn_modules import GELU, LayerNorm
+from torchtitan.models.common.param_layout import ParamLayout
 from torchtitan.models.common.rope import CosSinRoPE
 from torchtitan.models.common.vision_encoder import (
     create_block_diagonal_mask,
@@ -261,6 +268,66 @@ class VisionRotaryEmbedding(Module):
         return torch.outer(seq, self.inv_freq)
 
 
+class FullSequenceVarlenInnerAttention(VarlenInnerAttention):
+    """Varlen attention that runs one dense kernel when every sequence is full.
+
+    Image tiles of one size are sequences of exactly ``max_q`` tokens, so one
+    dense SDPA call over ``[sequences, H, max_q, K]`` computes the same attention
+    without the varlen bookkeeping. Any other input takes the varlen kernel.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(VarlenInnerAttention.Config):
+        pass
+
+    def _forward_varlen(
+        self,
+        q_THK: torch.Tensor,
+        k_THK: torch.Tensor,
+        v_THV: torch.Tensor,
+        *,
+        attention_metadata: VarlenAttentionMetadata,
+        scale: float | None = None,
+        out_transform: (
+            Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None
+        ) = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        max_q = attention_metadata.max_q
+        num_sequences = attention_metadata.cu_seq_q.shape[0] - 1
+        if (
+            out_transform is not None
+            or kwargs
+            or attention_metadata.cu_seq_k is not attention_metadata.cu_seq_q
+            or attention_metadata.window_size != (-1, -1)
+            # every sequence has at most max_q tokens: all are full
+            or num_sequences * max_q != q_THK.shape[0]
+        ):
+            return super()._forward_varlen(
+                q_THK,
+                k_THK,
+                v_THV,
+                attention_metadata=attention_metadata,
+                scale=scale,
+                out_transform=out_transform,
+                **kwargs,
+            )
+        # the kernel dtype of VarlenInnerAttention._forward_varlen
+        dtype = v_THV.dtype
+        if dtype not in (torch.float16, torch.bfloat16):
+            dtype = torch.bfloat16
+        with sdpa_kernel(self.sdpa_backends, set_priority=True):
+            out_SHQV = F.scaled_dot_product_attention(
+                *(
+                    x.to(dtype).unflatten(0, (num_sequences, max_q)).transpose(1, 2)
+                    for x in (q_THK, k_THK, v_THV)
+                ),
+                scale=scale,
+            )
+        out_THV = out_SHQV.transpose(1, 2).reshape(q_THK.shape[0], *v_THV.shape[1:])
+        return out_THV.to(q_THK.dtype)
+
+
 class PatchMerger(Module):
     """Merge spatial patches to reduce sequence length.
 
@@ -328,8 +395,11 @@ class Qwen35VisionEncoder(Module):
         # Sub-module configs
         patch_embed_proj: Linear.Config
         block: VisionTransformerBlock.Config
-        rotary_pos_emb: VisionRotaryEmbedding.Config
+        # None: no 2D RoPE, positions from the learned table only (SigLIP 2).
+        rotary_pos_emb: VisionRotaryEmbedding.Config | None
         merger: PatchMerger.Config
+        # SigLIP 2's post_layernorm after the last block; Qwen3.5 has none.
+        post_norm: LayerNorm.Config | None = None
 
         def build_flops_estimator(
             self,
@@ -341,6 +411,7 @@ class Qwen35VisionEncoder(Module):
                     encoder.patch_embed,
                     encoder.layers,
                     encoder.merger.norm,
+                    *([encoder.post_norm] if encoder.post_norm is not None else []),
                 )
             )
             output_token_flops = sum(
@@ -388,18 +459,29 @@ class Qwen35VisionEncoder(Module):
         )
         self.num_grid_per_side = int(config.num_position_embeddings**0.5)
 
-        self.rotary_pos_emb = config.rotary_pos_emb.build()
+        self.rotary_pos_emb = (
+            config.rotary_pos_emb.build() if config.rotary_pos_emb is not None else None
+        )
         self._cached_freq_table: torch.Tensor | None = None
 
         self.layers = ModuleDict(
             {str(idx): config.block.build() for idx in range(config.num_layers)}
         )
 
+        self.post_norm = (
+            config.post_norm.build() if config.post_norm is not None else None
+        )
         self.merger = config.merger.build()
+
+    def param_layouts(self) -> dict[str, ParamLayout]:
+        """The learned position table is a lookup (one row per grid position),
+        like a token embedding, not a map to orthogonalize; every other
+        parameter is classified by its rank (``models/common/param_layout.py``)."""
+        return {"pos_embed": ParamLayout("embedding")}
 
     def compute_position_embeddings(
         self, grids: list[list[int]]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:  # (learned positions, RoPE cache)
         """Compute packed learned position embeddings and RoPE caches.
 
         Delegates to two standalone helpers:
@@ -411,14 +493,10 @@ class Qwen35VisionEncoder(Module):
 
         Returns:
             learned_pos: ``(total_num_patches, dim)`` learned positions.
-            rope_cache: ``(total_num_patches, 1, head_dim*2)`` RoPE cache.
+            rope_cache: ``(total_num_patches, 1, head_dim*2)`` RoPE cache, or
+                None without 2D RoPE.
         """
         head_dim = self.config.dim // self.config.num_heads
-
-        # Get RoPE freq table, reusing cache when possible
-        max_hw = max(max(h, w) for _, h, w in grids)
-        if self._cached_freq_table is None or self._cached_freq_table.shape[0] < max_hw:
-            self._cached_freq_table = self.rotary_pos_emb(max_hw)
 
         learned_pos = _compute_learned_pos_embeds(
             self.pos_embed,
@@ -427,6 +505,13 @@ class Qwen35VisionEncoder(Module):
             self.spatial_merge_size,
             self.config.dim,
         )
+        if self.rotary_pos_emb is None:
+            return learned_pos, None
+
+        # Get RoPE freq table, reusing cache when possible
+        max_hw = max(max(h, w) for _, h, w in grids)
+        if self._cached_freq_table is None or self._cached_freq_table.shape[0] < max_hw:
+            self._cached_freq_table = self.rotary_pos_emb(max_hw)
 
         rope_cache = _compute_2d_rope_cache(
             self._cached_freq_table,
@@ -475,21 +560,47 @@ class Qwen35VisionEncoder(Module):
         learned_pos, rope_cache = self.compute_position_embeddings(grids)
         x = x + learned_pos
 
-        # BlockMask creation and use in FlexInnerAttention are blackboxed from
-        # typechecking.
+        # Attention metadata creation and use are blackboxed from typechecking.
         with spmd.no_typecheck():
-            attention_mask = create_block_diagonal_mask(
-                segment_lengths,
-                total_tokens,
-                x.device,
-            )
+            if isinstance(
+                self.config.block.attn.inner_attention, VarlenInnerAttention.Config
+            ):
+                # One full-attention sequence per frame; the max length comes
+                # from the host grid, so no extra device sync.
+                cu_seqlens = F.pad(
+                    torch.cumsum(segment_lengths, 0, dtype=torch.int32), (1, 0)
+                )
+                max_seqlen = max(h * w for _, h, w in grids)
+                attention_mask = VarlenAttentionMetadata(
+                    cu_seq_q=cu_seqlens,
+                    cu_seq_k=cu_seqlens,
+                    max_q=max_seqlen,
+                    max_k=max_seqlen,
+                    window_size=(-1, -1),
+                )
+            else:
+                attention_mask = create_block_diagonal_mask(
+                    segment_lengths,
+                    total_tokens,
+                    x.device,
+                )
 
+        rope_apply = CosSinRoPE.apply_rotary_emb if rope_cache is not None else _no_rope
         for layer in self.layers.values():
             x = layer(
                 x,
                 rope_cache=rope_cache,
-                rope_apply=CosSinRoPE.apply_rotary_emb,
+                rope_apply=rope_apply,
                 attention_mask=attention_mask,
             )
+        if self.post_norm is not None:
+            x = self.post_norm(x)
 
         return self.merger(x)
+
+
+def _no_rope(
+    q_THDh: torch.Tensor, k_THDh: torch.Tensor, rope_cache: None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The encoder without 2D RoPE (SigLIP 2): q and k as they are."""
+    return q_THDh, k_THDh

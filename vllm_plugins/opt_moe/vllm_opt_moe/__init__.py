@@ -6,10 +6,10 @@
 
 """vLLM plugin entry point for opt_moe (the ``vllm.general_plugins`` entry
 point of ``pyproject.toml``): adds ``OptMoeForCausalLM`` (``model.py``) to vLLM's
-model registry, the architecture an opt_moe HF folder's config.json names, and
-its MTP depths as the speculative draft ``OptMoeMTPModel``
+model registry, the architecture an opt_moe HF folder's config.json names, its
+MTP depths as the speculative draft ``OptMoeMTPModel``
 (``--speculative-config '{"method": "mtp", "num_speculative_tokens": 1}'``, as
-for DeepSeek / Qwen)."""
+for DeepSeek / Qwen), and the VLM ``OptMoeForConditionalGeneration`` (``vl.py``)."""
 
 import os
 from pathlib import Path
@@ -19,6 +19,7 @@ from vllm.config.speculative import SpeculativeConfig
 
 MODEL_ARCH = "OptMoeForCausalLM"
 MTP_ARCH = "OptMoeMTPModel"
+VL_ARCH = "OptMoeForConditionalGeneration"
 
 _vllm_draft_hf_config = SpeculativeConfig.hf_config_override
 
@@ -40,6 +41,9 @@ def draft_hf_config(hf_config):
 def register() -> None:
     ModelRegistry.register_model(MODEL_ARCH, f"{__name__}.model:OptMoeForCausalLM")
     ModelRegistry.register_model(MTP_ARCH, f"{__name__}.model:OptMoeMTP")
+    ModelRegistry.register_model(
+        VL_ARCH, f"{__name__}.vl:OptMoeForConditionalGeneration"
+    )
     # TODO: vLLM maps a target's model_type to its MTP draft architecture in
     # this static method only (no registry entry for out-of-tree models).
     SpeculativeConfig.hf_config_override = staticmethod(draft_hf_config)
@@ -50,4 +54,4 @@ def register() -> None:
     )
 
 
-__all__ = ["MODEL_ARCH", "MTP_ARCH", "register"]
+__all__ = ["MODEL_ARCH", "MTP_ARCH", "VL_ARCH", "register"]

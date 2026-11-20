@@ -90,6 +90,96 @@ greedy continuations of 48 tokens with the draft equal the ones without,
 384 / 384 drafts accepted; with the draft's hidden state zeroed 11 / 741
 (0.015).
 
+## Images (`vllm_opt_moe/vl.py`)
+
+A VLM folder (torchtitan's `convert_opt_moe_vl_to_hf.py`: `config.json` names
+`OptMoeForConditionalGeneration`, `vision_config` carries SigLIP 2's config and
+`spatial_merge_size`, `tile_size`, `max_tiles` and the token ids) is served by
+the second class `register()` adds, in the same package and entry point:
+
+```bash
+vllm serve <VL folder> --trust-remote-code --dtype bfloat16
+vllm serve <VL folder> --trust-remote-code --dtype bfloat16 \
+    --limit-mm-per-prompt '{"image": 0}'      # text only: the tower is not built
+```
+
+`OptMoeForConditionalGeneration` = vLLM's `SiglipVisionTransformer` (its
+parameter names are the folder's `visual.*`, q / k / v stacked at load; the
+tower stays bf16 under `--quantization`) + `OptMoeVisionMerger` (`merger.*`: the
+HF reference's connector, LayerNorm, 2 x 2 merge in block order, biased MLP with
+tanh GELU) + `OptMoeForCausalLM` as `language_model`, unchanged (the text names
+`model.*` / `lm_head.*` map onto it with a `WeightsMapper`). The tower and the
+merger are built under vLLM's `_mark_tower_model`, so with
+`--limit-mm-per-prompt '{"image": 0}'` they are not allocated or loaded and the
+engine runs in text-only mode (token ids into the text model).
+`--compilation-config '{"compile_mm_encoder": true}'` compiles the tower as a
+whole (`OptMoeVisionTower`, vLLM's tower under `support_torch_compile`, the
+number of tiles dynamic); off by default.
+
+Serving speed (11-21, one GH200, bf16, the 8B VLM, in-process engine,
+`max_num_batched_tokens` 16,384; 1-tile prompts 277 tokens, 13-tile prompts
+3,349 tokens):
+
+| 13-tile prompts | batch 1 | batch 16 | batch 64 |
+|---|---|---|---|
+| tower, ms per tile (eager / `compile_mm_encoder`) | 2.64 / 2.54 | 2.49 / 2.47 | 2.51 / 2.46 |
+| prefill, requests / s: images vs the same length in text | 13.0 vs 27.3 | 14.2 vs 48.0 | 14.2 vs 48.9 |
+| decode tokens / s: image vs text requests | 474 vs 479 | 4,750 vs 4,475 | 12,215 vs 12,173 |
+
+A lone 1-tile image takes 16.1 ms in the tower (10.2 ms compiled): one tile is
+launch-bound. An image costs its tower time once in prefill (46% of a 13-tile
+prompt's prefill at batch 64); decode is unchanged. Text served by this class
+runs within 3% of the text-only engine (image limit 0). FlashAttention is the
+tower's fastest backend (TORCH_SDPA up to 4% slower; FLASHINFER needs varlen
+inputs the tower does not pass); `max_num_batched_tokens` 4,096 caps the tower
+at 16 tiles per call and lowers image throughput by up to 44% (batched 1-tile
+requests). `fp8_per_block` raises decode by 15-31% at batch 16-64 (the tower
+stays bf16).
+
+There is no HF processor: `OptMoeMultiModalProcessor` tiles the image on the
+frontend's CPU exactly as the reference's `tile_images` (InternVL's dynamic
+tiling: the grid of at most `max_tiles` 512-px squares closest to the aspect
+ratio, bicubic antialiased resize, a thumbnail when there is more than one
+square; `max_tiles // number of images in the prompt` per image) and hands the
+uint8 tiles over; the model normalizes to [-1, 1] on the GPU. 256 LLM tokens per
+tile (32 x 32 patches, 2 x 2 merge). The prompt holds ONE
+`<|image_pad|>` per image, `<|vision_start|><|image_pad|><|vision_end|>` (what
+vLLM's chat API inserts for an image part, `get_placeholder_str`); the processor
+expands it to the tiles' tokens. The HF reference's `image_prompt` already
+expanded text must not be sent. All tiles of the images scheduled in a step go
+through the tower as one batch of 1024-patch sequences (no varlen); the
+connector's output replaces the pads' embeddings (vLLM's encoder cache keeps it
+across chunked-prefill steps).
+
+Checks (11-20, one shared login GPU, bf16, the 8B VLM trial's export; scripts
+`vllm_check.py`, `hf_check.py`, `tiling_equal.py` in the user's configs): the
+vLLM engine in one process, hooks on the model for the image embeddings and the
+logits of every sampled token, against the export's own HF
+`OptMoeForConditionalGeneration` (transformers, bf16, sdpa), teacher-forced on
+vLLM's tokens. Real DataComp-VLM samples: 1 tile, 3 tiles (2 x 1 + thumbnail),
+13 tiles (4 x 3 + thumbnail), 2 images (7 + 3 tiles: the budget split), a 13-tile
+image behind 2,200 text tokens (prompt 5,500: the image straddles the 4,096-token
+prefill chunk), and 2 text prompts, each sent twice (the second a prefix-cache
+hit: all but the last 5-16 tokens cached, the tower does not run again).
+
+| check | result |
+|---|---|
+| tiles, plugin vs HF `tile_images` | 65 (image size, budget) cases bit-equal after the normalization, equal token counts; the grid rule (vLLM's InternVL helpers) equals HF's `tile_grid` on 120,000 random (size, budget) pairs |
+| prompt ids, tiles | the expanded ids equal the HF `image_prompt` ones; the uint8 tiles normalized equal HF's float tiles bit for bit |
+| image embeddings, vLLM vs HF bf16 | median abs diff 0.023-0.031, max 1.7-2.3; the noise floor, HF bf16 vs HF fp32 (tower and merger): median 0.031-0.036, max 2.0-2.8 |
+| logits, per generated token max abs diff over the vocabulary | median 0.20-0.88 (text-only prompts 0.44-0.84), max 0.5-3.2; argmax agreement 0.97-1.0 (the misses are exact bf16 ties) |
+| greedy, up to 64 tokens | identical to HF to the end for 3 of 7 prompts (8-64 tokens), the others diverge at token 63, 44, 5 and 0, each at a bf16 near tie (HF top-2 gap 0.000-0.188) |
+| image straddling a prefill chunk | `max_num_batched_tokens` 4,096 vs 8,192: tokens, 64 logit rows and embeddings bit-equal; prefix caching on or off: the first request bit-equal, a request repeated without the cache bit-equal to its first |
+| `--limit-mm-per-prompt '{"image": 0}'` | tower and merger not built (0 parameters; 17,058,569,920 vs 17,946,998,432 bytes, the 888,428,512 of the tower and merger); text tokens and logits bit-equal to the full load |
+| tower compiled (`compile_mm_encoder`) | one compile of the tower for 1, 10 and 13 tiles; embeddings vs HF fp32: median 0.025-0.028 (bf16 floor 0.031-0.036), vs HF bf16 0.033-0.041, max 2.3-2.9; vs the eager tower median 0.033-0.039; logits vs HF median 0.35-0.78; without the flag bit-equal to the plain tower |
+| torch.compile + CUDA graphs (as served) | same prompts (5 of the 7), the text model compiled, piecewise graphs for prefill and full ones for decode, the tower eager: logits against HF per-token max abs diff median 0.41-1.0, max 1.0-3.1, argmax agreement 0.95-1.0; against the eager run (rows up to the first differing token) median 0.31-1.1 |
+
+The text classes (`OptMoeForCausalLM`, MTP) are unchanged by the VL class.
+`--quantization fp8_per_block` loads and serves image and text requests (the LLM
+part only; the tower and merger stay bf16), its accuracy against HF was not
+checked. Not checked: tensor parallelism, speculative decoding, vLLM's OpenAI
+server / chat API path (`get_placeholder_str`), image inputs other than PIL.
+
 ## Not yet supported
 
 - other `scoring_func`s than sigmoid.

@@ -157,6 +157,20 @@ class TestDocumentLayout(TestCase):
             for ranges in fragments:
                 self.assertEqual(sum(b - a for a, b in ranges), 128 // cp_size)
                 self.assertLessEqual(len(ranges), 4)
+        # every long document is cut: two 40-token documents in 4 chunks of
+        # 10 each, then the 16 short tokens in row order, 8 per rank
+        self.assertEqual(
+            document_cp_fragments([0, 40, 80, 96], cp_size=2, min_document_length=32),
+            [[(0, 10), (30, 50), (70, 88)], [(10, 30), (50, 70), (88, 96)]],
+        )
+        # chunk sizes differ by one: rank 0 gets 17 + 17 of two 33-token
+        # documents and hands its last token to rank 1 (33 each)
+        fragments = document_cp_fragments(
+            [0, 33, 66], cp_size=2, min_document_length=32
+        )
+        self.assertEqual([sum(b - a for a, b in f) for f in fragments], [33, 33])
+        covered = sorted(g for f in fragments for a, b in f for g in range(a, b))
+        self.assertEqual(covered, list(range(66)))
         # no document long enough: contiguous shards
         self.assertEqual(
             document_cp_fragments(offsets, cp_size=2, min_document_length=81),

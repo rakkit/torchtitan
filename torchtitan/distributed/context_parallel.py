@@ -160,27 +160,38 @@ def document_cp_fragments(
 ) -> list[list[tuple[int, int]]]:
     """Each CP rank's global token ranges ``[start, stop)`` (ascending) under
     `DocumentCPLoadBalancer`'s layout of one row with document offsets
-    ``cu_seqlens``: the longest document, if at least ``min_document_length``
-    tokens, is cut into 2 x CP chunks (rank r: chunks r and 2 CP - 1 - r); the
-    other tokens are dealt in row order, filling each rank to T / CP tokens."""
+    ``cu_seqlens``: every document of at least ``min_document_length`` tokens
+    is cut into 2 x CP chunks (rank r: chunks r and 2 CP - 1 - r); the other
+    tokens are dealt in row order, filling each rank to T / CP tokens. Chunk
+    sizes differ by one token, so a rank over T / CP after the cut documents
+    hands its last tokens to the row-order deal."""
     num_tokens = cu_seqlens[-1]
     if num_tokens % cp_size:
         raise ValueError(
             f"The token count ({num_tokens}) must be divisible by the CP degree "
             f"({cp_size})."
         )
-    lengths = [b - a for a, b in zip(cu_seqlens[:-1], cu_seqlens[1:])]
     pieces: list[list[tuple[int, int]]] = [[] for _ in range(cp_size)]
-    rest = [(0, num_tokens)]
-    longest = max(range(len(lengths)), key=lengths.__getitem__, default=None)
-    if longest is not None and lengths[longest] >= min_document_length:
-        start, stop = cu_seqlens[longest], cu_seqlens[longest + 1]
-        n = 2 * cp_size
+    rest = []
+    n = 2 * cp_size
+    for start, stop in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+        if stop - start < min_document_length:
+            rest.append((start, stop))
+            continue
         bounds = [start + j * (stop - start) // n for j in range(n + 1)]
         for rank in range(cp_size):
             for chunk in (rank, n - 1 - rank):
                 pieces[rank].append((bounds[chunk], bounds[chunk + 1]))
-        rest = [(0, start), (stop, num_tokens)]
+    for p in pieces:
+        excess = sum(b - a for a, b in p) - num_tokens // cp_size
+        while excess > 0:
+            a, b = p.pop()
+            take = min(excess, b - a)
+            if b - take > a:
+                p.append((a, b - take))
+            rest.append((b - take, b))
+            excess -= take
+    rest.sort()
     room = [num_tokens // cp_size - sum(b - a for a, b in p) for p in pieces]
     rank = 0
     for a, b in rest:
@@ -204,18 +215,22 @@ def document_cp_fragments(
 
 
 class DocumentCPLoadBalancer(ContextParallelLoadBalancer):
-    """Balance packed documents: head-tail inside the longest document.
+    """Balance packed documents: head-tail inside every long document.
 
     Head-tail over the whole row balances a row that is one document. With
     packed documents it does not: the rank whose chunks hold the late part of
     a long document does most of the attention (at 256k, CP 4, opt_moe l44:
-    one rank 5.8 s of attention vs 4.3 s on its group's lightest). Here the
-    row's longest document is cut into 2 x CP chunks, rank r taking chunks r
-    and 2 CP - 1 - r, and every other token is dealt in row order as
-    contiguous runs, T / CP tokens per rank::
+    one rank 5.8 s of attention vs 4.3 s on its group's lightest). Here each
+    document of at least ``min_document_length`` tokens is cut into 2 x CP
+    chunks, rank r taking chunks r and 2 CP - 1 - r, and every other token is
+    dealt in row order as contiguous runs, T / CP tokens per rank::
 
         row:     [A: short docs][D: long doc, chunks d0..d7][B: short docs]
         CP 4:    rank r holds d_r, d_(7-r) and a quarter of A + B in row order
+
+    Cutting only the longest document left the second longest on one rank
+    (L49 40B shape, 256k, CP 4: 3.33 s of attention vs ~1.7 s on the three
+    others of that row, the step's slowest GPU).
 
     The layout follows each step's document offsets (read on the host).
     """

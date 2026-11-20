@@ -359,6 +359,18 @@ class MultiModalCollator(Collator):
         )
         if self._num_mtp_layers == 0:
             loss_token_counts = loss_token_counts[0]
+        if "loss_weights" in rows[0]:
+            # Per-token loss weights (sample processors that set them, e.g.
+            # 1/sqrt(answer tokens)): the loss sums weight * NLL and is normalized
+            # by the weights' sum instead of the token count.
+            if self._num_mtp_layers:
+                raise ValueError("loss_weights do not support MTP")
+            loss_weights = torch.cat([sample["loss_weights"] for sample in rows])
+            loss_weights = torch.nn.functional.pad(
+                loss_weights, (0, labels.shape[0] - loss_weights.shape[0])
+            )
+            model_kwargs["loss_kwargs"] = {"loss_weights": loss_weights}
+            loss_token_counts = loss_weights.sum()
         return TokenizedTrainingMicrobatch(
             input=input_ids,
             labels=labels,

@@ -470,6 +470,9 @@ class MMSamplePackingConfig:
     dataset: GrainDatasetConfig
     num_packing_bins: int = 8
     """Candidate rows kept open; more bins can reduce padding but retain more media."""
+    loss_weights: bool = False
+    """Pack each sample's per-token ``loss_weights`` too (zero on padding); the
+    collator then weights the loss by them (sample processors that set them)."""
 
     def __post_init__(self) -> None:
         if self.num_packing_bins <= 0:
@@ -488,7 +491,10 @@ class MMSamplePackingConfig:
         dataset = dataset.filter(
             lambda sample: len(sample["input_ids"]) <= context.max_context_length
         )
-        dataset = dataset.map(_mm_sample_to_packing_input)
+        dataset = dataset.map(
+            partial(_mm_sample_to_packing_input, loss_weights=self.loss_weights)
+        )
+        weights = ("loss_weights",) if self.loss_weights else ()
         if isinstance(dataset, grain.MapDataset):
             dataset = dataset.to_iter_dataset(read_options=context.read_options)
         # TODO(data-global-pack-plan): Consider packing before DP sharding so
@@ -499,17 +505,20 @@ class MMSamplePackingConfig:
                 "input_ids": context.num_tokens_per_microbatch,
                 "labels": context.num_tokens_per_microbatch,
                 "positions": context.num_tokens_per_microbatch,
+                **dict.fromkeys(weights, context.num_tokens_per_microbatch),
             },
             padding_struct={
                 # pyrefly: ignore [missing-attribute]
                 "input_ids": context.tokenizer.pad_id,
                 "labels": IGNORE_INDEX,
                 "positions": 0,
+                **dict.fromkeys(weights, 0.0),
             },
             num_packing_bins=self.num_packing_bins,
             meta_features=(
                 "labels",
                 "positions",
+                *weights,
                 *_MEDIA_FIELDS,
             ),
             seed=dataset_iteration_policy.seed,
@@ -519,16 +528,24 @@ class MMSamplePackingConfig:
             partial(
                 _packing_output_to_mm_sample,
                 max_context_length=context.max_context_length,
+                loss_weights=self.loss_weights,
             )
         )
 
 
-def _mm_sample_to_packing_input(sample: dict[str, Any]) -> dict[str, Any]:
+def _mm_sample_to_packing_input(
+    sample: dict[str, Any], *, loss_weights: bool
+) -> dict[str, Any]:
     """Convert Torch token fields to the arrays expected by Grain packing."""
     return {
         "input_ids": np.asarray(sample["input_ids"]),
         "labels": np.asarray(sample["labels"]),
         "positions": np.asarray(sample["positions"]),
+        **(
+            {"loss_weights": np.asarray(sample["loss_weights"], dtype=np.float32)}
+            if loss_weights
+            else {}
+        ),
         **{key: sample.get(key, []) for key in _MEDIA_FIELDS},
     }
 
@@ -537,6 +554,7 @@ def _packing_output_to_mm_sample(
     packing_output: dict[str, Any],
     *,
     max_context_length: int,
+    loss_weights: bool,
 ) -> dict[str, Any]:
     """Restore Torch token fields and flatten per-document media lists."""
     padding_mask = np.asarray(packing_output["input_ids_segment_ids"]) == 0
@@ -551,6 +569,11 @@ def _packing_output_to_mm_sample(
         "labels": torch.from_numpy(packing_output["labels"]),
         "positions": torch.from_numpy(positions),
         "padding_mask": torch.from_numpy(padding_mask),
+        **(
+            {"loss_weights": torch.from_numpy(packing_output["loss_weights"])}
+            if loss_weights
+            else {}
+        ),
         **{
             key: [
                 item

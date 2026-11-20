@@ -397,6 +397,47 @@ class CrossEntropyLoss(Loss[torch.Tensor]):
         return loss, metrics
 
 
+class WeightedCrossEntropyLoss(Loss[torch.Tensor]):
+    """Cross-entropy summed with a weight per token (``loss_weights``, e.g.
+    InternVL's 1/sqrt(answer tokens) per sample); the collator counts the
+    weights' sum as the loss tokens. Without ``loss_weights`` (validation) every
+    token weighs 1. No z-loss."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Loss.Config):
+        global_vocab_size: int | None = None
+        """Full vocabulary size, needed for spmd_types loss-parallel CE."""
+
+    def __init__(self, config: Config):
+        self.global_vocab_size = config.global_vocab_size
+
+    def __call__(
+        self,
+        pred: torch.Tensor,
+        labels: torch.Tensor,
+        global_loss_token_counts: torch.Tensor | None = None,
+        *,
+        loss_weights: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> LossResult:
+        del kwargs
+        nll_T = cross_entropy_loss(
+            pred, labels, global_vocab_size=self.global_vocab_size, reduction="none"
+        )
+        loss = (nll_T if loss_weights is None else nll_T * loss_weights).sum()
+        # loss: V->P, annotate global_loss_token_counts
+        if current_spmd_mesh() is not None:
+            spmd.assert_type(loss, {"dp": spmd.P, "cp": spmd.P})
+            if global_loss_token_counts is not None:
+                spmd.assert_type(
+                    global_loss_token_counts,
+                    {"dp": spmd.R, "cp": spmd.R, "tp": spmd.I},
+                )
+        if global_loss_token_counts is not None:
+            loss = loss / global_loss_token_counts
+        return loss, {}
+
+
 @local_compile("loss", batch_invariant=False)
 def mse_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """MSE loss with sum reduction for Transformer models training."""

@@ -485,8 +485,10 @@ class HuggingFaceTokenizer(BaseTokenizer):
         add_bos = kwargs.get("add_bos", self.default_add_bos or self.hf_adds_bos)
         add_eos = kwargs.get("add_eos", self.default_add_eos or self.hf_adds_eos)
 
-        # Get base token IDs from the underlying tokenizer
-        token_ids = self.tokenizer.encode(text, add_special_tokens=False).ids
+        # Get base token IDs from the underlying tokenizer. encode_batch releases the
+        # GIL while it tokenizes (encode does not): the data loader's prefetch thread
+        # tokenizes during the training step, and a held GIL stalls the main thread.
+        token_ids = self.tokenizer.encode_batch([text], add_special_tokens=False)[0].ids
 
         # Add BOS token if requested
         if add_bos and self.bos_id is not None:

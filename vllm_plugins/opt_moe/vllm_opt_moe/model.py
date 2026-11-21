@@ -269,7 +269,12 @@ class OptMoeAttention(nn.Module):
             if rope is None
             else get_rope(
                 k,
-                max_position=config.max_position_embeddings,
+                # the prologue indexes the table by position: cover the engine's max_model_len too
+                # (an eval past the trained length, VLLM_ALLOW_LONG_MAX_MODEL_LEN)
+                max_position=max(
+                    config.max_position_embeddings,
+                    get_current_vllm_config().model_config.max_model_len,
+                ),
                 is_neox_style=True,  # torchtitan's rotate-half
                 rope_parameters={"rope_theta": rope["theta"], "rope_dim": rope["dim"]},
                 dtype=torch.float32,

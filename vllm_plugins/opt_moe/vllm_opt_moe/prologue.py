@@ -191,7 +191,9 @@ def _state_store_kernel(
     the projection's columns ``kv_col0 + h K``). A launch of its own, before
     the conv reads the state: a request with a prefix-cache hit reads state
     blocks that another request of the same forward writes."""
-    tokens = tl.program_id(0) * BT + tl.arange(0, BT)
+    # int64 rows: tokens x the projection's row stride passes 2^31 from ~233k tokens in one
+    # forward (gated, 9216 columns), and int32 offsets would wrap
+    tokens = tl.program_id(0).to(tl.int64) * BT + tl.arange(0, BT)
     head = tl.program_id(1)
     dims = tl.arange(0, K)
     slots = tl.load(slot_ptr + tokens, mask=tokens < T, other=-1)
@@ -251,7 +253,9 @@ def _prologue_kernel(
     ROPE: tl.constexpr,
     BT: tl.constexpr,
 ):
-    tokens = tl.program_id(0) * BT + tl.arange(0, BT)
+    # int64 rows: tokens x the projection's row stride passes 2^31 from ~233k tokens in one
+    # forward (gated, 9216 columns), and int32 offsets would wrap
+    tokens = tl.program_id(0).to(tl.int64) * BT + tl.arange(0, BT)
     head = tl.program_id(1)  # q heads 0 .. H - 1, then KV heads
     row_mask = tokens < T
     positions = tl.load(positions_ptr + tokens, mask=row_mask, other=0)

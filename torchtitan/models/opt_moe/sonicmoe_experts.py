@@ -248,15 +248,28 @@ def _(dh_N2F, x_TD, w13_EOI, offset_E1, gather_N, reverse_N, per_token_T1):
 
 # Offload of ``h`` (``sonic_offload_layers``): a storing layer's pre-activation
 # goes to pinned CPU memory during the forward and comes back for its down
-# projection's backward. D2H on a side stream right after the up projection
-# (``h.record_stream`` keeps the GPU block until the copy is done); in the
-# backward, the layer that runs next (the previous one in forward order) is
-# prefetched H2D on a second stream while this one computes. Opaque ops like the
-# kernels', so a compiled block runs them eagerly.
+# projection's backward. D2H on a side stream right after the up projection; the
+# GPU copy is kept here and freed two offloads later, after the compute stream
+# waited for its D2H (freed in GPU order, reusable at once). ``record_stream``
+# would free it only once the CPU sees the copy done, and the CPU runs layers
+# ahead of the GPU: every layer then took new memory (+4 GiB at 6 layers, 1 node;
+# allocator retries at 32 nodes). In the backward, the layer that runs next (the
+# previous one in forward order) is prefetched H2D on a second stream while this
+# one computes. Opaque ops like the kernels', so a compiled block runs them eagerly.
 _streams: dict[int, tuple[torch.cuda.Stream, torch.cuda.Stream]] = {}
 _d2h_done: dict[int, torch.cuda.Event] = {}  # CPU data_ptr -> its D2H copy's event
 _forward_order: list[torch.Tensor] = []  # this step's offloaded h, forward order
 _prefetched: dict[int, tuple[torch.Tensor, torch.cuda.Event]] = {}
+_pending_free: list[tuple[torch.Tensor, torch.cuda.Event]] = []  # GPU h, its D2H event
+_FREE_AFTER = 2  # offloads; a layer's forward (~30 ms at 64k tokens) >> its D2H (~8 ms)
+
+
+def _release_pending(keep: int) -> None:
+    current = torch.cuda.current_stream()
+    while len(_pending_free) > keep:
+        h_N2F, done = _pending_free.pop(0)
+        current.wait_event(done)
+        del h_N2F
 
 
 def _offload_streams() -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
@@ -273,8 +286,10 @@ def _h_to_cpu(h_N2F: torch.Tensor) -> torch.Tensor:
     with torch.cuda.stream(d2h):
         h_cpu = torch.empty(h_N2F.shape, dtype=h_N2F.dtype, pin_memory=True)
         h_cpu.copy_(h_N2F, non_blocking=True)
-        _d2h_done[h_cpu.data_ptr()] = d2h.record_event()
-    h_N2F.record_stream(d2h)
+        done = d2h.record_event()
+    _d2h_done[h_cpu.data_ptr()] = done
+    _pending_free.append((h_N2F, done))
+    _release_pending(_FREE_AFTER)
     _forward_order.append(h_cpu)
     return h_cpu
 
@@ -304,6 +319,7 @@ def _h_to_gpu(h_cpu: torch.Tensor, backward_dep: torch.Tensor) -> torch.Tensor:
     backward: without it a compiled block's partitioner runs this op in the
     forward and saves its GPU result, which frees nothing."""
     del backward_dep
+    _release_pending(0)  # the forward's last GPU copies
     current = torch.cuda.current_stream()
     _, h2d = _offload_streams()
     key = h_cpu.data_ptr()
@@ -312,7 +328,6 @@ def _h_to_gpu(h_cpu: torch.Tensor, backward_dep: torch.Tensor) -> torch.Tensor:
         current.wait_event(done)
     else:
         h_N2F = _start_h2d(h_cpu, current)
-    h_N2F.record_stream(current)
     # prefetch the layer whose backward runs next
     i = next(j for j, t in enumerate(_forward_order) if t.data_ptr() == key)
     if i > 0 and _forward_order[i - 1].data_ptr() not in _prefetched:

@@ -29,8 +29,9 @@ from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
 def _shard_rows_to_fp32(
     src, dst, numel, shard_numel, row_len, col, BLOCK: tl.constexpr
 ):
-    rank = tl.program_id(0)
-    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    # blocks on grid axis 0 (up to 2^31 - 1), ranks on axis 1 (<= 65,535): one rank's shard can be a whole 0.5B-value tensor
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    rank = tl.program_id(1)
     in_shard = offs < shard_numel
     # dim-0 shards are contiguous; the last ranks' shards may run past numel (zero padding)
     x = tl.load(
@@ -63,7 +64,7 @@ def bf16_fp32_reduce_scatter_input_fn(
             rows = -(-g.shape[0] // world_size)  # dim-0 rows per (padded) shard
             shard_numel = rows * (g.numel() // max(g.shape[0], 1))
             block = min(8192, triton.next_power_of_2(max(shard_numel, 1)))
-            _shard_rows_to_fp32[(world_size, triton.cdiv(shard_numel, block))](
+            _shard_rows_to_fp32[(triton.cdiv(shard_numel, block), world_size)](
                 g, out, g.numel(), shard_numel, row_len, col, BLOCK=block, num_warps=8
             )
             col += shard_numel

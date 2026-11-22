@@ -266,6 +266,7 @@ def build_opt_moe_layers(
     expert_gemm: Literal["torch", "deepgemm", "sonicmoe"] = "torch",
     sonic_state: Literal["recompute", "store"] = "recompute",
     sonic_store_layers: int = 0,
+    sonic_offload_layers: int = 0,
     router_topk: Literal["torch", "triton"] = "triton",
     w1_init_fn_type: str = "scaled_orthogonal",
     w1_init_std: float = 1.0,
@@ -323,6 +324,8 @@ def build_opt_moe_layers(
     "recompute" runs the experts as a rematerialisation region (nothing held for
     the backward; the first ``sonic_store_layers`` MoE layers store instead) and
     "store" keeps SonicMoE's state (1 GiB per layer at 64k tokens) in every MoE layer.
+    ``sonic_offload_layers``: the first that many MoE layers (all of them storing)
+    keep their state's ``h`` in pinned CPU memory instead of on the GPU.
     """
     if gated_attention_type not in (None, "element-wise"):
         raise ValueError(
@@ -343,12 +346,22 @@ def build_opt_moe_layers(
             "moe_hidden_dim, num_experts and top_k"
         )
     if expert_gemm != "sonicmoe" and (
-        sonic_state != "recompute" or sonic_store_layers != 0
+        sonic_state != "recompute"
+        or sonic_store_layers != 0
+        or sonic_offload_layers != 0
     ):
         raise ValueError(
             'sonic_state / sonic_store_layers need expert_gemm="sonicmoe" '
             f"(got expert_gemm={expert_gemm!r}, sonic_state={sonic_state!r}, "
             f"sonic_store_layers={sonic_store_layers})"
+        )
+    if sonic_offload_layers < 0 or (
+        sonic_state == "recompute" and sonic_offload_layers > sonic_store_layers
+    ):
+        raise ValueError(
+            "sonic_offload_layers counts storing MoE layers (from the first one): "
+            f"0 .. sonic_store_layers, got {sonic_offload_layers} with "
+            f"sonic_store_layers={sonic_store_layers}, sonic_state={sonic_state!r}"
         )
     if sonic_store_layers < 0 or (sonic_state == "store" and sonic_store_layers):
         raise ValueError(
@@ -540,7 +553,8 @@ def build_opt_moe_layers(
                 routed_experts_cls = SonicMoERoutedExperts
                 routed_experts_extra = dict(
                     recompute=sonic_state == "recompute"
-                    and layer_id - n_dense_layers >= sonic_store_layers
+                    and layer_id - n_dense_layers >= sonic_store_layers,
+                    offload_h=layer_id - n_dense_layers < sonic_offload_layers,
                 )
             dispatcher = (
                 GatherTokenDispatcher.Config(

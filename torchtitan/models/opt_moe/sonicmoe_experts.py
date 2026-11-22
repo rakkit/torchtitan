@@ -246,6 +246,79 @@ def _(dh_N2F, x_TD, w13_EOI, offset_E1, gather_N, reverse_N, per_token_T1):
     return dh_N2F.new_empty(x_TD.shape), w13_EOI.new_empty(w13_EOI.shape)
 
 
+# Offload of ``h`` (``sonic_offload_layers``): a storing layer's pre-activation
+# goes to pinned CPU memory during the forward and comes back for its down
+# projection's backward. D2H on a side stream right after the up projection
+# (``h.record_stream`` keeps the GPU block until the copy is done); in the
+# backward, the layer that runs next (the previous one in forward order) is
+# prefetched H2D on a second stream while this one computes. Opaque ops like the
+# kernels', so a compiled block runs them eagerly.
+_streams: dict[int, tuple[torch.cuda.Stream, torch.cuda.Stream]] = {}
+_d2h_done: dict[int, torch.cuda.Event] = {}  # CPU data_ptr -> its D2H copy's event
+_forward_order: list[torch.Tensor] = []  # this step's offloaded h, forward order
+_prefetched: dict[int, tuple[torch.Tensor, torch.cuda.Event]] = {}
+
+
+def _offload_streams() -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
+    device = torch.cuda.current_device()
+    if device not in _streams:
+        _streams[device] = (torch.cuda.Stream(), torch.cuda.Stream())
+    return _streams[device]
+
+
+@torch.library.custom_op("opt_moe::sonic_h_to_cpu", mutates_args=())
+def _h_to_cpu(h_N2F: torch.Tensor) -> torch.Tensor:
+    d2h, _ = _offload_streams()
+    d2h.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(d2h):
+        h_cpu = torch.empty(h_N2F.shape, dtype=h_N2F.dtype, pin_memory=True)
+        h_cpu.copy_(h_N2F, non_blocking=True)
+        _d2h_done[h_cpu.data_ptr()] = d2h.record_event()
+    h_N2F.record_stream(d2h)
+    _forward_order.append(h_cpu)
+    return h_cpu
+
+
+@_h_to_cpu.register_fake
+def _(h_N2F):
+    return torch.empty(h_N2F.shape, dtype=h_N2F.dtype, device="cpu")
+
+
+def _start_h2d(h_cpu: torch.Tensor, stream: torch.cuda.Stream) -> torch.Tensor:
+    stream.wait_event(_d2h_done.pop(h_cpu.data_ptr()))
+    with torch.cuda.stream(stream):
+        return h_cpu.to(torch.cuda.current_device(), non_blocking=True)
+
+
+@torch.library.custom_op("opt_moe::sonic_h_to_gpu", mutates_args=())
+def _h_to_gpu(h_cpu: torch.Tensor, backward_dep: torch.Tensor) -> torch.Tensor:
+    """``backward_dep`` (the incoming gradient, unused) ties the reload to the
+    backward: without it a compiled block's partitioner runs this op in the
+    forward and saves its GPU result, which frees nothing."""
+    del backward_dep
+    current = torch.cuda.current_stream()
+    _, h2d = _offload_streams()
+    key = h_cpu.data_ptr()
+    if key in _prefetched:
+        h_N2F, done = _prefetched.pop(key)
+        current.wait_event(done)
+    else:
+        h_N2F = _start_h2d(h_cpu, current)
+    h_N2F.record_stream(current)
+    # prefetch the layer whose backward runs next
+    i = next(j for j, t in enumerate(_forward_order) if t.data_ptr() == key)
+    if i > 0 and _forward_order[i - 1].data_ptr() not in _prefetched:
+        prev = _forward_order[i - 1]
+        _prefetched[prev.data_ptr()] = (_start_h2d(prev, h2d), h2d.record_event())
+    del _forward_order[i:]
+    return h_N2F
+
+
+@_h_to_gpu.register_fake
+def _(h_cpu, backward_dep):
+    return torch.empty(h_cpu.shape, dtype=h_cpu.dtype, device="cuda")
+
+
 @torch.library.custom_op("opt_moe::sonic_down", mutates_args=())
 def _down(
     a_NF: torch.Tensor,
@@ -257,10 +330,11 @@ def _down(
     scatter_N: torch.Tensor,
     reverse_N: torch.Tensor,
     per_token_T1: torch.Tensor,
+    offload_h: bool,
 ) -> torch.Tensor:
     """The down projection of ``a_NF`` and the combine
     ``out[t] = sum over t's pairs of score * row`` (fp32 sum, rounded once)."""
-    del h_N2F, gather_N, scatter_N  # its backward's
+    del h_N2F, gather_N, scatter_N, offload_h  # its backward's
     sonic = _sonic()
     num_experts, d, _ = w2_EDI.shape
     y_ND = a_NF.new_empty(a_NF.shape[0], d)
@@ -296,6 +370,7 @@ def _(
     scatter_N,
     reverse_N,
     per_token_T1,
+    offload_h,
 ):
     return a_NF.new_empty(per_token_T1.numel() - 1, w2_EDI.shape[1])
 
@@ -382,16 +457,22 @@ def _down_setup(ctx, inputs, output):
         scatter_N,
         _,
         _,
+        offload_h,
     ) = inputs
+    ctx.offload_h = offload_h
+    if offload_h:
+        h_N2F = _h_to_cpu(h_N2F)
     ctx.save_for_backward(h_N2F, w2_EDI, scores_N, offset_E1, gather_N, scatter_N)
 
 
 def _down_autograd(ctx, grad_out_TD):
     h_N2F, w2_EDI, scores_N, offset_E1, gather_N, scatter_N = ctx.saved_tensors
+    if ctx.offload_h:
+        h_N2F = _h_to_gpu(h_N2F, grad_out_TD)
     dh_N2F, dw2_EDI, ds_N = _down_backward(
         grad_out_TD, h_N2F, w2_EDI, scores_N, offset_E1, gather_N, scatter_N
     )
-    return None, dh_N2F, dw2_EDI, ds_N, None, None, None, None, None
+    return None, dh_N2F, dw2_EDI, ds_N, None, None, None, None, None, None
 
 
 _down.register_autograd(_down_autograd, setup_context=_down_setup)
@@ -403,6 +484,7 @@ def sonic_experts(
     topk_expert_ids_TK: torch.Tensor,
     w13_EOI: torch.Tensor,
     w2_EDI: torch.Tensor,
+    offload_h: bool = False,
 ) -> torch.Tensor:
     """``sum over the token's K experts of score * (swiglu(x @ w13.T) @ w2.T)`` as
     SonicMoE's three ops; ``w13_EOI`` [E, 2F, D] (gate rows, then up rows) and
@@ -422,6 +504,7 @@ def sonic_experts(
         scatter_N,
         reverse_N,
         per_token_T1,
+        offload_h,
     )
 
 
@@ -451,6 +534,9 @@ class SonicMoERoutedExperts(RoutedExperts):
     @dataclass(kw_only=True, slots=True)
     class Config(RoutedExperts.Config):
         recompute: bool = True
+        offload_h: bool = False
+        """With ``recompute`` False: keep ``h`` in pinned CPU memory instead of on
+        the GPU between this layer's forward and its backward."""
 
         def __post_init__(self) -> None:
             RoutedExperts.Config.__post_init__(self)  # slots: no zero-arg super()
@@ -466,6 +552,7 @@ class SonicMoERoutedExperts(RoutedExperts):
     def __init__(self, config: Config):
         super().__init__(config)
         self.recompute = config.recompute
+        self.offload_h = config.offload_h
         _sonic()  # fail at build time when SONICMOE_SITE is unset or not importable
 
     def _experts(self, x_TD, topk_scores_TK, topk_expert_ids_TK, w13_EOI, w2_EDI):
@@ -476,6 +563,7 @@ class SonicMoERoutedExperts(RoutedExperts):
             topk_expert_ids_TK,
             w13_EOI.bfloat16().contiguous(),
             w2_EDI.bfloat16().contiguous(),
+            self.offload_h,
         ).to(x_TD.dtype)
 
     def forward(

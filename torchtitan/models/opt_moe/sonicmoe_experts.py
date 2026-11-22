@@ -285,9 +285,17 @@ def _(h_N2F):
 
 
 def _start_h2d(h_cpu: torch.Tensor, stream: torch.cuda.Stream) -> torch.Tensor:
+    """Copy on ``stream`` into a buffer from the CURRENT stream's pool: a block
+    allocated on a side stream goes back to that stream's pool when freed and
+    cannot serve the compute stream, so reserved memory grew every step."""
+    h_N2F = torch.empty(
+        h_cpu.shape, dtype=h_cpu.dtype, device=torch.cuda.current_device()
+    )
+    stream.wait_stream(torch.cuda.current_stream())
     stream.wait_event(_d2h_done.pop(h_cpu.data_ptr()))
     with torch.cuda.stream(stream):
-        return h_cpu.to(torch.cuda.current_device(), non_blocking=True)
+        h_N2F.copy_(h_cpu, non_blocking=True)
+    return h_N2F
 
 
 @torch.library.custom_op("opt_moe::sonic_h_to_gpu", mutates_args=())

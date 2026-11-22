@@ -58,6 +58,18 @@ class ParallelismConfig:
     - "never" will disable `reshard_after_forward` for all forward passes.
     """
 
+    fsdp_backward_prefetch_depth: int = 1
+    """How many transformer blocks ahead the backward all-gathers its weights
+    (``FSDPModule.set_modules_to_backward_prefetch``). 1 = FSDP's own one-ahead
+    prefetch; 2 lets the gathers run a block further ahead, so a long block's
+    backward is not followed by a wait. Each extra block holds its gathered
+    weights."""
+
+    fsdp_keep_last_blocks_gathered: int = 0
+    """The last N transformer blocks keep their gathered weights from the
+    forward into the backward (``set_reshard_after_forward(False)``): the
+    backward starts with them, so it does not re-gather them."""
+
     fsdp_defer_gradient_reduction: bool = False
     """Defer FSDP gradient reduction until the last accumulation step."""
 
@@ -196,6 +208,14 @@ class ParallelismConfig:
     """
 
     def __post_init__(self):
+        if (
+            self.fsdp_backward_prefetch_depth < 1
+            or self.fsdp_keep_last_blocks_gathered < 0
+        ):
+            raise ValueError(
+                "fsdp_backward_prefetch_depth must be >= 1 and fsdp_keep_last_blocks_gathered >= 0, got "
+                f"{self.fsdp_backward_prefetch_depth} / {self.fsdp_keep_last_blocks_gathered}"
+            )
         layers_per_stage = self.pipeline_parallel_layers_per_stage
         if layers_per_stage is not None and layers_per_stage < 1:
             raise ValueError(

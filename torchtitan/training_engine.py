@@ -486,6 +486,19 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.model_parts = [model]
             self.pp_has_first_stage = True
             self.pp_has_last_stage = True
+            if not create_seed_checkpoint and (
+                config.parallelism.fsdp_backward_prefetch_depth != 1
+                or config.parallelism.fsdp_keep_last_blocks_gathered
+            ):
+                from torchtitan.distributed.fsdp import (
+                    set_fsdp_block_prefetch_and_reshard,
+                )
+
+                set_fsdp_block_prefetch_and_reshard(
+                    model,
+                    backward_prefetch_depth=config.parallelism.fsdp_backward_prefetch_depth,
+                    keep_last_blocks_gathered=config.parallelism.fsdp_keep_last_blocks_gathered,
+                )
 
         # Parameter init (e.g. an orthogonal QR per matrix) is skipped when the
         # checkpoint load right after restores every parameter; buffers are

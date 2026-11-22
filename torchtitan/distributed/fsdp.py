@@ -203,6 +203,34 @@ def enable_fsdp_symm_mem(model: nn.Module, scope: FSDPSymmMemScope) -> None:
         module.set_symm_mem_for_comm()
 
 
+def set_fsdp_block_prefetch_and_reshard(
+    model: nn.Module, *, backward_prefetch_depth: int, keep_last_blocks_gathered: int
+) -> None:
+    """Backward prefetch ``backward_prefetch_depth`` blocks ahead and keep the
+    last ``keep_last_blocks_gathered`` blocks gathered after their forward
+    (``ParallelismConfig.fsdp_backward_prefetch_depth`` /
+    ``fsdp_keep_last_blocks_gathered``)."""
+    blocks = list(model.layers.values())
+    for block in blocks[len(blocks) - keep_last_blocks_gathered :]:
+        block.set_reshard_after_forward(False, recurse=False)
+    if backward_prefetch_depth > 1:
+        # backward runs the blocks last -> first; block i prefetches i-1 .. i-depth
+        for i, block in enumerate(blocks):
+            ahead = blocks[max(0, i - backward_prefetch_depth) : i][::-1]
+            if i < backward_prefetch_depth and model.tok_embeddings is not None:
+                ahead = ahead + [model.tok_embeddings]
+            if ahead:
+                block.set_modules_to_backward_prefetch(ahead)
+        if model.lm_head is not None:
+            model.lm_head.set_modules_to_backward_prefetch(
+                blocks[::-1][:backward_prefetch_depth]
+            )
+    logger.info(
+        f"FSDP backward prefetch depth {backward_prefetch_depth}, "
+        f"last {keep_last_blocks_gathered} block(s) kept gathered after forward"
+    )
+
+
 def get_fsdp_reshard_after_forward_policy(
     reshard_after_forward_policy: str, pp_enabled: bool
 ) -> bool:

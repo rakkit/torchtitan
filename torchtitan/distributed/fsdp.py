@@ -20,6 +20,7 @@ from torch.distributed.fsdp import (
 from torch.distributed.tensor import Shard
 
 from torchtitan.config.parallelism import FSDPSymmMemScope
+from torchtitan.distributed.fsdp_copy_in import bf16_fp32_reduce_scatter_input_fn
 from torchtitan.distributed.fsdp_lifecycle import complete_fsdp_grouped_forward
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.base.module import Module
@@ -539,6 +540,8 @@ def apply_fsdp_to_decoder(
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)
+    # bf16 gradients into the fp32 reduce-scatter buffer with a faster copy (bit-identical)
+    model.set_reduce_scatter_input_fn(bf16_fp32_reduce_scatter_input_fn)
 
     # HSDP when the data-parallel mesh carries a replicate axis, else pure FSDP.
     if "dp_replicate" in (dp_mesh.mesh_dim_names or ()):

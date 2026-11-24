@@ -29,6 +29,7 @@ from torch.distributed.checkpoint.state_dict_saver import (
     AsyncCheckpointerType,
     AsyncSaveResponse,
 )
+from torch.distributed.tensor import DTensor
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools import filesystem
@@ -300,6 +301,10 @@ class CheckpointManager(BaseCheckpointManager):
         self.pg: dist.ProcessGroup | None = None
         if self.async_mode in (AsyncMode.ASYNC, AsyncMode.ASYNC_WITH_PINNED_MEM):
             self.pg = cast(dist.ProcessGroup, dist.new_group(backend="gloo"))
+        # HSDP: a load plans and reads inside this rank's replica (each replica holds the
+        # whole model), not over every rank: at 12 x 128 GPUs the plan exchange over all
+        # 1,536 ranks took ~65 s of a 107 s restart load.
+        self.load_pg = self._replica_group(model_parts)
 
         self.stager: DefaultStager | None = None
         self.staging_future: Future | None = None
@@ -518,12 +523,35 @@ class CheckpointManager(BaseCheckpointManager):
                         }
                     )
                 )
-            dcp.load(state_dict, checkpoint_id=checkpoint_id)
+            dcp.load(
+                state_dict, checkpoint_id=checkpoint_id, process_group=self.load_pg
+            )
 
             # TODO: Since we flatten the model states in state_dict, we need to
             # manually call load_state_dict() for the model. Need to fix this.
             if MODEL in states:
                 states[MODEL].load_state_dict(state_dict)
+
+    @staticmethod
+    def _replica_group(model_parts: list[nn.Module]) -> dist.ProcessGroup | None:
+        """This rank's gloo group of its HSDP replica; None without replicas."""
+        mesh = next(
+            (
+                p.device_mesh
+                for m in model_parts
+                for p in m.parameters()
+                if isinstance(p, DTensor)
+            ),
+            None,
+        )
+        if (
+            mesh is None
+            or (mesh.mesh_dim_names or ("",))[0] != "dp_replicate"
+            or mesh.size(0) == 1
+        ):
+            return None
+        replicas = mesh.mesh.reshape(mesh.size(0), -1).tolist()
+        return dist.new_subgroups_by_enumeration(replicas, backend="gloo")[0]
 
     def _save(self, curr_step: int, last_step: bool = False) -> bool:
         """Save the checkpoint for the current step.

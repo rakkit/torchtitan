@@ -24,6 +24,7 @@ from torch.distributed.checkpoint import HuggingFaceStorageWriter, Metadata
 from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
 )
+from torch.distributed.checkpoint.filesystem import FileSystem
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.checkpoint.state_dict_saver import (
     AsyncCheckpointerType,
@@ -48,6 +49,22 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _UnbufferedDataFileSystem(FileSystem):
+    """Opens checkpoint data files (.distcp) without Python's read buffer.
+
+    The default buffer is the file system block size (8 MiB on GPFS), and every
+    piece a rank reads after a seek refills all of it: on a 384-node restart a
+    rank read ~4.5x the bytes it needed. The metadata file keeps the buffer
+    (pickle makes many small reads).
+    """
+
+    @contextlib.contextmanager
+    def create_stream(self, path, mode):
+        unbuffered = "b" in mode and str(path).endswith(".distcp")
+        with open(path, mode, buffering=0 if unbuffered else -1) as stream:
+            yield stream
 
 
 if TYPE_CHECKING:
@@ -523,9 +540,9 @@ class CheckpointManager(BaseCheckpointManager):
                         }
                     )
                 )
-            dcp.load(
-                state_dict, checkpoint_id=checkpoint_id, process_group=self.load_pg
-            )
+            reader = dcp.FileSystemReader(checkpoint_id)
+            reader.fs = _UnbufferedDataFileSystem()
+            dcp.load(state_dict, storage_reader=reader, process_group=self.load_pg)
 
             # TODO: Since we flatten the model states in state_dict, we need to
             # manually call load_state_dict() for the model. Need to fix this.

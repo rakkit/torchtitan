@@ -923,6 +923,21 @@ def _mis_8b_a2b(**overrides: Any) -> OPTMoEModel.Config:
     )
 
 
+def _mis_11b_a2b(**overrides: Any) -> OPTMoEModel.Config:
+    """mis-40b-a3b (L49) with half the layers, F + (5S + 1F) x 4 = 25, and half the
+    experts, 128 x 512 top 8 + shared: 11.08B / 2.02B active."""
+    swa_pattern = "F" + "SSSSSF" * 4
+    return _mis_40b_a3b(
+        **dict(
+            n_layers=25,
+            swa_pattern=swa_pattern,
+            rope_pattern="".join("N" if c == "F" else "R" for c in swa_pattern),
+            num_experts=128,
+        )
+        | overrides
+    )
+
+
 def _mis_100b_a5b(**overrides: Any) -> OPTMoEModel.Config:
     return _opt_moe_config(
         **dict(
@@ -1017,6 +1032,7 @@ MODEL_FLAVORS: dict[str, tuple[Callable[..., OPTMoEModel.Config], int]] = {
     "mis-30b-a3b": (_mis_30b_a3b, 4096),
     "mis-8b-a2b": (_mis_8b_a2b, 16384),
     "mis-40b-a3b": (_mis_40b_a3b, 16384),
+    "mis-11b-a2b": (_mis_11b_a2b, 16384),
     "mis-100b-a5b": (_mis_100b_a5b, 4096),
     "gauge-d8-w256": (
         functools.partial(
